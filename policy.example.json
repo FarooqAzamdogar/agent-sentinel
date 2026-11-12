@@ -1,0 +1,24 @@
+{
+  "default": "block",
+  "tools": {
+    "read_file": {
+      "action": "allow",
+      "deny_args": [
+        { "arg": "path", "pattern": "\\.env|\\.ssh|id_rsa|credentials|secrets?" }
+      ]
+    },
+    "fetch_page": "allow",
+    "search_*": "allow",
+    "send_email": {
+      "action": "ask",
+      "allow_args": [
+        { "arg": "to", "pattern": "@example\\.com$" }
+      ]
+    },
+    "delete_*": "block",
+    "run_shell": "block"
+  },
+  "injection": {
+    "block_severity": "high"
+  }
+}
