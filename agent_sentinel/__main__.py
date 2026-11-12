@@ -4,6 +4,9 @@
     agent-sentinel scan [FILE]          scan text (or stdin) for prompt injection
     agent-sentinel validate POLICY      check that a policy file is well formed
     agent-sentinel report AUDIT_LOG     summarize an audit log
+
+Everything printed here may contain untrusted text (file contents, tool names
+from an audit log), so it goes through `printable` first.
 """
 
 from __future__ import annotations
@@ -17,19 +20,20 @@ from pathlib import Path
 from . import __version__, mcp_proxy
 from .detector import scan
 from .policy import Policy, PolicyError
+from .textutil import printable
 
 
 def _scan(args: argparse.Namespace) -> int:
     if args.file in (None, "-"):
-        text = sys.stdin.read()
+        data = sys.stdin.buffer.read()
     else:
-        text = Path(args.file).read_text(encoding="utf-8", errors="replace")
-    findings = scan(text)
+        data = Path(args.file).read_bytes()
+    findings = scan(data.decode("utf-8", errors="replace"))
     if not findings:
         print("No injection patterns found. (Pattern rules only: this is not proof the text is safe.)")
         return 0
     for finding in findings:
-        print(f"[{finding.severity.upper():6}] {finding.rule}: {finding.excerpt}")
+        print(f"[{finding.severity.upper():6}] {finding.rule}: {printable(finding.excerpt)}")
     return 1
 
 
@@ -54,37 +58,51 @@ def _validate(args: argparse.Namespace) -> int:
 
 def _report(args: argparse.Namespace) -> int:
     records = []
-    bad_lines = 0
-    with Path(args.audit).open(encoding="utf-8") as handle:
+    unreadable = 0
+    with Path(args.audit).open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
             if not line.strip():
                 continue
             try:
-                records.append(json.loads(line))
+                record = json.loads(line)
             except ValueError:
-                bad_lines += 1
+                record = None
+            if isinstance(record, dict):
+                records.append(record)
+            else:
+                unreadable += 1
     if not records:
         print("The audit log has no records.")
         return 0
 
-    counts: Counter[tuple[str, str]] = Counter((r.get("tool", "?"), r.get("action", "?")) for r in records)
-    tools = sorted({tool for tool, _ in counts})
-    print(f"{len(records)} records from {records[0].get('time')} to {records[-1].get('time')}\n")
-    print(f"{'tool':28} {'allowed':>8} {'blocked':>8}")
-    for tool in tools:
-        print(f"{tool:28} {counts[(tool, 'allow')]:>8} {counts[(tool, 'block')]:>8}")
+    def field(record: dict, name: str) -> str:
+        return printable(record.get(name, "?"), limit=200)
+
+    counts: Counter[tuple[str, str]] = Counter((printable(r.get("tool", "?"), limit=40), r.get("action")) for r in records)
+    print(f"{len(records)} records from {field(records[0], 'time')} to {field(records[-1], 'time')}\n")
+    print(f"{'tool':40} {'allowed':>8} {'blocked':>8}")
+    for tool in sorted({tool for tool, _ in counts}):
+        print(f"{tool:40} {counts[(tool, 'allow')]:>8} {counts[(tool, 'block')]:>8}")
 
     blocked = [r for r in records if r.get("action") == "block"]
     if blocked:
         print(f"\nLast {min(len(blocked), args.last)} blocked:")
         for record in blocked[-args.last:]:
-            print(f"  {record.get('time')}  {record.get('event')}  {record.get('tool')}: {record.get('reason')}")
-    if bad_lines:
-        print(f"\n{bad_lines} line(s) could not be read and were skipped.")
+            print(f"  {field(record, 'time')}  {field(record, 'event')}  {field(record, 'tool')}: {field(record, 'reason')}")
+    if unreadable:
+        print(f"\n{unreadable} line(s) could not be read and were skipped.")
     return 0
 
 
+def _make_output_safe() -> None:
+    """Never crash on a character the console cannot show (common on Windows)."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _make_output_safe()
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["proxy"]:  # the proxy parses its own arguments, including the '--' part
         return mcp_proxy.main(argv[1:])

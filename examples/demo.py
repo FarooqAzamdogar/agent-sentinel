@@ -1,4 +1,4 @@
-"""Demo: a pretend agent makes five tool calls through the firewall.
+"""Demo: a pretend agent makes six tool calls through the firewall.
 
 Run from the project folder:   python examples/demo.py
 """

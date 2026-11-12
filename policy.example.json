@@ -4,7 +4,7 @@
     "read_file": {
       "action": "allow",
       "deny_args": [
-        { "arg": "path", "pattern": "\\.env|\\.ssh|id_rsa|credentials|secrets?" }
+        { "arg": "*", "pattern": "\\.env|\\.ssh|id_rsa|credentials|secrets?" }
       ]
     },
     "fetch_page": "allow",
@@ -12,11 +12,17 @@
     "send_email": {
       "action": "ask",
       "allow_args": [
-        { "arg": "to", "pattern": "@example\\.com$" }
+        { "arg": "to", "pattern": "[^@\\s,;]+@example\\.com" }
       ]
     },
     "delete_*": "block",
-    "run_shell": "block"
+    "run_shell": "block",
+    "resources/read": {
+      "action": "allow",
+      "deny_args": [
+        { "arg": "uri", "pattern": "\\.env|\\.ssh|id_rsa|credentials|secrets?" }
+      ]
+    }
   },
   "injection": {
     "block_severity": "high"

@@ -1,14 +1,14 @@
 # agent-sentinel
 
-A small firewall for AI agents. It sits between an agent and its tools and does three things:
+A security sentinel for AI agents and MCP servers. It sits between an agent and its tools and does three things:
 
 1. **Checks every tool call against a permission policy** before the tool runs.
-2. **Scans what tools return for prompt injection** before the agent reads it, including poisoned tool descriptions.
+2. **Scans everything a tool server sends for prompt injection** before the agent reads it, including poisoned tool descriptions.
 3. **Writes an audit log** of every decision.
 
 It is pure Python (3.10+) with no dependencies. It works as a library inside your own agent, or as a proxy in front of any MCP server that uses the stdio transport.
 
-> **Status: early version (0.2.0).** The injection detector is a set of pattern rules, not a trained classifier. It catches common, unsophisticated injections. It will miss paraphrased, translated or encoded ones, and it can flag harmless text. The permission policy is the dependable part; treat the detector as an extra layer, not as proof that content is safe. The proxy has been tested against a test server included in this repository, not yet against third-party MCP servers.
+> **Status: early version (0.3.0).** The injection detector is a set of pattern rules, not a trained classifier. It catches common, unsophisticated injections. It will miss paraphrased, translated or encoded ones, and it can flag harmless text. The permission policy is the dependable part; treat the detector as an extra layer, not as proof that content is safe. The proxy has been tested against a test server included in this repository, not yet against third-party MCP servers. See [SECURITY.md](SECURITY.md) for what is and is not covered.
 
 ## Install
 
@@ -36,14 +36,18 @@ A policy is a JSON file. See [policy.example.json](policy.example.json).
   "tools": {
     "read_file": {
       "action": "allow",
-      "deny_args": [{ "arg": "path", "pattern": "\\.env|\\.ssh|id_rsa" }]
+      "deny_args": [{ "arg": "*", "pattern": "\\.env|\\.ssh|id_rsa" }]
     },
     "search_*": "allow",
     "send_email": {
       "action": "ask",
-      "allow_args": [{ "arg": "to", "pattern": "@example\\.com$" }]
+      "allow_args": [{ "arg": "to", "pattern": "[^@\\s,;]+@example\\.com" }]
     },
-    "delete_*": "block"
+    "delete_*": "block",
+    "resources/read": {
+      "action": "allow",
+      "deny_args": [{ "arg": "uri", "pattern": "\\.env|\\.ssh" }]
+    }
   },
   "injection": { "block_severity": "high" }
 }
@@ -51,20 +55,20 @@ A policy is a JSON file. See [policy.example.json](policy.example.json).
 
 | Field | Meaning |
 |---|---|
-| `default` | What happens to a tool with no rule: `allow`, `ask` or `block`. Use `block`. |
+| `default` | What happens to a tool with no rule: `allow`, `ask` or `block`. Defaults to `block`; keep it that way. |
 | `tools` | One rule per tool name. `*` wildcards are allowed; an exact name beats a wildcard. |
 | `action` | `allow` runs the tool, `block` refuses it, `ask` needs a human to approve. |
-| `deny_args` | The call is blocked if the named argument matches the pattern. |
-| `allow_args` | The call is blocked unless the named argument is present and matches the pattern. |
+| `deny_args` | The call is blocked if the pattern is found **anywhere in** the named argument, including inside nested lists and objects. Use `"arg": "*"` to check every argument. |
+| `allow_args` | The call is blocked unless the named argument is present and the pattern matches its **whole value**. For a list, every entry must match. |
 | `injection.block_severity` | Text with a finding at or above this level (`low`, `medium`, `high`) is blocked. `null` only logs. |
 
-Patterns are regular expressions and ignore case. Check a policy with:
+Things to know when writing rules:
 
-```bash
-agent-sentinel validate policy.json
-```
-
-Argument patterns match the text of the argument as given. They do not resolve file paths, so `notes/../.ssh/id_rsa` is caught by a pattern for `.ssh` but a symbolic link to that file is not. Use the tool's own access controls as well.
+- **Patterns** are regular expressions and ignore case.
+- **Deny is "contains", allow is "whole value".** An allow pattern of `[^@\s,;]+@example\.com` accepts `boss@example.com` and refuses `attacker@evil.example, boss@example.com`.
+- **Loading is strict.** An unknown key such as `deny_arg` is an error, so a typo cannot silently weaken a policy. Check a policy with `agent-sentinel validate policy.json`.
+- **MCP resource reads** are checked under the tool name `resources/read`, with one argument, `uri`. With `"default": "block"` they need a rule to be allowed.
+- **Patterns match text, not files.** A deny pattern for `.ssh` catches `notes/../.ssh/id_rsa` but not a symbolic link to that file. Use the tool's own access controls as well.
 
 ## Use it as a library
 
@@ -110,21 +114,23 @@ What the proxy does:
 | Traffic | Handling |
 |---|---|
 | `tools/call` request | Checked against the policy. A blocked call is answered by the proxy and never reaches the server. |
-| `tools/call` result | Scanned. A result with an injection is replaced with an error. |
-| `tools/list` result | Each tool's name, description and schema are scanned. A poisoned tool is removed from the list, and later calls to it are blocked. |
-| `resources/read` and `prompts/get` results | Scanned. A result with an injection is replaced with an error. |
+| `resources/read` request | Checked against the policy, under the name `resources/read`. |
+| `tools/call` and other results | Scanned. A result with an injection is replaced with an error. |
+| `tools/list` result | Each tool's name, description and schema are scanned. A poisoned tool is removed from the list, and calls to it are blocked from then on. |
+| `prompts/list`, `resources/list` results | Scanned entry by entry; poisoned entries are removed. |
+| `initialize` result | The server's `instructions` are scanned and removed if they look like an injection. |
+| Requests and notifications from the server | Scanned (a sampling request is a prompt the server wants the model to answer). Blocked ones are dropped. |
+| A reply that matches no request | Dropped. |
 | Anything malformed | Dropped. Invalid JSON, batched requests, bad ids and bad arguments are never forwarded. |
-| Everything else | Passed through. |
 
-The proxy fails closed: if it cannot check a message, it does not forward it. Messages are re-serialized, so the server sees exactly what the proxy checked. Warnings go to standard error.
+The proxy fails closed: if it cannot check a message, it does not forward it. Messages are re-serialized, so each side receives exactly what the proxy checked. Warnings go to standard error.
 
 Limits of the proxy in this version:
 
 - Only the stdio transport is supported, not HTTP.
 - Rules with action `ask` are blocked, because the proxy has no terminal to ask a human on.
-- Requests that the server sends to the client (sampling, elicitation) and notifications are not scanned.
-- A tool whose description changes after it was first listed is scanned again, but the change itself is not reported.
 - Binary content (images, audio, base64 data) is not decoded or scanned.
+- A tool is trusted or quarantined by its description at the time it is listed. A change of description is scanned again, but the change itself is not reported.
 
 ## The command line
 
@@ -140,10 +146,10 @@ agent-sentinel proxy ...              # run an MCP server behind the firewall
 One JSON object per line:
 
 ```json
-{"time": "2026-11-12T21:03:42+00:00", "event": "call", "tool": "read_file", "action": "block", "reason": "argument 'path' matches denied pattern ...", "args": {"path": "/home/me/.ssh/id_rsa"}}
+{"time": "2026-11-12T21:03:42+00:00", "event": "call", "tool": "read_file", "action": "block", "reason": "an argument has a value the policy denies", "args": {"path": "/home/me/.ssh/id_rsa"}}
 ```
 
-`event` is `call`, `result` or `tool_description`. Tool arguments are logged, and they can contain sensitive data. Pass `log_args=False` to `Firewall`, or `--no-log-args` to the proxy, to leave them out. If the log cannot be written, the firewall prints one warning and keeps enforcing decisions.
+`event` is one of `call`, `result`, `tool_description`, `list_item`, `server_instructions` or `server_request`. Tool arguments are logged, and they can contain sensitive data. Pass `log_args=False` to `Firewall`, or `--no-log-args` to the proxy, to leave them out. If the log cannot be written, the firewall prints one warning and keeps enforcing decisions.
 
 ## What the detector looks for
 
@@ -155,12 +161,14 @@ One JSON object per line:
 | `secret_request` | medium | "Send me the password" (no destination named) |
 | `role_hijack` | medium | "You are now...", `<system>` tags |
 | `tool_command` | medium | "Run the shell command silently" |
-| `invisible_characters` | medium | Zero-width or hidden Unicode characters |
+| `invisible_characters` | medium or low | Hidden Unicode characters. Low when they are only the joiners that emoji and some scripts use. |
 | `markdown_image_exfiltration` | medium | An image link that carries data in its URL |
 
-Before matching, text is normalized: invisible characters are removed and look-alike forms such as full-width letters are folded to plain ones. With the default policy only high findings block; medium findings are logged.
+Before matching, text is normalized: invisible characters are removed and look-alike forms such as full-width letters are folded to plain ones. With the default policy only high findings block; medium and low findings are logged.
 
-## Run the tests
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how the code is organized, how a message flows through it, and how to add a detector rule. To report a security problem, see [SECURITY.md](SECURITY.md).
 
 ```bash
 python -m unittest discover tests -v
