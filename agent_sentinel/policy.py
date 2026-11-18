@@ -26,7 +26,7 @@ from typing import Any, Sequence, TypeVar
 from urllib.parse import unquote
 
 from .detector import SEVERITY_ORDER
-from .textutil import texts_in
+from .textutil import printable, texts_in
 
 ACTIONS = ("allow", "ask", "block")
 
@@ -181,14 +181,27 @@ class Policy:
     max_calls_per_minute: int | None = None
     server_requests: tuple[ServerRequestRule, ...] = ()
 
+    def __post_init__(self) -> None:
+        # A policy can also be built in code, without the loader. An action such
+        # as "deny" or "Block" must not get through to mean "anything goes".
+        _expect_choice(self.default, "default", ACTIONS)
+        for rule in self.tools:
+            _expect_choice(rule.action, f"tools.{rule.name}.action", ACTIONS)
+        for request in self.server_requests:
+            _expect_choice(request.action, f"server_requests.{request.name}", ("allow", "block"))
+        _expect_choice(self.secrets_in_arguments, "secrets.in_arguments", ("block", "allow"))
+        if self.block_severity is not None and self.block_severity not in SEVERITY_ORDER:
+            raise PolicyError(f"injection.block_severity must be one of {list(SEVERITY_ORDER)} or null")
+
     # ---- loading ------------------------------------------------------------
 
     @classmethod
     def from_file(cls, path: str | Path) -> "Policy":
         """Load a policy from a JSON file.
 
-        Read as "utf-8-sig" because Notepad and Windows PowerShell 5 put a
-        byte order mark at the start of the files they save.
+        Read as "utf-8-sig" because some Windows editors put a byte order mark
+        at the start of the UTF-8 files they save. A file in another encoding
+        (UTF-16, for example) is reported as not valid JSON.
         """
         try:
             text = Path(path).read_text(encoding="utf-8-sig")
@@ -260,7 +273,7 @@ class Policy:
 
         rules = _deciding_rules(self.tools, tool)
         if not rules:
-            return _rule_verdict(self.default, f"no rule for '{tool}', default is {self.default}")
+            return _rule_verdict(self.default, f"no rule for '{printable(tool, limit=80)}', default is {self.default}")
 
         # Strictest wins, so a block holds whatever else matches and the order of
         # the rules in the file does not matter. max() returns the first of equals,
@@ -336,7 +349,8 @@ def _apply_rule(rule: ToolRule, args: dict[str, Any]) -> Verdict:
         named = {allow.arg for allow in rule.allow_args}
         for name in args:
             if name not in named:
-                return _argument_block(f"argument '{name}' is not accepted by the policy")
+                # The name is chosen by the agent: shorten and escape it before repeating it.
+                return _argument_block(f"argument '{printable(name, limit=60)}' is not accepted by the policy")
 
     return _rule_verdict(rule.action, f"rule '{rule.name}' says {rule.action}")
 
@@ -361,12 +375,14 @@ def _is_denied(rule: ArgRule, args: dict[str, Any]) -> bool:
     value cannot be hidden one level down.
     """
     if rule.arg == ANY_ARG:
-        value: Any = args
+        texts = texts_in(args, keys=True, scalars=True)
     elif rule.arg in args:
-        value = args[rule.arg]
+        # An empty list or object holds no text, but the argument is there: check
+        # it as empty text, so that a pattern meant to forbid the argument still does.
+        texts = texts_in(args[rule.arg], keys=True, scalars=True) or [""]
     else:
         return False
-    return any(_found_in_any_spelling(rule.pattern, text) for text in texts_in(value, keys=True, scalars=True))
+    return any(_found_in_any_spelling(rule.pattern, text) for text in texts)
 
 
 def _found_in_any_spelling(pattern: re.Pattern[str], text: str) -> bool:
@@ -374,13 +390,13 @@ def _found_in_any_spelling(pattern: re.Pattern[str], text: str) -> bool:
 
     "file:///home/me/%2Essh/id_rsa" names the same file as the plain spelling
     to anything that treats the value as a URI, so a deny rule has to see both.
-    Extra spellings can only add blocks, and only for values that decode to
-    something the author already denied.
+    Extra spellings can only add blocks.
 
     The number of rounds is fixed, so a value that was encoded a thousand
     times over cannot buy a thousand rounds of work. A value that still holds
-    an escape after the last round is treated as denied: nothing ordinary is
-    encoded that many times.
+    an escape after the last round is treated as denied, whatever it would
+    decode to: nothing ordinary is encoded that many times, and it could not
+    be checked.
 
     Compatibility folding (NFKC) is left out on purpose: file systems do not
     apply it, and it is slow on long runs of combining marks.
@@ -415,9 +431,27 @@ def _is_allowed(rule: ArgRule, value: Any) -> bool:
         return False
     for entry in entries:
         text = _scalar_text(entry)
-        if text is None or not rule.pattern.fullmatch(text):
+        if text is None or not _matches_whole_value(rule.pattern, text):
             return False
     return True
+
+
+# Characters that Python's case-insensitive matching treats as "i", "s" and "k":
+# dotted capital I, dotless i, long s and the Kelvin sign. A pattern for
+# "acme-inc.com" would otherwise accept "acme-ınc.com", a different domain
+# that anyone can register.
+_CASE_LOOKALIKES = dict.fromkeys((0x0130, 0x0131, 0x017F, 0x212A), "�")
+
+
+def _matches_whole_value(pattern: re.Pattern[str], text: str) -> bool:
+    """True if the pattern matches the whole text, also with case look-alikes made unmatchable.
+
+    The value is matched as written. It is not percent-decoded first, unlike
+    for deny rules: an allow pattern that lists "%" on purpose
+    ("docs/[\\w%./-]+") must keep accepting "docs/my%20notes.txt". An author
+    whose tool decodes its arguments should leave "%" out of the pattern.
+    """
+    return bool(pattern.fullmatch(text)) and bool(pattern.fullmatch(text.translate(_CASE_LOOKALIKES)))
 
 
 def _scalar_text(value: Any) -> str | None:
@@ -435,13 +469,15 @@ def _empty_match_warnings(where: str, deny_args: tuple[ArgRule, ...], allow_args
     """Warn about patterns that match the empty string.
 
     A warning and not an error: an empty deny pattern is a legitimate way to
-    forbid an argument outright. Optional allow entries are skipped, because
-    "any text, or left out" is how a closed argument list names a free-text
-    argument, and an empty value there says no more than leaving it out.
+    forbid an argument outright. A deny pattern that matches only the empty
+    string ("^$") forbids empty values and is not reported. Optional allow
+    entries are skipped, because "any text, or left out" is how a closed
+    argument list names a free-text argument, and an empty value there says
+    no more than leaving it out.
     """
     found = []
     for deny in deny_args:
-        if deny.pattern.search(""):
+        if deny.pattern.search("") and deny.pattern.search("x"):
             scope = "every call" if deny.arg == ANY_ARG else "every call that has the argument"
             found.append(
                 f"{where}: the deny pattern for argument '{deny.arg}' matches the empty string, "
@@ -468,6 +504,11 @@ def _overridden_glob_warnings(tools: list[ToolRule]) -> list[str]:
     for catch_all in globs:
         if catch_all.name.strip("*"):
             continue
+        if catch_all.action == "allow":
+            found.append(
+                f"tools.{catch_all.name}: allows every tool that has no rule of its own, "
+                'which is the same as "default": "allow"'
+            )
         for rule in globs:
             if _STRICTNESS[rule.action] < _STRICTNESS[catch_all.action]:
                 found.append(
@@ -534,6 +575,13 @@ def _arg_rules(specs: Any, where: str, deny: bool) -> tuple[ArgRule, ...]:
         _expect_name(arg, f"{where}: argument name")
         if arg == ANY_ARG and not deny:
             raise PolicyError(f"{where}: '{ANY_ARG}' is only supported in deny_args")
+        if "*" in arg and arg != ANY_ARG:
+            # Tool names take wildcards; argument names do not. "file_*" would
+            # load and then match only an argument literally called "file_*".
+            raise PolicyError(
+                f"{where}: argument name {arg!r} holds a '*'. Argument names are exact; "
+                f"use '{ANY_ARG}' alone to mean every argument"
+            )
         if not isinstance(optional, bool):
             raise PolicyError(f"{where}: 'optional' must be true or false, got {optional!r}")
         try:
@@ -581,6 +629,6 @@ def _expect_choice(value: Any, where: str, choices: tuple[str, ...]) -> None:
 
 
 def _expect_name(name: Any, what: str) -> None:
-    """Refuse a tool, method or argument name that can never match: empty, or with spaces around it."""
+    """Refuse a tool, method or argument name that is empty or has spaces around it: almost certainly a typo."""
     if not isinstance(name, str) or not name or name != name.strip():
         raise PolicyError(f"{what} {name!r} must be text that is not empty and has no spaces around it")

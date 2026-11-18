@@ -19,7 +19,7 @@ from collections import Counter
 from pathlib import Path
 
 from . import __version__, mcp_proxy
-from .detector import scan
+from .detector import scan_views
 from .policy import Policy, PolicyError
 from .textutil import printable
 
@@ -33,27 +33,30 @@ _BYTE_ORDER_MARKS = (
 )
 
 
-def _decode(data: bytes) -> str:
-    """Decode a file for scanning.
+def _readings(data: bytes) -> list[str]:
+    """The ways a file's bytes may be read as text. All of them are scanned.
 
-    Files are UTF-8 unless they say otherwise. A UTF-16 file read as UTF-8 has
-    a NUL between every letter and would scan as clean, so honour byte order
-    marks and recognise unmarked UTF-16 by its NUL bytes.
+    Always as UTF-8, which is what most programs assume. Also as the encoding
+    a byte order mark announces, and as UTF-16 when the NUL bytes suggest it:
+    a UTF-16 file has a NUL beside every letter. Guessing ONE encoding would
+    be a way to hide text: two bytes that look like a UTF-16 mark in front of
+    ordinary UTF-8 would make the scanner read noise where another program
+    reads the words.
     """
+    readings = [data.decode("utf-8", errors="replace")]
     for mark, encoding in _BYTE_ORDER_MARKS:
         if data.startswith(mark):
-            return data.decode(encoding, errors="replace")
+            readings.append(data.decode(encoding, errors="replace"))
     sample = data[:2000]
     if len(sample) >= 4 and sample.count(0) >= len(sample) // 4:
-        even_nuls = sample[0::2].count(0)
-        odd_nuls = sample[1::2].count(0)
-        return data.decode("utf-16-be" if even_nuls > odd_nuls else "utf-16-le", errors="replace")
-    return data.decode("utf-8", errors="replace")
+        readings.append(data.decode("utf-16-le", errors="replace"))
+        readings.append(data.decode("utf-16-be", errors="replace"))
+    return list(dict.fromkeys(readings))
 
 
 def _scan(args: argparse.Namespace) -> int:
     data = sys.stdin.buffer.read() if args.file in (None, "-") else Path(args.file).read_bytes()
-    findings = scan(_decode(data))
+    findings = scan_views(_readings(data))
     if not findings:
         print("No injection patterns found. (Pattern rules only: this is not proof the text is safe.)")
         return 0
@@ -71,7 +74,8 @@ def _validate(args: argparse.Namespace) -> int:
     print(f"Policy is valid. Default action: {policy.default}. Blocks injection findings at: {policy.block_severity}.")
     print(f"Secrets in tool arguments: {policy.secrets_in_arguments}.", end=" ")
     print(f"Policy-wide deny rules: {len(policy.deny_args)}.", end=" ")
-    print(f"Limit for all tools: {policy.max_calls_per_minute or 'none'} call(s) per minute.")
+    limit = policy.max_calls_per_minute
+    print(f"Limit for all tools: {f'{limit} call(s) per minute' if limit else 'none'}.")
     for rule in policy.tools:
         notes = []
         if rule.deny_args:
@@ -88,6 +92,9 @@ def _validate(args: argparse.Namespace) -> int:
     return 0
 
 
+_ACTIONS = ("allow", "block", "would_block")
+
+
 def _read_audit(path: str) -> tuple[list[dict], int]:
     records, unreadable = [], 0
     with Path(path).open(encoding="utf-8", errors="replace") as handle:
@@ -96,7 +103,7 @@ def _read_audit(path: str) -> tuple[list[dict], int]:
                 continue
             try:
                 record = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):  # not JSON, or nested absurdly deep
                 record = None
             if isinstance(record, dict):
                 records.append(record)
@@ -107,12 +114,26 @@ def _read_audit(path: str) -> tuple[list[dict], int]:
 
 def _report(args: argparse.Namespace) -> int:
     records, unreadable = _read_audit(args.audit)
+    # Said first and plainly: a line that cannot be read may be a record someone wanted hidden.
+    if unreadable:
+        print(f"WARNING: {unreadable} line(s) of the log could not be read and are not counted below.")
     if not records:
-        print("The audit log has no records.")
+        print("The audit log has no readable records.")
         return 0
 
     def field(record: dict, name: str, limit: int = 200) -> str:
         return printable(record.get(name, "?"), limit=limit)
+
+    def action(record: dict) -> str:
+        value = record.get("action")
+        return value if value in _ACTIONS else "other"  # anything unexpected still gets counted
+
+    def table(title: str, records: list[dict], key: str, first_column: str) -> None:
+        counts = Counter((field(r, key, 40), action(r)) for r in records)
+        print(f"\n{title:40} {first_column:>8} {'blocked':>8} {'would block':>12} {'other':>6}")
+        for name in sorted({name for name, _ in counts}):
+            row = [counts[(name, a)] for a in (*_ACTIONS, "other")]
+            print(f"{name:40} {row[0]:>8} {row[1]:>8} {row[2]:>12} {row[3]:>6}")
 
     print(f"{len(records)} records from {field(records[0], 'time')} to {field(records[-1], 'time')}")
 
@@ -120,28 +141,17 @@ def _report(args: argparse.Namespace) -> int:
     # server chose, so mixing them in would let a server invent "allowed" rows.
     calls = [r for r in records if r.get("event") == "call"]
     if calls:
-        counts = Counter((field(r, "tool", 40), r.get("action")) for r in calls)
-        print(f"\n{'Tool calls':40} {'allowed':>8} {'blocked':>8} {'would block':>12}")
-        for tool in sorted({tool for tool, _ in counts}):
-            row = (counts[(tool, "allow")], counts[(tool, "block")], counts[(tool, "would_block")])
-            print(f"{tool:40} {row[0]:>8} {row[1]:>8} {row[2]:>12}")
+        table("Tool calls", calls, "tool", "allowed")
+    checks = [r for r in records if r.get("event") != "call"]
+    if checks:
+        table("Content checks, by kind", checks, "event", "passed")
 
-    scans = [r for r in records if r.get("event") != "call"]
-    if scans:
-        counts = Counter((field(r, "event", 40), r.get("action")) for r in scans)
-        print(f"\n{'Content checks, by kind':40} {'passed':>8} {'blocked':>8} {'would block':>12}")
-        for event in sorted({event for event, _ in counts}):
-            row = (counts[(event, "allow")], counts[(event, "block")], counts[(event, "would_block")])
-            print(f"{event:40} {row[0]:>8} {row[1]:>8} {row[2]:>12}")
-
-    blocked = [r for r in records if r.get("action") in ("block", "would_block")]
+    blocked = [r for r in records if action(r) in ("block", "would_block")]
     shown = blocked[-args.last :] if args.last > 0 else []
     if shown:
         print(f"\nLast {len(shown)} blocked:")
         for record in shown:
             print(f"  {field(record, 'time')}  {field(record, 'event')}  {field(record, 'tool')}: {field(record, 'reason')}")
-    if unreadable:
-        print(f"\n{unreadable} line(s) could not be read and were skipped.")
     return 0
 
 
@@ -156,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     _make_output_safe()
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["proxy"]:  # the proxy parses its own arguments, including the '--' part
-        return mcp_proxy.main(argv[1:])
+        mcp_proxy.exit_process(mcp_proxy.main(argv[1:]))  # does not return: see exit_process for why
 
     parser = argparse.ArgumentParser(prog="agent-sentinel", description="A firewall for AI agent tool calls.")
     parser.add_argument("--version", action="version", version=f"agent-sentinel {__version__}")
@@ -177,6 +187,8 @@ def main(argv: list[str] | None = None) -> int:
     report_cmd.set_defaults(func=_report)
 
     args = parser.parse_args(argv)
+    if not hasattr(args, "func"):  # "proxy" reached here because something came before it, such as "--"
+        parser.error("write 'proxy' first: agent-sentinel proxy --policy FILE -- COMMAND")
     try:
         return args.func(args)
     except OSError as exc:

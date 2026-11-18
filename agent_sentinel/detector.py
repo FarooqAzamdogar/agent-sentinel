@@ -44,9 +44,10 @@ several ".{0,40}" gaps can be driven into very slow backtracking.
 
 Staying fast on hostile input
 -----------------------------
-Every quantifier in every pattern has an upper bound. Normalization works in
+Every pattern reads a text in one pass: its quantifiers are bounded, or cannot
+overlap, or run over single spaces only. Normalization works in
 short slices (see `_decompose`) and cannot make a text more than a few times
-longer. Each pattern is run over a view once; after that the chain matcher
+longer. Each rule runs its patterns over a view once; after that the chain matcher
 looks matches up in an index (see `_Occurrences`) and rarely has to search
 again. It counts its work and gives up at `_SCAN_BUDGET`: the text is then
 reported as a high `unscannable_content` finding, never passed as clean.
@@ -70,6 +71,8 @@ import unicodedata
 import urllib.parse
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+
+from .textutil import FIELD_BREAK
 
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
 
@@ -180,6 +183,9 @@ _WITHOUT_HIDDEN_TEXT = _Table()  # deletes the invisible characters that have no
 # Makes the matching view of single characters: deletes invisible characters
 # and combining marks, folds look-alikes and apostrophes.
 _FOLD = _Table()
+# As _FOLD, but control characters and the fillers that draw a blank become a space instead of nothing.
+_FOLD_SPACED = _Table()
+_BLANK_FILLERS = frozenset([0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x180E])
 
 
 def _classify(code: int) -> None:
@@ -196,6 +202,8 @@ def _classify(code: int) -> None:
     _WITHOUT_INVISIBLE[code] = None if invisible else code
     _WITHOUT_HIDDEN_TEXT[code] = None if invisible and not everyday else code
     _FOLD[code] = None if invisible or category in ("Mn", "Me") else _FOLDED.get(code, code)
+    spaced = code in _BLANK_FILLERS or (category == "Cc" and invisible)
+    _FOLD_SPACED[code] = " " if spaced else _FOLD[code]
 
 
 def _decompose(text: str) -> str:
@@ -225,14 +233,14 @@ def _without_expanding(piece: str) -> str:
     this a hostile text could make its matching view many times longer than itself.
     """
     expanding = [ch for ch in set(piece) if len(unicodedata.normalize("NFKD", ch)) > _MAX_EXPANSION]
-    return piece.translate(dict.fromkeys(map(ord, expanding), " "))
+    return piece.translate({ord(ch): unicodedata.normalize("NFKD", ch)[:_MAX_EXPANSION] for ch in expanding})
 
 
-def _normalize(text: str) -> str:
+def _normalize(text: str, table: "_Table | None" = None) -> str:
     """Build the matching view of `text`. Nothing a reader can see is removed, only folded to its plain form."""
     if not text.isascii():  # plain ASCII has nothing to decompose
         text = _decompose(text.replace(_ACUTE_ACCENT, "'"))
-    return " ".join(text.translate(_FOLD).split())
+    return " ".join(text.translate(_FOLD if table is None else table).split())
 
 
 # --------------------------------------------------------------------------
@@ -246,9 +254,11 @@ _ANSI_RE = re.compile(r"\x1b\[[0-?]{0,64}[ -/]{0,8}[@-~]|\x1b\][^\x07\x1b]{0,512
 # html.unescape() reads the digits of "&#...;" with int(), which is slow, or
 # raises, once there are thousands of them. No real reference has more than seven.
 _ENDLESS_REFERENCE_RE = re.compile(r"&#[0-9]{8}")
-# A tag or a short comment. Removing it joins the text on both sides, as a
-# browser does: "Ig<b></b>nore" reads "Ignore".
-_TAG_RE = re.compile(r"<[^<>]{0,300}>")
+_LEADING_ZEROS_RE = re.compile(r"&#0+(?=[0-9])")
+# A tag or a comment. Removing it joins the text on both sides, as a browser
+# does: "Ig<b></b>nore" reads "Ignore". No length bound is needed: the class
+# excludes "<", so no character is read by two attempts.
+_TAG_RE = re.compile(r"<[^<>]*>")
 # What glues a word to its neighbour without being part of either: the
 # underscore, and a newline, tab or return written out as in a JSON string.
 _GLUE = ("_", "\\n", "\\t", "\\r")
@@ -258,23 +268,24 @@ def _decode(text: str) -> str:
     """Undo, once, the encodings a terminal, a web page or a URL puts on text, which a model reads through.
 
     Terminal escape sequences, percent-encoding, HTML character references
-    and HTML tags only: base64, hex and the like are not decoded. Each step
-    is a single pass, and none is repeated, so text encoded twice is decoded
-    once.
+    and JSON-escaped slashes only: base64, hex and the like are not decoded.
+    Each step is a single pass in this order and none is repeated, so text
+    that needs the same step twice is not fully decoded. HTML tags are removed
+    by the caller, as a separate view.
     """
     if "\x1b" in text:
         text = _ANSI_RE.sub("", text)
+    if "\\/" in text:
+        text = text.replace("\\/", "/")  # "http:\/\/host", as JSON kept inside a string writes it
     if "%" in text:
         # Same result as urllib.parse.unquote(), which is slow when ASCII and
         # other characters alternate; on bytes the cost depends only on the "%" signs.
         text = urllib.parse.unquote_to_bytes(text.encode("utf-8", "replace")).decode("utf-8", "replace")
     if "&" in text:
         try:
-            text = html.unescape(_ENDLESS_REFERENCE_RE.sub(" ", text))
+            text = html.unescape(_ENDLESS_REFERENCE_RE.sub(" ", _LEADING_ZEROS_RE.sub("&#", text)))
         except ValueError as error:  # no input is known to get here; if one does, do not call the text clean
             raise _Unscannable("HTML character references could not be decoded") from error
-    if "<" in text:
-        text = _TAG_RE.sub("", text)
     return text
 
 
@@ -290,10 +301,18 @@ def _matching_views(text: str) -> Iterator[str]:
     """The views of `text` the chain rules are matched in: plain, then decoded if that is different."""
     plain = _normalize(text)
     yield plain
+    seen = {plain}
     decoded = _decode(text)
-    view = _unglue(plain if decoded == text else _normalize(decoded))
-    if view != plain:
-        yield view
+    candidates = [_unglue(plain if decoded == text else _normalize(decoded))]
+    if "<" in decoded:
+        candidates.append(_unglue(_normalize(_TAG_RE.sub("", decoded))))
+    if len(text.translate(_WITHOUT_INVISIBLE)) != len(text):
+        candidates.append(_normalize(text, _FOLD_SPACED))
+        candidates.append(_unglue(_normalize(decoded, _FOLD_SPACED)))
+    for view in candidates:
+        if view not in seen:
+            seen.add(view)
+            yield view
 
 
 # --------------------------------------------------------------------------
@@ -338,7 +357,7 @@ _NEGATION = r"(\bnever|\bnot|\bcannot|n't|\bdont) $"
 _NEGATION_REACH = 10  # characters before the verb that are looked at; longer than any negation above
 _SECRET = (
     r"(\b(api[_ -]?keys?|passwords?|credentials?|secrets?|(access |auth |session )?tokens?|ssh keys?|private keys?"
-    r"|(chat|conversation) history)\b|\.env\b)"
+    r"|(chat|conversation)[ _./-]?history)\b|\.env\b)"
 )
 # An email address is recognized from its "@domain.tld" part. Matching the
 # name before the "@" as well ("[\w.+-]+@") is slow on long runs of letters.
@@ -395,7 +414,13 @@ _SUPERSEDED_BY = {
 }
 
 # Where a sentence ends in a matching view (which has single spaces only).
-_SENTENCE_END_RE = re.compile(r"[.!?] ")
+# Matched against the view BEFORE it is lowercased: a capital after the full stop is the evidence.
+_SENTENCE_END_RE = re.compile(
+    FIELD_BREAK + "|"  # between two fields of a structured value: see textutil.text_views
+    r"[.!?](?<!\b[A-Za-z]\.)(?<!\.\.\.)"
+    r"(?i:(?<!\betc\.)(?<!\bmr\.)(?<!\bdr\.)(?<!\bms\.)(?<!\bst\.)(?<!\bvs\.)(?<!\bno\.)(?<!\bmrs\.)(?<!\bapprox\.))"
+    r" (?:(?![a-z0-9])|(?=(?i:https?://|www\.)))"
+)
 
 # A windowed search (see `_Occurrences.ends_of_matches`) reads this many
 # characters past the last place a match may start, and the end of the window
@@ -492,7 +517,7 @@ class _Occurrences:
             index += 1
 
 
-def _match_chain(rule: _Rule, text: str, budget: _Budget) -> tuple[int, int] | None:
+def _match_chain(rule: _Rule, text: str, budget: _Budget, cased: str = "") -> tuple[int, int] | None:
     """Return the (start, end) of the first place `rule` matches, or None."""
     first_pattern = rule.steps[0].pattern
     if next(_first_matches(first_pattern, text), None) is None:
@@ -502,8 +527,9 @@ def _match_chain(rule: _Rule, text: str, budget: _Budget) -> tuple[int, int] | N
         occurrences.append(_Occurrences(step, text))
         if not occurrences[-1]:
             return None  # this step occurs nowhere in the text, so the rule cannot match
-    sentence_ends = [match.start() for match in _SENTENCE_END_RE.finditer(text)] if rule.one_sentence else []
+    sentence_ends = [match.start() for match in _SENTENCE_END_RE.finditer(cased or text)] if rule.one_sentence else []
     for first in _first_matches(first_pattern, text):
+        budget.spend()
         if rule.unless_after and rule.unless_after.search(text, max(0, first.start() - _NEGATION_REACH), first.start()):
             continue
         next_end = bisect.bisect_left(sentence_ends, first.end())
@@ -536,7 +562,7 @@ def _match_rules(view: str, budget: _Budget, found: dict[str, Finding]) -> None:
         # A rule has one severity, so a match in an earlier view cannot be improved on.
         if rule.name in found or _SUPERSEDED_BY.get(rule.name) in found:
             continue
-        span = _match_chain(rule, lowered, budget)
+        span = _match_chain(rule, lowered, budget, view)
         if span:
             found[rule.name] = Finding(rule.name, rule.severity, _excerpt(view, *span))
 
@@ -590,7 +616,7 @@ def _excerpt(text: str, start: int, end: int, pad: int = 30) -> str:
 # Public API
 # --------------------------------------------------------------------------
 
-def scan(text: str) -> list[Finding]:
+def scan(text: str, budget: "_Budget | None" = None) -> list[Finding]:
     """Return the injection findings in `text`, at most one per rule."""
     if not text:
         return []
@@ -598,7 +624,7 @@ def scan(text: str) -> list[Finding]:
     for finding in (_invisible_finding(text), _image_finding(text)):
         if finding:
             found[finding.rule] = finding
-    budget = _Budget()
+    budget = budget or _Budget()
     try:
         for view in _matching_views(text):
             _match_rules(view, budget, found)
@@ -615,8 +641,11 @@ def scan_views(texts: Iterable[str]) -> list[Finding]:
     read as several texts.
     """
     strongest: dict[str, Finding] = {}
+    budget = _Budget()
     for text in texts:
-        for finding in scan(text):
+        if "unscannable_content" in strongest:
+            break
+        for finding in scan(text, budget):
             known = strongest.get(finding.rule)
             if known is None or SEVERITY_ORDER[finding.severity] > SEVERITY_ORDER[known.severity]:
                 strongest[finding.rule] = finding

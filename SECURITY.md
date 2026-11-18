@@ -17,7 +17,7 @@ When the proxy is in front of an MCP server:
 5. Hostile text cannot stall the scanner, and text printed by the proxy or written to the audit log has its control codes escaped. This includes the server's error output.
 6. A tool whose description is flagged, or whose definition changes after it was first listed, is removed from the tool list and cannot be called.
 
-These were last checked by an internal multi-angle review of version 0.3.0, whose findings were fixed in 0.4.0. There has been no independent audit.
+These were checked by two internal reviews: a multi-angle review of version 0.3.0, and a line-by-line review of version 0.4.0 whose findings are fixed in 0.4.1. There has been no independent audit.
 
 ## Who is trusted
 
@@ -32,14 +32,16 @@ These were last checked by an internal multi-angle review of version 0.3.0, whos
 
 These are not guarantees, and reports about them are not vulnerabilities:
 
-- **The detector is pattern rules.** It misses reworded and translated attacks, base64 or hex encoded text, and look-alike letters outside the small set it folds. It only scans text, not images or audio. It can flag harmless text.
+- **The detector is pattern rules.** It misses reworded and translated attacks, base64 or hex encoded text, and look-alike letters outside the small set it folds. It only scans text, not images or audio. It can flag harmless text: a field named `override_system_prompt` or `never_notify_user` reads as the phrase it spells, and a URL whose host is named like a verb (`user@email.com:secret@host`) can read as an instruction.
+- **Sending a secret to an address is high only within one sentence**, and not when the verb is negated ("never email your password to..."). Both rules exist to keep login pages and security advice from being blocked, and both can be used to write an instruction that is only logged, not blocked.
 - **Policy patterns match text.** Deny rules undo percent-encoding, but nothing resolves paths, follows symbolic links or decodes other encodings. A deny rule is one layer; the tool should enforce its own access controls.
 - **A policy is only as strict as it is written.** `"default": "allow"` lets any tool without a rule run. Methods other than tool calls and resource requests (for example `prompts/get`) are forwarded without a policy check; their replies are scanned.
 - **The secret guard knows a fixed list of formats.** Passwords and keys in other formats pass.
 - **`ask` rules are blocked in the proxy**, because there is no way to reach a human yet.
 - **Monitor mode protects nothing.** It exists for tuning a policy.
 - **The audit log is a plain file.** Anyone who can write to it can change it. It records tool arguments unless that is turned off; only recognisable secrets are redacted.
-- **Resource limits are simple.** Messages over a size limit are dropped and the proxy caps what it remembers, but a server can still keep the proxy busy with a flood of valid messages.
+- **Resource limits are simple.** Messages over a size limit are dropped and the proxy caps what it remembers, but a server can still keep the proxy busy with a flood of valid messages. A reply that is dropped for its size leaves the client's request unanswered. A server that stops reading its input can keep the proxy from noticing that the client has left.
+- **A killed proxy cannot stop its server.** If the host application kills the proxy outright, the server is left running. The proxy stops the server itself when its input closes or it is asked to terminate.
 - **A tool call waits for a tool list that is being checked.** A server that never answers a list request delays tool calls by up to 15 seconds before they are refused.
 - **The server inherits the proxy's environment variables.** Do not start the proxy with secrets in its environment that the server should not see.
 - **Only the stdio transport is supported.**

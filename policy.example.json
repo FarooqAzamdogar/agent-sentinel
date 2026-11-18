@@ -1,7 +1,7 @@
 {
   "default": "block",
   "deny_args": [
-    { "arg": "*", "pattern": "(^|[\\\\/])\\.(ssh|aws|env)\\b|id_rsa|id_ed25519" }
+    { "arg": "*", "pattern": "(^|[\\\\/:])\\.(ssh|aws|env)\\b|id_rsa|id_ed25519" }
   ],
   "tools": {
     "read_file": "allow",

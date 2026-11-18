@@ -24,7 +24,7 @@ python examples/demo.py                  # see the firewall make six decisions
 | `agent_sentinel/textutil.py` | `texts_in` and `text_views` (collect text from nested data) and `printable` (make text terminal-safe). | nothing |
 | `docs/` | The project website, served by GitHub Pages. Plain HTML, CSS and a little JavaScript; no build step. | nothing |
 
-Each module has its own test file in `tests/`: `test_detector.py`, `test_leaks.py`, `test_policy.py`, `test_firewall.py`, `test_textutil.py`, `test_proxy.py` and `test_proxy_hardening.py` (for `mcp_proxy.py`) and `test_cli.py` (for `__main__.py`). `tests/support.py` holds the shared setup.
+Each module has its own test file in `tests/`: `test_detector.py`, `test_leaks.py`, `test_policy.py`, `test_firewall.py`, `test_textutil.py`, `test_proxy.py` and `test_proxy_hardening.py` (for `mcp_proxy.py`) and `test_cli.py` (for `__main__.py`). `test_second_review.py` holds one test for each gap found when version 0.4.0 was reviewed. `tests/support.py` holds the shared setup.
 
 ## How a tool call flows (library use)
 

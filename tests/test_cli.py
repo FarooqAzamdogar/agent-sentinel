@@ -79,7 +79,7 @@ class Report(unittest.TestCase):
             report = cli("report", str(audit))
         self.assertEqual(report.returncode, 0, report.stderr.decode(errors="replace"))
         self.assertNotIn(b"\x1b", report.stdout)
-        self.assertIn(b"2 line(s) could not be read", report.stdout)
+        self.assertIn(b"2 line(s) of the log could not be read", report.stdout)
 
 
 class ScanEncodings(unittest.TestCase):

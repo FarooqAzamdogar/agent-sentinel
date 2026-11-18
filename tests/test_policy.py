@@ -577,7 +577,73 @@ class Warnings(unittest.TestCase):
         warnings = rules({"*": "ask", "search_*": "allow", "delete_*": "block", "read_file": "allow"}).warnings()
         self.assertEqual(len(warnings), 1)
         self.assertIn("tools.search_*", warnings[0])
-        self.assertEqual(rules({"*": "allow", "delete_*": "block"}).warnings(), [])
+        self.assertEqual(rules({"*": "block", "delete_*": "block"}).warnings(), [])
+
+    def test_a_catch_all_allow_rule_is_warned_about_like_default_allow(self):
+        for name in ("*", "**"):
+            with self.subTest(rule=name):
+                warnings = rules({name: "allow", "delete_*": "block"}).warnings()
+                self.assertEqual(len(warnings), 1)
+                self.assertIn('"default": "allow"', warnings[0])
+
+    def test_a_deny_pattern_that_only_forbids_empty_values_is_not_warned_about(self):
+        policy = rules({"search": {"action": "allow", "deny_args": [{"arg": "q", "pattern": r"^\s*$"}]}})
+        self.assertEqual(policy.warnings(), [])
+        self.assertEqual(policy.evaluate("search", {"q": "hello"}).action, "allow")
+
+
+class FindingsOfTheSecondReview(unittest.TestCase):
+    """Each test here closes a gap found when version 0.4.0 was reviewed."""
+
+    def test_case_lookalike_letters_do_not_pass_an_allow_pattern(self):
+        # Python's case-insensitive matching treats dotless i (U+0131) as "i",
+        # so "acme-ınc.com" (a different, registrable domain) used to pass.
+        policy = rules({"mail": {"action": "allow", "allow_args": [{"arg": "to", "pattern": r"[^@\s,;]+@acme-inc\.com"}]}})
+        self.assertEqual(policy.evaluate("mail", {"to": "bob@acme-inc.com"}).action, "allow")
+        self.assertEqual(policy.evaluate("mail", {"to": "BOB@ACME-INC.COM"}).action, "allow")
+        self.assertEqual(policy.evaluate("mail", {"to": "ılker@acme-inc.com"}).action, "allow")  # in the free part
+        for lookalike in ("bob@acme-ınc.com", "bob@acme-İnc.com", "bob@acme-inc.Kom"):
+            with self.subTest(to=lookalike):
+                self.assertEqual(policy.evaluate("mail", {"to": lookalike}).action, "block")
+
+    def test_a_windows_drive_relative_path_does_not_get_round_the_example_deny_rule(self):
+        for path in ("C:.ssh\\id_ecdsa", "C:.aws/credentials", "c:.env"):
+            with self.subTest(path=path):
+                self.assertEqual(POLICY.evaluate("read_file", {"path": path}).action, "block")
+        self.assertEqual(POLICY.evaluate("resources/read", {"uri": "file:C:.aws/credentials"}).action, "block")
+        self.assertEqual(POLICY.evaluate("search_web", {"q": "how do I read process.env in node"}).action, "allow")
+
+    def test_an_empty_list_or_object_does_not_get_round_a_deny_rule_that_forbids_an_argument(self):
+        policy = rules({"wipe": {"action": "allow", "deny_args": [{"arg": "force", "pattern": ""}]}})
+        self.assertEqual(policy.evaluate("wipe", {"target": "x"}).action, "allow")
+        for value in (True, "yes", [], {}, [[], {}]):
+            with self.subTest(force=value):
+                self.assertEqual(policy.evaluate("wipe", {"force": value}).action, "block")
+
+    def test_a_wildcard_in_an_argument_name_is_an_error(self):
+        for arg in ("file_*", "*path", "a*b"):
+            with self.subTest(arg=arg):
+                with self.assertRaises(PolicyError):
+                    Policy.from_dict({"deny_args": [{"arg": arg, "pattern": "x"}]})
+        Policy.from_dict({"deny_args": [{"arg": "*", "pattern": "x"}]})  # "*" alone is still fine
+
+    def test_a_policy_built_in_code_is_validated_too(self):
+        for bad in ({"default": "deny"}, {"default": "Block"}, {"secrets_in_arguments": "yes"}, {"block_severity": "max"}):
+            with self.subTest(arguments=bad):
+                with self.assertRaises(PolicyError):
+                    Policy(**bad)
+
+    def test_an_argument_name_is_shortened_and_escaped_before_it_is_repeated(self):
+        policy = rules({"mail": {"action": "allow", "allow_args": [{"arg": "to", "pattern": ".+"}], "other_args": "block"}})
+        verdict = policy.evaluate("mail", {"to": "a@example.com", "x\x1b[2J" + "y" * 5000: 1})
+        self.assertEqual(verdict.action, "block")
+        self.assertNotIn("\x1b", verdict.public)
+        self.assertLess(len(verdict.public), 200)
+
+    def test_a_tool_name_is_shortened_and_escaped_in_the_reason(self):
+        verdict = Policy.from_dict({}).evaluate("t\x1b[2J" + "x" * 5000, {})
+        self.assertNotIn("\x1b", verdict.reason)
+        self.assertLess(len(verdict.reason), 300)
 
 
 class Loading(unittest.TestCase):

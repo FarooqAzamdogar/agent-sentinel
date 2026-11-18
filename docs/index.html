@@ -23,7 +23,7 @@
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="agent-sentinel: a security layer between your AI agent and the tools it uses.">
-<meta name="twitter:card" content="summary">
+<meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="https://farooqazamdogar.github.io/agent-sentinel/og-image.png">
 <meta name="twitter:image:alt" content="agent-sentinel: a security layer between your AI agent and the tools it uses.">
 <meta name="twitter:title" content="agent-sentinel: AI agent security and MCP firewall in Python">
@@ -46,7 +46,7 @@
       "applicationCategory": "SecurityApplication",
       "operatingSystem": "Cross-platform (any system with Python 3.10 or newer)",
       "softwareRequirements": "Python 3.10 or newer",
-      "softwareVersion": "0.4.0",
+      "softwareVersion": "0.4.1",
       "license": "https://opensource.org/licenses/MIT",
       "isAccessibleForFree": true,
       "downloadUrl": "https://github.com/FarooqAzamdogar/agent-sentinel",
@@ -114,7 +114,7 @@
       "name": "Does it send my data anywhere?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "No. It runs locally, has no telemetry and makes no network calls. The audit log is a file on your own machine, and secrets are redacted from it."
+        "text": "No. It runs locally, has no telemetry and makes no network calls. The audit log is a file on your own machine. Recognizable keys and tokens are redacted from it; other argument values are logged as they are unless you turn that off."
       }
     },
     {
@@ -122,7 +122,7 @@
       "name": "Is it production ready?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "Not yet. Version 0.4.0 is an alpha release. It has not been tested against a wide range of third-party MCP servers and has had no independent audit. Start in monitor mode, read the limits, and treat it as one layer of defense."
+        "text": "Not yet. Version 0.4.1 is an alpha release. It has not been tested against a wide range of third-party MCP servers and has had no independent audit. Start in monitor mode, read the limits, and treat it as one layer of defense."
       }
     },
     {
@@ -209,7 +209,7 @@
   <section class="hero" id="top" aria-labelledby="hero-title">
     <div class="container hero__inner">
       <div class="hero__copy">
-        <p class="hero__eyebrow"><span class="pill pill--accent">v0.4.0 alpha</span> Open-source security for AI agents and MCP</p>
+        <p class="hero__eyebrow"><span class="pill pill--accent">v0.4.1 alpha</span> Open-source security for AI agents and MCP</p>
         <h1 id="hero-title">A security layer between your AI agent and the tools it uses.</h1>
         <p class="hero__lead">agent-sentinel checks every tool call against a permission policy and scans everything a tool server sends for prompt injection before the model reads it. Use it as a Python library, or as a drop-in proxy in front of any MCP server that uses stdio.</p>
 
@@ -430,7 +430,7 @@
         <li class="step">
           <span class="step__num" aria-hidden="true">3</span>
           <h3 class="step__title">Audit log</h3>
-          <p>Every decision is written as one JSON line. You can see what was allowed, what was blocked, and why.</p>
+          <p>Every tool call and everything that is blocked is written as one JSON line. You can see what was allowed, what was blocked, and why.</p>
         </li>
       </ol>
 
@@ -456,7 +456,7 @@
             <li class="tline">
               <code class="tline__call">agent calls fetch_page({'url': 'https://evil.example/recipes'})</code>
               <span class="status status--bad"><svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-x"/></svg>BLOCKED</span>
-              <span class="tline__reason">possible prompt injection</span>
+              <span class="tline__reason">possible prompt injection; the content was withheld</span>
             </li>
             <li class="tline">
               <code class="tline__call">agent calls send_email({'to': 'boss@example.com', ...})</code>
@@ -471,7 +471,7 @@
             <li class="tline">
               <code class="tline__call">agent calls delete_file({'path': 'notes/todo.txt'})</code>
               <span class="status status--bad"><svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-x"/></svg>BLOCKED</span>
-              <span class="tline__reason"></span>
+              <span class="tline__reason">this call is not permitted by the policy</span>
             </li>
           </ol>
         </div>
@@ -484,7 +484,7 @@
     <div class="container">
       <header class="section__head">
         <p class="eyebrow"><span class="eyebrow__num">03</span> Features</p>
-        <h2 id="features-title">What is in version 0.4.0</h2>
+        <h2 id="features-title">What is in version 0.4.1</h2>
         <p class="section__lead">Guardrails for the tools an LLM agent can call, written as rules you can read and test.</p>
       </header>
 
@@ -524,13 +524,13 @@
           <svg class="icon feature__icon" aria-hidden="true" focusable="false" width="22" height="22"><use href="#i-key"/></svg>
           <h3 class="card__title">Secret-leak guard</h3>
           <p>A tool call whose arguments contain what looks like a private key or an API token is blocked.</p>
-          <p>Secrets are redacted from the audit log.</p>
+          <p>Recognizable keys and tokens are redacted from the audit log.</p>
         </article>
 
         <article class="card feature">
           <svg class="icon feature__icon" aria-hidden="true" focusable="false" width="22" height="22"><use href="#i-log"/></svg>
           <h3 class="card__title">Audit log and monitor mode</h3>
-          <p>Every decision is one JSON line, and the <code>report</code> command summarizes a log.</p>
+          <p>Every tool call and every block is one JSON line, and the <code>report</code> command summarizes a log.</p>
           <p>Monitor mode logs what would be blocked without blocking, so you can tune a policy safely. It protects nothing while it is on.</p>
         </article>
 
@@ -697,7 +697,7 @@ agent-sentinel report audit.jsonl</code></pre>
               <pre tabindex="0"><code>{
   <span class="t-k">"default"</span>: <span class="t-s">"block"</span>,
   <span class="t-k">"deny_args"</span>: [
-    { <span class="t-k">"arg"</span>: <span class="t-s">"*"</span>, <span class="t-k">"pattern"</span>: <span class="t-s">"\\.ssh|\\.env|id_rsa"</span> }
+    { <span class="t-k">"arg"</span>: <span class="t-s">"*"</span>, <span class="t-k">"pattern"</span>: <span class="t-s">"(^|[\\\\/:])\\.(ssh|aws|env)\\b|id_rsa"</span> }
   ],
   <span class="t-k">"tools"</span>: {
     <span class="t-k">"read_file"</span>: <span class="t-s">"allow"</span>,
@@ -705,8 +705,11 @@ agent-sentinel report audit.jsonl</code></pre>
     <span class="t-k">"send_email"</span>: {
       <span class="t-k">"action"</span>: <span class="t-s">"ask"</span>,
       <span class="t-k">"allow_args"</span>: [
-        { <span class="t-k">"arg"</span>: <span class="t-s">"to"</span>, <span class="t-k">"pattern"</span>: <span class="t-s">"[^@\\s,;]+@example\\.com"</span> }
-      ]
+        { <span class="t-k">"arg"</span>: <span class="t-s">"to"</span>, <span class="t-k">"pattern"</span>: <span class="t-s">"[^@\\s,;]+@example\\.com"</span> },
+        { <span class="t-k">"arg"</span>: <span class="t-s">"cc"</span>, <span class="t-k">"pattern"</span>: <span class="t-s">"[^@\\s,;]+@example\\.com"</span>, <span class="t-k">"optional"</span>: true },
+        { <span class="t-k">"arg"</span>: <span class="t-s">"body"</span>, <span class="t-k">"pattern"</span>: <span class="t-s">"(?s).*"</span>, <span class="t-k">"optional"</span>: true }
+      ],
+      <span class="t-k">"other_args"</span>: <span class="t-s">"block"</span>
     },
     <span class="t-k">"delete_*"</span>: <span class="t-s">"block"</span>
   }
@@ -847,7 +850,7 @@ agent-sentinel report audit.jsonl</code></pre>
         </article>
         <article class="card card--plain">
           <h3 class="card__title">Data rules</h3>
-          <p>Write rules such as <q>email only to our domain</q> with an allow pattern on the <code>to</code> argument. Keep an agent away from <code>.ssh</code> and <code>.env</code> paths with a policy-wide deny rule.</p>
+          <p>Write rules such as <q>email only to our domain</q> with allow patterns on the recipient arguments and <code>"other_args": "block"</code>, so no other recipient field is accepted. Keep an agent away from <code>.ssh</code> and <code>.env</code> paths with a policy-wide deny rule.</p>
         </article>
         <article class="card card--plain">
           <h3 class="card__title">Audit and compliance review</h3>
@@ -946,11 +949,11 @@ agent-sentinel report audit.jsonl</code></pre>
         </div>
         <div class="faq__item">
           <h3 class="faq__q">Does it send my data anywhere?</h3>
-          <p class="faq__a">No. It runs locally, has no telemetry and makes no network calls. The audit log is a file on your own machine, and secrets are redacted from it.</p>
+          <p class="faq__a">No. It runs locally, has no telemetry and makes no network calls. The audit log is a file on your own machine. Recognizable keys and tokens are redacted from it; other argument values are logged as they are unless you turn that off.</p>
         </div>
         <div class="faq__item">
           <h3 class="faq__q">Is it production ready?</h3>
-          <p class="faq__a">Not yet. Version 0.4.0 is an alpha release. It has not been tested against a wide range of third-party MCP servers and has had no independent audit. Start in monitor mode, read the limits, and treat it as one layer of defense.</p>
+          <p class="faq__a">Not yet. Version 0.4.1 is an alpha release. It has not been tested against a wide range of third-party MCP servers and has had no independent audit. Start in monitor mode, read the limits, and treat it as one layer of defense.</p>
         </div>
         <div class="faq__item">
           <h3 class="faq__q">How is it different from a prompt-injection classifier?</h3>
@@ -973,7 +976,7 @@ agent-sentinel report audit.jsonl</code></pre>
         <svg class="icon brand__mark" aria-hidden="true" focusable="false" width="24" height="24"><use href="#i-shield"/></svg>
         <span class="brand__name">agent-sentinel</span>
       </a>
-      <p>A security layer between an AI agent and the tools it uses. Version 0.4.0, alpha.</p>
+      <p>A security layer between an AI agent and the tools it uses. Version 0.4.1, alpha.</p>
       <p>Released under the MIT license. Built in the open.</p>
     </div>
     <nav class="site-footer__nav" aria-label="Project links">

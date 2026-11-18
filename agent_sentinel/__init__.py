@@ -17,4 +17,4 @@ from .policy import Policy, PolicyError
 from .textutil import printable
 
 __all__ = ["BlockedError", "Decision", "Finding", "Firewall", "Policy", "PolicyError", "printable", "scan"]
-__version__ = "0.4.0"
+__version__ = "0.4.1"

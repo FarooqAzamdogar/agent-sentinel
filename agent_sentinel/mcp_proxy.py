@@ -41,21 +41,26 @@ import hashlib
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, Callable
 
 from .firewall import Decision, Firewall
 from .policy import Policy, PolicyError
-from .textutil import printable, text_views
+from .textutil import printable
 
 # How long a tool call waits for an in-flight tools/list reply to be checked.
 TOOL_LIST_WAIT_SECONDS = 15
-# How long the server gets to finish after the client disconnects.
-SHUTDOWN_GRACE_SECONDS = 5
+# After either side closes, how long the server has in all to finish answering
+# and exit before it is stopped. Kept short: a host application that closes
+# our input typically waits only a couple of seconds before killing us, and a
+# proxy that is killed first leaves its server running.
+SHUTDOWN_GRACE_SECONDS = 1.5
 
 # Resource limits. Each bounds something a hostile peer could otherwise grow forever.
 DEFAULT_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
@@ -64,11 +69,15 @@ MAX_SERVER_REQUESTS = 1_000  # server requests waiting for the client's reply
 MAX_QUARANTINED_TOOLS = 10_000
 MAX_PINNED_TOOLS = 10_000
 MAX_LABEL_CHARS = 200
+MAX_NAME_CHARS = 256  # tool names and request ids the proxy has to remember
 
 # Resource reads are checked by the policy under this name, with one
 # argument, "uri". A policy rule for it looks like a rule for a tool.
 RESOURCE_READ = "resources/read"
 _RESOURCE_METHODS = (RESOURCE_READ, "resources/subscribe")
+
+# The members of a tool definition that reach the model, and so are pinned.
+_PINNED_FIELDS = ("name", "title", "description", "inputSchema", "outputSchema", "annotations")
 
 # List methods and the result field that holds their items. Items are scanned
 # one by one, so a single poisoned entry does not take the whole list down.
@@ -103,9 +112,9 @@ _DROP = _Outcome()
 
 # ---- small helpers ----------------------------------------------------------
 
-def _warn(message: str) -> None:
+def _warn(message: str, limit: int = 300) -> None:
     # Warnings can include names chosen by the server, so make them terminal-safe.
-    print(f"agent-sentinel: {printable(message)}", file=sys.stderr, flush=True)
+    print(f"agent-sentinel: {printable(message, limit=limit)}", file=sys.stderr, flush=True)
 
 
 def _reject_constant(name: str) -> Any:
@@ -126,8 +135,18 @@ def _parse(line: bytes) -> Any:
 
 
 def _valid_id(value: Any) -> bool:
-    """MCP request ids are strings or integers (bool is an int in Python, so exclude it)."""
-    return isinstance(value, (str, int)) and not isinstance(value, bool)
+    """MCP request ids are strings or integers (bool is an int in Python, so exclude it).
+
+    Ids are remembered until answered, so a very long one is refused too.
+    """
+    if isinstance(value, str):
+        return len(value) <= MAX_NAME_CHARS
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_name(value: Any) -> bool:
+    """A usable tool, prompt or resource name. The proxy remembers names, so they have a length limit."""
+    return isinstance(value, str) and 0 < len(value) <= MAX_NAME_CHARS
 
 
 def _label(text: str) -> str:
@@ -166,7 +185,8 @@ class ToolPins:
     entry, or the file.
     """
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(self, path: str | Path | None = None, enabled: bool = True) -> None:
+        self._enabled = enabled
         self._path = Path(path) if path else None
         self._fingerprints: dict[str, str] = {}
         self._unsaved = False
@@ -183,11 +203,20 @@ class ToolPins:
 
     @staticmethod
     def fingerprint(tool: JsonObject) -> str:
-        canonical = json.dumps(tool, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        """A digest of the parts of a tool definition that a model reads.
+
+        Other members, such as "_meta", are left out: servers put counters and
+        timestamps there, and a tool that "changed" on every listing would be
+        quarantined for nothing.
+        """
+        pinned = {name: tool[name] for name in _PINNED_FIELDS if name in tool}
+        canonical = json.dumps(pinned, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return hashlib.sha256(canonical.encode("ascii")).hexdigest()
 
     def check(self, name: str, tool: JsonObject) -> str:
         """Return "same", "changed", "new" (and remember it) or "full"."""
+        if not self._enabled:
+            return "same"
         fingerprint = self.fingerprint(tool)
         known = self._fingerprints.get(name)
         if known is not None:
@@ -234,7 +263,8 @@ class Proxy:
         # tool calls can wait for tool lists to finish being checked.
         self._state = threading.Condition()
         self._pending: dict[str | int, _PendingRequest] = {}
-        self._server_requests: set[str | int] = set()  # ids of server requests the client has yet to answer
+        # Ids of server requests the client has yet to answer, oldest first (a dict keeps insertion order).
+        self._server_requests: dict[str | int, None] = {}
         self._quarantined_tools: set[str] = set()
         self._quarantine_overflowed = False
         self._tools_unverified = False  # set while the latest tools/list reply was malformed
@@ -303,14 +333,13 @@ class Proxy:
 
     def _dropped(self, what: str) -> _Outcome:
         """Record and report a message that is being dropped for its shape."""
-        self._firewall.block("?", f"dropped {what}", event="dropped")
+        self._firewall.refuse("?", f"dropped {what}", event="dropped")
         _warn(f"dropped {what}")
         return _DROP
 
     def _refusal(self, label: str, reason: str) -> Decision:
         """A block for a structural reason. Unlike a policy block, monitor mode does not lift it."""
-        self._firewall.block(label, reason)
-        return Decision(False, reason)
+        return self._firewall.refuse(label, reason)
 
     # ---- client -> server ---------------------------------------------------
 
@@ -339,7 +368,7 @@ class Proxy:
     def _refuse_batch(self, batch: list[Any]) -> _Outcome:
         # MCP no longer uses JSON-RPC batches. Refusing them keeps every
         # request on the single, checked path above.
-        self._firewall.block("?", "dropped a batched client message", event="dropped")
+        self._firewall.refuse("?", "dropped a batched client message", event="dropped")
         replies = [
             _rpc_error(item["id"], "batched requests are not supported", code=-32600)
             for item in batch
@@ -354,7 +383,7 @@ class Proxy:
         with self._state:
             expected = is_reply and _valid_id(msg_id) and msg_id in self._server_requests
             if expected:
-                self._server_requests.discard(msg_id)
+                del self._server_requests[msg_id]
         if not expected:
             return self._dropped("a client message that answers no request from the server")
         return _Outcome(to_server=message)
@@ -406,7 +435,7 @@ class Proxy:
             return _Outcome(to_server=message)  # a notification: no reply will come
         with self._state:
             # If the client reuses an id that is still in flight, the newer
-            # request wins. That is safe because every reply is scanned.
+            # request wins. The reply is scanned either way; honest clients do not reuse ids.
             is_new = message["id"] not in self._pending
             if is_new and len(self._pending) >= MAX_PENDING_REQUESTS:
                 reason = "too many requests are waiting for a reply"
@@ -447,6 +476,11 @@ class Proxy:
             # No tool can be vouched for if more were quarantined than can be
             # remembered, or if the last tool list could not be checked at all.
             return self._quarantine_overflowed or self._tools_unverified or tool in self._quarantined_tools
+
+    def _was_quarantined(self, tool: str) -> bool:
+        """Whether this tool itself was quarantined (for filtering a list; calls use _is_quarantined)."""
+        with self._state:
+            return self._quarantine_overflowed or tool in self._quarantined_tools
 
     def _set_tools_unverified(self, unverified: bool) -> None:
         with self._state:
@@ -498,11 +532,12 @@ class Proxy:
         if self._firewall.policy.server_request_action(method) == "block":
             decision = self._firewall.block(label, "the policy does not permit this server request", "server_request")
         else:
-            decision = self._firewall.scan_result(label, text_views(message), event="server_request", log_clean=False)
-        if decision.allowed and is_request and not self._expect_client_reply(msg_id):
-            decision = Decision(False, "too many server requests are waiting for a reply")
-
+            decision = self._firewall.scan_result(label, message, event="server_request", log_clean=False)
         if decision.allowed:
+            if is_request:
+                self._expect_client_reply(msg_id)
+            elif method == "notifications/cancelled":
+                self._forget_cancelled_server_request(message)
             return _Outcome(to_client=message)
         _warn(f"refused a '{method}' message from the server: {decision.reason}")
         if is_request:
@@ -510,12 +545,21 @@ class Proxy:
             return _Outcome(to_server=_rpc_error(msg_id, "request refused"))
         return _DROP
 
-    def _expect_client_reply(self, msg_id: str | int) -> bool:
+    def _expect_client_reply(self, msg_id: str | int) -> None:
         with self._state:
-            if len(self._server_requests) >= MAX_SERVER_REQUESTS and msg_id not in self._server_requests:
-                return False
-            self._server_requests.add(msg_id)
-            return True
+            self._server_requests.pop(msg_id, None)
+            self._server_requests[msg_id] = None
+            if len(self._server_requests) > MAX_SERVER_REQUESTS:
+                # Forget the oldest one: its answer, if it ever comes, is dropped.
+                # Refusing new requests instead would let abandoned ones block the server for good.
+                del self._server_requests[next(iter(self._server_requests))]
+
+    def _forget_cancelled_server_request(self, message: JsonObject) -> None:
+        params = message.get("params")
+        request_id = params.get("requestId") if isinstance(params, dict) else None
+        if _valid_id(request_id):
+            with self._state:
+                self._server_requests.pop(request_id, None)
 
     def _check_server_reply(self, message: JsonObject) -> _Outcome:
         msg_id = message.get("id")
@@ -550,7 +594,6 @@ class Proxy:
             return self._deliver_or_block(pending, msg_id, "error", message["error"], scan=message["error"])
 
         result = message["result"]
-        to_scan = result
         items_key = _LIST_ITEMS_KEY.get(pending.method)
         if items_key is not None:
             is_tool_list = items_key == "tools"
@@ -563,21 +606,21 @@ class Proxy:
                 result[items_key] = self._clean_items(result[items_key], items_key)
                 if is_tool_list:
                     self._set_tools_unverified(False)
-                # The items were just checked one by one; what is left is checked below.
-                to_scan = {key: value for key, value in result.items() if key != items_key}
+                # The entries were checked one by one. What is left is scanned as a
+                # whole below, because a phrase can be split over two entries.
         elif pending.method == "initialize" and isinstance(result, dict):
             self._strip_poisoned_instructions(result)
-        return self._deliver_or_block(pending, msg_id, "result", result, scan=to_scan, log_clean=items_key is None)
+        return self._deliver_or_block(pending, msg_id, "result", result, scan=result, log_clean=items_key is None)
 
     def _malformed_reply(self, pending: _PendingRequest, msg_id: Any, reason: str) -> JsonObject:
-        self._firewall.block(pending.label, f"malformed reply: {reason}", event="result")
+        self._firewall.refuse(pending.label, f"malformed reply: {reason}", event="result")
         _warn(f"blocked a malformed reply to {pending.method}: {reason}")
         return _rpc_error(msg_id, "the server sent a malformed reply")
 
     def _deliver_or_block(
         self, pending: _PendingRequest, msg_id: Any, member: str, value: Any, scan: Any, log_clean: bool = True
     ) -> JsonObject:
-        decision = self._firewall.scan_result(pending.label, text_views(scan), log_clean=log_clean)
+        decision = self._firewall.scan_result(pending.label, scan, log_clean=log_clean)
         if decision.allowed:
             return {"jsonrpc": "2.0", "id": msg_id, member: value}
         if pending.method == "tools/call":
@@ -604,7 +647,7 @@ class Proxy:
         kept = []
         for item in items:
             name = item.get("name") if isinstance(item, dict) else None
-            label = _label(name) if isinstance(name, str) and name else "?"
+            label = _label(name) if _is_name(name) else "?"
             problem = self._problem_with_item(item, label, is_tool=items_key == "tools")
             if problem is None:
                 kept.append(item)
@@ -618,11 +661,11 @@ class Proxy:
         """Why a list entry must be removed, or None if it may stay."""
         if not isinstance(item, dict) or (is_tool and label == "?"):
             return "it is not a well-formed entry"
-        if is_tool and self._is_quarantined(item["name"]):
+        if is_tool and self._was_quarantined(item["name"]):
             return "it was quarantined earlier"  # even if it looks clean now
 
         event = "tool_description" if is_tool else "list_item"
-        decision = self._firewall.scan_result(label, text_views(item), event=event, log_clean=False)
+        decision = self._firewall.scan_result(label, item, event=event, log_clean=False)
         if decision.allowed and is_tool:
             decision = self._check_pin(item, label)
         if decision.allowed:
@@ -636,7 +679,10 @@ class Proxy:
     def _check_pin(self, tool: JsonObject, label: str) -> Decision:
         status = self._pins.check(tool["name"], tool)
         if status == "changed":
-            reason = "its definition changed after it was first seen"
+            reason = (
+                "its definition changed after it was first seen. If the change is expected, restart the proxy; "
+                "with --pins, first delete this tool's entry from the pins file"
+            )
             return self._firewall.block(label, f"tool quarantined: {reason}", event="tool_changed")
         if status == "full":
             return Decision(False, "too many tools to keep track of")
@@ -671,14 +717,16 @@ def _resolve_executable(name: str) -> str | None:
     """
     if os.path.dirname(name):
         return name
-    here = os.path.normcase(os.path.abspath(os.getcwd()))
+    here = os.getcwd()
+    # A relative PATH entry ("node_modules\\.bin") points into the current
+    # folder too, and the same folder can be spelled in more than one way.
     folders = [
         folder for folder in os.environ.get("PATH", "").split(os.pathsep)
-        if folder and os.path.normcase(os.path.abspath(folder)) != here
+        if os.path.isabs(folder) and not _same_folder(folder, here)
     ]
     endings = [""]
     if sys.platform == "win32":
-        endings = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e]
+        endings = [e for e in os.environ.get("PATHEXT", "").split(os.pathsep) if e] or _DEFAULT_PATHEXT
         if any(name.lower().endswith(e.lower()) for e in endings):
             endings = [""]
     for folder in folders:
@@ -687,6 +735,31 @@ def _resolve_executable(name: str) -> str | None:
             if os.path.isfile(candidate) and (sys.platform == "win32" or os.access(candidate, os.X_OK)):
                 return candidate
     return None
+
+
+_DEFAULT_PATHEXT = [".COM", ".EXE", ".BAT", ".CMD"]
+# Characters that cmd.exe gives a meaning of its own, even inside an argument.
+_CMD_SPECIAL = set('&|<>^%!"\n\r')
+
+
+def _same_folder(one: str, other: str) -> bool:
+    try:
+        return os.path.samefile(one, other)  # sees through short names, links and letter case
+    except OSError:  # one of them does not exist
+        return os.path.normcase(os.path.abspath(one)) == os.path.normcase(os.path.abspath(other))
+
+
+def _unsafe_for_batch_file(executable: str, arguments: list[str]) -> list[str]:
+    """The arguments that a .cmd or .bat launcher would not receive as written.
+
+    Windows runs such a file through cmd.exe, which reads "&", "%NAME%" and
+    "^" in an argument as its own syntax: a URL "…?a=1&b=2" would be cut at
+    the "&" and "b=2" run as a command. Better to refuse than to start the
+    server with something other than what the operator wrote.
+    """
+    if sys.platform != "win32" or not executable.lower().endswith((".bat", ".cmd")):
+        return []
+    return [argument for argument in arguments if _CMD_SPECIAL & set(argument)]
 
 
 def _relay_stderr(stream: BinaryIO) -> None:
@@ -704,11 +777,19 @@ def _relay_stderr(stream: BinaryIO) -> None:
             return
         text = chunk.decode("utf-8", errors="replace").rstrip("\r\n")
         if text:
-            _warn(f"server stderr: {text}")
+            _warn(f"server stderr: {text}", limit=len(text) + 20)  # the whole line: reads are already bounded
 
 
-def _stop(server: subprocess.Popen) -> int:
-    """Make sure the server process is gone and return its exit code."""
+def _stop(server: subprocess.Popen, deadline: float) -> int:
+    """Make sure the server process is gone and return its exit code.
+
+    The server has until `deadline` to exit by itself: one that has closed its
+    output may still be writing its state to disk.
+    """
+    try:
+        return server.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except subprocess.TimeoutExpired:
+        pass
     if server.poll() is None:
         if sys.platform == "win32":
             # terminate() would leave grandchildren running (e.g. the node
@@ -718,10 +799,25 @@ def _stop(server: subprocess.Popen) -> int:
         else:
             server.terminate()
     try:
-        return server.wait(timeout=SHUTDOWN_GRACE_SECONDS)
+        return server.wait(timeout=5)
     except subprocess.TimeoutExpired:
         server.kill()
         return server.wait()
+
+
+def exit_process(code: int) -> None:
+    """End the process now, with this exit code.
+
+    A normal exit would wait on the thread that is still blocked reading our
+    standard input (the client has not closed it), and Python aborts with a
+    "Fatal Python error" and a meaningless exit code when it cannot.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+    os._exit(code)
 
 
 def _positive_int(text: str) -> int:
@@ -738,6 +834,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-log-args", action="store_true", help="leave tool arguments out of the audit log")
     parser.add_argument("--pins", default=None, metavar="FILE",
                         help="remember tool definitions in FILE and quarantine a tool that changes later")
+    parser.add_argument("--no-pins", action="store_true",
+                        help="do not quarantine a tool whose definition changes (for servers that change them often)")
     parser.add_argument("--monitor", action="store_true",
                         help="log what the policy and the scanner would block, but block nothing (for tuning a policy)")
     parser.add_argument("--max-message-bytes", type=_positive_int, default=DEFAULT_MAX_MESSAGE_BYTES,
@@ -756,7 +854,7 @@ def main(argv: list[str] | None = None) -> int:
         _warn(f"cannot load policy: {exc}")
         return 2
     try:
-        pins = ToolPins(args.pins)
+        pins = ToolPins(args.pins, enabled=not args.no_pins)
     except (OSError, ValueError) as exc:  # unreadable, not JSON, or not a pins file
         _warn(f"cannot load tool pins: {exc}")
         return 2
@@ -766,7 +864,13 @@ def main(argv: list[str] | None = None) -> int:
         _warn(f"cannot find the server command '{command[0]}' on PATH. The current folder is not searched; "
               f"to run a file from it, write the path, for example .{os.sep}{command[0]}")
         return 2
-    # Keep Windows from looking in the current folder when it starts the process.
+    unsafe = _unsafe_for_batch_file(executable, command[1:])
+    if unsafe:
+        _warn(f"cannot pass {unsafe[0]!r} to the batch file {executable}: cmd.exe would change it. "
+              "Start the program behind the batch file directly, for example with node or python")
+        return 2
+    # Keeps cmd.exe, and whatever the server starts, from running a file in the
+    # current folder in place of a command of the same name on PATH.
     os.environ["NoDefaultCurrentDirectoryInExePath"] = "1"
     try:
         server = subprocess.Popen(
@@ -791,21 +895,32 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             one_side_closed.set()
 
+    # Asked to stop (SIGTERM, or Ctrl+Break on Windows): shut down as if a side had closed,
+    # so that the server is stopped too instead of being left running.
+    for signal_name in ("SIGTERM", "SIGBREAK"):
+        if hasattr(signal, signal_name):
+            try:
+                signal.signal(getattr(signal, signal_name), lambda *_: one_side_closed.set())
+            except (ValueError, OSError):  # not the main thread, or not supported here
+                pass
+
     client_relay = threading.Thread(target=relay, args=(proxy.pump_client_to_server, sys.stdin.buffer), daemon=True)
     server_relay = threading.Thread(target=relay, args=(proxy.pump_server_to_client, server.stdout), daemon=True)
     # The stderr relay is never joined: a grandchild of the server can hold that pipe open.
     threading.Thread(target=_relay_stderr, args=(server.stderr,), daemon=True).start()
     client_relay.start()
     server_relay.start()
-    one_side_closed.wait()
+    while not one_side_closed.wait(0.25):  # in short waits, so that a signal handler gets to run
+        pass
 
+    deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS
     try:
         server.stdin.close()  # tell the server there is no more input
     except OSError:
         pass
     server_relay.join(timeout=SHUTDOWN_GRACE_SECONDS)  # let it finish answering
-    return _stop(server)
+    return _stop(server, deadline)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_process(main())

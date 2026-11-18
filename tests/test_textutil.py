@@ -1,10 +1,13 @@
 import dataclasses
 import unittest
-from collections import OrderedDict, deque
+from unittest import mock
+from array import array
+from collections import OrderedDict, UserString, deque
 from types import MappingProxyType
 
 import support  # noqa: F401  (sets up the import path)
-from agent_sentinel.textutil import UnscannableError, printable, text_views, texts_in
+from agent_sentinel import textutil
+from agent_sentinel.textutil import FIELD_BREAK, UnscannableError, printable, text_views, texts_in
 
 
 @dataclasses.dataclass
@@ -114,36 +117,70 @@ class TextViews(unittest.TestCase):
     def test_a_plain_string_is_its_own_single_view(self):
         self.assertEqual(text_views("Lentil soup"), ["Lentil soup"])
 
-    def test_first_view_is_every_key_and_string_joined_by_newlines(self):
+    def test_first_view_lists_every_key_and_string_with_a_break_between_fields(self):
         value = {"a": "one", "b": ["two", {"c": "three"}], "d": 4}
-        self.assertEqual(text_views(value)[0], "\n".join(texts_in(value)))
+        self.assertEqual(text_views(value)[0], f"a\none\n{FIELD_BREAK}\nb\ntwo\n{FIELD_BREAK}\nc\nthree\n{FIELD_BREAK}\nd")
 
-    def test_strings_split_over_list_items_are_joined_into_one_view(self):
-        value = {"content": [{"type": "text", "text": "Do not"}, {"type": "text", "text": "tell the user"}]}
-        self.assertEqual(
-            text_views(value),
-            ["content\ntype\ntext\ntext\nDo not\ntype\ntext\ntext\ntell the user", "text text", "Do not tell the user"],
-        )
+    def test_a_key_and_its_own_value_are_not_separated(self):
+        self.assertEqual(text_views({"Do not": "tell the user"}), ["Do not\ntell the user"])
 
-    def test_strings_under_different_keys_are_not_joined(self):
-        value = {"title": "Do not", "body": "tell the user"}
-        self.assertEqual(text_views(value), ["title\nDo not\nbody\ntell the user"])
+    def test_values_of_different_fields_are_joined_into_one_view(self):
+        views = text_views({"title": "Do not", "body": "tell the user"})
+        self.assertEqual(views, [f"title\nDo not\n{FIELD_BREAK}\nbody\ntell the user", "Do not tell the user"])
+
+    def test_values_at_different_depths_are_joined_too(self):
+        self.assertIn("Do not tell the user", text_views({"content": ["Do not", {"text": "tell the user"}]}))
+        self.assertIn("Do not tell the user", text_views({"a": {"text": "Do not"}, "b": {"text": "tell the user"}}))
+
+    def test_strings_split_over_list_items_are_joined_with_a_space_and_with_nothing(self):
+        value = {"content": [{"type": "text", "text": "Ign"}, {"type": "text", "text": "ore this"}]}
+        views = text_views(value)
+        self.assertIn("Ign ore this", views)  # a phrase split between two words
+        self.assertIn("Ignore this", views)  # a word split in two
+        self.assertIn("text text", views)  # the "type" values are siblings too
 
     def test_items_of_a_plain_list_are_joined(self):
-        self.assertEqual(text_views(["Never", "reveal this"]), ["Never\nreveal this", "Never reveal this"])
+        self.assertEqual(text_views(["Never", "reveal this"]), ["Never\nreveal this", "Never reveal this", "Neverreveal this"])
 
     def test_rows_of_a_nested_list_share_one_view(self):
-        self.assertEqual(text_views({"rows": [["a", "b"], ["c"]]}), ["rows\na\nb\nc", "a b c"])
+        self.assertIn("a b c", text_views({"rows": [["a", "b"], ["c"]]}))
 
     def test_bytes_take_part_like_strings(self):
-        self.assertEqual(text_views([b"Do not", "tell the user"])[-1], "Do not tell the user")
+        self.assertIn("Do not tell the user", text_views([b"Do not", "tell the user"]))
 
     def test_blank_and_duplicate_views_are_left_out(self):
         self.assertEqual(text_views(None), [])
         self.assertEqual(text_views({}), [])
         self.assertEqual(text_views(["", " "]), [])
-        self.assertEqual(text_views(["", "only"]), ["\nonly", " only"])
-        self.assertEqual(text_views({"a": ["x", "x"], "b": ["x", "x"]}), ["a\nx\nx\nb\nx\nx", "x x"])
+        views = text_views({"a": ["x", "x"], "b": ["x", "x"]})
+        self.assertEqual(len(views), len(set(views)))
+        self.assertEqual(views.count("x x"), 1)
+
+    def test_a_part_that_appears_twice_is_read_twice(self):
+        # Its JSON would hold it twice; skipping the second time hid a phrase split over a list.
+        part = {"type": "text", "text": "Do not"}
+        value = {"echo": part, "content": [part, {"type": "text", "text": "tell the user about this."}]}
+        self.assertIn("Do not tell the user about this.", text_views(value))
+        self.assertEqual(texts_in([part, part], keys=False), ["text", "Do not", "text", "Do not"])
+
+    def test_a_value_built_from_shared_parts_cannot_explode(self):
+        value = ["x"]
+        for _ in range(40):  # 2**40 lists if written out
+            value = [value, value]
+        with mock.patch.object(textutil, "MAX_CONTAINERS", 10_000):
+            with self.assertRaises(UnscannableError):
+                text_views(value)
+
+    def test_a_user_string_is_read_as_text(self):
+        self.assertEqual(texts_in(UserString("Do not tell the user"), strict=True), ["Do not tell the user"])
+        self.assertEqual(text_views([UserString("Do not"), "tell the user"])[1], "Do not tell the user")
+
+    def test_ranges_and_arrays_are_not_walked(self):
+        self.assertEqual(texts_in([range(10**12), array("u", "hidden")]), [])
+        for value in (range(3), array("u", "hidden")):
+            with self.subTest(type=type(value).__name__):
+                with self.assertRaises(UnscannableError):
+                    texts_in(value, strict=True)
 
     def test_strict_is_passed_on_to_the_walk(self):
         self.assertEqual(text_views(["a", object()]), ["a"])
@@ -170,8 +207,9 @@ class Printable(unittest.TestCase):
     def test_a_long_stack_of_combining_marks_is_escaped_after_the_second(self):
         self.assertEqual(printable("x" + "\u0301" * 5 + "y"), "x\u0301\u0301" + "\\u0301" * 3 + "y")
 
-    def test_long_text_is_cut(self):
-        self.assertEqual(printable("x" * 500, limit=10), "x" * 10 + "...")
+    def test_long_text_is_cut_and_says_how_much_is_missing(self):
+        self.assertEqual(printable("x" * 500, limit=10), "x" * 10 + "... (+490 more characters)")
+        self.assertEqual(printable("x" * 10, limit=10), "x" * 10)
 
     def test_non_text_is_converted(self):
         self.assertEqual(printable(None), "None")
