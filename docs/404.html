@@ -9,10 +9,11 @@
 <meta name="description" content="This page does not exist. Go back to the agent-sentinel home page.">
 <meta name="robots" content="noindex">
 <meta name="color-scheme" content="dark light">
-<meta name="theme-color" content="#0b0f14" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#d0d0d0" media="(prefers-color-scheme: light)">
 <!-- Absolute paths: GitHub Pages serves this file for any missing URL, at any depth. -->
 <link rel="icon" href="/agent-sentinel/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="/agent-sentinel/fonts/space-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/agent-sentinel/styles.css">
 <script src="/agent-sentinel/site.js"></script>
 </head>
@@ -26,10 +27,12 @@
 
 <a class="skip-link" href="#main">Skip to content</a>
 
+<div class="page">
+
 <header class="site-header">
   <div class="container site-header__inner">
     <a class="brand" href="/agent-sentinel/" aria-label="agent-sentinel home">
-      <svg class="icon brand__mark" aria-hidden="true" focusable="false" width="24" height="24"><use href="#i-shield"/></svg>
+      <span class="brand__mark"><svg class="icon" aria-hidden="true" focusable="false" width="24" height="24"><use href="#i-shield"/></svg></span>
       <span class="brand__name">agent-sentinel</span>
     </a>
     <div class="site-header__actions">
@@ -44,12 +47,14 @@
 <main id="main">
   <section class="hero notfound" aria-labelledby="notfound-title">
     <div class="container">
-      <p class="notfound__code">Error 404</p>
-      <h1 id="notfound-title">Page not found.</h1>
-      <p>Nothing lives at this address. The site is a single page, so everything is one click away.</p>
-      <div class="btn-row">
-        <a class="btn btn--primary" href="/agent-sentinel/">Go to the home page</a>
-        <a class="btn btn--ghost" href="https://github.com/FarooqAzamdogar/agent-sentinel" rel="noopener">View on GitHub</a>
+      <div class="notfound__card">
+        <p class="notfound__code">Error 404</p>
+        <h1 id="notfound-title">Page not found.</h1>
+        <p>Nothing lives at this address. The site is a single page, so <span class="hl hl--cyan">everything is one click away</span>.</p>
+        <div class="btn-row">
+          <a class="btn btn--primary" href="/agent-sentinel/">Go to the home page</a>
+          <a class="btn btn--ghost" href="https://github.com/FarooqAzamdogar/agent-sentinel" rel="noopener">View on GitHub</a>
+        </div>
       </div>
     </div>
   </section>
@@ -60,6 +65,8 @@
     <p>agent-sentinel is released under the MIT license. Built in the open.</p>
   </div>
 </footer>
+
+</div>
 
 </body>
 </html>

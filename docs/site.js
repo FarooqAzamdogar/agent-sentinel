@@ -1,11 +1,12 @@
-/* agent-sentinel site script: theme toggle, mobile menu, tabs, copy buttons.
+/* agent-sentinel site script: theme toggle, mobile menu, tabs, copy buttons,
+   current-section highlight, reading progress, back to top, code-block fades.
    No dependencies and no network requests. The page works without it. */
 (function () {
   'use strict';
 
   var root = document.documentElement;
   var THEME_KEY = 'agent-sentinel-theme';
-  var THEME_COLORS = { dark: '#0b0f14', light: '#f6f7f9' };
+  var THEME_COLORS = { dark: '#0a0a0a', light: '#d0d0d0' };
 
   // Runs in <head>, before first paint, so the stored theme applies at once.
   root.classList.add('js');
@@ -36,9 +37,19 @@
     return chosen === 'light' || chosen === 'dark' ? chosen : systemTheme();
   }
 
+  // A chosen theme overrides the system one, so both theme-color metas must
+  // carry its color. They sit above this script in <head>, so they exist now.
+  function syncThemeColor(theme) {
+    var metas = document.querySelectorAll('meta[name="theme-color"]');
+    for (var i = 0; i < metas.length; i += 1) {
+      metas[i].setAttribute('content', THEME_COLORS[theme]);
+    }
+  }
+
   var stored = readStoredTheme();
   if (stored) {
     root.setAttribute('data-theme', stored);
+    syncThemeColor(stored);
   }
 
   function initTheme() {
@@ -57,10 +68,7 @@
       var next = currentTheme() === 'dark' ? 'light' : 'dark';
       root.setAttribute('data-theme', next);
       storeTheme(next);
-      var metas = document.querySelectorAll('meta[name="theme-color"]');
-      for (var i = 0; i < metas.length; i += 1) {
-        metas[i].setAttribute('content', THEME_COLORS[next]);
-      }
+      syncThemeColor(next);
       describe();
     });
 
@@ -81,6 +89,10 @@
       return;
     }
 
+    function isOpen() {
+      return button.getAttribute('aria-expanded') === 'true';
+    }
+
     function setOpen(open) {
       nav.classList.toggle('is-open', open);
       button.setAttribute('aria-expanded', open ? 'true' : 'false');
@@ -88,7 +100,7 @@
     }
 
     button.addEventListener('click', function () {
-      var open = button.getAttribute('aria-expanded') !== 'true';
+      var open = !isOpen();
       setOpen(open);
       if (open) {
         var first = nav.querySelector('a');
@@ -104,12 +116,31 @@
       }
     });
 
+    // A click or tap anywhere outside the open panel closes it.
+    document.addEventListener('click', function (event) {
+      if (isOpen() && !nav.contains(event.target) && !button.contains(event.target)) {
+        setOpen(false);
+      }
+    });
+
     document.addEventListener('keydown', function (event) {
-      if (event.key === 'Escape' && button.getAttribute('aria-expanded') === 'true') {
+      if (event.key === 'Escape' && isOpen()) {
         setOpen(false);
         button.focus();
       }
     });
+
+    // The panel only exists on narrow screens. Reset it when the window grows.
+    if (window.matchMedia) {
+      var wide = window.matchMedia('(min-width: 73em)');
+      if (wide.addEventListener) {
+        wide.addEventListener('change', function (event) {
+          if (event.matches) {
+            setOpen(false);
+          }
+        });
+      }
+    }
   }
 
   function initTabs() {
@@ -250,11 +281,134 @@
     });
   }
 
+  // Marks the header link of the section that is on screen with aria-current.
+  function initSectionSpy() {
+    var nav = document.getElementById('site-nav');
+    if (!nav || !('IntersectionObserver' in window)) {
+      return;
+    }
+
+    var links = {};
+    Array.prototype.forEach.call(nav.querySelectorAll('a[href^="#"]'), function (link) {
+      links[link.getAttribute('href').slice(1)] = link;
+    });
+
+    var sections = Array.prototype.slice.call(document.querySelectorAll('main > section[id]'));
+    if (!sections.length) {
+      return;
+    }
+    var onScreen = sections.map(function () {
+      return false;
+    });
+
+    function update() {
+      var current = null;
+      sections.forEach(function (section, i) {
+        if (onScreen[i]) {
+          current = section.id;
+        }
+      });
+      Object.keys(links).forEach(function (id) {
+        if (id === current) {
+          links[id].setAttribute('aria-current', 'location');
+        } else {
+          links[id].removeAttribute('aria-current');
+        }
+      });
+    }
+
+    // A thin band a little above the middle of the window decides which
+    // section counts as the one being read.
+    var observer = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        onScreen[sections.indexOf(entry.target)] = entry.isIntersecting;
+      });
+      update();
+    }, { rootMargin: '-35% 0px -60% 0px', threshold: 0 });
+
+    sections.forEach(function (section) {
+      observer.observe(section);
+    });
+  }
+
+  // Reading-progress bar under the header, and the back-to-top link.
+  function initScrollCues() {
+    var bar = document.querySelector('[data-progress]');
+    var toTop = document.querySelector('[data-to-top]');
+    if (!bar && !toTop) {
+      return;
+    }
+    var waiting = false;
+
+    function update() {
+      waiting = false;
+      var page = document.documentElement;
+      var y = window.pageYOffset || page.scrollTop || 0;
+      var max = page.scrollHeight - window.innerHeight;
+      if (bar) {
+        var done = max > 0 ? Math.min(1, Math.max(0, y / max)) : 0;
+        bar.style.transform = 'scaleX(' + done.toFixed(4) + ')';
+      }
+      if (toTop) {
+        toTop.classList.toggle('is-visible', y > window.innerHeight * 0.9);
+      }
+    }
+
+    function request() {
+      if (!waiting) {
+        waiting = true;
+        window.requestAnimationFrame(update);
+      }
+    }
+
+    window.addEventListener('scroll', request, { passive: true });
+    window.addEventListener('resize', request);
+    update();
+  }
+
+  // Shows a fade at the edge of a code block while more code lies that way,
+  // and keeps a block in the tab order only when it actually scrolls.
+  function initCodeScroll() {
+    var blocks = document.querySelectorAll('.code');
+
+    Array.prototype.forEach.call(blocks, function (block) {
+      var pre = block.querySelector('pre');
+      if (!pre) {
+        return;
+      }
+
+      function update() {
+        var max = pre.scrollWidth - pre.clientWidth;
+        var scrolls = max > 4;
+        block.classList.toggle('has-more-start', scrolls && pre.scrollLeft > 4);
+        block.classList.toggle('has-more-end', scrolls && pre.scrollLeft < max - 4);
+        if (pre.clientWidth > 0) {
+          if (scrolls) {
+            pre.setAttribute('tabindex', '0');
+          } else {
+            pre.removeAttribute('tabindex');
+          }
+        }
+      }
+
+      pre.addEventListener('scroll', update, { passive: true });
+      if ('ResizeObserver' in window) {
+        new ResizeObserver(update).observe(pre);
+      } else {
+        window.addEventListener('resize', update);
+      }
+      update();
+    });
+  }
+
   function init() {
     initTheme();
     initMenu();
     initTabs();
     initCopy();
+    initSectionSpy();
+    initScrollCues();
+    initCodeScroll();
   }
 
   if (document.readyState === 'loading') {
