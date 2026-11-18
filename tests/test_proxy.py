@@ -38,10 +38,11 @@ def text_result(text):
 class Harness:
     """A Proxy wired to in-memory streams, with helpers to play both sides."""
 
-    def __init__(self):
+    def __init__(self, firewall=None, **proxy_options):
         self.to_client = io.BytesIO()
         self.to_server = io.BytesIO()
-        self.proxy = Proxy(Firewall(POLICY), client_out=self.to_client, server_in=self.to_server)
+        self.firewall = firewall or Firewall(POLICY)
+        self.proxy = Proxy(self.firewall, client_out=self.to_client, server_in=self.to_server, **proxy_options)
         self.warnings = io.StringIO()
 
     def _feed(self, handle_line, message):
@@ -146,7 +147,7 @@ class ProxyUnitTests(unittest.TestCase):
         self.h.from_client(call(2, "search_notes", {"q": "soup"}))  # the policy allows search_*
         self.assertEqual(self.h.sent_to_server(), [])
         (refusal,) = self.h.sent_to_client()
-        self.assertIn("poisoned", refusal["result"]["content"][0]["text"])
+        self.assertIn("removed from the tool list", refusal["result"]["content"][0]["text"])
 
     def test_quarantine_survives_a_later_clean_listing(self):
         self.h.round_trip(request(1, "tools/list"), {"tools": [{"name": "search_notes", "description": INJECTION}]})
@@ -283,17 +284,17 @@ class ProxyUnitTests(unittest.TestCase):
 
 
 class ProxyEndToEndTests(unittest.TestCase):
-    def run_proxy(self, messages):
+    def run_proxy(self, messages, proxy_args=(), server=ROOT / "examples" / "fake_mcp_server.py"):
         """Send messages through a real proxy process; return (replies by id, stderr)."""
         raw = "\n".join(json.dumps(m) for m in messages) + "\n"
         proc = subprocess.run(
             [
-                sys.executable, "-m", "agent_sentinel", "proxy", "--policy", str(EXAMPLE_POLICY_PATH),
-                "--", sys.executable, str(ROOT / "examples" / "fake_mcp_server.py"),
+                sys.executable, "-m", "agent_sentinel", "proxy", "--policy", str(EXAMPLE_POLICY_PATH), *proxy_args,
+                "--", sys.executable, str(server),
             ],
             input=raw.encode("utf-8"), capture_output=True, cwd=ROOT, timeout=60,
         )
-        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode(errors="replace"))
         replies = {m["id"]: m for m in map(json.loads, proc.stdout.decode().splitlines())}
         return replies, proc.stderr.decode()
 

@@ -1,26 +1,31 @@
 # agent-sentinel
 
-A security sentinel for AI agents and MCP servers. It sits between an agent and its tools and does three things:
+A security sentinel for AI agents and MCP servers. It sits between an agent and its tools and does four things:
 
 1. **Checks every tool call against a permission policy** before the tool runs.
 2. **Scans everything a tool server sends for prompt injection** before the agent reads it, including poisoned tool descriptions.
-3. **Writes an audit log** of every decision.
+3. **Stops secrets leaving** in tool-call arguments.
+4. **Writes an audit log** of every decision.
 
 It is pure Python (3.10+) with no dependencies. It works as a library inside your own agent, or as a proxy in front of any MCP server that uses the stdio transport.
 
-> **Status: early version (0.3.0).** The injection detector is a set of pattern rules, not a trained classifier. It catches common, unsophisticated injections. It will miss paraphrased, translated or encoded ones, and it can flag harmless text. The permission policy is the dependable part; treat the detector as an extra layer, not as proof that content is safe. The proxy has been tested against a test server included in this repository, not yet against third-party MCP servers. See [SECURITY.md](SECURITY.md) for what is and is not covered.
+Website: https://farooqazamdogar.github.io/agent-sentinel/
+
+> **Status: early version (0.4.0).** The injection detector is a set of pattern rules, not a trained classifier. It catches common, direct injections and undoes several cheap disguises. It will miss reworded, translated or base64-encoded ones, and it can flag harmless text. The permission policy is the dependable part; treat the detector as an extra layer, not as proof that content is safe. The proxy has been tested against a test server included in this repository, not yet against third-party MCP servers. See [SECURITY.md](SECURITY.md) for what is and is not covered.
 
 ## Install
 
 ```bash
-pip install .
+pip install git+https://github.com/FarooqAzamdogar/agent-sentinel.git
 ```
 
-This adds the `agent-sentinel` command. Without installing, run `python -m agent_sentinel` from the project folder instead.
+This adds the `agent-sentinel` command. From a clone of the repository, `pip install .` does the same, and `python -m agent_sentinel` works without installing.
 
 ## Try it
 
 ```bash
+git clone https://github.com/FarooqAzamdogar/agent-sentinel.git
+cd agent-sentinel
 python examples/demo.py
 ```
 
@@ -28,72 +33,91 @@ A pretend agent makes six tool calls. The firewall allows a normal file read, bl
 
 ## Write a policy
 
-A policy is a JSON file. See [policy.example.json](policy.example.json).
+A policy is a JSON file. See [policy.example.json](policy.example.json) for a complete one.
 
 ```json
 {
   "default": "block",
+  "deny_args": [{ "arg": "*", "pattern": "(^|[\\\\/])\\.(ssh|aws|env)\\b|id_rsa" }],
   "tools": {
-    "read_file": {
-      "action": "allow",
-      "deny_args": [{ "arg": "*", "pattern": "\\.env|\\.ssh|id_rsa" }]
-    },
+    "read_file": "allow",
     "search_*": "allow",
     "send_email": {
       "action": "ask",
-      "allow_args": [{ "arg": "to", "pattern": "[^@\\s,;]+@example\\.com" }]
+      "allow_args": [
+        { "arg": "to", "pattern": "[^@\\s,;]+@example\\.com" },
+        { "arg": "cc", "pattern": "[^@\\s,;]+@example\\.com", "optional": true },
+        { "arg": "body", "pattern": "(?s).*", "optional": true }
+      ],
+      "other_args": "block",
+      "max_calls_per_minute": 5
     },
     "delete_*": "block",
-    "resources/read": {
-      "action": "allow",
-      "deny_args": [{ "arg": "uri", "pattern": "\\.env|\\.ssh" }]
-    }
+    "resources/read": "allow"
   },
-  "injection": { "block_severity": "high" }
+  "server_requests": { "sampling/createMessage": "block", "*": "allow" },
+  "injection": { "block_severity": "high" },
+  "secrets": { "in_arguments": "block" },
+  "limits": { "max_calls_per_minute": 120 }
 }
 ```
 
 | Field | Meaning |
 |---|---|
 | `default` | What happens to a tool with no rule: `allow`, `ask` or `block`. Defaults to `block`; keep it that way. |
-| `tools` | One rule per tool name. `*` wildcards are allowed; an exact name beats a wildcard. |
-| `action` | `allow` runs the tool, `block` refuses it, `ask` needs a human to approve. |
-| `deny_args` | The call is blocked if the pattern is found **anywhere in** the named argument, including inside nested lists and objects. Use `"arg": "*"` to check every argument. |
-| `allow_args` | The call is blocked unless the named argument is present and the pattern matches its **whole value**. For a list, every entry must match. |
+| `deny_args` (top level) | Deny rules for every call, whichever tool it is for, including tools with no rule. |
+| `tools` | One rule per tool name. `*` is a wildcard. A rule is either an action (`"allow"`) or an object with an `action` and the fields below. |
+| `action` | `allow` runs the tool, `block` refuses it, `ask` needs a human to approve. Required in the object form. |
+| `deny_args` (in a rule) | The call is blocked if the pattern is found **anywhere in** the named argument, including inside nested lists and objects. `"arg": "*"` checks every argument. |
+| `allow_args` | The call is blocked unless the named argument is present and the pattern matches its **whole value**. With `"optional": true` the argument may be absent. |
+| `other_args` | `"block"` refuses any top-level argument that no `allow_args` entry names. Default `"allow"`. |
+| `max_calls_per_minute` | A rate limit for the tools this rule matches. |
+| `server_requests` | Which requests the MCP server may send to the client (`allow` or `block`), by method name. Everything is allowed, and scanned, if this is left out. |
 | `injection.block_severity` | Text with a finding at or above this level (`low`, `medium`, `high`) is blocked. `null` only logs. |
+| `secrets.in_arguments` | `block` (the default) refuses a call whose arguments contain a recognisable secret. `allow` turns that off. |
+| `limits.max_calls_per_minute` | A rate limit for all tool calls together. |
 
 Things to know when writing rules:
 
 - **Patterns** are regular expressions and ignore case.
-- **Deny is "contains", allow is "whole value".** An allow pattern of `[^@\s,;]+@example\.com` accepts `boss@example.com` and refuses `attacker@evil.example, boss@example.com`.
-- **Loading is strict.** An unknown key such as `deny_arg` is an error, so a typo cannot silently weaken a policy. Check a policy with `agent-sentinel validate policy.json`.
-- **MCP resource reads** are checked under the tool name `resources/read`, with one argument, `uri`. With `"default": "block"` they need a rule to be allowed.
+- **Deny is "contains", allow is "whole value".** An allow pattern of `[^@\s,;]+@example\.com` accepts `boss@example.com` and refuses `attacker@evil.example, boss@example.com`. For a list, every entry must match; objects and empty lists are refused.
+- **Deny rules also see percent-decoded spellings**, so `%2Essh` does not get round a rule for `.ssh`.
+- **When several wildcard rules match a tool, the strictest wins** (block over ask over allow). A rule with the exact tool name beats all wildcards. Use `default` for the fallback, not a `"*"` rule.
+- **Loading is strict.** An unknown key, a duplicate key, a rule without an `action` or a wrong type is an error, so a typo cannot silently weaken a policy. Check a policy with `agent-sentinel validate policy.json`; it also prints warnings.
+- **MCP resource reads and subscriptions** are checked under the tool name `resources/read`, with one argument, `uri`. With `"default": "block"` they need a rule to be allowed.
 - **Patterns match text, not files.** A deny pattern for `.ssh` catches `notes/../.ssh/id_rsa` but not a symbolic link to that file. Use the tool's own access controls as well.
 
 ## Use it as a library
 
 ```python
-from agent_sentinel import BlockedError, Firewall, Policy
+from agent_sentinel import BlockedError, Firewall, Policy, printable
 
 def approve(tool, args, reason):
-    return input(f"Allow {tool} {args}? [y/N] ").lower() == "y"
+    # tool and args are chosen by the agent: make them safe to display.
+    answer = input(f"Allow {printable(tool)} {printable(args)}? [y/N] ")
+    return answer.strip().lower() == "y"      # must return exactly True to approve
 
 firewall = Firewall(Policy.from_file("policy.json"), audit_path="audit.jsonl", approver=approve)
 
 try:
     result = firewall.run("read_file", {"path": "notes.txt"}, read_file)
-except BlockedError as reason:
-    result = f"Blocked: {reason}"   # give this to the agent instead of the tool result
+except BlockedError as error:
+    result = f"Blocked: {error}"   # safe to give to the agent in place of the tool result
 ```
 
-`firewall.run` checks the call, runs the function, scans its result and returns it. If you need the steps separately, use `firewall.check_call(tool, args)` and `firewall.scan_result(tool, text)`; each returns a `Decision` with `allowed`, `reason` and `findings`.
+`firewall.run` checks the call, runs the function, scans its result and returns it. For an `async def` tool use `await firewall.run_async(...)`.
+
+- **What is scanned:** strings, bytes, and anything made of lists, tuples, sets, dictionaries and dataclasses. A result of any other kind (a generator, a response object) is refused, because it cannot be read without using it up; convert it to text first. An error message raised by the tool is scanned too.
+- **What the agent is told:** `str(error)` never names the rule or pattern that refused the call. The full reason is in `error.decision.reason` and in the audit log.
+- **Doing the steps yourself:** `firewall.check_call(tool, args)` and `firewall.scan_result(tool, text)` each return a `Decision` with `allowed`, `reason`, `public_reason` and `findings`. A blocked `Decision` is falsy.
+- **Trying a policy safely:** `Firewall(..., monitor=True)` blocks nothing and logs what it would have blocked.
 
 ## Use it in front of an MCP server
 
 Put the proxy command where the server command used to be:
 
 ```bash
-agent-sentinel proxy --policy policy.json --audit audit.jsonl -- npx some-mcp-server
+agent-sentinel proxy --policy policy.json --audit audit.jsonl --pins pins.json -- npx some-mcp-server
 ```
 
 For example, in an MCP client configuration:
@@ -109,34 +133,46 @@ For example, in an MCP client configuration:
 }
 ```
 
+| Option | Meaning |
+|---|---|
+| `--policy FILE` | The policy. Required. |
+| `--audit FILE` | Where to write the audit log. |
+| `--pins FILE` | Remember each tool's definition in this file, so a change is caught across restarts. Use one file per server. |
+| `--monitor` | Log what the policy and the scanner would block, but block nothing. For tuning a policy; it protects nothing. |
+| `--no-log-args` | Leave tool arguments out of the audit log. |
+| `--max-message-bytes N` | Drop any message larger than this. Default 16 MiB. |
+
 What the proxy does:
 
 | Traffic | Handling |
 |---|---|
-| `tools/call` request | Checked against the policy. A blocked call is answered by the proxy and never reaches the server. |
-| `resources/read` request | Checked against the policy, under the name `resources/read`. |
-| `tools/call` and other results | Scanned. A result with an injection is replaced with an error. |
-| `tools/list` result | Each tool's name, description and schema are scanned. A poisoned tool is removed from the list, and calls to it are blocked from then on. |
-| `prompts/list`, `resources/list` results | Scanned entry by entry; poisoned entries are removed. |
-| `initialize` result | The server's `instructions` are scanned and removed if they look like an injection. |
-| Requests and notifications from the server | Scanned (a sampling request is a prompt the server wants the model to answer). Blocked ones are dropped. |
+| `tools/call` request | Checked against the policy, the secret guard and the rate limits. A blocked call is answered by the proxy and never reaches the server. |
+| `resources/read`, `resources/subscribe` requests | Checked against the policy, under the name `resources/read`. |
+| Every reply from the server | Scanned, then rebuilt from the checked parts, so nothing else in the message rides along. A reply with an injection is replaced with an error. |
+| `tools/list` reply | Each tool's name, description and schema are scanned. A poisoned tool is removed from the list and calls to it are refused from then on. |
+| A tool that changes | A tool whose definition differs from the first time it was listed is removed and quarantined (a "rug pull"). |
+| `prompts/list`, `resources/list` replies | Scanned entry by entry; poisoned entries are removed. |
+| `initialize` reply | The server's `instructions` are scanned and removed if they look like an injection. |
+| Requests and notifications from the server | Refused if the policy's `server_requests` says so; otherwise scanned. |
+| The server's error output (stderr) | Printed with control codes escaped and a `server stderr:` label, so it cannot pass for a message from the proxy. |
 | A reply that matches no request | Dropped. |
-| Anything malformed | Dropped. Invalid JSON, batched requests, bad ids and bad arguments are never forwarded. |
+| Anything malformed or oversized | Dropped. Invalid JSON, batched requests, bad ids and bad arguments are never forwarded. |
 
 The proxy fails closed: if it cannot check a message, it does not forward it. Messages are re-serialized, so each side receives exactly what the proxy checked. Warnings go to standard error.
 
 Limits of the proxy in this version:
 
 - Only the stdio transport is supported, not HTTP.
-- Rules with action `ask` are blocked, because the proxy has no terminal to ask a human on.
+- Rules with action `ask` are blocked, because the proxy has no way to reach a human yet.
 - Binary content (images, audio, base64 data) is not decoded or scanned.
-- A tool is trusted or quarantined by its description at the time it is listed. A change of description is scanned again, but the change itself is not reported.
+- The server command is looked up on `PATH` only, never in the current folder. To run a local file, write its path, such as `./server`.
+- To accept a legitimate update to a pinned tool, delete its entry from the pins file, or the file.
 
 ## The command line
 
 ```bash
 agent-sentinel scan page.txt          # scan a file (or stdin) for prompt injection; exit code 1 if found
-agent-sentinel validate policy.json   # check a policy file
+agent-sentinel validate policy.json   # check a policy file and print warnings
 agent-sentinel report audit.jsonl     # allowed and blocked counts per tool, plus recent blocks
 agent-sentinel proxy ...              # run an MCP server behind the firewall
 ```
@@ -146,10 +182,19 @@ agent-sentinel proxy ...              # run an MCP server behind the firewall
 One JSON object per line:
 
 ```json
-{"time": "2026-11-12T21:03:42+00:00", "event": "call", "tool": "read_file", "action": "block", "reason": "an argument has a value the policy denies", "args": {"path": "/home/me/.ssh/id_rsa"}}
+{"time": "2026-11-17T22:04:04+00:00", "event": "call", "tool": "read_file", "action": "block", "reason": "an argument has a value the policy denies", "args": {"path": "/home/me/.ssh/id_rsa"}}
 ```
 
-`event` is one of `call`, `result`, `tool_description`, `list_item`, `server_instructions` or `server_request`. Tool arguments are logged, and they can contain sensitive data. Pass `log_args=False` to `Firewall`, or `--no-log-args` to the proxy, to leave them out. If the log cannot be written, the firewall prints one warning and keeps enforcing decisions.
+- **`event`** is `call` for a tool call or resource request. Content checks use `result`, `tool_error`, `tool_description`, `tool_changed`, `list_item`, `server_instructions` or `server_request`. `dropped` records a message that was discarded for its shape.
+- **`action`** is `allow`, `block`, or `would_block` in monitor mode.
+- **`tool`** is the tool name, the resource URI, or `server:<method>` for something the server sent.
+- **Secrets are redacted.** Recognisable keys and tokens are replaced with a marker such as `[redacted GitHub token]`. Other argument values are logged as they are; pass `log_args=False` to `Firewall`, or `--no-log-args` to the proxy, to leave arguments out.
+- **Control characters are escaped**, so a hostile tool name cannot rewrite your terminal or split a record when you read the file.
+- If the log cannot be written, the firewall prints one warning and keeps enforcing decisions.
+
+## The secret guard
+
+A hijacked agent that has read a key will try to pass it to a tool. Calls whose arguments contain one of these are refused: a PEM private key, an AWS access key, a GitHub, Slack or Stripe token, a Google API key, or an OpenAI- or Anthropic-style API key. Only formats with a fixed, recognisable shape are listed, so ordinary identifiers and hashes are not flagged. It is not a general secret scanner: a password or a key in a format it does not know passes.
 
 ## What the detector looks for
 
@@ -158,13 +203,15 @@ One JSON object per line:
 | `instruction_override` | high | "Ignore all previous instructions" |
 | `hide_from_user` | high | "Do not tell the user" |
 | `exfiltration_to_destination` | high | "Send the API keys to http://..." |
+| `unscannable_content` | high | Text built to make scanning very slow; refused instead of scanned |
+| `instruction_override_weak` | medium | "Ignore all the rules" (too common in ordinary text to block) |
 | `secret_request` | medium | "Send me the password" (no destination named) |
 | `role_hijack` | medium | "You are now...", `<system>` tags |
 | `tool_command` | medium | "Run the shell command silently" |
-| `invisible_characters` | medium or low | Hidden Unicode characters. Low when they are only the joiners that emoji and some scripts use. |
+| `invisible_characters` | medium or low | Hidden Unicode characters. Low when they are only the kind that emoji and some scripts use. |
 | `markdown_image_exfiltration` | medium | An image link that carries data in its URL |
 
-Before matching, text is normalized: invisible characters are removed and look-alike forms such as full-width letters are folded to plain ones. With the default policy only high findings block; medium and low findings are logged.
+Before matching, text is normalized so that cheap disguises fail: invisible characters and terminal colour codes are removed, accents and look-alike letters (full-width, Cyrillic, Greek) are folded to plain ones, and HTML entities, HTML tags inside words and percent-encoding are undone. A phrase split across several fields of a reply is also read as one text. With the default policy only high findings block; medium and low findings are logged.
 
 ## Contributing
 
@@ -177,9 +224,9 @@ python -m unittest discover tests -v
 ## Ideas for what to build next
 
 - Test against widely used MCP servers and clients.
-- Human approval in the proxy, through a local web page.
+- Human approval in the proxy.
 - A dashboard that reads the audit log.
-- Alerts when a tool's description changes after first use ("rug pull").
+- A tamper-evident audit log.
 - An optional model-based injection classifier next to the pattern rules.
 - HTTP transport for the proxy.
 

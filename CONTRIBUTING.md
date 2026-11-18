@@ -15,31 +15,35 @@ python examples/demo.py                  # see the firewall make six decisions
 
 | File | What it does | Depends on |
 |---|---|---|
-| `agent_sentinel/detector.py` | Finds prompt injection in text. Pure functions, no state. | nothing |
-| `agent_sentinel/policy.py` | Loads a policy and answers allow / ask / block for a call. | detector (severity names) |
-| `agent_sentinel/firewall.py` | Combines policy and detector, and writes the audit log. The public core. | detector, policy |
+| `agent_sentinel/detector.py` | Finds prompt injection in text. Pure functions, no state. | textutil |
+| `agent_sentinel/leaks.py` | Recognises secrets (keys, tokens) in outgoing text and redacts them. | nothing |
+| `agent_sentinel/policy.py` | Loads a policy and answers allow / ask / block for a call. | detector (severity names), textutil |
+| `agent_sentinel/firewall.py` | Combines policy, secret guard, rate limits and detector, and writes the audit log. The public core. | the three above |
 | `agent_sentinel/mcp_proxy.py` | Puts the firewall between an MCP client and server. | firewall |
 | `agent_sentinel/__main__.py` | The `agent-sentinel` command line. | everything |
-| `agent_sentinel/textutil.py` | `texts_in` (collect text from nested data) and `printable` (make text terminal-safe). | nothing |
+| `agent_sentinel/textutil.py` | `texts_in` and `text_views` (collect text from nested data) and `printable` (make text terminal-safe). | nothing |
+| `docs/` | The project website, served by GitHub Pages. Plain HTML, CSS and a little JavaScript; no build step. | nothing |
 
-Each module has its own test file in `tests/`: `test_detector.py`, `test_policy.py`, `test_firewall.py`, `test_textutil.py`, `test_proxy.py` (for `mcp_proxy.py`) and `test_cli.py` (for `__main__.py`). `tests/support.py` holds the shared setup.
+Each module has its own test file in `tests/`: `test_detector.py`, `test_leaks.py`, `test_policy.py`, `test_firewall.py`, `test_textutil.py`, `test_proxy.py` and `test_proxy_hardening.py` (for `mcp_proxy.py`) and `test_cli.py` (for `__main__.py`). `tests/support.py` holds the shared setup.
 
 ## How a tool call flows (library use)
 
 ```
 firewall.run(tool, args, fn)
   │
-  ├─ check_call ──► policy.evaluate ──► allow / ask / block
-  │                   ask ──► approver(tool, args, reason)
-  │                   block ──► BlockedError (fn never runs)
+  ├─ check_call
+  │    ├─ policy.evaluate ──► allow / ask / block      (block stops here)
+  │    ├─ secret guard: do the arguments hold a key or token?
+  │    ├─ rate limits
+  │    └─ ask ──► approver(tool, args, reason), which must return exactly True
   │
-  ├─ fn(**args)
+  ├─ fn(**args)                 an error it raises is scanned before it is re-raised
   │
-  └─ scan_result ──► detector.scan ──► findings
+  └─ scan_result ──► detector.scan_views(text_views(result)) ──► findings
                       a finding at or above policy.block_severity ──► BlockedError
 ```
 
-Every `check_call` and `scan_result` writes one line to the audit log.
+Every decision writes one line to the audit log. A `Decision` has two texts: `reason` for the log and the operator, and `public_reason` for the agent.
 
 ## How a message flows (MCP proxy)
 
@@ -54,34 +58,41 @@ client ◄── handle_server_line ◄── _inspect_server_message ◄── 
 Client side, in order:
 
 1. Refuse batches, non-objects and invalid ids.
-2. `tools/call`: validate the shape, wait for any tool list still being checked, refuse quarantined tools, then ask the policy.
-3. `resources/read`: ask the policy, as tool `resources/read` with argument `uri`.
-4. Anything else with an id is remembered in `_pending`, so its reply can be matched, and forwarded.
+2. A message with no method must be the answer to a request the server made; otherwise it is dropped.
+3. `tools/call`: validate the shape, wait for any tool list still being checked, refuse quarantined tools, then ask the firewall.
+4. `resources/read` and `resources/subscribe`: ask the firewall, as tool `resources/read` with argument `uri`.
+5. Anything else with an id is remembered in `_pending`, so its reply can be matched, and forwarded.
 
 Server side, in order:
 
-1. A message with a `method` is a request or notification from the server: scan it all.
-2. Otherwise it is a reply. If it matches nothing in `_pending`, drop it.
-3. Scan the reply. Lists are filtered entry by entry; `initialize` has its `instructions` checked; everything else is scanned whole.
+1. A message with a `method` must be a well-formed request or notification. The policy's `server_requests` may refuse it; otherwise all of it is scanned.
+2. Otherwise it is a reply. If it matches nothing in `_pending`, drop it. It must have exactly one of `result` and `error`.
+3. Check the reply. Lists are filtered entry by entry, and tools are compared with their pinned definition; `initialize` has its `instructions` checked; everything else is scanned whole.
+4. Build a new message from the checked `result` or `error`. The server's own envelope is never forwarded.
 
 ## Rules a change must keep
 
 These are the security properties of the project. A pull request that breaks one needs a very good reason.
 
-1. **Fail closed.** If a message cannot be parsed, matched or checked, it is dropped or answered with an error. It is never forwarded "just in case". An exception inside a check counts as a failed check.
-2. **Everything from the server is scanned.** Do not add a path that forwards server text to the client without passing through `scan_result`.
-3. **Forward what was checked.** The proxy re-serializes messages. Never forward the raw bytes that came in.
-4. **Untrusted text is never printed raw.** Anything that reaches a terminal goes through `printable`.
-5. **The scanner must stay fast on hostile input.** Text is attacker-controlled. Read the note at the top of `detector.py` before adding a pattern, and add a case to `HostileInputIsScannedQuickly` in `tests/test_detector.py`.
-6. **Do not tell the agent how the policy works.** Reasons returned to the agent say that a value was denied, not which pattern denied it.
+1. **Fail closed.** If a message cannot be parsed, matched or checked, it is dropped or answered with an error. It is never forwarded "just in case". An exception inside a check counts as a failed check. Monitor mode lifts policy and scanner blocks only, never these.
+2. **Everything from the server is scanned.** Do not add a path that forwards server text to the client without passing through `scan_result`, and scan `text_views(...)`, not a hand-made join.
+3. **Forward what was checked.** The proxy re-serializes messages and rebuilds replies. Never forward the raw bytes that came in, or a server's envelope.
+4. **Untrusted text is never printed raw.** Anything that reaches a terminal goes through `printable`; the audit log escapes control characters.
+5. **Stay fast on hostile input.** Text is attacker-controlled, in both directions. Read the note at the top of `detector.py` before adding a pattern, and add a case to the hostile-input tests. Anything that grows with what a peer sends needs a bound.
+6. **Do not tell the agent how the policy works.** What goes to the agent is `public_reason`: it may name an argument, never a rule, a pattern or the default. Tell a refused server nothing at all.
 7. **No dependencies.** The package uses only the standard library, which keeps the supply chain of a security tool small.
+8. **Strict configuration.** A policy key the loader does not know is an error. A new key needs validation, a test for a wrong type, and a line in the README table.
 
 ## How to add a detector rule
 
-1. Add a `_rule(...)` entry to `_RULES` in `detector.py`. A rule is a first pattern followed by `(max_gap, pattern)` steps.
+1. Add a `_rule(...)` entry to `_RULES` in `detector.py`. A rule is a first pattern followed by `(max_gap, pattern)` steps. Write patterns in lowercase and follow the conventions in the note at the top of that file; they are what keeps matching fast.
 2. Choose the severity carefully. `high` blocks content by default, so a high rule must be narrow.
-3. In `tests/test_detector.py`, add a test that it fires, a harmless sentence to `test_harmless_sentences_are_not_high_severity`, and a repetitive input to `HostileInputIsScannedQuickly`.
+3. In `tests/test_detector.py`, add a test that it fires, a harmless sentence that must not be high, and a repetitive input to the hostile-input tests.
 4. Add the rule to the table in the README.
+
+## How to add a secret format
+
+Add a pattern to `leaks.py`. It must start with a literal prefix, have explicit length bounds, and must not be able to match a double quote. Add a positive and a negative example to `tests/test_leaks.py`.
 
 ## Style
 

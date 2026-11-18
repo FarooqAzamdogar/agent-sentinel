@@ -1,30 +1,39 @@
 {
   "default": "block",
+  "deny_args": [
+    { "arg": "*", "pattern": "(^|[\\\\/])\\.(ssh|aws|env)\\b|id_rsa|id_ed25519" }
+  ],
   "tools": {
-    "read_file": {
-      "action": "allow",
-      "deny_args": [
-        { "arg": "*", "pattern": "\\.env|\\.ssh|id_rsa|credentials|secrets?" }
-      ]
-    },
+    "read_file": "allow",
     "fetch_page": "allow",
     "search_*": "allow",
     "send_email": {
       "action": "ask",
       "allow_args": [
-        { "arg": "to", "pattern": "[^@\\s,;]+@example\\.com" }
-      ]
+        { "arg": "to", "pattern": "[^@\\s,;]+@example\\.com" },
+        { "arg": "cc", "pattern": "[^@\\s,;]+@example\\.com", "optional": true },
+        { "arg": "bcc", "pattern": "[^@\\s,;]+@example\\.com", "optional": true },
+        { "arg": "subject", "pattern": "(?s).*", "optional": true },
+        { "arg": "body", "pattern": "(?s).*", "optional": true }
+      ],
+      "other_args": "block",
+      "max_calls_per_minute": 5
     },
     "delete_*": "block",
     "run_shell": "block",
-    "resources/read": {
-      "action": "allow",
-      "deny_args": [
-        { "arg": "uri", "pattern": "\\.env|\\.ssh|id_rsa|credentials|secrets?" }
-      ]
-    }
+    "resources/read": "allow"
+  },
+  "server_requests": {
+    "sampling/createMessage": "block",
+    "*": "allow"
   },
   "injection": {
     "block_severity": "high"
+  },
+  "secrets": {
+    "in_arguments": "block"
+  },
+  "limits": {
+    "max_calls_per_minute": 120
   }
 }
