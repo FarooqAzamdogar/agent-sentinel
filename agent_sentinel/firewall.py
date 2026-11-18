@@ -313,7 +313,9 @@ class Firewall:
         waiting), is a refusal. Before approving, the flow rules are checked
         again: if what the agent read while the call waited means a flow rule
         now blocks it, the call is refused. Rate limits are not counted again.
-        The audit record has event "approval".
+        The audit record has event "approval". Monitor mode never lifts this
+        answer: it lifts what the policy would block, not a human's "no" or an
+        answer that matches no waiting call (and in monitor mode nothing waits).
         """
         if not isinstance(decision, Decision) or not decision.pending:
             raise ValueError("finish_approval takes a pending Decision from check_call(..., defer_ask=True)")
@@ -334,7 +336,8 @@ class Firewall:
             final = self._refused_approval(decision, f"{base}; {what} by {who}")
         else:
             final = self._approved_unless_a_flow_blocks(decision, tool, base, who)
-        return self._finish("approval", tool, final)
+        self._audit("approval", tool, "allow" if final.allowed else "block", final, None)
+        return final
 
     def scan_result(
         self, tool: str, content: Any, event: str = "result", log_clean: bool = True, *, call_id: str | None = None

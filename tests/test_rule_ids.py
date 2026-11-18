@@ -369,6 +369,17 @@ class DescribingRules(unittest.TestCase):
             with self.subTest(rule=rule_id):
                 self.assertIsNone(policy.describe_rule(rule_id))
 
+    def test_a_hostile_rule_id_from_an_edited_log_is_not_described_and_raises_nothing(self):
+        # explain reads `rule` from a plain file anyone with access can edit: any JSON value can be there.
+        policy = Policy.from_dict({**self.POLICY_DATA, "flows": [{"after": ["untrusted"], "action": "block"}]})
+        huge = "9" * 5000  # more digits than Python will turn into a number
+        for rule_id in (None, 5, ["default"], {"rule": "default"}, f"deny_args[{huge}]", f"flows[{huge}]",
+                        f"tools.send.email.allow_args[{huge}]", f"secrets.patterns[{huge}]", "deny_args[00]",
+                        "deny_args[-1]", "flows[01]", "x" * 1_000_000):
+            with self.subTest(rule=str(rule_id)[:40]):
+                self.assertIsNone(policy.describe_rule(rule_id))
+        self.assertIsNotNone(policy.describe_rule("flows[0]"))
+
     def test_every_rule_id_a_decision_carries_is_described(self):
         firewall = Firewall(POLICY)
         decisions = [

@@ -430,6 +430,19 @@ class Urls(unittest.TestCase):
                 self.assertEqual(verdict(policy, url=url), "block")
         self.assertEqual(verdict(policy, url="https://example.com/"), "allow")
 
+    def test_deny_reads_a_url_as_written_so_an_escape_in_its_path_is_no_reason_to_deny(self):
+        # Decoding "%20" gives a space, which read_url refuses: decoding first would deny every such URL.
+        policy = rule({"arg": "url", "type": "url", "hosts": ["pastebin.com"]}, deny=True)
+        for url in ("https://docs.python.org/search?q=two%20words", "https://example.com/a%0Ab",
+                    "https://example.com/a%5Cb", "https://example.com/%25252525252525"):
+            with self.subTest(url=url):
+                self.assertEqual(verdict(policy, url=url), "allow")
+        # An escape in the host, or a URL that only an extra decoding makes readable, is still denied.
+        for url in ("https://pastebin%2Ecom/x", "https%3A%2F%2Fpastebin.com/x", "https://example.com%40pastebin.com/",
+                    "https://pastebin.com/search?q=two%20words"):
+            with self.subTest(url=url):
+                self.assertEqual(verdict(policy, url=url), "block")
+
     def test_private_and_metadata_addresses_cannot_be_allowed(self):
         for host in ("127.0.0.1", "10.0.0.5", "192.168.1.1", "169.254.169.254", "100.100.100.200", "::1",
                      "[fd00:ec2::254]", "::ffff:169.254.169.254", "0.0.0.0", "224.0.0.1", "localhost",

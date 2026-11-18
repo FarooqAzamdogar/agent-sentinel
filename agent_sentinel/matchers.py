@@ -15,7 +15,8 @@ Each matcher answers the question of the list it is in:
 
     found_in(text)   deny_args: is this text a match? The policy asks it for
                      every text inside the argument, nested values and object
-                     keys included, and for their percent-decoded spellings.
+                     keys included, and for their percent-decoded spellings
+                     (except the url matcher, which reads escapes itself).
     accepts(text)    allow_args: is this the whole of an acceptable value? The
                      policy asks it for the value, or for each entry of a flat list.
 
@@ -105,6 +106,10 @@ class Matcher:
     key = ""  # the policy key that chose this matcher, such as "pattern"
     # True: in allow_args only text is acceptable, never a number or true/false.
     text_only = False
+    # True: in deny_args the policy also asks found_in about each percent-decoded
+    # spelling of a text (see decoded_spellings), and refuses a text still encoded
+    # after the last round. A matcher that reads escapes itself turns this off.
+    deny_checks_decoded = True
 
     def found_in(self, text: str) -> bool:
         raise NotImplementedError
@@ -644,6 +649,12 @@ class UrlMatcher(Matcher):
     schemes: tuple[str, ...] = ("https",)
     key = "type"
     text_only = True
+    # deny_args reads the URL as written, not its percent-decoded spellings. A
+    # URL that can be read has no escape in its scheme or host (read_url refuses
+    # a "%" there), so decoding cannot change which host it names; it could only
+    # turn an ordinary "%20" in the path or query into a space that read_url
+    # refuses, which would deny every such URL. A URL that cannot be read is denied.
+    deny_checks_decoded = False
 
     def accepts(self, text: str) -> bool:
         url = read_url(text)

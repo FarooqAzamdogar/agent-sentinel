@@ -236,6 +236,25 @@ class SecretSettings(unittest.TestCase):
         self.assertIn("at most 100 canaries", load_error({"secrets": {"canaries": canaries}}))
         self.assertIn("8 to 200 characters", load_error({"secrets": {"canaries": ["c" * 1_000_000]}}))
 
+    def test_a_policy_built_in_code_has_its_secret_settings_checked(self):
+        # A text where a tuple belongs would otherwise be read one character at a time.
+        for field, value, expected in [
+            ("secrets_canaries", "sentinel-canary-3f9c1e", "must be a list"),
+            ("secrets_canaries", ("short",), "8 to 200 characters"),
+            ("secrets_known_values_from_env", "GITHUB_TOKEN", "must be a list"),
+            ("secrets_known_values_from_env", ("not a name",), "NAME of an environment variable"),
+            ("secrets_patterns", SecretPattern("x", "pre_", "hex", 8, 8), "must be a tuple of SecretPattern"),
+            ("secrets_patterns", (self.PATTERN,), "secrets.patterns[0] must be a SecretPattern"),
+        ]:
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(PolicyError) as caught:
+                    Policy(**{field: value})
+                self.assertIn(expected, str(caught.exception))
+        policy = Policy(secrets_canaries=["sentinel-canary-3f9c1e"], secrets_known_values_from_env=("DB_PASSWORD",),
+                        secrets_patterns=[SecretPattern("x", "pre_", "hex", 8, 8)])
+        self.assertEqual(policy.secrets_canaries, ("sentinel-canary-3f9c1e",))  # lists become tuples
+        self.assertIsInstance(policy.secrets_patterns, tuple)
+
     def test_unknown_secret_keys_are_errors(self):
         self.assertIn("did you mean 'canaries'?", load_error({"secrets": {"canary": []}}))
 

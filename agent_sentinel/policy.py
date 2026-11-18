@@ -408,6 +408,12 @@ class Policy:
             _check_flow(flow, f"flows[{index}]")
         _expect_choice(self.secrets_in_arguments, "secrets.in_arguments", ("block", "allow"))
         _expect_choice(self.secrets_in_results, "secrets.in_results", SECRETS_IN_RESULTS)
+        # The same checks as the loader. Without them, a text written where a
+        # tuple belongs (secrets_canaries="my-canary-1") would be read one
+        # character at a time by the code that acts on these settings.
+        self.secrets_known_values_from_env = _env_names(_as_list(self.secrets_known_values_from_env))
+        self.secrets_canaries = _canaries(_as_list(self.secrets_canaries))
+        self.secrets_patterns = _code_secret_patterns(self.secrets_patterns)
         _expect_severity(self.block_severity)
         for name, value in (("classify_by_annotations", self.classify_by_annotations),
                             ("hide_blocked_tools", self.hide_blocked_tools)):
@@ -521,7 +527,7 @@ class Policy:
         extra_labels: labels the tool has besides those the policy gives it
                       (the firewall passes the ones its MCP annotations imply).
         """
-        verdict = self._rule_verdict(tool, args)
+        verdict = self._verdict_without_flows(tool, args)
         if marks is None or verdict.action == "block":
             return verdict
         flow = self.flow_verdict(tool, marks, extra_labels)
@@ -530,7 +536,7 @@ class Policy:
             return flow
         return verdict
 
-    def _rule_verdict(self, tool: str, args: dict[str, Any] | None) -> Verdict:
+    def _verdict_without_flows(self, tool: str, args: dict[str, Any] | None) -> Verdict:
         """The verdict of the deny rules, tool rules and default, without flows."""
         if args is None:
             args = {}
@@ -707,8 +713,12 @@ class Policy:
         """What the rule with this id checks, for the operator; None if this policy has no such rule.
 
         For `explain` and similar tools that start from an audit record. Never
-        show the result to the agent: it names patterns and rules.
+        show the result to the agent: it names patterns and rules. An audit log
+        is a plain file anyone with access can edit, so a `rule` read from it
+        may be anything: what is not text, or not an id this policy has, gives None.
         """
+        if not isinstance(rule_id, str):
+            return None
         fixed = {
             RULE_DEFAULT: f'the default: "{self.default}" for every tool without a rule',
             RULE_SECRETS: "the secret guard: the arguments hold what looks like a key or token (secrets.in_arguments)",
@@ -728,11 +738,11 @@ class Policy:
             return secret_part
         if rule_id == "limits.max_calls_per_minute" and self.max_calls_per_minute is not None:
             return f"at most {self.max_calls_per_minute} call(s) per minute for all tools together"
-        indexed = re.fullmatch(r"deny_args\[([0-9]+)\]", rule_id)
+        indexed = re.fullmatch(rf"deny_args{_INDEX}", rule_id)
         if indexed:
             entry = _entry(self.deny_args, indexed.group(1))
             return None if entry is None else f"policy-wide deny rule, {entry.describe()}"
-        indexed = re.fullmatch(r"flows\[([0-9]+)\]", rule_id)
+        indexed = re.fullmatch(rf"flows{_INDEX}", rule_id)
         if indexed:
             flow = _entry(self.flows, indexed.group(1))
             return None if flow is None else f"flow rule: {flow.describe()}"
@@ -761,7 +771,7 @@ class Policy:
         if rule_id == RULE_SECRETS_KNOWN_VALUES and self.secrets_known_values_from_env:
             names = ", ".join(self.secrets_known_values_from_env)
             return f"the value of one of these environment variables: {names} (secrets.known_values_from_env)"
-        indexed = re.fullmatch(r"secrets\.patterns\[([0-9]+)\]", rule_id)
+        indexed = re.fullmatch(rf"secrets\.patterns{_INDEX}", rule_id)
         if indexed:
             pattern = _entry(self.secrets_patterns, indexed.group(1))
             return None if pattern is None else f"custom secret format {pattern.describe()}"
@@ -877,10 +887,12 @@ def _found_in_any(matcher: Matcher, texts: list[str]) -> bool:
     """True if the matcher finds a match in any text, as written or after percent-decoding.
 
     Extra spellings can only add blocks. A text still encoded after the last
-    round of decoding counts as a match: it could not be checked.
+    round of decoding counts as a match: it could not be checked. A matcher
+    that reads escapes itself (Matcher.deny_checks_decoded) sees the text as written only.
     """
     for text in texts:
-        for spelling in decoded_spellings(text):
+        spellings = decoded_spellings(text) if matcher.deny_checks_decoded else (text,)
+        for spelling in spellings:
             if spelling is None or matcher.found_in(spelling):
                 return True
     return False
@@ -923,6 +935,12 @@ def _scalar_text(value: Any) -> str | None:
 
 # ---- describing rules -----------------------------------------------------------
 
+# A position as rule ids write it: "[0]", "[12]". No leading zeros, so each entry
+# has one id; at most nine digits, so a hostile id cannot make int() do much work
+# (or fail: Python refuses to read a number of more than 4300 digits).
+_INDEX = r"\[(0|[1-9][0-9]{0,8})\]"
+
+
 def _entry(entries: tuple[Any, ...], index: str) -> Any:
     """The entry at a position written in a rule id ("deny_args[2]"), or None if there is no such entry."""
     position = int(index)
@@ -943,7 +961,7 @@ def _describe_tool_rule_part(rule: ToolRule, rule_id: str) -> str | None:
         return f"tool rule '{rule.name}' accepts only the arguments its allow_args name ({named})"
     if part == "max_calls_per_minute" and rule.max_calls_per_minute is not None:
         return f"tool rule '{rule.name}': at most {rule.max_calls_per_minute} call(s) per minute"
-    indexed = re.fullmatch(r"(deny_args|allow_args)\[([0-9]+)\]", part)
+    indexed = re.fullmatch(rf"(deny_args|allow_args){_INDEX}", part)
     if indexed:
         entries = rule.deny_args if indexed.group(1) == "deny_args" else rule.allow_args
         entry = _entry(entries, indexed.group(2))
@@ -1286,6 +1304,24 @@ def _secret_patterns(specs: Any) -> tuple[SecretPattern, ...]:
         _check_secret_pattern(spec, entry)
         patterns.append(SecretPattern(spec["name"], spec["prefix"], spec["charset"], spec["min_len"], spec["max_len"]))
     return tuple(patterns)
+
+
+def _as_list(value: Any) -> Any:
+    """A tuple given in code, as the list the loader's checks expect; anything else unchanged, for them to refuse."""
+    return list(value) if isinstance(value, tuple) else value
+
+
+def _code_secret_patterns(value: Any) -> tuple[SecretPattern, ...]:
+    """Check secrets_patterns given in code: a list or tuple of SecretPattern (each checked itself when made)."""
+    where = "secrets.patterns"
+    if not isinstance(value, (list, tuple)):
+        raise PolicyError(f"{where} must be a tuple of SecretPattern, got {type_name(value)}")
+    for index, entry in enumerate(value):
+        if not isinstance(entry, SecretPattern):
+            raise PolicyError(f"{where}[{index}] must be a SecretPattern, got {type_name(entry)}")
+    if len(value) > MAX_SECRET_PATTERNS:
+        raise PolicyError(f"{where} can hold at most {MAX_SECRET_PATTERNS} formats")
+    return tuple(value)
 
 
 def _check_secret_pattern(spec: Any, where: str) -> None:

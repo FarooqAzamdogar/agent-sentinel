@@ -127,6 +127,17 @@ class FinishingAnApproval(unittest.TestCase):
         self.assertFalse(self.firewall.finish_approval(self.pending, True, "dialog").allowed)
         self.assertFalse(self.firewall.finish_approval(first, True, "dialog").allowed)
 
+    def test_monitor_mode_does_not_turn_a_refused_or_unmatched_answer_into_an_approval(self):
+        # Monitor mode lifts what the policy would block. A human's "no", or an answer
+        # for a call this firewall is not waiting for, is not a policy block.
+        foreign = Firewall(POLICY).check_call("send_email", EMAIL, defer_ask=True)
+        monitor = Firewall(POLICY, monitor=True)
+        self.assertFalse(monitor.finish_approval(foreign, True, "dialog").allowed)
+        self.firewall.monitor = True  # switched on while the call waited
+        final = self.firewall.finish_approval(self.pending, False, "dialog")
+        self.assertFalse(final.allowed)
+        self.assertEqual(final.ref, self.pending.ref)
+
     def test_a_hostile_approver_label_is_made_printable_and_short(self):
         final = self.firewall.finish_approval(self.pending, False, "dia\x1b[2Jlog" + "x" * 1000)
         self.assertNotIn("\x1b", final.reason)
