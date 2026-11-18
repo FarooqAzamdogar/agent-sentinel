@@ -21,6 +21,7 @@ from pathlib import Path
 from . import __version__, mcp_proxy
 from .detector import scan_views
 from .policy import Policy, PolicyError
+from .policy_errors import file_error_message
 from .textutil import printable
 
 # Byte order marks, longest first: the UTF-32-LE mark begins with the UTF-16-LE one.
@@ -69,7 +70,12 @@ def _validate(args: argparse.Namespace) -> int:
     try:
         policy = Policy.from_file(args.policy)
     except (OSError, PolicyError) as exc:
-        print(f"Invalid policy: {printable(exc)}", file=sys.stderr)
+        message = file_error_message(args.policy, exc) if isinstance(exc, OSError) else str(exc)
+        # Line by line: a JSON error shows the line of the file with a caret under the mistake.
+        lines = message.splitlines() or [""]
+        print(f"Invalid policy: {printable(lines[0], limit=1000)}", file=sys.stderr)
+        for line in lines[1:]:
+            print(printable(line, limit=1000), file=sys.stderr)
         return 2
     print(f"Policy is valid. Default action: {policy.default}. Blocks injection findings at: {policy.block_severity}.")
     print(f"Secrets in tool arguments: {policy.secrets_in_arguments}.", end=" ")

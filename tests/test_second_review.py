@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import EXAMPLE_POLICY_PATH, INJECTION, POLICY, ROOT
+from support import EXAMPLE_POLICY_PATH, INJECTION, POLICY, ROOT, without_ref
 from test_proxy import Harness, call, reply, request, text_result
 from agent_sentinel import BlockedError, Firewall, Policy, mcp_proxy, scan
 from agent_sentinel.detector import scan_views
@@ -134,8 +134,9 @@ class TheSecretGuard(unittest.TestCase):
         to_allowed = firewall.check_call("search_web", {"q": TOKEN})
         to_blocked = firewall.check_call("delete_file", {"path": TOKEN})
         to_unknown = firewall.check_call("made_up_tool", {"x": TOKEN})
-        self.assertEqual(to_allowed.public_reason, to_blocked.public_reason)
-        self.assertEqual(to_allowed.public_reason, to_unknown.public_reason)
+        # Equal apart from each refusal's random reference.
+        self.assertEqual(without_ref(to_allowed.public_reason), without_ref(to_blocked.public_reason))
+        self.assertEqual(without_ref(to_allowed.public_reason), without_ref(to_unknown.public_reason))
 
     def test_ordinary_lookalikes_do_not_block_a_call(self):
         firewall = Firewall(POLICY)
@@ -148,7 +149,7 @@ class RefusalsDoNotLeak(unittest.TestCase):
     def test_a_rule_waiting_for_approval_is_not_revealed_by_the_rate_limit(self):
         policy = Policy.from_dict({"tools": {"send_*": {"action": "ask", "max_calls_per_minute": 3}}})
         firewall = Firewall(policy)  # no approver, as in the proxy
-        reasons = {firewall.check_call("send_email", {}).public_reason for _ in range(8)}
+        reasons = {without_ref(firewall.check_call("send_email", {}).public_reason) for _ in range(8)}
         self.assertEqual(reasons, {NOT_PERMITTED})
 
     def test_an_action_the_firewall_does_not_know_means_block(self):

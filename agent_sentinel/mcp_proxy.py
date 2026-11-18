@@ -51,7 +51,8 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable
 
 from .firewall import Decision, Firewall
-from .policy import Policy, PolicyError
+from .policy import RULE_MALFORMED, RULE_QUARANTINE, Policy, PolicyError
+from .policy_errors import file_error_message
 from .textutil import printable
 
 # How long a tool call waits for an in-flight tools/list reply to be checked.
@@ -333,13 +334,13 @@ class Proxy:
 
     def _dropped(self, what: str) -> _Outcome:
         """Record and report a message that is being dropped for its shape."""
-        self._firewall.refuse("?", f"dropped {what}", event="dropped")
+        self._firewall.refuse("?", f"dropped {what}", event="dropped", rule=RULE_MALFORMED)
         _warn(f"dropped {what}")
         return _DROP
 
-    def _refusal(self, label: str, reason: str) -> Decision:
+    def _refusal(self, label: str, reason: str, rule: str = RULE_MALFORMED) -> Decision:
         """A block for a structural reason. Unlike a policy block, monitor mode does not lift it."""
-        return self._firewall.refuse(label, reason)
+        return self._firewall.refuse(label, reason, rule=rule)
 
     # ---- client -> server ---------------------------------------------------
 
@@ -368,9 +369,12 @@ class Proxy:
     def _refuse_batch(self, batch: list[Any]) -> _Outcome:
         # MCP no longer uses JSON-RPC batches. Refusing them keeps every
         # request on the single, checked path above.
-        self._firewall.refuse("?", "dropped a batched client message", event="dropped")
+        decision = self._firewall.refuse(
+            "?", "dropped a batched client message", event="dropped",
+            public_reason="batched requests are not supported", rule=RULE_MALFORMED,
+        )
         replies = [
-            _rpc_error(item["id"], "batched requests are not supported", code=-32600)
+            _rpc_error(item["id"], decision.public_reason, code=-32600)
             for item in batch
             if isinstance(item, dict) and _valid_id(item.get("id"))
         ]
@@ -401,9 +405,10 @@ class Proxy:
             # Resource reads share the policy's namespace; a tool must not borrow their rule.
             decision = self._refusal(_label(name), "this tool name is reserved")
         elif not self._wait_for_tool_lists():
-            decision = self._refusal(_label(name), "timed out waiting for the tool list to be checked")
+            decision = self._refusal(_label(name), "timed out waiting for the tool list to be checked", RULE_QUARANTINE)
         elif self._is_quarantined(name):
-            decision = self._refusal(_label(name), "this tool was removed from the tool list and cannot be called")
+            reason = "this tool was removed from the tool list and cannot be called"
+            decision = self._refusal(_label(name), reason, RULE_QUARANTINE)
         else:
             decision = self._firewall.check_call(name, arguments or {})
         return self._forward_or_refuse(message, decision, label=_label(str(name)), refusal=_tool_error)
@@ -529,8 +534,10 @@ class Proxy:
             return self._dropped("a server message that is neither a valid request nor a reply")
 
         label = _label(f"server:{method}")  # prefixed so it cannot pass for a tool name in the log
-        if self._firewall.policy.server_request_action(method) == "block":
-            decision = self._firewall.block(label, "the policy does not permit this server request", "server_request")
+        verdict = self._firewall.policy.server_request_verdict(method)
+        if verdict.action == "block":
+            rule = verdict.rule or RULE_MALFORMED
+            decision = self._firewall.block(label, verdict.reason, "server_request", rule=rule)
         else:
             decision = self._firewall.scan_result(label, message, event="server_request", log_clean=False)
         if decision.allowed:
@@ -613,9 +620,12 @@ class Proxy:
         return self._deliver_or_block(pending, msg_id, "result", result, scan=result, log_clean=items_key is None)
 
     def _malformed_reply(self, pending: _PendingRequest, msg_id: Any, reason: str) -> JsonObject:
-        self._firewall.refuse(pending.label, f"malformed reply: {reason}", event="result")
+        decision = self._firewall.refuse(
+            pending.label, f"malformed reply: {reason}", event="result",
+            public_reason="the server sent a malformed reply", rule=RULE_MALFORMED,
+        )
         _warn(f"blocked a malformed reply to {pending.method}: {reason}")
-        return _rpc_error(msg_id, "the server sent a malformed reply")
+        return _rpc_error(msg_id, decision.public_reason)
 
     def _deliver_or_block(
         self, pending: _PendingRequest, msg_id: Any, member: str, value: Any, scan: Any, log_clean: bool = True
@@ -683,9 +693,10 @@ class Proxy:
                 "its definition changed after it was first seen. If the change is expected, restart the proxy; "
                 "with --pins, first delete this tool's entry from the pins file"
             )
-            return self._firewall.block(label, f"tool quarantined: {reason}", event="tool_changed")
+            reason = f"tool quarantined: {reason}"
+            return self._firewall.block(label, reason, event="tool_changed", rule=RULE_QUARANTINE)
         if status == "full":
-            return Decision(False, "too many tools to keep track of")
+            return Decision(False, "too many tools to keep track of", rule=RULE_QUARANTINE)
         return Decision(True, "tool definition is unchanged or new")
 
     # ---- sending ------------------------------------------------------------
@@ -851,7 +862,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         policy = Policy.from_file(args.policy)
     except (OSError, PolicyError) as exc:
-        _warn(f"cannot load policy: {exc}")
+        message = file_error_message(args.policy, exc) if isinstance(exc, OSError) else str(exc)
+        # One line at a time: a JSON error shows the line of the file with a caret under it.
+        for number, line in enumerate(message.splitlines()):
+            _warn(f"cannot load policy: {line}" if number == 0 else line, limit=500)
         return 2
     try:
         pins = ToolPins(args.pins, enabled=not args.no_pins)

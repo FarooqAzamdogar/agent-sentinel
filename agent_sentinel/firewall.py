@@ -11,6 +11,12 @@ A Decision carries two texts. `reason` is the full detail and goes to the audit
 log and the human approver. `public_reason` is what may be shown to the agent:
 it never says which rule or pattern refused the call, because a hijacked agent
 would use that to find a way round the policy.
+
+Every block also gets a `ref`, eight random hex characters. It ends the text
+the agent sees ("... (ref 7f3a9c21)") and is written to the audit record, so
+a person who sees a refusal in a chat can find the record that explains it.
+Being random, it tells the agent nothing. The record also names the rule that
+decided (`rule`, see policy.py) and the argument it matched (`matched_arg`).
 """
 
 from __future__ import annotations
@@ -26,11 +32,22 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from secrets import token_hex
 from typing import Any, Awaitable, BinaryIO, Callable, Iterable
 
 from .detector import SEVERITY_ORDER, Finding, max_severity, scan_views
 from .leaks import find_secrets, redact, redact_value
-from .policy import Policy, Verdict
+from .policy import (
+    PERMITTED,
+    RULE_CALLER,
+    RULE_INJECTION,
+    RULE_MALFORMED,
+    RULE_SECRETS,
+    RULE_UNSCANNABLE,
+    Policy,
+    Verdict,
+    limit_rule,
+)
 from .textutil import UnscannableError, printable, text_views, texts_in
 
 # Called for "ask" rules: (tool, args, reason) -> True to approve. It must
@@ -57,16 +74,42 @@ _RATE_REFUSAL = "too many calls in a short time; try again later"
 _UNSCANNABLE_REFUSAL = "the content has a type that cannot be checked"
 
 
+def new_ref() -> str:
+    """A fresh block reference: eight random lowercase hex characters."""
+    return token_hex(4)
+
+
+def with_ref(text: str, ref: str) -> str:
+    """The text an agent is shown for a block: the public reason, then the reference."""
+    suffix = f" (ref {ref})"
+    return text if text.endswith(suffix) else text + suffix
+
+
 @dataclass(frozen=True)
 class Decision:
+    """The answer to one check.
+
+    For a block, `public_reason` ends with " (ref <ref>)", and `ref` is set
+    to a new random reference unless one is given. For an allowed decision
+    `public_reason` defaults to the neutral PERMITTED, which names no rule.
+    `rule` and `matched_arg` are for the audit log and the operator only.
+    """
+
     allowed: bool
     reason: str  # full detail: for the audit log and the operator
     findings: list[Finding] = field(default_factory=list)
-    public_reason: str = ""  # safe to show to the agent; defaults to `reason`
+    public_reason: str = ""  # safe to show to the agent; a block defaults to `reason`
+    rule: str | None = None  # which rule decided (see policy.py for the names)
+    matched_arg: str | None = None  # the argument a rule about one argument matched
+    ref: str | None = None  # blocks only: the reference shared by the agent's text and the audit record
 
     def __post_init__(self) -> None:
-        if not self.public_reason:
-            object.__setattr__(self, "public_reason", self.reason)
+        public = self.public_reason or (self.reason if not self.allowed else PERMITTED)
+        if not self.allowed:
+            ref = self.ref or new_ref()
+            object.__setattr__(self, "ref", ref)
+            public = with_ref(public, ref)
+        object.__setattr__(self, "public_reason", public)
 
     def __bool__(self) -> bool:
         # So that `if firewall.check_call(...):` means what it looks like.
@@ -139,7 +182,9 @@ class Firewall:
         if args is None:
             args = {}
         if not isinstance(tool, str) or not isinstance(args, dict):
-            return self.refuse(printable(tool, limit=80), "the tool name must be text and the arguments an object")
+            return self.refuse(
+                printable(tool, limit=80), "the tool name must be text and the arguments an object", rule=RULE_MALFORMED
+            )
         return self._finish("call", tool, self._decide_call(tool, args), args=args)
 
     def scan_result(
@@ -162,7 +207,9 @@ class Firewall:
                 views = text_views(content, strict=True)
             except UnscannableError as exc:
                 # Fail closed: content that cannot be read cannot be called clean.
-                return self.refuse(tool, str(exc), event=event, public_reason=_UNSCANNABLE_REFUSAL)
+                return self.refuse(
+                    tool, str(exc), event=event, public_reason=_UNSCANNABLE_REFUSAL, rule=RULE_UNSCANNABLE
+                )
 
         findings = scan_views(views)
         worst = max_severity(findings)
@@ -171,23 +218,35 @@ class Firewall:
         if worst is None:
             decision = Decision(True, "no injection patterns found")
         elif threshold is not None and SEVERITY_ORDER[worst] >= SEVERITY_ORDER[threshold]:
-            decision = Decision(False, f"possible prompt injection ({rules})", findings, _INJECTION_REFUSAL)
+            reason = f"possible prompt injection ({rules})"
+            decision = Decision(False, reason, findings, _INJECTION_REFUSAL, rule=RULE_INJECTION)
         else:
             decision = Decision(True, f"suspicious content below blocking threshold ({rules})", findings)
         return self._finish(event, tool, decision, log=bool(findings) or log_clean)
 
-    def block(self, tool: str, reason: str, event: str = "call", public_reason: str = "") -> Decision:
-        """Record and return a block that monitor mode may lift, like a block by the policy."""
-        return self._finish(event, tool, Decision(False, reason, public_reason=public_reason))
+    def block(
+        self, tool: str, reason: str, event: str = "call", public_reason: str = "", rule: str = RULE_CALLER
+    ) -> Decision:
+        """Record and return a block that monitor mode may lift, like a block by the policy.
 
-    def refuse(self, tool: str, reason: str, event: str = "call", public_reason: str = "") -> Decision:
+        rule: the rule id for the audit log, such as "server_requests.sampling/createMessage".
+              The default, "caller", says the program that called block() decided.
+        """
+        return self._finish(event, tool, Decision(False, reason, public_reason=public_reason, rule=rule))
+
+    def refuse(
+        self, tool: str, reason: str, event: str = "call", public_reason: str = "", rule: str = RULE_MALFORMED
+    ) -> Decision:
         """Record and return a block that always holds, even in monitor mode.
 
         For what cannot be checked at all: a malformed call, a result of an
-        unreadable type. Monitor mode is for trying out a policy, and must not
-        let these through.
+        unreadable type, a tool that cannot be vouched for. Monitor mode is for
+        trying out a policy, and must not let these through.
+
+        rule: the rule id for the audit log: "malformed" (the default),
+              "unscannable" or "quarantine".
         """
-        decision = Decision(False, reason, public_reason=public_reason)
+        decision = Decision(False, reason, public_reason=public_reason, rule=rule)
         self._audit(event, tool, "block", decision, None)
         return decision
 
@@ -213,7 +272,8 @@ class Firewall:
         if inspect.isawaitable(result):
             if inspect.iscoroutine(result):
                 result.close()  # it will never be awaited; avoid a runtime warning
-            self._require_allowed(self.refuse(tool, "the tool returned an awaitable; use run_async", event="result"))
+            reason = "the tool returned an awaitable; use run_async"
+            self._require_allowed(self.refuse(tool, reason, event="result", rule=RULE_UNSCANNABLE))
         return self._checked_result(tool, result)
 
     async def run_async(self, tool: str, args: dict[str, Any] | None, fn: Callable[..., Any]) -> Any:
@@ -243,12 +303,14 @@ class Firewall:
             secrets = find_secrets("\n".join([tool, *texts_in(args, keys=True)]))
             if secrets:
                 reason = f"the call contains what looks like a secret ({', '.join(secrets)})"
-                return Decision(False, reason, public_reason=_SECRET_REFUSAL)
+                return Decision(False, reason, public_reason=_SECRET_REFUSAL, rule=RULE_SECRETS)
 
         verdict = self.policy.evaluate(tool, args)
         if verdict.action not in ("allow", "ask"):
             # Any other word means block, including one this code does not know.
-            return Decision(False, verdict.reason, public_reason=verdict.public)
+            return Decision(
+                False, verdict.reason, public_reason=verdict.public, rule=verdict.rule, matched_arg=verdict.matched_arg
+            )
         if verdict.action == "ask" and self.approver is None:
             # Refused before the rate limit is touched: otherwise the switch to
             # "too many calls" would reveal which tools are waiting for approval.
@@ -256,15 +318,17 @@ class Firewall:
 
         bucket = self._limiter.over_limit(self.policy.call_limits(tool), time.monotonic())
         if bucket is not None:
-            return Decision(False, f"rate limit reached for '{bucket}'", public_reason=_RATE_REFUSAL)
+            reason = f"rate limit reached for '{bucket}'"
+            return Decision(False, reason, public_reason=_RATE_REFUSAL, rule=limit_rule(bucket))
 
         if verdict.action == "ask":
             return self._ask_human(tool, args, verdict)
-        return Decision(True, verdict.reason)
+        return Decision(True, verdict.reason, rule=verdict.rule)
 
     @staticmethod
     def _refused_ask(verdict: Verdict, why: str) -> Decision:
-        return Decision(False, f"{verdict.reason}; {why}", public_reason=verdict.public)
+        # The rule is the one that said "ask": that is what the operator would change.
+        return Decision(False, f"{verdict.reason}; {why}", public_reason=verdict.public, rule=verdict.rule)
 
     def _ask_human(self, tool: str, args: dict[str, Any], verdict: Verdict) -> Decision:
         assert self.approver is not None
@@ -276,7 +340,7 @@ class Firewall:
             answer.close()
             return self._refused_ask(verdict, "the approver is async, which is not supported, so nobody was asked")
         if answer is True:  # exactly True: a truthy "no" or an un-awaited coroutine must not approve
-            return Decision(True, f"{verdict.reason}; approved by a human")
+            return Decision(True, f"{verdict.reason}; approved by a human", rule=verdict.rule)
         if answer is False:
             return self._refused_ask(verdict, "rejected by a human")
         return self._refused_ask(verdict, "the approver did not return True or False")
@@ -309,7 +373,8 @@ class Firewall:
         """Write the audit record and apply monitor mode."""
         if self.monitor and not decision.allowed:
             self._audit(event, tool, "would_block", decision, args)
-            return Decision(True, f"monitor mode, would block: {decision.reason}", decision.findings)
+            reason = f"monitor mode, would block: {decision.reason}"
+            return Decision(True, reason, decision.findings, rule=decision.rule, matched_arg=decision.matched_arg)
         if log:
             self._audit(event, tool, "allow" if decision.allowed else "block", decision, args)
         return decision
@@ -322,8 +387,13 @@ class Firewall:
             "event": event,
             "tool": tool,
             "action": action,
-            "reason": decision.reason,
         }
+        # Which rule decided, the argument it matched, and the reference the agent was given.
+        for name in ("rule", "matched_arg", "ref"):
+            value = getattr(decision, name)
+            if value is not None:
+                record[name] = value
+        record["reason"] = decision.reason
         if args is not None and self.log_args:
             record["args"] = args
         if decision.findings:

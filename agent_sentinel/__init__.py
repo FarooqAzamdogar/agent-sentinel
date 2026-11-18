@@ -5,6 +5,8 @@ Module map:
     detector.py   finds prompt injection in text            (no dependencies)
     leaks.py      recognises secrets in outgoing text       (no dependencies)
     policy.py     decides allow / ask / block for a call    (uses detector for severities)
+    matchers.py   the ways a policy judges one argument's value (pattern, one_of, path, url, ...)
+    policy_errors.py  error messages that help fix a policy file
     firewall.py   combines the three and writes the audit log   (the public core)
     mcp_proxy.py  puts the firewall in front of an MCP server
     __main__.py   the `agent-sentinel` command line

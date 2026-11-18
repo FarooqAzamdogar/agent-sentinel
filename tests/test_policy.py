@@ -6,7 +6,7 @@ from pathlib import Path
 
 from support import POLICY
 from agent_sentinel import Policy, PolicyError
-from agent_sentinel.policy import NOT_PERMITTED
+from agent_sentinel.policy import NOT_PERMITTED, PERMITTED
 
 ADDRESS = r"[^@\s,;]+@example\.com"
 
@@ -216,6 +216,32 @@ class PolicyWideDeny(unittest.TestCase):
         ]:
             with self.subTest(tool=tool, args=args):
                 self.assertEqual(action(tool, args), "allow")
+
+    def test_example_policy_denies_other_common_credential_stores(self):
+        for path in [
+            "~/.config/gh/hosts.yml", "/home/me/.git-credentials", "~/.docker/config.json", "~/.kube/config",
+            "/home/me/.netrc", "/proc/self/environ", "/proc/1234/environ", "~/.npmrc", "~/.pypirc", "~/.pgpass",
+            "~/.gnupg/private-keys-v1.d/x.key", "~/.azure/msal_token_cache.json", "~/.config/gcloud/credentials.db",
+            "~/.ssh/id_ecdsa", "~/.ssh/id_dsa", "~/.claude.json", ".cursor/mcp.json", ".vscode/mcp.json",
+            "C:\\Users\\me\\AppData\\Roaming\\Claude\\claude_desktop_config.json",
+            "C:\\Users\\me\\AppData\\Roaming\\Code\\User\\mcp.json",
+        ]:
+            with self.subTest(path=path):
+                self.assertEqual(action("read_file", {"path": path}), "block")
+
+    def test_example_policy_denies_windows_short_names_of_credential_folders(self):
+        # Windows opens "SSH~1" as ".ssh"; the long-name pattern alone would not see it.
+        for path in ["C:\\Users\\me\\SSH~1\\ID_ED2~1", "C:\\Users\\me\\AWS~1\\credentials", "C:\\app\\ENV~1",
+                     "C:\\Users\\me\\CONFIG~1\\gh\\hosts.yml", "C:\\Users\\me\\GIT-CR~1", "C:\\Users\\me\\DOCKER~1\\x"]:
+            with self.subTest(path=path):
+                self.assertEqual(action("read_file", {"path": path}), "block")
+
+    def test_example_policy_leaves_other_short_names_and_lookalike_names_alone(self):
+        for value in ["C:\\Users\\FAROOQ~1\\AppData\\Local\\Temp\\notes.txt", "C:\\PROGRA~1\\app\\readme.txt",
+                      ".dockerignore", "docker compose up", "the kube config docs", "config/settings.json",
+                      "/home/me/app/.envrc", "procedure/environment.md", "project/.configure"]:
+            with self.subTest(value=value):
+                self.assertEqual(action("search_web", {"q": value}), "allow")
 
 
 class PercentEncodedDenyValues(unittest.TestCase):
@@ -437,12 +463,16 @@ class WhatTheAgentIsTold(unittest.TestCase):
         deny = [{"arg": "*", "pattern": "private"}]
         wide = Policy.from_dict({"default": "allow", "deny_args": deny}).evaluate("read", {"path": "private"})
         own = rules({"read": {"action": "allow", "deny_args": deny}}).evaluate("read", {"path": "private"})
-        self.assertEqual(wide, own)
+        # Only the operator-side rule id tells them apart.
+        self.assertEqual((wide.action, wide.reason, wide.public), (own.action, own.reason, own.public))
+        self.assertEqual((wide.rule, own.rule), ("deny_args[0]", "tools.read.deny_args[0]"))
 
-    def test_allowed_call_has_the_same_public_text_and_reason(self):
+    def test_allowed_call_gets_a_neutral_public_text(self):
         for verdict in (POLICY.evaluate("read_file", {"path": "a.txt"}), POLICY.evaluate("search_web", {"q": "soup"})):
             self.assertEqual(verdict.action, "allow")
-            self.assertEqual(verdict.public, verdict.reason)
+            self.assertEqual(verdict.public, PERMITTED)
+            self.assertNotIn("search_*", verdict.public)
+        self.assertIn("search_*", POLICY.evaluate("search_web", {"q": "soup"}).reason)  # the operator still sees it
 
 
 class ServerRequests(unittest.TestCase):
