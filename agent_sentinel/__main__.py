@@ -92,10 +92,48 @@ def _validate(args: argparse.Namespace) -> int:
             notes.append("other arguments blocked")
         if rule.max_calls_per_minute:
             notes.append(f"{rule.max_calls_per_minute} call(s) per minute")
+        if rule.labels:
+            notes.append(f"labels {', '.join(rule.labels)}")
         print(f"  {printable(rule.name):24} {rule.action:6} {', '.join(notes)}")
+    _print_new_settings(policy)
     for warning in policy.warnings():
         print(f"Warning: {printable(warning)}")
     return 0
+
+
+def _print_new_settings(policy: Policy) -> None:
+    """The settings added in 0.5, each only when the policy uses it, so older policies print as before.
+
+    Canary strings and the values of known secrets are never printed: an agent
+    that reads this output (in a log, a chat) could strip them from what it sends.
+    """
+    extra = []
+    if policy.secrets_in_results != "off":
+        extra.append(f"Secrets in tool results: {policy.secrets_in_results}.")
+    if policy.secrets_patterns:
+        extra.append(f"Custom secret formats: {', '.join(printable(p.name) for p in policy.secrets_patterns)}.")
+    if policy.secrets_known_values_from_env:
+        extra.append(f"Values never sent, from the environment: {', '.join(policy.secrets_known_values_from_env)}.")
+    if policy.secrets_canaries:
+        extra.append(f"Canaries: {len(policy.secrets_canaries)}.")
+    if extra:
+        print(" ".join(extra))
+    if policy.flows:
+        print("Flow rules:")
+        for index, flow in enumerate(policy.flows):
+            print(f"  flows[{index}]  {flow.describe()}")
+        if policy.classify_by_annotations:
+            print("  MCP tool annotations add labels: openWorldHint -> untrusted, sink; destructiveHint -> sink.")
+    if policy.client_requests is not None:
+        rules = ", ".join(f"{printable(rule.name)} {rule.action}" for rule in policy.client_requests) or "none"
+        print(f"Client requests: {rules}.")
+    if policy.checks_prompts:
+        print("prompts/get is checked like a tool call named 'prompts/get'.")
+    if policy.hide_blocked_tools:
+        hidden = [printable(rule.name) for rule in policy.tools if policy.tool_level_action(rule.name) == "block"]
+        if policy.default == "block":
+            hidden.append("every tool without a rule")
+        print(f"Hidden from the tool list (blocked outright): {', '.join(hidden) or 'none'}.")
 
 
 _ACTIONS = ("allow", "block", "would_block")

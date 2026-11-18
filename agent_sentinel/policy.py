@@ -3,8 +3,10 @@
 A policy is loaded from JSON (see policy.example.json) and answers one main
 question, `Policy.evaluate(tool, args)`, with a `Verdict` of allow, ask or
 block. It also holds the settings the firewall and the proxy read: limits on
-calls per minute, what to do with secrets in arguments, and which requests
-the server may send to the client.
+calls per minute, the secret guard's settings, flow rules (which look at what
+the agent has read earlier in the session, see session.py), which requests
+the server may send to the client and which the client may send to the
+server, and whether tools the policy blocks are hidden from the tool list.
 
 Loading is strict: an unknown key, a repeated key or a wrong type is an error,
 because a slip that is silently ignored leaves a policy weaker than its author
@@ -30,6 +32,9 @@ in the policy file:
     tools.send_email.other_args          an argument no allow rule names
     tools.send_email.max_calls_per_minute, limits.max_calls_per_minute   rate limits
     server_requests.sampling/createMessage
+    client_requests.completion/complete
+    flows[0]                             the first flow rule
+    secrets.patterns[0]                  the first custom secret format
 
 Checks that are not written in the policy have the fixed names below (RULE_*).
 """
@@ -41,7 +46,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence, TypeVar
+from typing import Any, Iterable, Sequence, TypeVar
 
 from . import matchers
 from .detector import SEVERITY_ORDER
@@ -49,6 +54,7 @@ from .matchers import Matcher, PathMatcher, PatternMatcher, decoded_spellings
 from .policy_errors import (
     PolicyError,
     choice_message,
+    did_you_mean,
     json_error_message,
     listed,
     quoted,
@@ -56,6 +62,7 @@ from .policy_errors import (
     unicode_error_message,
     unknown_keys_message,
 )
+from .session import BUILTIN_LABELS, SINK, UNTRUSTED, SessionMarks, is_label
 from .textutil import printable, texts_in
 
 ACTIONS = ("allow", "ask", "block")
@@ -81,12 +88,64 @@ RULE_UNSCANNABLE = "unscannable"  # content of a type that cannot be read
 RULE_MALFORMED = "malformed"  # a call or message whose shape cannot be checked
 RULE_QUARANTINE = "quarantine"  # a tool removed from the tool list, or one that cannot be vouched for yet
 RULE_CALLER = "caller"  # Firewall.block() called by the program that uses the firewall
+RULE_SESSION = "session"  # a result withheld because the session's marks could not be recorded (see session.py)
+# Fixed ids for the parts of the secret guard, for code that wants to say which part refused
+# (RULE_SECRETS stays the id for the guard as a whole). A custom format is "secrets.patterns[<i>]".
+RULE_SECRETS_IN_RESULTS = "secrets.in_results"
+RULE_SECRETS_CANARIES = "secrets.canaries"
+RULE_SECRETS_KNOWN_VALUES = "secrets.known_values_from_env"
 
 # An argument name is chosen by the agent; `matched_arg` keeps at most this much of it.
 MAX_MATCHED_ARG_CHARS = 200
 
+# ---- client methods -------------------------------------------------------------
+
+# Client methods that the "tools" rules decide, as calls: "tools/call" by the tool's
+# name, the two resource methods as tool "resources/read" with the argument "uri".
+# The "client_requests" section cannot name them, and its wildcards do not cover them.
+POLICY_CHECKED_METHODS = ("tools/call", "resources/read", "resources/subscribe")
+
+# prompts/get is checked like a tool call of this name, once the policy opts in
+# (see Policy.checks_prompts).
+PROMPTS_GET = "prompts/get"
+
+# ---- secret settings ----------------------------------------------------------------
+
+# secrets.in_results: leave results as they are, replace the secrets in them, or withhold them.
+SECRETS_IN_RESULTS = ("off", "redact", "block")
+
+# The characters a custom secret format's body may use. A fixed set, compiled
+# by the loader, so that no operator-written regular expression ever runs on
+# the agent's text.
+SECRET_CHARSETS = {
+    "alnum": "A-Za-z0-9",
+    "upper_alnum": "A-Z0-9",
+    "alnum_dash": "A-Za-z0-9_-",
+    "hex": "0-9a-fA-F",
+    "base64": "A-Za-z0-9+/",
+    "base64url": "A-Za-z0-9_-",  # the same characters as alnum_dash, under the name people know
+}
+# What a custom format's literal prefix may contain: no space, quote or backslash.
+_SECRET_PREFIX = re.compile(r"[A-Za-z0-9_.:/+=@~-]{3,64}")
+_SECRET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.()-]{0,59}")
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+MIN_SECRET_BODY = 8
+MAX_SECRET_BODY = 1024
+MAX_SECRET_PATTERNS = 50
+MIN_CANARY_CHARS = 8
+MAX_CANARY_CHARS = 200
+MAX_CANARIES = 100
+MAX_KNOWN_VALUE_NAMES = 100
+
 # Higher is stricter. When several wildcard rules match, the strictest verdict wins.
 _STRICTNESS = {"allow": 0, "ask": 1, "block": 2}
+
+# The keys a policy file may have, at the top and in "secrets".
+_TOP_LEVEL_KEYS = (
+    "default", "deny_args", "tools", "server_requests", "client_requests", "injection", "secrets", "limits",
+    "flows", "classify_by_annotations", "hide_blocked_tools",
+)
+_SECRETS_KEYS = ("in_arguments", "in_results", "known_values_from_env", "canaries", "patterns")
 
 
 def limit_rule(bucket: str) -> str:
@@ -188,11 +247,71 @@ class ToolRule(_NamedRule):
     other_args: str = "allow"
     # Calls per minute for this rule. A wildcard rule has one count for all the tools it matches.
     max_calls_per_minute: int | None = None
+    # Flow labels of the tools this rule matches, such as ("untrusted",) or ("private", "sink").
+    labels: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class ServerRequestRule(_NamedRule):
     """Whether the server may send the client a request with this method, such as "sampling/createMessage"."""
+
+
+@dataclass(frozen=True)
+class ClientRequestRule(_NamedRule):
+    """Whether the client may send the server a request or notification with this method ("completion/complete")."""
+
+
+@dataclass(frozen=True)
+class FlowRule:
+    """One entry of "flows": once the session has every mark in `after`, a call to a tool labelled `then` gets `action`.
+
+    {"after": ["untrusted", "private"], "then": "sink", "action": "block"}
+    reads: after the agent has read untrusted content and private data, it
+    may not call a tool that sends data out.
+    """
+
+    after: tuple[str, ...]  # marks that must all be set; never "sink"
+    then: str = SINK  # the label of the tool being called
+    action: str = "block"  # "ask" or "block"
+
+    def __post_init__(self) -> None:
+        if isinstance(self.after, list):  # a list written in code; a text stays as it is and is refused
+            object.__setattr__(self, "after", tuple(self.after))
+
+    def describe(self) -> str:
+        """What this rule does, for the operator."""
+        does = "refused" if self.action == "block" else "sent to a human for approval"
+        read = " and ".join(f"'{label}'" for label in self.after)
+        return f"after {read} content reached the agent, a call to a tool labelled '{self.then}' is {does}"
+
+
+@dataclass(frozen=True)
+class SecretPattern:
+    """A custom secret format: a literal prefix, then `min_len` to `max_len` characters of one charset.
+
+    {"name": "Internal token", "prefix": "itk_", "charset": "alnum", "min_len": 32, "max_len": 32}
+
+    `regex` is the compiled form, prefix + "[chars]{min_len,max_len}". It is
+    built here from fixed parts, never from an operator's regular expression,
+    so it runs in linear time. It has no guard at either end: a longer run of
+    the charset still matches its first `max_len` characters.
+    """
+
+    name: str  # shown in reasons and redaction markers ("[redacted Internal token]"); never the secret
+    prefix: str
+    charset: str  # a key of SECRET_CHARSETS
+    min_len: int  # length of the body after the prefix
+    max_len: int
+    regex: re.Pattern[str] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        _check_secret_pattern(self, "secrets.patterns entry")
+        body = f"[{SECRET_CHARSETS[self.charset]}]{{{self.min_len},{self.max_len}}}"
+        object.__setattr__(self, "regex", re.compile(re.escape(self.prefix) + body))
+
+    def describe(self) -> str:
+        length = str(self.min_len) if self.min_len == self.max_len else f"{self.min_len} to {self.max_len}"
+        return f"'{self.name}': '{self.prefix}' followed by {length} characters of {self.charset}"
 
 
 @dataclass(frozen=True)
@@ -231,6 +350,26 @@ def _bounded_name(name: Any) -> str:
 
 @dataclass
 class Policy:
+    """A loaded policy. Build one with `Policy.from_file` or `Policy.from_dict`.
+
+    The fields mirror the JSON keys. Those added in 0.5, for the code that acts on them:
+
+    secrets_in_results               "off" (the default: results are left as they are), "redact" or "block":
+                                     what to do with a recognisable secret in a tool's RESULT.
+    secrets_known_values_from_env    names of environment variables whose VALUES must never leave in a
+                                     call; the policy holds the names only, never a value.
+    secrets_canaries                 strings the user planted in private files; a call carrying one is
+                                     refused. Never print them: an agent that learns one can strip it.
+    secrets_patterns                 custom secret formats (SecretPattern), with a compiled `regex` each.
+    client_requests                  None when the section is absent; otherwise its rules (may be empty).
+                                     See client_request_action and checks_prompts.
+    flows                            flow rules (FlowRule); see flow_verdict and session.py.
+    classify_by_annotations          whether MCP tool annotations may add flow labels (default true).
+    hide_blocked_tools               whether the proxy hides tools that tool_level_action says "block"
+                                     from tools/list (default false). Hiding is not enforcement:
+                                     a call to a hidden tool is still checked and refused.
+    """
+
     default: str = "block"
     tools: list[ToolRule] = field(default_factory=list)
     # Text with a finding at or above this severity is blocked.
@@ -243,6 +382,15 @@ class Policy:
     # Calls per minute for all tools together. None means no limit.
     max_calls_per_minute: int | None = None
     server_requests: tuple[ServerRequestRule, ...] = ()
+    # ---- added in 0.5; kept after the older fields so that positional construction still works
+    secrets_in_results: str = "off"
+    secrets_known_values_from_env: tuple[str, ...] = ()
+    secrets_canaries: tuple[str, ...] = ()
+    secrets_patterns: tuple[SecretPattern, ...] = ()
+    client_requests: tuple[ClientRequestRule, ...] | None = None
+    flows: tuple[FlowRule, ...] = ()
+    classify_by_annotations: bool = True
+    hide_blocked_tools: bool = False
 
     def __post_init__(self) -> None:
         # A policy can also be built in code, without the loader. An action such
@@ -250,10 +398,20 @@ class Policy:
         _expect_choice(self.default, "default", ACTIONS)
         for rule in self.tools:
             _expect_choice(rule.action, f"tools.{rule.name}.action", ACTIONS)
+            for label in rule.labels:
+                _expect_label(label, f"tools.{rule.name}.labels")
         for request in self.server_requests:
             _expect_choice(request.action, f"server_requests.{request.name}", ("allow", "block"))
+        for request in self.client_requests or ():
+            _expect_choice(request.action, f"client_requests.{request.name}", ("allow", "block"))
+        for index, flow in enumerate(self.flows):
+            _check_flow(flow, f"flows[{index}]")
         _expect_choice(self.secrets_in_arguments, "secrets.in_arguments", ("block", "allow"))
+        _expect_choice(self.secrets_in_results, "secrets.in_results", SECRETS_IN_RESULTS)
         _expect_severity(self.block_severity)
+        for name, value in (("classify_by_annotations", self.classify_by_annotations),
+                            ("hide_blocked_tools", self.hide_blocked_tools)):
+            _expect_bool(value, name)
 
     # ---- loading ------------------------------------------------------------
 
@@ -289,10 +447,7 @@ class Policy:
 
     @classmethod
     def from_dict(cls, data: Any) -> "Policy":
-        _expect_object(
-            data, "the policy",
-            allowed_keys=("default", "deny_args", "tools", "server_requests", "injection", "secrets", "limits"),
-        )
+        _expect_object(data, "the policy", allowed_keys=_TOP_LEVEL_KEYS)
 
         default = data.get("default", "block")
         _expect_choice(default, "default", ACTIONS)
@@ -307,12 +462,23 @@ class Policy:
         _expect_severity(severity)
 
         secrets = data.get("secrets", {})
-        _expect_object(secrets, "secrets", allowed_keys=("in_arguments",))
+        _expect_object(secrets, "secrets", allowed_keys=_SECRETS_KEYS)
         in_arguments = secrets.get("in_arguments", "block")
         _expect_choice(in_arguments, "secrets.in_arguments", ("block", "allow"))
+        in_results = secrets.get("in_results", "off")
+        _expect_in_results(in_results)
 
         limits = data.get("limits", {})
         _expect_object(limits, "limits", allowed_keys=("max_calls_per_minute",))
+
+        classify = data.get("classify_by_annotations", True)
+        _expect_bool(classify, "classify_by_annotations")
+        hide = data.get("hide_blocked_tools", False)
+        _expect_bool(hide, "hide_blocked_tools")
+
+        client_requests = None
+        if "client_requests" in data:
+            client_requests = _client_request_rules(data["client_requests"])
 
         return cls(
             default=default,
@@ -322,18 +488,50 @@ class Policy:
             secrets_in_arguments=in_arguments,
             max_calls_per_minute=_calls_per_minute(limits, "limits"),
             server_requests=_server_request_rules(data.get("server_requests", {})),
+            secrets_in_results=in_results,
+            secrets_known_values_from_env=_env_names(secrets.get("known_values_from_env", [])),
+            secrets_canaries=_canaries(secrets.get("canaries", [])),
+            secrets_patterns=_secret_patterns(secrets.get("patterns", [])),
+            client_requests=client_requests,
+            flows=_flow_rules(data.get("flows", [])),
+            classify_by_annotations=classify,
+            hide_blocked_tools=hide,
         )
 
     # ---- evaluating ---------------------------------------------------------
 
-    def evaluate(self, tool: str, args: dict[str, Any] | None) -> Verdict:
+    def evaluate(
+        self,
+        tool: str,
+        args: dict[str, Any] | None,
+        marks: SessionMarks | Iterable[str] | None = None,
+        extra_labels: Iterable[str] = (),
+    ) -> Verdict:
         """Decide what should happen to a call of `tool` with `args`.
 
         In order: the policy-wide deny_args, which hold for every call; then
         the rule with exactly this name; otherwise every wildcard rule that
         matches, each checked in full, and the strictest result wins. With no
         rule at all, the default.
+
+        marks:        what the session has read (a SessionMarks, or plain labels
+                      such as {"untrusted"} to ask "what if"). When given, the
+                      flow rules are applied too, and the stricter of the two
+                      verdicts wins (see flow_verdict). None leaves flows out.
+        extra_labels: labels the tool has besides those the policy gives it
+                      (the firewall passes the ones its MCP annotations imply).
         """
+        verdict = self._rule_verdict(tool, args)
+        if marks is None or verdict.action == "block":
+            return verdict
+        flow = self.flow_verdict(tool, marks, extra_labels)
+        # A flow that is at least as strict wins a tie: its reason says more (what was read, and where from).
+        if flow is not None and _STRICTNESS[flow.action] >= _STRICTNESS[verdict.action]:
+            return flow
+        return verdict
+
+    def _rule_verdict(self, tool: str, args: dict[str, Any] | None) -> Verdict:
+        """The verdict of the deny rules, tool rules and default, without flows."""
         if args is None:
             args = {}
         if not isinstance(tool, str) or not isinstance(args, dict):
@@ -364,21 +562,109 @@ class Policy:
         before this section existed, and the verdict names no rule. A policy
         closes that with "*": "block".
         """
-        if not isinstance(method, str):
-            return Verdict("block", "the method name is not text", NOT_PERMITTED, RULE_MALFORMED)
-        rules = _deciding_rules(self.server_requests, method)
-        for rule in rules:
-            if rule.action == "block":
-                reason = f"server_requests rule '{rule.name}' says block"
-                return Verdict("block", reason, NOT_PERMITTED, f"server_requests.{rule.name}")
-        if rules:
-            reason = f"server_requests rule '{rules[0].name}' says allow"
-            return Verdict("allow", reason, PERMITTED, f"server_requests.{rules[0].name}")
-        return Verdict("allow", "no server_requests rule matches, so it is allowed", PERMITTED)
+        return _method_verdict(self.server_requests, method, "server_requests")
 
     def server_request_action(self, method: str) -> str:
         """Return "allow" or "block" for a request the server sends to the client (see server_request_verdict)."""
         return self.server_request_verdict(method).action
+
+    def client_request_action(self, method: str) -> Verdict:
+        """Decide whether the client may send the server a request or notification with this method.
+
+        The "client_requests" section, which mirrors "server_requests": an
+        exact method name beats a wildcard, and among matching wildcards a
+        block wins; the verdict's rule is "client_requests.<name as written>".
+        A method no rule matches is allowed with rule None, which is also the
+        answer for every method when the section is absent (the behaviour
+        before 0.5). A method that is not text is blocked as malformed.
+
+        The methods in POLICY_CHECKED_METHODS (tools/call, resources/read,
+        resources/subscribe) are always allowed here: the "tools" rules decide
+        them, call by call. For prompts/get see `checks_prompts`.
+
+        The proxy answers a blocked request with a JSON-RPC error (the C44
+        proposal suggests code -32601, "method not found") that names no rule.
+        """
+        if not isinstance(method, str):
+            return Verdict("block", "the method name is not text", NOT_PERMITTED, RULE_MALFORMED)
+        if method in POLICY_CHECKED_METHODS:
+            return Verdict("allow", f"{method} is decided by the tools rules, not client_requests", PERMITTED)
+        return _method_verdict(self.client_requests or (), method, "client_requests")
+
+    @property
+    def checks_prompts(self) -> bool:
+        """Whether prompts/get must be checked like a tool call named "prompts/get".
+
+        True when the policy opts in: it has a "client_requests" section (even
+        an empty one), or a "tools" rule named exactly "prompts/get". A
+        wildcard such as "*" does not opt in, so a policy written before 0.5
+        keeps forwarding prompts/get as it did. Once opted in, prompts/get is
+        judged like any call: deny_args, the secret guard, the tools rules
+        (wildcards included), the default, rate limits and flows.
+
+        The proxy checks it after client_request_action, as
+        `firewall.check_call("prompts/get", {"name": <prompt name>, "arguments": <its arguments, or {}>})`,
+        so a policy can allow prompts by name ({"arg": "name", "one_of": [...]})
+        and deny values in any argument ("arg": "*").
+        """
+        return self.client_requests is not None or any(rule.name == PROMPTS_GET for rule in self.tools)
+
+    def tool_level_action(self, tool: str) -> str:
+        """The action for `tool` before any argument is looked at: "allow", "ask" or "block".
+
+        The action of the rule with exactly this name; otherwise the strictest
+        action among the wildcard rules that match; otherwise the default. For
+        hiding tools that the policy blocks outright (hide_blocked_tools): a
+        tool for which this is "block" can never be called, whatever its
+        arguments. The reverse does not hold: deny rules, allow rules, flows,
+        rate limits and the secret guard can still refuse a call to a tool for
+        which this is "allow". A name that is not text gets "block".
+        """
+        if not isinstance(tool, str):
+            return "block"
+        rules = _deciding_rules(self.tools, tool)
+        if not rules:
+            return self.default
+        return max((rule.action for rule in rules), key=lambda action: _STRICTNESS[action])
+
+    def tool_labels(self, tool: str) -> frozenset[str]:
+        """The flow labels the policy gives `tool`: those of EVERY rule that matches it.
+
+        Unlike actions, labels add up: an exact rule does not drop the labels of
+        a wildcard that also matches, just as it does not lift a wildcard's
+        rate limit. A label only ever adds a restriction, so an exception
+        written for some other reason must not quietly remove one.
+        """
+        if not isinstance(tool, str):
+            return frozenset()
+        return frozenset(label for rule in self.tools if rule.labels and rule.matches(tool) for label in rule.labels)
+
+    def flow_verdict(
+        self, tool: str, marks: SessionMarks | Iterable[str], extra_labels: Iterable[str] = ()
+    ) -> Verdict | None:
+        """The verdict of the flow rules for a call of `tool` in a session with these marks, or None.
+
+        A flow rule applies when the tool has the rule's `then` label (from the
+        policy, or in `extra_labels`) and the session has every mark in its
+        `after`. Of the rules that apply, the strictest wins, and the first in
+        the file among equals; its id is "flows[<index>]". None when no rule
+        applies. The agent is told NOT_PERMITTED, as for any rule; the reason,
+        for the audit log, says what was read and which tool delivered it.
+        """
+        if not self.flows or not isinstance(tool, str):
+            return None
+        if not isinstance(marks, SessionMarks):
+            marks = SessionMarks.of(marks)
+        labels = self.tool_labels(tool) | frozenset(extra_labels)
+        chosen: tuple[int, FlowRule] | None = None
+        for index, flow in enumerate(self.flows):
+            if flow.then in labels and marks.has_all(flow.after):
+                if chosen is None or _STRICTNESS[flow.action] > _STRICTNESS[chosen[1].action]:
+                    chosen = (index, flow)
+        if chosen is None:
+            return None
+        index, flow = chosen
+        return Verdict(flow.action, _flow_reason(index, flow, tool, marks), NOT_PERMITTED, f"flows[{index}]")
 
     def call_limits(self, tool: str) -> list[tuple[str, int]]:
         """Return the (bucket name, calls per minute) limits that apply to a call of `tool`.
@@ -412,6 +698,9 @@ class Policy:
             found.extend(_empty_match_warnings(f"tools.{rule.name}", rule.deny_args, rule.allow_args))
         found.extend(_overridden_glob_warnings(self.tools))
         found.extend(_missing_root_warnings(self))
+        found.extend(_flow_warnings(self))
+        found.extend(_client_request_warnings(self))
+        found.extend(_secret_warnings(self))
         return found
 
     def describe_rule(self, rule_id: str) -> str | None:
@@ -430,29 +719,96 @@ class Policy:
             RULE_QUARANTINE: "the tool was removed from the tool list (its description was flagged, it changed "
                              "after it was first seen, or its list could not be checked)",
             RULE_CALLER: "the program that uses the firewall blocked it (Firewall.block)",
+            RULE_SESSION: "the session state of the flow rules could not be recorded, so the result was withheld",
         }
         if rule_id in fixed:
             return fixed[rule_id]
+        secret_part = self._describe_secret_rule(rule_id)
+        if secret_part is not None:
+            return secret_part
         if rule_id == "limits.max_calls_per_minute" and self.max_calls_per_minute is not None:
             return f"at most {self.max_calls_per_minute} call(s) per minute for all tools together"
         indexed = re.fullmatch(r"deny_args\[([0-9]+)\]", rule_id)
         if indexed:
             entry = _entry(self.deny_args, indexed.group(1))
             return None if entry is None else f"policy-wide deny rule, {entry.describe()}"
-        if rule_id.startswith("server_requests."):
-            name = rule_id[len("server_requests."):]
-            for request in self.server_requests:
-                if request.name == name:
-                    return f"server request rule '{name}': {request.action}"
-            return None
+        indexed = re.fullmatch(r"flows\[([0-9]+)\]", rule_id)
+        if indexed:
+            flow = _entry(self.flows, indexed.group(1))
+            return None if flow is None else f"flow rule: {flow.describe()}"
+        for section, requests, who in (
+            ("server_requests", self.server_requests, "server"),
+            ("client_requests", self.client_requests or (), "client"),
+        ):
+            if rule_id.startswith(section + "."):
+                name = rule_id[len(section) + 1:]
+                for request in requests:
+                    if request.name == name:
+                        return f"{who} request rule '{name}': {request.action}"
+                return None
         for rule in self.tools:
             found = _describe_tool_rule_part(rule, rule_id)
             if found is not None:
                 return found
         return None
 
+    def _describe_secret_rule(self, rule_id: str) -> str | None:
+        """describe_rule for the parts of the secret guard. Never names a canary or a value."""
+        if rule_id == RULE_SECRETS_IN_RESULTS:
+            return f"the secret guard on tool results: {self.secrets_in_results} (secrets.in_results)"
+        if rule_id == RULE_SECRETS_CANARIES and self.secrets_canaries:
+            return f"one of the {len(self.secrets_canaries)} canary string(s) in secrets.canaries"
+        if rule_id == RULE_SECRETS_KNOWN_VALUES and self.secrets_known_values_from_env:
+            names = ", ".join(self.secrets_known_values_from_env)
+            return f"the value of one of these environment variables: {names} (secrets.known_values_from_env)"
+        indexed = re.fullmatch(r"secrets\.patterns\[([0-9]+)\]", rule_id)
+        if indexed:
+            pattern = _entry(self.secrets_patterns, indexed.group(1))
+            return None if pattern is None else f"custom secret format {pattern.describe()}"
+        return None
+
 
 # ---- applying a rule ----------------------------------------------------------
+
+def _method_verdict(rules: Sequence[_NamedRule], method: Any, section: str) -> Verdict:
+    """The verdict of a server_requests or client_requests section for one method.
+
+    An exact name beats a wildcard; among matching wildcards a block wins.
+    No matching rule: allowed, and the verdict names no rule.
+    """
+    if not isinstance(method, str):
+        return Verdict("block", "the method name is not text", NOT_PERMITTED, RULE_MALFORMED)
+    matching = _deciding_rules(rules, method)
+    for rule in matching:
+        if rule.action == "block":
+            return Verdict("block", f"{section} rule '{rule.name}' says block", NOT_PERMITTED, f"{section}.{rule.name}")
+    if matching:
+        name = matching[0].name
+        return Verdict("allow", f"{section} rule '{name}' says allow", PERMITTED, f"{section}.{name}")
+    return Verdict("allow", f"no {section} rule matches, so it is allowed", PERMITTED)
+
+
+def _flow_reason(index: int, flow: FlowRule, tool: str, marks: SessionMarks) -> str:
+    """The audit reason of a flow verdict: what the session read, where from, and what the tool is.
+
+    Tool names in it are chosen by the agent or the server, so they are shortened and escaped.
+    """
+    if marks.everything:
+        seen = f"the session state cannot be trusted ({marks.why}), so every mark counts as set"
+    else:
+        parts = []
+        for label in flow.after:
+            cause = marks.marks.get(label)
+            source = f" from '{printable(cause.tool, limit=80)}'" if cause is not None and cause.tool else ""
+            when = f" at {cause.time}" if cause is not None and cause.time else ""
+            parts.append(f"'{label}' content{source}{when}")
+        seen = "the agent has read " + " and ".join(parts)
+    outcome = "is refused" if flow.action == "block" else "needs approval"
+    return (
+        f"flow rule flows[{index}]: {seen}, and '{printable(tool, limit=80)}' is labelled "
+        f"'{flow.then}', so the call {outcome}"
+    )
+
 
 def _apply_rule(rule: ToolRule, args: dict[str, Any]) -> Verdict:
     """Check a call against one rule: its deny_args, its allow_args, its other_args, then its action."""
@@ -567,7 +923,8 @@ def _scalar_text(value: Any) -> str | None:
 
 # ---- describing rules -----------------------------------------------------------
 
-def _entry(entries: tuple[ArgRule, ...], index: str) -> ArgRule | None:
+def _entry(entries: tuple[Any, ...], index: str) -> Any:
+    """The entry at a position written in a rule id ("deny_args[2]"), or None if there is no such entry."""
     position = int(index)
     return entries[position] if position < len(entries) else None
 
@@ -576,7 +933,8 @@ def _describe_tool_rule_part(rule: ToolRule, rule_id: str) -> str | None:
     """Describe `rule_id` if it names this tool rule or one of its parts."""
     prefix = f"tools.{rule.name}"
     if rule_id == prefix:
-        return f"tool rule '{rule.name}': {rule.action}"
+        labels = f" (flow labels: {', '.join(rule.labels)})" if rule.labels else ""
+        return f"tool rule '{rule.name}': {rule.action}{labels}"
     if not rule_id.startswith(prefix + "."):
         return None
     part = rule_id[len(prefix) + 1:]
@@ -669,6 +1027,70 @@ def _missing_root_warnings(policy: Policy) -> list[str]:
     return found
 
 
+def _flow_warnings(policy: Policy) -> list[str]:
+    """Warn about flow rules that can never apply, labels nothing uses, and tools a flow will lock after one use."""
+    if not policy.flows:
+        return []
+    given = {label for rule in policy.tools for label in rule.labels}
+    from_annotations = {UNTRUSTED, SINK} if policy.classify_by_annotations else set()
+    used = {label for flow in policy.flows for label in (*flow.after, flow.then)}
+    found = []
+    for index, flow in enumerate(policy.flows):
+        for label in dict.fromkeys((*flow.after, flow.then)):
+            if label in given or label in from_annotations:
+                continue
+            hint = did_you_mean(label, sorted(given))
+            found.append(
+                f"flows[{index}]: no tool rule has the label '{label}', so this flow never applies"
+                + (f"; did you mean '{hint}'?" if hint else "")
+            )
+    for rule in policy.tools:
+        for label in rule.labels:
+            if label not in used:
+                hint = did_you_mean(label, sorted(used))
+                found.append(
+                    f"tools.{rule.name}.labels: no flow rule uses the label '{label}'"
+                    + (f"; did you mean '{hint}'?" if hint else "")
+                )
+        for index, flow in enumerate(policy.flows):
+            if flow.action == "block" and flow.then in rule.labels and set(flow.after) <= set(rule.labels):
+                labels = ", ".join(f"'{label}'" for label in (*flow.after, flow.then))
+                found.append(
+                    f"tools.{rule.name}: it has the labels {labels}, so once one of its results reaches the agent, "
+                    f"flows[{index}] refuses every later call to it"
+                )
+    return found
+
+
+def _client_request_warnings(policy: Policy) -> list[str]:
+    """Warn about client_requests settings that would break the connection or refuse every prompt."""
+    found = []
+    if policy.client_requests is not None:
+        for method in ("initialize", "notifications/initialized"):
+            if policy.client_request_action(method).action == "block":
+                found.append(f"client_requests blocks '{method}', so no client can connect")
+    prompts_reach_the_policy = (
+        policy.checks_prompts and policy.client_request_action(PROMPTS_GET).action == "allow"
+    )
+    if prompts_reach_the_policy and not _deciding_rules(policy.tools, PROMPTS_GET) and policy.default != "allow":
+        found.append(
+            "prompts/get is checked like a tool call because the policy has a client_requests section, but no "
+            f'tools rule matches it, so the default "{policy.default}" applies to every prompt; '
+            'add a rule for "prompts/get" to tools'
+        )
+    return found
+
+
+def _secret_warnings(policy: Policy) -> list[str]:
+    """Warn about secrets.known_values_from_env names that are not set where `validate` runs."""
+    return [
+        f"secrets.known_values_from_env: '{name}' is not set in this environment "
+        "(it is read where the firewall runs, so this may be expected)"
+        for name in policy.secrets_known_values_from_env
+        if name not in os.environ
+    ]
+
+
 # ---- validation helpers -------------------------------------------------------
 
 def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -695,7 +1117,7 @@ def _tool_rule(name: Any, spec: Any) -> ToolRule:
     elif not isinstance(spec, dict):
         raise PolicyError(f"{where} must be an action ({listed(ACTIONS)}) or an object, got {type_name(spec)}")
     _expect_object(
-        spec, where, allowed_keys=("action", "deny_args", "allow_args", "other_args", "max_calls_per_minute")
+        spec, where, allowed_keys=("action", "deny_args", "allow_args", "other_args", "max_calls_per_minute", "labels")
     )
     if "action" not in spec:
         # No default on purpose: a rule left without an action while editing must not come to mean allow.
@@ -710,7 +1132,187 @@ def _tool_rule(name: Any, spec: Any) -> ToolRule:
         allow_args=_arg_rules(spec.get("allow_args", []), f"{where}.allow_args", deny=False),
         other_args=other_args,
         max_calls_per_minute=_calls_per_minute(spec, where),
+        labels=_labels(spec.get("labels", []), f"{where}.labels", allow_sink=True),
     )
+
+
+def _labels(specs: Any, where: str, allow_sink: bool) -> tuple[str, ...]:
+    """Read a list of flow labels: tool rule "labels" (allow_sink=True) or a flow's "after" (False)."""
+    if not isinstance(specs, list):
+        raise PolicyError(f"{where} must be a list of labels ([ ... ]), got {type_name(specs)}")
+    labels: list[str] = []
+    for index, label in enumerate(specs):
+        _expect_label(label, f"{where}[{index}]")
+        if label == SINK and not allow_sink:
+            raise PolicyError(
+                f"{where}[{index}]: 'sink' describes what a tool does, not content it returns, so it is never "
+                "a mark; put it in 'then'"
+            )
+        if label in labels:
+            raise PolicyError(f"{where}[{index}]: the label '{label}' is listed twice")
+        labels.append(label)
+    return tuple(labels)
+
+
+def _expect_label(label: Any, where: str) -> None:
+    if is_label(label):
+        return
+    message = (
+        f"{where} must be a label: a lowercase letter, then lowercase letters, digits, '_' or '-', at most 40 "
+        f"characters (built in: {', '.join(BUILTIN_LABELS)}), got {quoted(label)}"
+    )
+    hint = did_you_mean(label, BUILTIN_LABELS)
+    raise PolicyError(message + (f"; did you mean '{hint}'?" if hint else ""))
+
+
+def _flow_rules(specs: Any) -> tuple[FlowRule, ...]:
+    if not isinstance(specs, list):
+        raise PolicyError(f"flows must be a list ([ ... ]), got {type_name(specs)}")
+    flows = []
+    for index, spec in enumerate(specs):
+        where = f"flows[{index}]"
+        _expect_object(spec, where, allowed_keys=("after", "then", "action"))
+        if "after" not in spec or "action" not in spec:
+            # No default action, as for tool rules; and a flow with nothing in "after" would be a plain block.
+            raise PolicyError(f"{where} needs 'after' (a list of labels) and 'action' ('ask' or 'block')")
+        after = _labels(spec["after"], f"{where}.after", allow_sink=False)
+        if not after:
+            raise PolicyError(f"{where}.after must name at least one label")
+        then = spec.get("then", SINK)
+        _expect_label(then, f"{where}.then")
+        action = spec["action"]
+        if action == "allow":
+            raise PolicyError(f"{where}.action must be 'ask' or 'block': a flow rule can only add a restriction")
+        _expect_choice(action, f"{where}.action", ("ask", "block"))
+        flows.append(FlowRule(after, then, action))
+    return tuple(flows)
+
+
+def _check_flow(flow: FlowRule, where: str) -> None:
+    """Validate a FlowRule built in code (the loader checks the same, with more specific messages)."""
+    if not flow.after or not isinstance(flow.after, tuple):
+        raise PolicyError(f"{where}.after must be a non-empty tuple of labels")
+    for label in flow.after:
+        _expect_label(label, f"{where}.after")
+        if label == SINK:
+            raise PolicyError(f"{where}.after: 'sink' is never a mark")
+    _expect_label(flow.then, f"{where}.then")
+    _expect_choice(flow.action, f"{where}.action", ("ask", "block"))
+
+
+def _client_request_rules(specs: Any) -> tuple[ClientRequestRule, ...]:
+    _expect_object(specs, "client_requests")
+    rules = []
+    for name, action in specs.items():
+        _expect_name(name, "client_requests: method name")
+        if name in POLICY_CHECKED_METHODS:
+            raise PolicyError(
+                f"client_requests.{name}: {name} is decided by the tools rules (as a call), so it cannot be listed "
+                "here; write the rule in tools"
+            )
+        # No "ask": these are protocol messages, not actions a human weighs one by one.
+        _expect_choice(action, f"client_requests.{name}", ("allow", "block"))
+        rules.append(ClientRequestRule(name, action))
+    return tuple(rules)
+
+
+def _expect_in_results(value: Any) -> None:
+    if value == "allow":  # the word the first proposal used; say what it is called here
+        raise PolicyError("secrets.in_results must be 'off', 'redact' or 'block', got 'allow'; 'off' leaves results "
+                          "as they are")
+    _expect_choice(value, "secrets.in_results", SECRETS_IN_RESULTS)
+
+
+def _env_names(specs: Any) -> tuple[str, ...]:
+    where = "secrets.known_values_from_env"
+    if not isinstance(specs, list):
+        raise PolicyError(f"{where} must be a list of environment variable names ([ ... ]), got {type_name(specs)}")
+    if len(specs) > MAX_KNOWN_VALUE_NAMES:
+        raise PolicyError(f"{where} can name at most {MAX_KNOWN_VALUE_NAMES} variables")
+    names: list[str] = []
+    for index, name in enumerate(specs):
+        if not isinstance(name, str) or not _ENV_NAME.fullmatch(name):
+            raise PolicyError(
+                f"{where}[{index}] must be the NAME of an environment variable (letters, digits and '_', not "
+                f"starting with a digit), got {quoted(name)}. Never write the value itself in a policy"
+            )
+        if name in names:
+            raise PolicyError(f"{where}[{index}]: '{name}' is listed twice")
+        names.append(name)
+    return tuple(names)
+
+
+def _canaries(specs: Any) -> tuple[str, ...]:
+    """Read secrets.canaries. Error messages never repeat a canary: an agent that learns one can strip it."""
+    where = "secrets.canaries"
+    if not isinstance(specs, list):
+        raise PolicyError(f"{where} must be a list of texts ([ ... ]), got {type_name(specs)}")
+    if len(specs) > MAX_CANARIES:
+        raise PolicyError(f"{where} can hold at most {MAX_CANARIES} canaries")
+    canaries: list[str] = []
+    for index, canary in enumerate(specs):
+        if not isinstance(canary, str):
+            raise PolicyError(f"{where}[{index}] must be text, got {type_name(canary)}")
+        if not MIN_CANARY_CHARS <= len(canary) <= MAX_CANARY_CHARS:
+            raise PolicyError(
+                f"{where}[{index}] must be {MIN_CANARY_CHARS} to {MAX_CANARY_CHARS} characters long, "
+                f"got {len(canary)}: a short canary would match ordinary text"
+            )
+        if not canary.isprintable() or canary != canary.strip():
+            raise PolicyError(f"{where}[{index}] must be printable text with no spaces at either end")
+        if canary.casefold() in (known.casefold() for known in canaries):
+            raise PolicyError(f"{where}[{index}] is the same as an earlier canary (canaries are matched ignoring case)")
+        canaries.append(canary)
+    return tuple(canaries)
+
+
+def _secret_patterns(specs: Any) -> tuple[SecretPattern, ...]:
+    where = "secrets.patterns"
+    if not isinstance(specs, list):
+        raise PolicyError(f"{where} must be a list ([ ... ]), got {type_name(specs)}")
+    if len(specs) > MAX_SECRET_PATTERNS:
+        raise PolicyError(f"{where} can hold at most {MAX_SECRET_PATTERNS} formats")
+    patterns = []
+    keys = ("name", "prefix", "charset", "min_len", "max_len")
+    for index, spec in enumerate(specs):
+        entry = f"{where}[{index}]"
+        _expect_object(spec, entry, allowed_keys=keys)
+        missing = [key for key in keys if key not in spec]
+        if missing:
+            raise PolicyError(
+                f"{entry} needs {listed(missing)}: a secret format is a name, a literal prefix, a charset "
+                f"({', '.join(SECRET_CHARSETS)}) and the body's min_len and max_len"
+            )
+        _check_secret_pattern(spec, entry)
+        patterns.append(SecretPattern(spec["name"], spec["prefix"], spec["charset"], spec["min_len"], spec["max_len"]))
+    return tuple(patterns)
+
+
+def _check_secret_pattern(spec: Any, where: str) -> None:
+    """Validate one custom secret format, given as the policy's object or as a SecretPattern."""
+    get = spec.get if isinstance(spec, dict) else lambda key: getattr(spec, key)
+    name, prefix, charset = get("name"), get("prefix"), get("charset")
+    if not isinstance(name, str) or not _SECRET_NAME.fullmatch(name) or name != name.strip():
+        raise PolicyError(
+            f"{where}.name must be 1 to 60 letters, digits, spaces or '_.()-', starting with a letter or digit, "
+            f"got {quoted(name)}"
+        )
+    if not isinstance(prefix, str) or not _SECRET_PREFIX.fullmatch(prefix):
+        raise PolicyError(
+            f"{where}.prefix must be 3 to 64 characters of letters, digits and '_.:/+=@~-' (no spaces or quotes), "
+            f"got {quoted(prefix)}: a secret format must start with literal text that ordinary words do not"
+        )
+    _expect_choice(charset, f"{where}.charset", tuple(SECRET_CHARSETS))
+    lengths = []
+    for key in ("min_len", "max_len"):
+        value = get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or not MIN_SECRET_BODY <= value <= MAX_SECRET_BODY:
+            raise PolicyError(
+                f"{where}.{key} must be a whole number from {MIN_SECRET_BODY} to {MAX_SECRET_BODY}, got {quoted(value)}"
+            )
+        lengths.append(value)
+    if lengths[0] > lengths[1]:
+        raise PolicyError(f"{where}: min_len ({lengths[0]}) is larger than max_len ({lengths[1]})")
 
 
 def _arg_rules(specs: Any, where: str, deny: bool) -> tuple[ArgRule, ...]:
@@ -780,6 +1382,11 @@ def _expect_object(value: Any, where: str, allowed_keys: tuple[str, ...] | None 
 def _expect_choice(value: Any, where: str, choices: tuple[str, ...]) -> None:
     if not isinstance(value, str) or value not in choices:
         raise PolicyError(choice_message(where, value, choices))
+
+
+def _expect_bool(value: Any, where: str) -> None:
+    if not isinstance(value, bool):
+        raise PolicyError(f"{where} must be true or false (without quotes), got {quoted(value)}")
 
 
 def _expect_severity(severity: Any) -> None:

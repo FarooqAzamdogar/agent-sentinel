@@ -1,5 +1,6 @@
 {
   "default": "block",
+  "hide_blocked_tools": true,
   "deny_args": [
     { "arg": "*", "pattern": "(^|[\\\\/:])\\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\\b|id_(rsa|dsa|ecdsa|ed25519)|(^|[\\\\/:])(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]|(^|[\\\\/:])(\\.config|config~[0-9]+)[\\\\/](gh|gcloud|github-copilot)\\b|(^|[\\\\/])proc[\\\\/][^\\\\/]+[\\\\/]environ\\b|claude_desktop_config\\.json|(^|[\\\\/:])\\.claude\\.json\\b|(^|[\\\\/:])\\.(cursor|vscode)[\\\\/]mcp\\.json\\b|[\\\\/]code[\\\\/]user[\\\\/]mcp\\.json\\b" }
   ],

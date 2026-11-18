@@ -32,6 +32,15 @@ stream, which keeps them easy to test.
 
 Rules with action "ask" are blocked here, because a stdio proxy has no
 terminal to ask a human on.
+
+Flow rules
+----------
+One proxy process is one session. When a tools/call or resources/read result
+is delivered, the session gains the marks of that tool (Firewall.marks_for,
+worked out when the call was let through), so a later call can be refused by
+a flow rule. Marks are set just before the reply is sent, and only for a
+reply that is sent; a reply that is blocked sets none. The labels implied by
+each listed tool's MCP annotations are passed to the firewall as well.
 """
 
 from __future__ import annotations
@@ -53,6 +62,7 @@ from typing import Any, BinaryIO, Callable
 from .firewall import Decision, Firewall
 from .policy import RULE_MALFORMED, RULE_QUARANTINE, Policy, PolicyError
 from .policy_errors import file_error_message
+from .session import SessionStateError
 from .textutil import printable
 
 # How long a tool call waits for an in-flight tools/list reply to be checked.
@@ -98,6 +108,9 @@ class _PendingRequest:
 
     method: str
     label: str  # the name used in the audit log: tool name, resource URI or method
+    # Flow marks to set when the reply is delivered (tools/call and resources/read only).
+    marks: frozenset[str] = frozenset()
+    call_id: str | None = None  # the firewall's id for this call, so the result's record shares it
 
 
 @dataclass(frozen=True)
@@ -411,7 +424,8 @@ class Proxy:
             decision = self._refusal(_label(name), reason, RULE_QUARANTINE)
         else:
             decision = self._firewall.check_call(name, arguments or {})
-        return self._forward_or_refuse(message, decision, label=_label(str(name)), refusal=_tool_error)
+        marks = self._firewall.marks_for(name) if decision.allowed else frozenset()
+        return self._forward_or_refuse(message, decision, label=_label(str(name)), refusal=_tool_error, marks=marks)
 
     def _check_resource_request(self, message: JsonObject) -> _Outcome:
         """resources/read and resources/subscribe both ask the server to open a URI."""
@@ -421,19 +435,24 @@ class Proxy:
             decision = self._refusal(RESOURCE_READ, f"malformed {message['method']} request: missing uri")
         else:
             decision = self._firewall.check_call(RESOURCE_READ, {"uri": uri})
-        return self._forward_or_refuse(message, decision, label=_label(str(uri)), refusal=_rpc_error)
+        # Only a read returns content; a subscription's updates arrive as reads of their own.
+        reads = decision.allowed and message["method"] == RESOURCE_READ
+        marks = self._firewall.marks_for(RESOURCE_READ) if reads else frozenset()
+        return self._forward_or_refuse(message, decision, label=_label(str(uri)), refusal=_rpc_error, marks=marks)
 
     def _forward_or_refuse(
-        self, message: JsonObject, decision: Decision, label: str, refusal: Callable[[Any, str], JsonObject]
+        self, message: JsonObject, decision: Decision, label: str, refusal: Callable[[Any, str], JsonObject],
+        marks: frozenset[str] = frozenset(),
     ) -> _Outcome:
         if decision.allowed:
-            return self._forward_request(message, label, refusal)
+            return self._forward_request(message, label, refusal, marks=marks, call_id=decision.call_id)
         if "id" in message:
             return _Outcome(to_client=refusal(message["id"], decision.public_reason))
         return _DROP
 
     def _forward_request(
-        self, message: JsonObject, label: str, refusal: Callable[[Any, str], JsonObject] = _rpc_error
+        self, message: JsonObject, label: str, refusal: Callable[[Any, str], JsonObject] = _rpc_error,
+        marks: frozenset[str] = frozenset(), call_id: str | None = None,
     ) -> _Outcome:
         """Forward a client message, remembering a request so its reply can be matched and scanned."""
         if "id" not in message:
@@ -445,7 +464,7 @@ class Proxy:
             if is_new and len(self._pending) >= MAX_PENDING_REQUESTS:
                 reason = "too many requests are waiting for a reply"
                 return _Outcome(to_client=refusal(message["id"], reason))
-            self._pending[message["id"]] = _PendingRequest(message["method"], label)
+            self._pending[message["id"]] = _PendingRequest(message["method"], label, marks, call_id)
             if message["method"] == "tools/list":
                 self._tool_lists_in_flight.add(message["id"])
         return _Outcome(to_server=message)
@@ -630,12 +649,26 @@ class Proxy:
     def _deliver_or_block(
         self, pending: _PendingRequest, msg_id: Any, member: str, value: Any, scan: Any, log_clean: bool = True
     ) -> JsonObject:
-        decision = self._firewall.scan_result(pending.label, scan, log_clean=log_clean)
+        decision = self._firewall.scan_result(pending.label, scan, log_clean=log_clean, call_id=pending.call_id)
+        if decision.allowed:
+            decision = self._mark_delivered(pending)
         if decision.allowed:
             return {"jsonrpc": "2.0", "id": msg_id, member: value}
         if pending.method == "tools/call":
             return _tool_error(msg_id, decision.public_reason)
         return _rpc_error(msg_id, decision.public_reason)
+
+    def _mark_delivered(self, pending: _PendingRequest) -> Decision:
+        """Set the flow marks of a reply that is about to be delivered; a refusal if they cannot be recorded.
+
+        An error reply sets them too: its text reaches the agent like a result.
+        """
+        try:
+            self._firewall.mark_delivered(pending.label, pending.marks)
+        except SessionStateError as exc:
+            _warn(f"withheld a reply to {pending.method}: {exc}")
+            return self._firewall.withhold(pending.label, exc, call_id=pending.call_id)
+        return Decision(True, "delivered", call_id=pending.call_id)
 
     def _strip_poisoned_instructions(self, result: JsonObject) -> None:
         """Remove the server's `instructions` if they look like an injection.
@@ -679,6 +712,9 @@ class Proxy:
         if decision.allowed and is_tool:
             decision = self._check_pin(item, label)
         if decision.allowed:
+            if is_tool:
+                # Annotations are pinned with the rest of the tool, and they can only add flow labels.
+                self._firewall.learn_annotations(item["name"], item.get("annotations"))
             return None
         if is_tool:
             # Remember the name: the agent may already know it from an
