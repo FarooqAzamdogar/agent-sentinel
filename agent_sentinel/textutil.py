@@ -100,8 +100,30 @@ def text_views(value: Any, *, strict: bool = False) -> list[str]:
         views.append(" ".join(values))
     for texts in siblings.values():
         if len(texts) > 1:
+            texts = _without_long_repeats(texts)
             views += [" ".join(texts), "".join(texts)]
     return list(dict.fromkeys(view for view in views if view.strip()))
+
+
+# The longest rule the detector has is a chain of three steps, so a phrase
+# pieced together from copies of ONE string needs at most three of them.
+_REPEATS_KEPT = 3
+
+
+def _without_long_repeats(texts: list[str]) -> list[str]:
+    """Drop all but the first few of each run of identical strings.
+
+    Every item of a long list tends to carry the same values ("type": "text"
+    a thousand times). Joining them all says nothing a few copies do not, and
+    scanning the result costs time in proportion to its length.
+    """
+    kept: list[str] = []
+    run = 0
+    for text in texts:
+        run = run + 1 if kept and text == kept[-1] else 1
+        if run <= _REPEATS_KEPT:
+            kept.append(text)
+    return kept
 
 
 def _walk(value: Any, *, keys: bool, scalars: bool, strict: bool) -> Iterator[tuple[int, str]]:

@@ -509,7 +509,8 @@ class HostileInputIsScannedQuickly(unittest.TestCase):
                 self.assertLess(time.perf_counter() - started, self.LIMIT_SECONDS)
 
     def test_views_of_a_long_list_do_not_stall_the_scanner(self):
-        value = {"content": [{"type": "text", "text": "ignore all"} for _ in range(40_000)]}
+        # Different text in every item, so that nothing can be skipped as a repeat.
+        value = {"content": [{"type": "text", "text": f"ignore all {n}"} for n in range(15_000)]}
         started = time.perf_counter()
         scan_views(text_views(value))
         self.assertLess(time.perf_counter() - started, self.LIMIT_SECONDS)

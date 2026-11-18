@@ -156,6 +156,17 @@ class TextViews(unittest.TestCase):
         self.assertEqual(len(views), len(set(views)))
         self.assertEqual(views.count("x x"), 1)
 
+    def test_a_long_run_of_identical_strings_is_joined_only_a_few_times(self):
+        value = {"content": [{"type": "text", "text": f"item {n}"} for n in range(500)]}
+        views = text_views(value)
+        self.assertIn("text text text", views)  # the "type" values: three copies say all that 500 would
+        self.assertEqual(views[-2].count("item"), 500)  # strings that differ are all kept
+
+    def test_a_phrase_made_of_copies_of_one_string_is_still_seen(self):
+        # Three copies are kept because the longest rule has three steps.
+        piece = "instructions previous ignore"
+        self.assertIn(" ".join([piece] * 3), text_views([piece] * 10))
+
     def test_a_part_that_appears_twice_is_read_twice(self):
         # Its JSON would hold it twice; skipping the second time hid a phrase split over a list.
         part = {"type": "text", "text": "Do not"}

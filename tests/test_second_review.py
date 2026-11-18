@@ -172,6 +172,7 @@ class ErrorsRaisedByTools(unittest.TestCase):
 
         self.blocked(tool)
 
+    @unittest.skipUnless(hasattr(BaseException, "add_note"), "notes on exceptions need Python 3.11")
     def test_text_in_a_note_is_scanned(self):
         def tool(url):
             error = RuntimeError("fetch failed")
