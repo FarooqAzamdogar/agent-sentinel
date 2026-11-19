@@ -6,7 +6,8 @@ from pathlib import Path
 
 from support import POLICY
 from agent_sentinel import Policy, PolicyError
-from agent_sentinel.policy import NOT_PERMITTED, PERMITTED
+from agent_sentinel.matchers import OneOfMatcher
+from agent_sentinel.policy import NOT_PERMITTED, PERMITTED, ArgRule, ToolRule
 
 ADDRESS = r"[^@\s,;]+@example\.com"
 
@@ -176,7 +177,10 @@ class PolicyWideDeny(unittest.TestCase):
 
     def test_it_blocks_a_tool_that_has_no_rule(self):
         verdict = Policy.from_dict({"deny_args": self.DENY}).evaluate("anything", {"path": "/home/me/.ssh/config"})
-        self.assertEqual((verdict.action, verdict.reason), ("block", "an argument has a value the policy denies"))
+        self.assertEqual((verdict.action, verdict.reason, verdict.rule),
+                         ("block", "argument 'path' has a value the policy does not permit", "deny_args[0]"))
+        # The default blocks the tool anyway: a name that is no tool must not let the agent probe the deny list.
+        self.assertEqual(verdict.public, NOT_PERMITTED)
 
     def test_it_holds_when_the_default_is_allow(self):
         policy = Policy.from_dict({"default": "allow", "deny_args": self.DENY})
@@ -191,7 +195,8 @@ class PolicyWideDeny(unittest.TestCase):
     def test_it_can_name_one_argument(self):
         policy = Policy.from_dict({"default": "allow", "deny_args": [{"arg": "path", "pattern": "private"}]})
         verdict = policy.evaluate("anything", {"path": "private/a.txt"})
-        self.assertEqual((verdict.action, verdict.reason), ("block", "argument 'path' has a value the policy denies"))
+        self.assertEqual(verdict.action, "block")
+        self.assertEqual(verdict.public, "argument 'path' has a value the policy does not permit")
         self.assertEqual(policy.evaluate("anything", {"note": "private"}).action, "allow")
 
     def test_example_policy_denies_secret_paths_for_every_allowed_tool(self):
@@ -285,6 +290,15 @@ class PercentEncodedDenyValues(unittest.TestCase):
             POLICY.evaluate("search_web", {"q": text})
         self.assertLess(time.perf_counter() - started, 5)
 
+    def test_a_long_value_whose_ascii_and_other_letters_alternate_is_decoded_quickly(self):
+        # urllib.parse.unquote is many times slower on this shape; every deny rule decodes the value again.
+        policy = Policy.from_dict({
+            "default": "allow", "deny_args": [{"arg": "*", "contains": f"forbidden-{n}"} for n in range(10)],
+        })
+        started = time.perf_counter()
+        self.assertEqual(policy.evaluate("search_web", {"q": "aé" * 250_000 + "%252541"}).action, "allow")
+        self.assertLess(time.perf_counter() - started, 5)
+
     def test_named_deny_argument_is_decoded_too(self):
         policy = rules({"read": {"action": "allow", "deny_args": [{"arg": "path", "pattern": "private/"}]}})
         self.assertEqual(policy.evaluate("read", {"path": "private%2Fa.txt"}).action, "block")
@@ -368,7 +382,7 @@ class OptionalAllowArgs(unittest.TestCase):
             with self.subTest(arg=name):
                 verdict = POLICY.evaluate("send_email", {"to": "a@example.com", name: "attacker@evil.example"})
                 self.assertEqual(verdict.action, "block")
-                self.assertEqual(verdict.reason, f"argument '{name}' has a value the policy does not allow")
+                self.assertEqual(verdict.reason, f"argument '{name}' has a value the policy does not permit")
 
     def test_optional_argument_with_a_good_value_passes(self):
         args = {"to": "a@example.com", "cc": ["b@example.com", "c@example.com"], "bcc": "d@example.com"}
@@ -449,15 +463,50 @@ class WhatTheAgentIsTold(unittest.TestCase):
             "send": {"action": "allow", "allow_args": [{"arg": "to", "pattern": ADDRESS}], "other_args": "block"},
         })
         for tool, args, text in [
-            ("grep", {"q": "private"}, "an argument has a value the policy denies"),
-            ("read", {"path": "private"}, "argument 'path' has a value the policy denies"),
+            ("grep", {"q": "private"}, "argument 'q' has a value the policy does not permit"),
+            ("read", {"path": "private"}, "argument 'path' has a value the policy does not permit"),
             ("send", {}, "argument 'to' is required by the policy but missing"),
-            ("send", {"to": "x@evil.example"}, "argument 'to' has a value the policy does not allow"),
+            ("send", {"to": "x@evil.example"}, "argument 'to' has a value the policy does not permit"),
             ("send", {"to": "a@example.com", "bcc": "b@example.com"}, "argument 'bcc' is not accepted by the policy"),
         ]:
             with self.subTest(tool=tool, args=args):
                 verdict = policy.evaluate(tool, args)
                 self.assertEqual((verdict.action, verdict.reason, verdict.public), ("block", text, text))
+
+    def test_a_deny_list_and_an_allow_list_give_the_same_text(self):
+        # Which list refused a value would tell the agent whether another value might pass.
+        denied = rules({"send": {"action": "allow", "deny_args": [{"arg": "to", "contains": "evil"}]}})
+        allowed = rules({"send": {"action": "allow", "allow_args": [{"arg": "to", "pattern": ADDRESS}]}})
+        self.assertEqual(denied.evaluate("send", {"to": "x@evil.example"}).public,
+                         allowed.evaluate("send", {"to": "x@evil.example"}).public)
+
+    def test_a_tool_the_agent_can_never_call_tells_it_nothing_about_its_arguments(self):
+        policy = Policy.from_dict({
+            "default": "block",
+            "deny_args": [{"arg": "*", "pattern": r"\.ssh\b"}],
+            "tools": {
+                "send_email": {"action": "block", "other_args": "block",
+                               "allow_args": [{"arg": "to", "pattern": ADDRESS}],
+                               "deny_args": [{"arg": "body", "contains": "confidential"}]},
+                "delete_*": "block",
+                "delete_draft": {"action": "allow", "deny_args": [{"arg": "id", "contains": "all"}]},
+            },
+        })
+        for tool, args in [
+            ("send_email", {}),                                                  # a required argument
+            ("send_email", {"to": "a@example.com", "bcc": "x"}),                 # a closed argument list
+            ("send_email", {"to": "x@evil.example"}),                            # an allow list
+            ("send_email", {"to": "a@example.com", "body": "Confidential"}),     # the tool's deny list
+            ("no_such_tool", {"q": "~/.ssh/config"}),                            # the policy-wide deny list
+            ("delete_file", {"path": "~/.ssh/config"}),                          # through a wildcard that blocks
+        ]:
+            with self.subTest(tool=tool, args=args):
+                verdict = policy.evaluate(tool, args)
+                self.assertEqual((verdict.action, verdict.public), ("block", NOT_PERMITTED))
+                self.assertNotEqual(verdict.reason, NOT_PERMITTED)  # the operator still gets the detail
+        # A tool it may call still names the argument, so that an honest agent can fix its call.
+        self.assertEqual(policy.evaluate("delete_draft", {"id": "all"}).public,
+                         "argument 'id' has a value the policy does not permit")
 
     def test_policy_wide_and_rule_deny_lists_give_the_same_text(self):
         deny = [{"arg": "*", "pattern": "private"}]
@@ -662,6 +711,28 @@ class FindingsOfTheSecondReview(unittest.TestCase):
             with self.subTest(arguments=bad):
                 with self.assertRaises(PolicyError):
                     Policy(**bad)
+
+    def test_the_tool_rules_of_a_policy_built_in_code_are_validated_too(self):
+        # As for actions: a typo must not quietly mean "allow" ("Block" leaving the argument list open).
+        to = ArgRule("to", OneOfMatcher(frozenset({"boss@example.com"})))
+        for bad in (
+            ToolRule("send_email", "allow", allow_args=(to,), other_args="Block"),
+            ToolRule("send_email", "allow", allow_args=(to,), other_args="deny"),
+            ToolRule("send_email", "allow", allow_args=(ArgRule("to", to.matcher, optional="no"),)),
+            ToolRule("send_email", "allow", deny_args=(ArgRule("to", to.matcher, optional=True),)),
+            ToolRule("send_email", "allow", max_calls_per_minute=0),
+            ToolRule("send_email", "allow", max_calls_per_minute=True),
+        ):
+            with self.subTest(rule=bad):
+                with self.assertRaises(PolicyError):
+                    Policy(tools=[bad])
+        for bad in ({"deny_args": (ArgRule("to", to.matcher, optional=1),)}, {"max_calls_per_minute": "5"}):
+            with self.subTest(arguments=bad):
+                with self.assertRaises(PolicyError):
+                    Policy(**bad)
+        closed = Policy(default="block", tools=[ToolRule("send_email", "allow", allow_args=(to,), other_args="block")])
+        self.assertEqual(closed.evaluate("send_email", {"to": "boss@example.com", "bcc": "x@evil.example"}).action,
+                         "block")
 
     def test_an_argument_name_is_shortened_and_escaped_before_it_is_repeated(self):
         policy = rules({"mail": {"action": "allow", "allow_args": [{"arg": "to", "pattern": ".+"}], "other_args": "block"}})

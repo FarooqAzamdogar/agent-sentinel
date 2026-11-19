@@ -63,9 +63,8 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, NamedTuple
-from urllib.parse import unquote
 
-from .textutil import MAX_CONTAINERS, EncodedRuns, UnscannableError, texts_in
+from .textutil import MAX_CONTAINERS, EncodedRuns, UnscannableError, percent_decoded, texts_in
 
 _NOT_AFTER = r"(?<![A-Za-z0-9])"  # the token does not continue a longer word
 _NOT_BEFORE = r"(?![A-Za-z0-9])"
@@ -498,7 +497,8 @@ class SecretGuard:
     canaries:       strings planted in private files; matched ignoring case.
 
     Values shorter than MIN_VALUE_CHARS or longer than MAX_VALUE_CHARS are
-    left out. Thread-safe: nothing in it changes after it is built.
+    left out. Thread-safe: nothing in it changes after it is built, except a
+    cache of folded values that is replaced in one step.
     """
 
     def __init__(
@@ -519,6 +519,8 @@ class SecretGuard:
             if MIN_VALUE_CHARS <= len(canary) <= MAX_VALUE_CHARS
         ]
         self._values = tuple(values)
+        # The values in the form `shows_a_value` compares them in: (the fold function, the folded values).
+        self._folded: tuple[Callable[[str], str], tuple[str, ...]] | None = None
 
     @property
     def has_values(self) -> bool:
@@ -560,6 +562,38 @@ class SecretGuard:
                 if item not in found:
                     found.append(item)
         return found
+
+    def shows_a_value(self, text: str, fold: Callable[[str], str], shortest_part: int = 6) -> bool:
+        """Whether `text` shows a known value or canary in another spelling, or a part of one cut off at either end.
+
+        For a detector excerpt (firewall): it is cut from a matching view,
+        which may spell a value differently from the text as it arrived
+        ("_" read as a space, accents dropped, decoded), so the log's exact
+        redaction would miss it; and the cut may go through a value. `fold`
+        turns the text and every value into the form they are compared in
+        (detector.folded_for_comparison). A value with fewer than
+        `shortest_part` characters in that form, and a part of a value
+        shorter than that, are not counted.
+        """
+        shown = fold(text)
+        if not shown:
+            return False
+        for value in self._folded_values(fold):
+            if len(value) < shortest_part:
+                continue
+            if value in shown:
+                return True
+            for size in range(shortest_part, min(len(value), len(shown) + 1)):
+                if shown.startswith(value[-size:]) or shown.endswith(value[:size]):
+                    return True
+        return False
+
+    def _folded_values(self, fold: Callable[[str], str]) -> tuple[str, ...]:
+        cached = self._folded
+        if cached is None or cached[0] is not fold:
+            cached = (fold, tuple(fold(value.plain) for value in self._values))
+            self._folded = cached  # one assignment: another thread sees the old pair or the new one
+        return cached[1]
 
     def _found_in(self, text: str, *, formats: bool, canaries: bool, redaction_only: bool) -> list[Found]:
         found: list[Found] = []
@@ -980,7 +1014,7 @@ def _percent_decoded(text: str) -> str:
     for _ in range(_DECODE_ROUNDS):
         if not _PERCENT_ESCAPE.search(text):
             break
-        text = unquote(text, errors="replace")
+        text = percent_decoded(text)
     return text
 
 
@@ -990,7 +1024,7 @@ def _spellings(text: str) -> list[str]:
     for _ in range(_DECODE_ROUNDS):
         if not _PERCENT_ESCAPE.search(spellings[-1]):
             break
-        spellings.append(unquote(spellings[-1], errors="replace"))
+        spellings.append(percent_decoded(spellings[-1]))
     decoder = _decoder()
     for spelling in list(spellings):
         spellings.extend(run.text for run in decoder.decoded(spelling))

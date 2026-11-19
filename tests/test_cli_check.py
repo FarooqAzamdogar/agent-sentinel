@@ -34,7 +34,7 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("verdict:     BLOCK", out)
         self.assertIn("tools.send_email.allow_args[0], argument 'to'", out)
-        self.assertIn("agent sees:  argument 'to' has a value the policy does not allow (ref <random>)", out)
+        self.assertIn("agent sees:  argument 'to' has a value the policy does not permit (ref <random>)", out)
         self.assertIn("to allow:", out)
         self.assertIn("WHOLE value", out)
 

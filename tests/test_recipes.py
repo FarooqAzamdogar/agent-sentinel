@@ -157,7 +157,7 @@ class LangChainRecipe(TempFolderTest):
 
     def test_a_refused_call_or_an_injected_note_gives_the_model_a_short_text(self):
         refused = self.read_note.invoke({"name": "../secret.txt"})
-        self.assertRegex(refused, r"^argument 'name' has a value the policy does not allow \(ref [0-9a-f]{8}\)$")
+        self.assertRegex(refused, r"^argument 'name' has a value the policy does not permit \(ref [0-9a-f]{8}\)$")
         withheld = self.read_note.invoke({"name": "trap.txt"})
         self.assertRegex(withheld, r"^possible prompt injection; the content was withheld \(ref [0-9a-f]{8}\)$")
 

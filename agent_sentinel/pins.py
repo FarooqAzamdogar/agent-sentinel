@@ -78,8 +78,8 @@ terminal, accepts it with `agent-sentinel pins accept` (cli_pins.py), which
 scans it again. The changed entry stays removed until the proxy restarts.
 
 A running proxy writes the pins file whole when it pins something new. It
-writes the file as it is on disk plus what it pinned itself, so a pin that
-`pins accept` or `pins forget` changed meanwhile is not put back.
+writes the file as it is on disk plus what it pinned since its last write,
+so a pin that `pins accept` or `pins forget` changed meanwhile is not put back.
 """
 
 from __future__ import annotations
@@ -397,8 +397,8 @@ class ToolPins:
             self._pins = read_pins_file(self._path)
         self._stored_chars = stored_chars(self._pins)
         self._unsaved = False
-        # What this process pinned itself (section, name; INSTRUCTIONS, None for the instructions): only
-        # these are written over what is on disk (see save).
+        # What this process pinned itself since it last wrote the file (section, name; INSTRUCTIONS, None for
+        # the instructions): only these are written over what is on disk (see save).
         self._added: set[tuple[str, str | None]] = set()
         # The changed definitions seen by this process, for the pending file (see "Changes waiting").
         self._pending = PinsFile()
@@ -473,9 +473,10 @@ class ToolPins:
         """Write the pins file and the pending file, if there is a file and anything changed. Raises OSError.
 
         The pins file is written as it is on disk now, plus the pins this
-        process made itself: a pin the operator accepted or forgot meanwhile
-        (agent-sentinel pins accept / forget) is kept as they left it. A
-        pins file that has become unreadable is written from memory.
+        process made since it last wrote the file: a pin the operator
+        accepted or forgot meanwhile (agent-sentinel pins accept / forget) is
+        kept as they left it, even one this process made earlier. A pins file
+        that has become unreadable is written from memory.
         """
         if self._path is None:
             return
@@ -483,6 +484,9 @@ class ToolPins:
             if self._unsaved:
                 write_pins_file(self._path, self._merged_with_disk())
                 self._unsaved = False
+                # Written: from now on the file on disk is the operator's to change. A pin missing from it
+                # later was forgotten on purpose, and must not be put back by the next save.
+                self._added.clear()
             if self._pending_unsaved:
                 write_pins_file(pending_path(self._path), self._pending_merged_with_disk())
                 self._pending_unsaved = False

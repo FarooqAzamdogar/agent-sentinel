@@ -20,7 +20,10 @@ PreToolUse          firewall.check_call(tool_name, tool_input): the secret guard
                              permission prompt. Only in the permission modes that show that
                              prompt (PROMPTING_MODES); in any other mode, bypassPermissions
                              among them, nobody would be asked, so the call is refused.
-PostToolUse         firewall.check_result(tool_name, tool_response). A clean result sets the
+                    A call that goes ahead (allow or ask) to a tool outside the default
+                    PostToolUse matcher (Read, Grep, Bash ...) sets its flow marks here,
+                    because no later hook may see its output.
+PostToolUse        firewall.check_result(tool_name, tool_response). A clean result sets the
                     session's flow marks, and gets no answer. With the policy's
                     secrets.in_results "redact", a result holding a secret is replaced
                     (updatedToolOutput) by the copy with the secret replaced, which has
@@ -62,7 +65,7 @@ from typing import Any, Awaitable, Callable
 from .cli_common import CommandError, strict_json
 from .firewall import MAX_CALL_ID_CHARS, Decision, Firewall, new_ref, with_ref
 from .hook_state import FileRateLimiter, RateLimitStateError
-from .policy import RULE_MALFORMED, Policy, PolicyError
+from .policy import RULE_MALFORMED, RULE_SESSION, Policy, PolicyError
 from .policy_errors import file_error_message
 from .session import MAX_SESSION_ID_CHARS, FileSessionStore, SessionStateError
 from .textutil import printable
@@ -82,6 +85,14 @@ EXIT_BLOCK = 2
 
 # The largest event read. The proxy drops MCP messages larger than this by default.
 MAX_EVENT_BYTES = 16 * 1024 * 1024
+
+# The tools whose output the PostToolUse hooks see when `hook install` runs
+# without --scan-all-results: what comes from the web and from MCP servers.
+# Read, Grep and Bash output is left out, because reading this project's own
+# tests, or security notes, would be flagged. A JavaScript regular expression,
+# as Claude Code reads a matcher with characters other than letters and "|".
+RESULTS_MATCHER = "WebFetch|WebSearch|mcp__.*"
+_RESULTS_MATCHER = re.compile(RESULTS_MATCHER)
 MAX_TOOL_NAME_CHARS = 512
 
 # Written as "server" into the audit records of the hook, so that a log shared
@@ -347,17 +358,49 @@ def _pre_tool_use(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
             tool, f"the rate limits could not be counted: {exc}", public_reason=_UNCHECKED_CALL,
             rule=RULE_HOOK_FAILED, call_id=call_id,
         )
+    if decision.pending:
+        mode = event.get("permission_mode")
+        if mode not in PROMPTING_MODES:
+            shown = printable(mode, limit=40) if isinstance(mode, str) else "unknown"
+            decision = firewall.finish_approval(
+                decision, False, f"the hook: permission mode {shown} would not show the prompt"
+            )
+    if decision.allowed or decision.pending:
+        decision = _marked_before_the_call(firewall, tool, decision)
     if decision.allowed:
         return HookAnswer()  # nothing: Claude Code's own permission rules decide the rest
     if decision.pending:
-        mode = event.get("permission_mode")
-        if mode in PROMPTING_MODES:
-            return HookAnswer(_pre_tool_use_output("ask", _ask_text(decision)))
-        shown = printable(mode, limit=40) if isinstance(mode, str) else "unknown"
-        decision = firewall.finish_approval(
-            decision, False, f"the hook: permission mode {shown} would not show the prompt"
-        )
+        return HookAnswer(_pre_tool_use_output("ask", _ask_text(decision)))
     return HookAnswer(_pre_tool_use_output("deny", blocked_text(decision.public_reason)))
+
+
+def _marked_before_the_call(firewall: Firewall, tool: str, decision: Decision) -> Decision:
+    """Set now the flow marks of a call whose output the PostToolUse hooks may never see; refuse it if they cannot be.
+
+    By default the PostToolUse hooks run only for web and MCP tools
+    (RESULTS_MATCHER). Without this, a policy that labels Read, Grep or Bash
+    "private" would never get that mark, and a flow rule that needs it would
+    never apply. Setting the marks before the call runs is the safe side: at
+    worst a call that then fails, or that the user refuses in Claude Code's
+    prompt, counts as read. Tools the default matcher covers keep their marks
+    for when their output is actually delivered.
+    """
+    if covered_by_results_hooks(tool):
+        return decision
+    try:
+        firewall.mark_delivered(tool)
+    except SessionStateError as exc:
+        reason = f"the call was refused: its flow marks could not be recorded: {exc}"
+        if decision.pending:
+            return firewall.finish_approval(decision, False, f"the hook: {reason}")
+        return firewall.refuse(tool, reason, public_reason=_UNCHECKED_CALL, rule=RULE_SESSION,
+                               call_id=decision.call_id)
+    return decision
+
+
+def covered_by_results_hooks(tool: str) -> bool:
+    """Whether the PostToolUse hooks run for `tool` as `hook install` sets them up by default (RESULTS_MATCHER)."""
+    return _RESULTS_MATCHER.fullmatch(tool) is not None
 
 
 def _post_tool_use(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:

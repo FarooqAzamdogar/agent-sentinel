@@ -60,7 +60,7 @@ from pathlib import Path
 from secrets import token_hex
 from typing import Any, Awaitable, Callable, Iterable, Mapping
 
-from .detector import METADATA, RESULT, SEVERITY_ORDER, Finding, max_severity, scan_views
+from .detector import METADATA, RESULT, SEVERITY_ORDER, Finding, folded_for_comparison, max_severity, scan_views
 from .filelock import lock_file as _lock_file, unlock_file as _unlock_file
 from .leaks import (
     CANARY,
@@ -97,7 +97,15 @@ from .session import (
     SessionStore,
     labels_from_annotations,
 )
-from .textutil import UnscannableError, media_payloads, printable, text_views, texts_in, tool_parameters
+from .textutil import (
+    UnscannableError,
+    media_payloads,
+    printable,
+    text_views,
+    texts_in,
+    tool_parameters,
+    without_field_breaks,
+)
 
 # Called for "ask" rules: (tool, args, reason) -> True to approve. It must
 # return exactly True to approve; anything else is a refusal. `tool` and `args`
@@ -138,6 +146,10 @@ MAX_JOINED_ARGUMENT_CHARS = 100_000
 # out of the text around a match, and the cut can go through the middle of a
 # token, leaving most of it in a form the redaction no longer recognises.
 _LONG_RUN = re.compile(r"[A-Za-z0-9_+/=-]{20,}")
+# The marker of the view an excerpt was found in, such as "[base64] " (detector._marked).
+_VIEW_MARKER = re.compile(r"\[[a-z0-9]+\] ")
+# What the log keeps of an excerpt that may show a known value or canary (see _logged_excerpt).
+_EXCERPT_LEFT_OUT = "[excerpt not logged: it may show a value the policy guards]"
 
 _INJECTION_REFUSAL = "possible prompt injection; the content was withheld"
 _SECRET_REFUSAL = "the call contains what looks like a secret, so it was not made"
@@ -889,7 +901,7 @@ class Firewall:
         not, a result that would need redacting is refused instead.
         """
         if isinstance(content, str):
-            views = [content]
+            views = [without_field_breaks(content)]  # as text_views reads the strings of a structured value
         else:
             try:
                 views = text_views(content, strict=True)
@@ -947,7 +959,7 @@ class Firewall:
             if not kinds:
                 copy_views = views
             elif isinstance(copy, str):
-                copy_views = [copy]
+                copy_views = [without_field_breaks(copy)]
             else:
                 copy_views = text_views(copy, strict=True)
         except (CannotRedact, UnscannableError) as exc:
@@ -1070,7 +1082,8 @@ class Firewall:
         if args is not None and self.log_args:
             record["args"] = args
         if decision.findings:
-            record["findings"] = [dict(asdict(f), excerpt=_LONG_RUN.sub("[...]", f.excerpt)) for f in decision.findings]
+            guard = self._secret_guard()
+            record["findings"] = [dict(asdict(f), excerpt=_logged_excerpt(f.excerpt, guard)) for f in decision.findings]
         try:
             _append_line(self.audit_path, _audit_line(record, self._secret_guard()))
         except OSError as exc:
@@ -1186,11 +1199,33 @@ def secret_rule(found: list[Found]) -> str:
     return RULE_SECRETS
 
 
+def _logged_excerpt(excerpt: str, guard: SecretGuard) -> str:
+    """A detector finding's excerpt as the audit log keeps it.
+
+    An excerpt is cut from one of the detector's matching views, not from
+    the text as it arrived, so a known value or canary in it may be spelled
+    otherwise ("_" read as a space, accents dropped, decoded), and the cut
+    at either end may go through one. The log's redaction matches values
+    exactly and would miss both: an excerpt that may show a value is left
+    out. Long runs of letters and digits (most of a token the cut went
+    through, which redaction no longer recognises) become "[...]".
+    """
+    if guard.has_values:
+        marker = _VIEW_MARKER.match(excerpt)
+        if guard.shows_a_value(excerpt[marker.end():] if marker else excerpt, folded_for_comparison):
+            return _EXCERPT_LEFT_OUT
+    return _LONG_RUN.sub("[...]", excerpt)
+
+
 def _audit_line(record: dict[str, Any], guard: SecretGuard) -> str:
     """One audit record as a line of JSON: secrets redacted, oversized arguments left out, safe to display.
 
     `guard` knows the policy's custom formats, known values and canaries, so
-    those are redacted as well as the built-in formats.
+    those are redacted as well as the built-in formats. Redaction works string
+    by string, so a secret split over several arguments (or over a key and its
+    value) would be left in pieces that join back into it: arguments in which
+    the guard still finds a secret when it reads them joined, as check_call
+    does, are left out of the record.
     """
     record = guard.redact_value(record)  # before json.dumps: see SecretGuard.redact_value for why
     args = record.get("args")
@@ -1198,6 +1233,8 @@ def _audit_line(record: dict[str, Any], guard: SecretGuard) -> str:
         size = len(json.dumps(args, ensure_ascii=False, default=str))
         if size > MAX_LOGGED_ARGS_CHARS:
             record["args"] = f"[{size} characters of arguments not logged]"
+        elif guard.find_in_texts(_call_spellings(None, args)):
+            record["args"] = "[arguments not logged: they hold a secret split over several values]"
     return _log_safe(json.dumps(record, ensure_ascii=False, default=lambda value: guard.redact(str(value))))
 
 

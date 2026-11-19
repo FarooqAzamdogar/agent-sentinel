@@ -37,9 +37,10 @@ import re
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, Callable, Iterator
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
 from .policy_errors import PolicyError, did_you_mean, listed, quoted, type_name
+from .textutil import percent_decoded
 
 # The keys that choose a matcher. An entry has exactly one of them.
 MATCHER_KEYS = ("pattern", "contains", "one_of", "starts_with", "ends_with", "no_options", "type")
@@ -58,8 +59,8 @@ ENTRY_KEYS = ("arg", *MATCHER_KEYS, *TYPE_SETTINGS, "optional")
 # values that were encoded again on the way; a value that needs more is refused.
 DECODE_ROUNDS = 3
 
-# What unquote() would change. Looking for it first keeps text with no escapes
-# in it ("100% done", or megabytes of bare "%") away from unquote, which is slow there.
+# What percent-decoding would change. Looking for it first means a text with no
+# escapes in it ("100% done", or megabytes of bare "%") is not copied.
 _PERCENT_ESCAPE = re.compile("%[0-9A-Fa-f]{2}")
 
 
@@ -80,7 +81,7 @@ def decoded_spellings(text: str) -> Iterator[str | None]:
     for _ in range(DECODE_ROUNDS):
         if not _PERCENT_ESCAPE.search(text):
             return
-        text = unquote(text, errors="replace")
+        text = percent_decoded(text)
         yield text
     if _PERCENT_ESCAPE.search(text):
         yield None
@@ -242,6 +243,30 @@ _DEVICE_NAMES = frozenset(
 _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 _WINDOWS_DRIVE_URI_PATH = re.compile(r"/[A-Za-z]:")
 
+# Folders that every system has under a second name, with no link the agent
+# made: through them a value reaches a root without naming it. Windows keeps
+# junctions for programs written for XP (in lowercase, as deny_args compares;
+# each is (the alias, what it leads to)). "Application Data" leads to
+# AppData\Roaming in a profile, but to the folder that holds it inside
+# AppData\Local and ProgramData, so both readings are made.
+_WINDOWS_ALIASES = (
+    ("\\documents and settings\\", "\\users\\"),
+    ("\\users\\all users\\", "\\programdata\\"),
+    ("\\users\\default user\\", "\\users\\default\\"),
+    ("\\local settings\\", "\\appdata\\local\\"),
+    ("\\application data\\", "\\appdata\\roaming\\"),
+    ("\\application data\\", "\\"),
+    ("\\my documents\\", "\\documents\\"),
+)
+# How many alias readings one value may have: a few aliases in one path, never more.
+_MAX_ALIAS_READINGS = 32
+# On Linux, /proc/<process>/root, cwd, fd ... lead into another process's view of
+# the files (/dev/fd is /proc/self/fd), where a root can be reached by any name.
+# A path through them cannot be read with certainty.
+_PROC_LINKS = re.compile(r"(?:^|/)(?:proc/[^/]+(?:/task/[^/]+)?/(?:root|cwd|fd|fdinfo|map_files|exe)|dev/fd)(?:/|$)")
+# On macOS, /etc, /tmp and /var are links into /private.
+_MACOS_PRIVATE = ("etc", "tmp", "var")
+
 
 class _Unreadable(Exception):
     """A path that cannot be read with certainty. The message says why, for an error about a root."""
@@ -259,13 +284,16 @@ class PathMatcher(Matcher):
     becomes "b"), then compared with each root component by component, never
     as a plain prefix ("C:/work/app2" is not inside "C:/work/app"). Symbolic
     links and junctions are not followed, so a link inside a root can still
-    lead out of it.
+    lead out of it, and a link elsewhere into it. deny_args does know the
+    second names the system itself gives some folders (_WINDOWS_ALIASES, such
+    as "C:\\Documents and Settings" for "C:\\Users"; "/private/etc" on macOS).
 
     A value is refused (allow_args) or denied (deny_args) when it cannot be
     read with certainty: a Windows short name ("SSH~1"), an alternate data
     stream ("a.txt:secret"), a "\\\\?\\" or "\\\\.\\" path, a network (UNC) path, a
     device name (CON, NUL, COM1...), a name ending in a dot or a space,
-    wildcards, control characters, "~user", or more than MAX_PATH_CHARS characters.
+    wildcards, control characters, "~user", a path through /proc/<process>/root,
+    cwd or fd or through /dev/fd, or more than MAX_PATH_CHARS characters.
 
     Readings. A value starting with "~/" is read as the home folder, as most
     tools read it; deny_args also checks it as a folder named "~". A "file:"
@@ -339,7 +367,8 @@ class PathMatcher(Matcher):
         except _Unreadable:
             return True
         roots = [root.casefold() for root in self.roots]
-        return any(self._inside(path.casefold(), root) for path in readings for root in roots)
+        names = [name for path in readings for name in self._other_names(path.casefold())]
+        return any(self._inside(name, root) for name in names for root in roots)
 
     def describe(self) -> str:
         return f"a path inside {', '.join(quoted(root, limit=200) for root in self.roots)}"
@@ -433,12 +462,38 @@ class PathMatcher(Matcher):
             raise _Unreadable("it holds wildcards")
         if not path.startswith("/"):
             path = posixpath.join(self._here(), path)
+        # Looked for before and after ".." is resolved: the system resolves a ".." after following the
+        # link, so "/proc/self/cwd/.." is the parent of the current folder, not "/proc/self".
+        if _PROC_LINKS.search(path) or _PROC_LINKS.search(posixpath.normpath(path)):
+            raise _Unreadable("it goes through /proc/<process>/root, cwd or fd, or /dev/fd, which lead elsewhere")
         path = posixpath.normpath(path)
         if path.startswith("//"):  # two leading slashes may name a network path
             raise _Unreadable("it starts with two slashes")
         return path
 
     # ---- comparing --------------------------------------------------------------
+
+    def _other_names(self, path: str) -> list[str]:
+        """`path` (absolute, lowercase), and what it names under the system's own aliases (_WINDOWS_ALIASES, /private).
+
+        For deny_args: "C:\\Documents and Settings\\me\\.ssh" is "C:\\Users\\me\\.ssh",
+        and on macOS "/private/etc" is "/etc". Extra readings can only add blocks.
+        """
+        if not self._windows:
+            parts = path.split("/")
+            if len(parts) > 2 and parts[1] == "private" and parts[2] in _MACOS_PRIVATE:
+                return [path, "/" + "/".join(parts[2:])]
+            if len(parts) > 1 and parts[1] in _MACOS_PRIVATE:
+                return [path, "/private" + path]
+            return [path]
+        names = [path]
+        for name in names:  # grows as it goes: an alias reached through another is read too
+            for alias, target in _WINDOWS_ALIASES:
+                if alias in name + "\\" and len(names) < _MAX_ALIAS_READINGS:
+                    other = ntpath.normpath((name + "\\").replace(alias, target))
+                    if other not in names:
+                        names.append(other)
+        return names
 
     def _allow_key(self, path: str) -> str:
         return path.translate(_ASCII_LOWER) if self._windows else path

@@ -224,6 +224,14 @@ class HoldingACall(ApprovalTest):
         self.assertEqual(sorted(m["id"] for m in to_server), [1, 2])
         self.assertEqual(sorted(asked.tool for asked, _ in approver.asked), ["prompts/get", "resources/read"])
 
+    def test_a_held_subscription_is_shown_as_a_subscription(self):
+        approver = FakeApprover()
+        h = self.proxy(approver, policy=Policy.from_dict({"tools": {"resources/read": "ask"}}))
+        h.from_client(request(1, "resources/subscribe", {"uri": "file:///notes/a.txt"}))
+        self.settled(h)
+        ((asked, _),) = approver.asked
+        self.assertEqual((asked.tool, asked.method), ("resources/read", "resources/subscribe"))
+
     def test_a_subscription_that_needs_approval_is_refused_not_held(self):
         policy = Policy.from_dict({"tools": {"resources/read": "ask"}})
         approver = FakeApprover()
@@ -277,6 +285,30 @@ class WhileACallWaits(ApprovalTest):
         self.assertEqual(self.settled(h), ([], []))  # the cancellation of a held call is not forwarded either
         answered = [r for r in read_audit(self.audit) if r["event"] == "approval"][0]
         self.assertIn("cancelled", answered["reason"])
+
+    def test_a_call_sent_without_an_id_is_refused_so_a_later_cancel_still_finds_its_call(self):
+        gate = self.gate()
+        approver = FakeApprover(gate=gate)
+        h = self.proxy(approver)
+        h.from_client({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "send_email", "arguments": EMAIL}})
+        h.from_client(call(7, "send_email", EMAIL))
+        h.from_client({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 7}})
+        gate.set()
+        self.assertEqual(self.settled(h), ([], []))
+        self.assertNotIn("internal error", self.output(h))
+        self.assertEqual(len(approver.asked), 1)
+        refused = read_audit(self.audit)[0]
+        self.assertEqual((refused["rule"], refused["action"]), ("malformed", "block"))
+        self.assertIn("it has no id", refused["reason"])
+
+    def test_no_request_the_policy_decides_may_come_as_a_notification(self):
+        policy = Policy.from_dict({"default": "allow"})
+        for method, params in (("tools/call", {"name": "send_email"}), ("resources/read", {"uri": "file:///a"}),
+                               ("resources/subscribe", {"uri": "file:///a"}), ("prompts/get", {"name": "p"})):
+            with self.subTest(method=method):
+                h = self.proxy(FakeApprover(), policy=policy)
+                h.from_client({"jsonrpc": "2.0", "method": method, "params": params})
+                self.assertEqual((h.sent_to_server(), h.sent_to_client()), ([], []))
 
     def test_at_most_sixteen_calls_wait(self):
         gate = self.gate()

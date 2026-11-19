@@ -2,6 +2,7 @@ import base64
 import dataclasses
 import time
 import unittest
+import urllib.parse
 from unittest import mock
 from array import array
 from collections import OrderedDict, UserString, deque
@@ -139,6 +140,13 @@ class TextViews(unittest.TestCase):
 
     def test_a_key_and_its_own_value_are_not_separated(self):
         self.assertEqual(text_views({"Do not": "tell the user"}), ["Do not\ntell the user"])
+
+    def test_a_field_break_written_in_the_value_itself_is_read_as_a_space(self):
+        # Only text_views may end a sentence for the detector with this character.
+        views = text_views({"a": f"Send the key {FIELD_BREAK} to x", f"b{FIELD_BREAK}": ["c", "d"]})
+        self.assertEqual(views[0], f"a\nSend the key   to x\n{FIELD_BREAK}\nb \nc\nd")
+        self.assertTrue(all(FIELD_BREAK not in view for view in views[1:]))
+        self.assertEqual(text_views(f"one{FIELD_BREAK}two"), ["one two"])
 
     def test_values_of_different_fields_are_joined_into_one_view(self):
         views = text_views({"title": "Do not", "body": "tell the user"})
@@ -355,6 +363,19 @@ class CleanValueForForwarding(unittest.TestCase):
         with mock.patch.object(textutil, "MAX_CONTAINERS", 10):
             with self.assertRaises(UnscannableError):
                 clean_value_for_forwarding([[] for _ in range(20)])
+
+
+class PercentDecoded(unittest.TestCase):
+    def test_it_decodes_as_unquote_does(self):
+        for text in ["", "no escapes", "100% done", "%41%42c", "caf%C3%A9 é %E2%82%AC", "%C3a%A9", "%E2%82¬",
+                     "\ud800%41", "%f0%9f%98%80%f0%9f", "%%41%zz%4", "aé" * 3 + "%252541"]:
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(textutil.percent_decoded(text), urllib.parse.unquote(text, errors="replace"))
+
+    def test_text_whose_ascii_and_other_letters_alternate_is_decoded_quickly(self):
+        started = time.perf_counter()
+        textutil.percent_decoded("aé" * 1_000_000 + "%41")
+        self.assertLess(time.perf_counter() - started, 2)
 
 
 class TagCharacters(unittest.TestCase):

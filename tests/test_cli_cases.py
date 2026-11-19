@@ -35,7 +35,7 @@ class RunningCases(TempFolderTest):
         self.assertEqual(code, 1)
         self.assertIn("FAIL  cases[0]", out)
         self.assertIn("expected allow, got block (tools.send_email.allow_args[0])", out)
-        self.assertIn("reason: argument 'to' has a value the policy does not allow", out)
+        self.assertIn("reason: argument 'to' has a value the policy does not permit", out)
 
     def test_the_rule_must_match_when_the_case_names_one(self):
         code, out, _ = self.run_cases([{"tool": "delete_file", "expect": "block", "expect_rule": "default"}])

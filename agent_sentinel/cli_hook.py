@@ -63,10 +63,9 @@ Codex, Cursor, VS Code (Copilot) and the Antigravity CLI are not supported yet.
 
 # How long Claude Code waits for one hook run, in seconds. A timeout blocks the call ("onFailure": "block").
 HOOK_TIMEOUT_SECONDS = 60
-# What the PostToolUse hooks scan by default: what comes from the web and from MCP servers. Read, Grep and
-# Bash output is left out, because reading this project's own tests, or security notes, would be flagged.
-# A JavaScript regular expression, as Claude Code reads a matcher with characters other than letters and "|".
-RESULTS_MATCHER = "WebFetch|WebSearch|mcp__.*"
+# What the PostToolUse hooks scan by default: what comes from the web and from MCP servers (see
+# claude_hooks.RESULTS_MATCHER). The PreToolUse hook sets the flow marks of the other tools itself.
+RESULTS_MATCHER = claude_hooks.RESULTS_MATCHER
 ALL = "*"
 # Some of Claude Code's own tools. A policy written for MCP servers blocks them all when its default is
 # "block", including the ones Claude uses to ask the user something or to leave plan mode.

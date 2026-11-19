@@ -129,7 +129,7 @@ class PromptsGet(WithAnAuditLog):
         h = self.harness(PROMPT_RULE)
         self.forwarded(h, prompt(1, "summarize", {"path": "a.txt"}))
         answer = self.refused(h, prompt(2, "delete_everything"))
-        self.assertIn("argument 'name' has a value the policy does not allow", answer["error"]["message"])
+        self.assertIn("argument 'name' has a value the policy does not permit", answer["error"]["message"])
         records = self.records()
         self.assertEqual([(r["event"], r["tool"], r["action"]) for r in records],
                          [("call", "prompts/get", "allow"), ("call", "prompts/get", "block")])

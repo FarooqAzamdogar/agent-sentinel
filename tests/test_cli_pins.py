@@ -83,6 +83,19 @@ class ChangesWaitBesideThePinsFile(PinsTest):
         self.assertIn("review it with: agent-sentinel pins diff --pins", h.warnings.getvalue())
         self.assertIn("read_file; then pins accept, and restart the proxy", h.warnings.getvalue())
 
+    def test_a_name_a_shell_would_read_something_into_is_left_out_of_the_suggested_command(self):
+        # Windows quoting leaves cmd.exe's "&" and PowerShell's "$(...)" working: the name is the server's.
+        for name in ("search_notes&echo.INJECTED", "notes$(Write-Output INJECTED)", "-notes"):
+            with self.subTest(name=name):
+                tool = dict(TOOL, name=name)
+                self.list_tools(tool)
+                h = self.proxy()
+                h.round_trip(request(2, "tools/list"), {"tools": [dict(tool, description="Read a note.")]})
+                (line,) = [line for line in h.warnings.getvalue().splitlines() if "review it with" in line]
+                command = line.split("review it with: ", 1)[1].split("; then", 1)[0]
+                self.assertTrue(command.startswith("agent-sentinel pins diff --pins"), command)
+                self.assertNotIn("notes", command)
+
     def test_without_a_pins_file_nothing_is_kept_and_a_restart_is_the_advice(self):
         h = Harness(Firewall(Policy.from_dict({"default": "allow"})))
         h.round_trip(request(1, "tools/list"), {"tools": [dict(TOOL)]})
@@ -117,6 +130,27 @@ class ChangesWaitBesideThePinsFile(PinsTest):
         tools = self.pins_file().lists["tools"]
         self.assertEqual(tools["read_file"].definition, CHANGED_TOOL)
         self.assertIn("list_files", tools)
+
+    def test_a_pin_the_operator_forgot_is_not_put_back_by_the_running_proxy(self):
+        running = ToolPins(self.pins)
+        running.check("read_file", TOOL)
+        running.save()
+        forgotten = self.pins_file()  # meanwhile, the operator runs `pins forget read_file`
+        del forgotten.lists["tools"]["read_file"]
+        write_pins_file(self.pins, forgotten)
+        running.check("list_files", {"name": "list_files"})  # the running proxy pins something new, and saves
+        running.save()
+        self.assertEqual(list(self.pins_file().lists["tools"]), ["list_files"])
+
+    def test_a_pin_that_could_not_be_written_is_written_by_the_next_save(self):
+        running = ToolPins(self.pins)
+        running.check("read_file", TOOL)
+        with mock.patch("agent_sentinel.pins.write_pins_file", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                running.save()
+        running.check("list_files", {"name": "list_files"})
+        running.save()
+        self.assertEqual(sorted(self.pins_file().lists["tools"]), ["list_files", "read_file"])
 
     def test_a_definition_the_scanner_removes_does_not_wait(self):
         self.list_tools(TOOL)

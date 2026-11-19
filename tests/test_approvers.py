@@ -6,6 +6,7 @@ programs written into a temporary folder.
 """
 
 import ctypes
+import itertools
 import json
 import os
 import stat
@@ -37,6 +38,16 @@ EMAIL = {"to": "bob@example.com", "subject": "Lunch", "body": "See you at noon."
 
 def request(arguments=None, tool="send_email", reason="rule 'send_email' says ask", server=None):
     return ApprovalRequest(tool, dict(EMAIL) if arguments is None else arguments, reason, "7f3a9c21", server)
+
+
+def unhurried():
+    """A clock for a dialog fake: each reading is ten seconds after the one before, so no answer comes too fast."""
+    return itertools.count(0, 10).__next__
+
+
+def hurried(seconds):
+    """A clock for a dialog fake whose answer comes `seconds` after the dialog opened."""
+    return iter([0.0, seconds]).__next__
 
 
 class FakeRunner:
@@ -108,24 +119,40 @@ class WhatThePersonReads(unittest.TestCase):
             self.assertNotIn(markup, text.split("Arguments", 1)[1])
         self.assertIn("mailto:eve@evil.example", text)  # still shown, as text
 
+    def test_the_text_for_the_client_escapes_markup_in_the_tool_name_too(self):
+        # The server chose the name: an unclosed comment in it would hide the rest of the question.
+        text = approval_text(request(tool="notes<!--[x](y)`&"), 60, for_client=True)
+        for markup in ("[", "]", "<", ">", "`", "&"):
+            self.assertNotIn(markup, text)
+        self.assertIn("notes\\u003c!--", text.splitlines()[0])
+
     def test_what_a_command_reads(self):
         data = request(server="mail").as_json(90.7)
-        self.assertEqual(data, {"version": 1, "server": "mail", "tool": "send_email", "arguments": EMAIL,
-                                "reason": "rule 'send_email' says ask", "ref": "7f3a9c21", "timeout_seconds": 90})
+        self.assertEqual(data, {"version": 1, "server": "mail", "method": None, "tool": "send_email",
+                                "arguments": EMAIL, "reason": "rule 'send_email' says ask", "ref": "7f3a9c21",
+                                "timeout_seconds": 90})
+
+    def test_a_subscription_is_named_as_one_although_the_policy_checks_it_as_a_read(self):
+        held = ApprovalRequest("resources/read", {"uri": "file:///notes/a.txt"}, "ask", "7f3a9c21",
+                               method="resources/subscribe")
+        self.assertIn("The agent wants to subscribe to a resource", approval_text(held, 5))
+        self.assertNotIn("read a resource", approval_text(held, 5))
+        data = held.as_json(5)
+        self.assertEqual((data["method"], data["tool"]), ("resources/subscribe", "resources/read"))
 
 
 # ---- the dialog --------------------------------------------------------------------------------
 
 class TheWindowsDialog(unittest.TestCase):
-    def ask(self, code):
+    def ask(self, code, clock=None):
         shown = []
 
         def message_box(text, title, timeout_ms):
             shown.append((text, title, timeout_ms))
             return code
 
-        answer = DialogApprover(platform="win32", message_box=message_box).ask(request(server="mail"), 30)
-        return answer, shown[0]
+        dialog = DialogApprover(platform="win32", message_box=message_box, clock=clock or unhurried())
+        return dialog.ask(request(server="mail"), 30), shown[0]
 
     def test_only_ok_approves(self):
         self.assertEqual(self.ask(1)[0], Answer(True, "OK"))
@@ -160,6 +187,15 @@ class TheWindowsDialog(unittest.TestCase):
         self.assertEqual(flags & 0xF, 0x1)  # MB_OKCANCEL: no Yes button, whose "y" key a typing person could hit
         self.assertTrue(flags & 0x100)  # MB_DEFBUTTON2: Enter and Space choose Cancel
         self.assertTrue(flags & 0x40000)  # MB_TOPMOST
+        self.assertFalse(flags & 0x10000)  # not MB_SETFOREGROUND: it must not grab the keys of a person typing
+
+    def test_an_ok_that_comes_too_soon_after_the_box_opened_is_refused(self):
+        # Tab then Enter, typed for the editor, moves the focus to OK and presses it.
+        answer, _ = self.ask(1, clock=hurried(0.3))
+        self.assertFalse(answer.approved)
+        self.assertIn("too soon to have been read", answer.detail)
+        self.assertEqual(self.ask(1, clock=hurried(approvers.MIN_SECONDS_TO_APPROVE))[0], Answer(True, "OK"))
+        self.assertEqual(self.ask(2, clock=hurried(0.3))[0], Answer(False, "Cancel"))
 
     def test_without_user32_there_is_no_dialog(self):
         with mock.patch.object(approvers, "_user32_loads", return_value=False):
@@ -171,7 +207,7 @@ class TheWindowsDialog(unittest.TestCase):
 class TheMacDialog(unittest.TestCase):
     def test_the_text_is_passed_as_an_argument_never_as_script(self):
         runner = FakeRunner(0, b"button returned:Allow, gave up:false\n")
-        dialog = DialogApprover(platform="darwin", run=runner)
+        dialog = DialogApprover(platform="darwin", run=runner, clock=unhurried())
         hostile = request({"body": '" & do shell script "touch /tmp/x" & "'})
         self.assertTrue(dialog.ask(hostile, 45).approved)
         (argv, data, timeout), = runner.calls
@@ -188,15 +224,20 @@ class TheMacDialog(unittest.TestCase):
                           (0, b"button returned:, gave up:true"), (0, b"button returned:Allow, gave up:true"),
                           (0, b"button returned:Allow, gave up:false, extra"), (None, b"")):
             with self.subTest(code=code, out=out):
-                dialog = DialogApprover(platform="darwin", run=FakeRunner(code, out))
+                dialog = DialogApprover(platform="darwin", run=FakeRunner(code, out), clock=unhurried())
                 self.assertFalse(dialog.ask(request(), 5).approved)
+
+    def test_an_allow_that_comes_too_soon_is_refused(self):
+        runner = FakeRunner(0, b"button returned:Allow, gave up:false\n")
+        self.assertFalse(DialogApprover(platform="darwin", run=runner, clock=hurried(0.5)).ask(request(), 45).approved)
 
 
 class TheLinuxDialog(unittest.TestCase):
     DISPLAY = {"DISPLAY": ":0", "PATH": "/usr/bin"}
 
-    def dialog(self, runner=None, environ=DISPLAY, zenity="/usr/bin/zenity"):
-        return DialogApprover(platform="linux", environ=environ, find=lambda name: zenity, run=runner or FakeRunner())
+    def dialog(self, runner=None, environ=DISPLAY, zenity="/usr/bin/zenity", clock=None):
+        return DialogApprover(platform="linux", environ=environ, find=lambda name: zenity, run=runner or FakeRunner(),
+                              clock=clock or unhurried())
 
     def test_it_needs_a_display_and_zenity(self):
         self.assertIn("no display", self.dialog(environ={"PATH": "/usr/bin"}).unavailable())
@@ -219,6 +260,12 @@ class TheLinuxDialog(unittest.TestCase):
         for code in (1, 5, -1, None):
             with self.subTest(code=code):
                 self.assertFalse(self.dialog(FakeRunner(code)).ask(request(), 5).approved)
+
+    def test_an_allow_that_comes_too_soon_is_refused(self):
+        # zenity (GTK) moves the focus with Tab too.
+        answer = self.dialog(FakeRunner(0), clock=hurried(1.0)).ask(request(), 60)
+        self.assertFalse(answer.approved)
+        self.assertIn("too soon", answer.detail)
 
 
 class OtherPlatforms(unittest.TestCase):

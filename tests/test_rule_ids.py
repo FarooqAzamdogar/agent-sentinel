@@ -54,8 +54,9 @@ class RuleIdsOnVerdicts(unittest.TestCase):
         ]})
         verdict = policy.evaluate("grep", {"q": "keys", "paths": ["a.txt", "/home/me/.ssh/id_rsa"]})
         self.assertEqual((verdict.rule, verdict.matched_arg), ("deny_args[1]", "paths"))
-        # The agent's text is unchanged: it names no rule and, for "*", no argument.
-        self.assertEqual(verdict.public, "an argument has a value the policy denies")
+        # The agent's text names no rule. It names the argument, as a named entry's text does, so that the
+        # agent cannot tell a "*" entry from one for that argument.
+        self.assertEqual(verdict.public, "argument 'paths' has a value the policy does not permit")
 
     def test_a_match_in_an_argument_name_is_attributed_to_that_argument(self):
         policy = Policy.from_dict({"default": "allow", "deny_args": [{"arg": "*", "pattern": r"\.env"}]})

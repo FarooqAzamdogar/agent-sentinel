@@ -15,9 +15,12 @@ person looks when a tool "does not work". So the proxy writes there:
 * with --verbose, one line for every call it lets through.
 
 Nothing here reaches the agent. Lines about traffic are limited (LineBudget):
-a peer that provokes a flood of blocks cannot flood the log. Everything that
-came from a peer, a file or the command line is passed through `printable`
-before it is printed (mcp_proxy._warn does that for every line).
+a peer that provokes a flood of blocks cannot flood the log. What the server
+writes to its own stderr is passed on with a budget of its own (also with
+--quiet), so a server that writes a flood cannot bury the proxy's lines.
+Everything that came from a peer, a file or the command line is passed
+through `printable` before it is printed (mcp_proxy._warn does that for
+every line).
 
 Levels (proxy --quiet and --verbose):
 
@@ -51,6 +54,10 @@ VERBOSE = "verbose"
 # At most this many lines about traffic in each window of this many seconds.
 LINES_PER_WINDOW = 20
 WINDOW_SECONDS = 10.0
+# The lines the server writes to its own stderr, which have a budget of their own
+# (see the module docstring). Enough for the traceback of a server that fails to start.
+SERVER_LINES_PER_WINDOW = 60
+SERVER_WINDOW_SECONDS = 60.0
 # The policy's own warnings (Policy.warnings, as `validate` prints them) shown at startup.
 MAX_POLICY_WARNINGS_SHOWN = 10
 # What the firewall's reason says when monitor mode let a block through (firewall.Firewall._finish).
@@ -253,6 +260,8 @@ class LineBudget:
     Nothing waits on a timer, so no thread prints at an unexpected moment.
 
     write: prints one line: (text, length limit for printable).
+    where: where the lines left out can be found, for the notices; by
+           default the audit log, or how to keep one (has_audit).
     """
 
     def __init__(
@@ -262,9 +271,12 @@ class LineBudget:
         limit: int = LINES_PER_WINDOW,
         window: float = WINDOW_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        where: str | None = None,
     ) -> None:
         self._write = write
-        self._where = "the audit log has every block" if has_audit else "start the proxy with --audit FILE to keep them"
+        if where is None:
+            where = "the audit log has every block" if has_audit else "start the proxy with --audit FILE to keep them"
+        self._where = where
         self._limit = limit
         self._window = window
         self._clock = clock

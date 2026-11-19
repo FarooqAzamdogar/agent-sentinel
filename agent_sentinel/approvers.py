@@ -13,7 +13,9 @@ repeated; for each call the first backend that can ask at that moment is used):
   on macOS osascript's `display dialog`; on Linux zenity, when it is installed
   and a display is set. Elsewhere it cannot ask. kdialog is not used: its
   command line cannot make "refuse" the default button, so a stray Enter
-  would approve.
+  would approve. An approval that comes within MIN_SECONDS_TO_APPROVE of
+  the dialog opening is refused: it can only be keys typed for another
+  window (Tab moves the focus to the approving button, Enter presses it).
 * "command:<program>": the operator's own program. It gets the request as one
   line of JSON on its standard input (see ApprovalRequest.as_json) and
   approves only by exiting with code 0 after printing exactly "approve". It is
@@ -47,6 +49,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Union
 
@@ -78,14 +81,25 @@ ELICITATION_VERSIONS = ("2025-06-18", "2025-11-25")
 _MODE_VERSIONS = ("2025-11-25",)
 APPROVE_FIELD = "approve"
 
+# A dialog answered "allow" sooner than this after it opened is refused. A box
+# that appears while the person types elsewhere can get the keystrokes meant
+# for the editor, and standard dialog keys then approve: Tab moves the focus
+# (and with it the default) from Cancel to OK, and Enter presses OK.
+# Accepting a completion with Tab and then starting a new line is exactly that.
+# Nobody reads a call and decides about it this fast. Counted from when the
+# dialog was asked for, which can be a moment before it shows (keys typed in
+# that moment wait for it), so this is more than a quick reader would need.
+MIN_SECONDS_TO_APPROVE = 3.0
+
 # Windows message box flags and answers (winuser.h). OK/Cancel rather than
-# Yes/No: in a Yes/No box the letter "y" presses Yes, so a person typing in the
-# chat when the box takes the focus could approve without seeing it. Enter,
-# Space and Esc all choose Cancel, the default button.
+# Yes/No: in a Yes/No box the letter "y" presses Yes. Cancel is the default
+# button, so Enter, Space and Esc refuse; Tab then Enter would press OK, which
+# MIN_SECONDS_TO_APPROVE guards against. The box is always on top, so it is
+# seen, but it does not ask to be brought to the foreground (MB_SETFOREGROUND),
+# so that it takes the keyboard from the person only when Windows lets it.
 _MB_OKCANCEL = 0x1
 _MB_ICONWARNING = 0x30
 _MB_DEFBUTTON2 = 0x100
-_MB_SETFOREGROUND = 0x10000
 _MB_TOPMOST = 0x40000
 _IDOK = 1
 _IDCANCEL = 2
@@ -115,13 +129,16 @@ class NotShowable(ValueError):
 class ApprovalRequest:
     """One call waiting for a person's answer.
 
-    tool:      what the agent wants to call: a tool's name, or "resources/read" / "prompts/get".
+    tool:      what the policy checked: a tool's name, or "resources/read" / "prompts/get".
     arguments: its arguments, as the agent wrote them.
     reason:    why the policy asks (operator text: it names the rule). Shown by
                the dialog and given to a command, never put in an elicitation,
                which a client might let the model read.
     ref:       the reference the agent is shown if the call is refused, also in the audit log.
     server:    the server's name (proxy --name), if it has one.
+    method:    the MCP request held, when it is not what `tool` suggests: a
+               resources/subscribe is checked as "resources/read", but it asks
+               for updates for as long as the session lasts.
     """
 
     tool: str
@@ -129,12 +146,14 @@ class ApprovalRequest:
     reason: str
     ref: str
     server: str | None = None
+    method: str | None = None
 
     def as_json(self, timeout: float) -> dict[str, Any]:
         """What a command approver reads on its standard input (one line of JSON, ASCII only)."""
         return {
             "version": COMMAND_INPUT_VERSION,
             "server": self.server,
+            "method": self.method,
             "tool": self.tool,
             "arguments": self.arguments,
             "reason": self.reason,
@@ -195,7 +214,10 @@ def argument_lines(arguments: Mapping[str, Any]) -> list[str]:
     return lines or ["  (none)"]
 
 
-def _what_is_called(tool: str) -> str:
+def _what_is_called(request: ApprovalRequest) -> str:
+    tool = request.tool
+    if request.method == "resources/subscribe":
+        return "subscribe to a resource (its updates keep coming until the session ends)"
     if tool == "resources/read":
         return "read a resource"
     if tool == "prompts/get":
@@ -208,17 +230,16 @@ def approval_text(request: ApprovalRequest, timeout: float, how_to_answer: str =
 
     for_client: the text goes into an elicitation. Then the policy's reason
                 is left out (a client might let the model read it), and the
-                characters that Markdown or HTML would act on are escaped, so
-                that agent text cannot hide part of the question in a client
-                that renders the message (an HTML comment, a link that shows
-                other text than its address, an entity for an invisible character).
+                characters that Markdown or HTML would act on are escaped in
+                the whole text, so that what the server named the tool or the
+                agent wrote cannot hide part of the question in a client that
+                renders the message (an HTML comment, a link that shows other
+                text than its address, an entity for an invisible character).
     """
     where = f" on the server '{request.server}'" if request.server else ""
     arguments = "\n".join(argument_lines(request.arguments))
-    if for_client:
-        arguments = _without_markup(arguments)
     lines = [
-        f"The agent wants to {_what_is_called(request.tool)}{where}.",
+        f"The agent wants to {_what_is_called(request)}{where}.",
         "",
         "Arguments, as the agent wrote them (long values are cut):",
         arguments,
@@ -231,7 +252,8 @@ def approval_text(request: ApprovalRequest, timeout: float, how_to_answer: str =
     )
     if how_to_answer:
         lines.append(how_to_answer)
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    return _without_markup(text) if for_client else text
 
 
 _MARKUP = {"&": "\\u0026", "<": "\\u003c", ">": "\\u003e", "[": "\\u005b", "]": "\\u005d", "`": "\\u0060"}
@@ -326,16 +348,19 @@ class DialogApprover:
         find: Callable[[str], str | None] | None = None,
         run: Runner | None = None,
         message_box: Callable[[str, str, int], int] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """The defaults are the real system; tests pass fakes, so that no test ever opens a window.
 
         message_box: (text, title, timeout in milliseconds) -> the Windows answer code.
+        clock:       seconds, for how long the dialog was open (MIN_SECONDS_TO_APPROVE).
         """
         self._platform = platform
         self._environ = environ
         self._find = find if find is not None else (lambda name: find_program(name, environ))
         self._run = run if run is not None else run_program
         self._message_box = message_box
+        self._clock = clock
 
     def describe(self) -> str:
         return DIALOG
@@ -355,11 +380,18 @@ class DialogApprover:
         return None
 
     def ask(self, request: ApprovalRequest, timeout: float) -> Answer:
+        """Show the dialog and wait. An approval given sooner than MIN_SECONDS_TO_APPROVE is refused."""
+        opened = self._clock()
         if self._platform == "win32":
-            return self._ask_windows(request, timeout)
-        if self._platform == "darwin":
-            return self._ask_macos(request, timeout)
-        return self._ask_zenity(request, timeout)
+            answer = self._ask_windows(request, timeout)
+        elif self._platform == "darwin":
+            answer = self._ask_macos(request, timeout)
+        else:
+            answer = self._ask_zenity(request, timeout)
+        if answer.approved and self._clock() - opened < MIN_SECONDS_TO_APPROVE:
+            return Answer(False, f"'{answer.detail}' came less than {MIN_SECONDS_TO_APPROVE} seconds after the "
+                                 "dialog opened, too soon to have been read (keys typed for another window?)")
+        return answer
 
     def _ask_windows(self, request: ApprovalRequest, timeout: float) -> Answer:
         text = approval_text(request, timeout, "Press OK to allow this call, or Cancel to refuse it.")
@@ -422,7 +454,7 @@ def _user32_loads() -> bool:
 
 
 def _windows_message_box(text: str, title: str, timeout_ms: int) -> int:
-    """Show a Windows message box (always on top, Cancel the default) and return the answer code.
+    """Show a Windows message box (always on top, Cancel the default, not forced to the foreground); return the answer.
 
     MessageBoxTimeoutW closes the box by itself when time is up. It is not in
     Microsoft's documentation but has been in user32 since Windows XP; if it
@@ -433,7 +465,7 @@ def _windows_message_box(text: str, title: str, timeout_ms: int) -> int:
     import ctypes
 
     user32 = ctypes.WinDLL("user32")
-    flags = _MB_OKCANCEL | _MB_ICONWARNING | _MB_DEFBUTTON2 | _MB_SETFOREGROUND | _MB_TOPMOST
+    flags = _MB_OKCANCEL | _MB_ICONWARNING | _MB_DEFBUTTON2 | _MB_TOPMOST
     box = getattr(user32, "MessageBoxTimeoutW", None)
     if box is not None:
         box.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_ushort,

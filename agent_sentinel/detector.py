@@ -12,7 +12,9 @@ not match the text as it arrived. `_normalize` builds a *matching view*:
 
   * compatibility forms such as full-width letters are folded to plain ones,
     and accents and other combining marks are dropped;
-  * invisible characters are removed, so they cannot split a trigger word;
+  * invisible characters are removed, so they cannot split a trigger word
+    (a further view turns them into spaces instead, for text that uses
+    them in place of spaces);
   * Cyrillic and Greek letters that look like Latin letters become Latin;
   * typographic apostrophes become "'";
   * every run of whitespace becomes one space.
@@ -121,6 +123,7 @@ from .textutil import (
     EncodedRuns,
     decode_tags,
     smuggled_text,
+    without_field_breaks,
     without_flags,
 )
 from .textutil import TERMINAL_ESCAPE as _ANSI_RE
@@ -240,7 +243,11 @@ _WITHOUT_HIDDEN_TEXT = _Table()  # deletes the invisible characters that have no
 # Makes the matching view of single characters: deletes invisible characters
 # and combining marks, folds look-alikes and apostrophes.
 _FOLD = _Table()
-# As _FOLD, but control characters and the fillers that draw a blank become a space instead of nothing.
+# As _FOLD, but every invisible character (control and format characters, the
+# zero-width space and joiners among them) and the fillers that draw a blank
+# become a space instead of nothing. Deleting them stops them splitting a
+# trigger word; but written INSTEAD of spaces, deleting them glues the words
+# of a sentence together, which a model still reads as separate words.
 _FOLD_SPACED = _Table()
 _BLANK_FILLERS = frozenset([0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800, 0x180E])
 
@@ -259,8 +266,7 @@ def _classify(code: int) -> None:
     _WITHOUT_INVISIBLE[code] = None if invisible else code
     _WITHOUT_HIDDEN_TEXT[code] = None if invisible and not everyday else code
     _FOLD[code] = None if invisible or category in ("Mn", "Me") else _FOLDED.get(code, code)
-    spaced = code in _BLANK_FILLERS or (category == "Cc" and invisible)
-    _FOLD_SPACED[code] = " " if spaced else _FOLD[code]
+    _FOLD_SPACED[code] = " " if invisible or code in _BLANK_FILLERS else _FOLD[code]
 
 
 def _decompose(text: str) -> str:
@@ -698,7 +704,7 @@ _SUPERSEDED_BY = {
 # Where a sentence ends in a matching view (which has single spaces only).
 # Matched against the view BEFORE it is lowercased: a capital after the full stop is the evidence.
 _SENTENCE_END_RE = re.compile(
-    FIELD_BREAK + "|"  # between two fields of a structured value: see textutil.text_views
+    FIELD_BREAK + "|"  # between two fields of a structured value: only textutil.text_views writes one
     r"[.!?](?<!\b[A-Za-z]\.)(?<!\.\.\.)"
     r"(?i:(?<!\betc\.)(?<!\bmr\.)(?<!\bdr\.)(?<!\bms\.)(?<!\bst\.)(?<!\bvs\.)(?<!\bno\.)(?<!\bmrs\.)(?<!\bapprox\.))"
     r" (?:(?![a-z0-9])|(?=(?i:https?://|www\.)))"
@@ -1086,6 +1092,17 @@ def _excerpt(text: str, start: int, end: int, pad: int = 30) -> str:
     return text[max(0, start - pad) : min(len(text), end + pad)].strip()
 
 
+def folded_for_comparison(text: str) -> str:
+    """`text` reduced to what every matching view keeps of it: its letters and digits, folded, in lowercase.
+
+    An excerpt is cut from a matching view, not from the text as it arrived:
+    "_" may be a space there, accents are dropped, encodings undone. To tell
+    whether an excerpt shows a secret value (firewall: known values and
+    canaries must not reach the audit log), compare the two in this form.
+    """
+    return "".join(ch for ch in _normalize(text).lower() if ch.isalnum())
+
+
 def _marked(marker: str, excerpt: str) -> str:
     """An excerpt with the marker of the view it was found in, such as "[base64]"."""
     return f"{marker} {excerpt}" if marker else excerpt
@@ -1146,7 +1163,7 @@ def _scan(text: str, context: _Context) -> dict[str, Finding]:
 def _scan_parameter(name: str, description: str, context: _Context) -> dict[str, Finding]:
     """The findings in the text of one tool parameter (see `_PARAMETER_RULES`)."""
     found: dict[str, Finding] = {}
-    text = f"{name}: {description}" if description else name
+    text = without_field_breaks(f"{name}: {description}" if description else name)
     rules = _PARAMETER_RULES
     if not _PATH_PARAMETER.search(_unglue(_normalize(text)).lower()):
         rules = _PARAMETER_FILE_RULES + rules
@@ -1163,10 +1180,11 @@ def scan(
 ) -> list[Finding]:
     """Return the injection findings in `text`, at most one per rule.
 
-    profile and foreign_tools are as in `scan_views`.
+    profile and foreign_tools are as in `scan_views`. A FIELD_BREAK in `text`
+    is read as a space: in a text scanned on its own, it is the sender's.
     """
     context = _Context(profile, budget=budget, foreign_tools=foreign_tools)
-    return _without_superseded(_scan(text, context))
+    return _without_superseded(_scan(without_field_breaks(text), context))
 
 
 def scan_views(
@@ -1181,7 +1199,8 @@ def scan_views(
 
     For a rule found in more than one text, the highest severity wins, and
     among equals the first. See `textutil.text_views` for why one value is
-    read as several texts.
+    read as several texts. A FIELD_BREAK in a text ends a sentence: pass the
+    views text_views makes, or untrusted text through `without_field_breaks`.
 
     profile:       "result" (the default) or "metadata", for what a server says
                    about itself (see "Profiles" in the module docstring).

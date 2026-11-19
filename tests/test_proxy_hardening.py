@@ -4,6 +4,7 @@ Each test here was written for a way of getting unchecked text or an
 unapproved action past an earlier version of the proxy.
 """
 
+import contextlib
 import io
 import json
 import os
@@ -338,6 +339,38 @@ class FindingTheServerCommand(unittest.TestCase):
 
     def test_an_explicit_path_is_used_as_given(self):
         self.assertEqual(mcp_proxy._resolve_executable(os.path.join(".", "server")), os.path.join(".", "server"))
+
+
+class TheServersStderr(unittest.TestCase):
+    """What the server writes to its stderr is passed on with a line budget of its own."""
+
+    def relay(self, data):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mcp_proxy._relay_stderr(io.BytesIO(data), mcp_proxy.server_stderr_budget())
+        return err.getvalue().splitlines()
+
+    def test_a_flood_is_cut_to_the_budget_and_counted(self):
+        flood = b"".join(b"blocked tools/call 'x': nothing to see [rule tools.x, ref %08d]\n" % n for n in range(5000))
+        lines = self.relay(flood)
+        allowed = mcp_proxy.proxy_report.SERVER_LINES_PER_WINDOW
+        self.assertEqual(len(lines), allowed + 2)  # the lines, the notice that more are left out, and the count
+        self.assertTrue(all(line.startswith("agent-sentinel: server stderr: ") for line in lines[:allowed]))
+        self.assertIn("the next ones are left out", lines[allowed])
+        self.assertIn(f"left out {5000 - allowed} line(s)", lines[-1])
+        self.assertIn("the server wrote them to its stderr", lines[-1])
+
+    def test_a_short_start_up_error_is_passed_on_whole(self):
+        traceback = b"".join(b"  File \"server.py\", line %d, in main\n" % n for n in range(40)) + b"ImportError: x\n"
+        lines = self.relay(traceback)
+        self.assertEqual(len(lines), 41)
+        self.assertEqual(lines[-1], "agent-sentinel: server stderr: ImportError: x")
+
+    def test_the_proxys_own_lines_keep_their_budget(self):
+        h = Harness()
+        self.relay(b"noise\n" * 5000)
+        h.from_client(call(1, "delete_file", {"path": "notes.txt"}))
+        self.assertIn("blocked tools/call 'delete_file'", h.warnings.getvalue())
 
 
 NOISY_SERVER = r'''

@@ -17,7 +17,9 @@ matchers.py.
 A verdict carries two texts. `reason` is the full detail, for the audit log
 and the human approver. `public` is what the agent may be told. It never says
 which rule, wildcard or default produced a refusal, because a hijacked model
-would use that to map the policy.
+would use that to map the policy. It names a refused argument only for a tool
+the agent may call (so that it can fix the call), and in the same words
+whichever list refused the value.
 
 A verdict also names the rule that decided it, in `rule`, and for a rule
 about one argument the argument it matched, in `matched_arg`. Both are for
@@ -41,6 +43,7 @@ Checks that are not written in the policy have the fixed names below (RULE_*).
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -74,6 +77,11 @@ ANY_ARG = "*"
 # from the default, or from an "ask". One constant for all three, so the agent
 # cannot tell them apart and learns no rule name, wildcard or default.
 NOT_PERMITTED = "this call is not permitted by the policy"
+
+# What the agent is told about an argument whose value a deny_args or an
+# allow_args entry refuses: the same words for both, and for a policy-wide
+# entry as for a tool's own, so the agent cannot tell which list refused it.
+VALUE_NOT_PERMITTED = "argument '{}' has a value the policy does not permit"
 
 # The one text for anything that is let through, whichever rule, default or
 # approval allowed it. Nothing shows it to the agent today; a program that
@@ -337,7 +345,9 @@ def _argument_block(reason: str, rule: str, matched_arg: str) -> Verdict:
     """A block caused by one argument.
 
     The agent is told which argument, because a well-behaved agent can fix the
-    call with that. It is never told the pattern or which list held the rule.
+    call with that. It is never told the pattern or which list held the rule,
+    and for a tool it may never call it is told nothing about the arguments
+    (see Policy._verdict_without_flows).
     """
     return Verdict("block", reason, reason, rule, matched_arg)
 
@@ -397,9 +407,19 @@ class Policy:
         # as "deny" or "Block" must not get through to mean "anything goes".
         _expect_choice(self.default, "default", ACTIONS)
         for rule in self.tools:
-            _expect_choice(rule.action, f"tools.{rule.name}.action", ACTIONS)
+            where = f"tools.{rule.name}"
+            _expect_choice(rule.action, f"{where}.action", ACTIONS)
+            # Only exactly "block" closes the argument list: "Block" or "deny" would quietly leave it open.
+            _expect_choice(rule.other_args, f"{where}.other_args", ("allow", "block"))
+            if rule.max_calls_per_minute is not None:  # None: no limit
+                _expect_calls_per_minute(rule.max_calls_per_minute, where)
+            _check_code_arg_rules(rule.deny_args, f"{where}.deny_args", deny=True)
+            _check_code_arg_rules(rule.allow_args, f"{where}.allow_args", deny=False)
             for label in rule.labels:
-                _expect_label(label, f"tools.{rule.name}.labels")
+                _expect_label(label, f"{where}.labels")
+        _check_code_arg_rules(self.deny_args, "deny_args", deny=True)
+        if self.max_calls_per_minute is not None:
+            _expect_calls_per_minute(self.max_calls_per_minute, "limits")
         for request in self.server_requests:
             _expect_choice(request.action, f"server_requests.{request.name}", ("allow", "block"))
         for request in self.client_requests or ():
@@ -545,6 +565,16 @@ class Policy:
             reason = "the tool name is not text or the arguments are not an object"
             return Verdict("block", reason, NOT_PERMITTED, RULE_MALFORMED)
 
+        verdict = self._argument_and_rule_verdict(tool, args)
+        if verdict.public != NOT_PERMITTED and self.tool_level_action(tool) == "block":
+            # The agent can never call this tool, so naming the argument would help no honest agent fix its
+            # call; it would only let one probe the argument rules (the policy-wide deny_args too, through a
+            # name that is no tool). The operator still gets the rule that matched.
+            verdict = dataclasses.replace(verdict, public=NOT_PERMITTED)
+        return verdict
+
+    def _argument_and_rule_verdict(self, tool: str, args: dict[str, Any]) -> Verdict:
+        """The policy-wide deny_args first; then the tool rules that decide for `tool`, or the default."""
         denied = _denied_argument(self.deny_args, args, "deny_args")
         if denied is not None:
             return denied
@@ -834,7 +864,7 @@ def _apply_rule(rule: ToolRule, args: dict[str, Any]) -> Verdict:
                 continue
             return _argument_block(f"argument '{allow.arg}' is required by the policy but missing", rule_id, allow.arg)
         if not _is_allowed(allow, args[allow.arg]):
-            return _argument_block(f"argument '{allow.arg}' has a value the policy does not allow", rule_id, allow.arg)
+            return _argument_block(VALUE_NOT_PERMITTED.format(allow.arg), rule_id, allow.arg)
 
     if rule.other_args == "block":
         # Top level only. An allowed argument cannot carry more arguments inside
@@ -852,14 +882,16 @@ def _apply_rule(rule: ToolRule, args: dict[str, Any]) -> Verdict:
 def _denied_argument(rules: tuple[ArgRule, ...], args: dict[str, Any], where: str) -> Verdict | None:
     """Return a block for the first deny rule that matches, or None.
 
-    The wording is the same for policy-wide and per-rule deny lists, so the
-    agent cannot tell which list refused it; `rule` tells the operator.
+    The wording is VALUE_NOT_PERMITTED, as for an allow list, and names the
+    argument also for a "*" entry, so the agent cannot tell which list
+    refused it; `rule` tells the operator.
     """
     for index, rule in enumerate(rules):
         matched = _denied_in(rule, args)
         if matched is not None:
-            which = "an argument" if rule.arg == ANY_ARG else f"argument '{rule.arg}'"
-            return _argument_block(f"{which} has a value the policy denies", f"{where}[{index}]", matched)
+            # For "*" the name is the agent's: shorten and escape it before repeating it.
+            shown = printable(matched, limit=60) if rule.arg == ANY_ARG else rule.arg
+            return _argument_block(VALUE_NOT_PERMITTED.format(shown), f"{where}[{index}]", matched)
     return None
 
 
@@ -1404,10 +1436,28 @@ def _calls_per_minute(spec: dict[str, Any], where: str) -> int | None:
     if "max_calls_per_minute" not in spec:
         return None
     value = spec["max_calls_per_minute"]
+    _expect_calls_per_minute(value, where)
+    return value
+
+
+def _expect_calls_per_minute(value: Any, where: str) -> None:
+    """Refuse a max_calls_per_minute that is not a whole number of 1 or more."""
     # bool is a subclass of int in Python, and `true` is not a number of calls.
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise PolicyError(f"{where}.max_calls_per_minute must be a whole number of 1 or more, got {quoted(value)}")
-    return value
+
+
+def _check_code_arg_rules(rules: Sequence[ArgRule], where: str, deny: bool) -> None:
+    """The checks `_arg_rules` makes of "optional", for argument rules built in code (Policy.__post_init__).
+
+    A truthy text such as "no" must not make a required argument optional,
+    and a deny entry is never optional.
+    """
+    for index, rule in enumerate(rules):
+        if not isinstance(rule.optional, bool):
+            raise PolicyError(f"{where}[{index}]: 'optional' must be true or false, got {quoted(rule.optional)}")
+        if deny and rule.optional:
+            raise PolicyError(f"{where}[{index}]: 'optional' is only used in allow_args")
 
 
 def _expect_object(value: Any, where: str, allowed_keys: tuple[str, ...] | None = None) -> None:

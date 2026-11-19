@@ -29,9 +29,10 @@ class TheDemo(TempFolderTest):
         folder = re.search(r"Files are written to (.+) \(deleted at the end\)", out).group(1).strip('"')
         self.assertFalse(Path(folder).exists())
         # The library part, the proxy part and the log part all happened.
-        self.assertIn("BLOCKED. The agent is told: an argument has a value the policy denies (ref ", out)
+        self.assertIn("BLOCKED. The agent is told: argument 'path' has a value the policy does not permit (ref ", out)
         self.assertIn("removed by the proxy: search_notes", out)
-        self.assertIn("the agent reads: Blocked by agent-sentinel: an argument has a value the policy denies", out)
+        self.assertIn("the agent reads: Blocked by agent-sentinel: argument 'path' has a value the policy does not "
+                      "permit", out)
         self.assertIn("the agent reads: contents of notes/todo.txt", out)
         self.assertIn("Top reasons for blocks:", out)
         self.assertIn("decided by:  deny_args[0], argument 'path'", out)

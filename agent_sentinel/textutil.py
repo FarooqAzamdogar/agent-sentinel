@@ -35,8 +35,21 @@ class UnscannableError(TypeError):
 
 # Put between two fields of a structured value in the view that lists every key
 # and string (see `text_views`). The detector treats it as the end of a
-# sentence. A visible symbol on purpose: it must survive normalization.
+# sentence. A visible symbol on purpose: it must survive normalization. Only
+# text_views may write one: the same character in the text itself would end a
+# sentence where a model reads none, so it is made a space first
+# (`without_field_breaks`).
 FIELD_BREAK = "␞"
+
+
+def without_field_breaks(text: str) -> str:
+    """`text` with each FIELD_BREAK in it made a space: what the detector reads of untrusted text.
+
+    For a text scanned on its own (not through text_views, which does this
+    itself), so that an attacker cannot end a sentence for the detector by
+    writing the character between the words of one order.
+    """
+    return text.replace(FIELD_BREAK, " ") if FIELD_BREAK in text else text
 
 # How many containers (lists, objects) one walk may open. JSON of a few
 # megabytes stays far below this. It stops a value built in code out of shared
@@ -94,12 +107,14 @@ def text_views(value: Any, *, strict: bool = False) -> list[str]:
          joined by nothing. These see a phrase, or a single word, split over
          the items of a list, where reading 1 has the items' keys in between.
 
-    Blank views are left out. `strict` is as in `texts_in`.
+    Blank views are left out. `strict` is as in `texts_in`. A FIELD_BREAK in
+    the value's own text becomes a space, so every one in a view is a real break.
     """
     everything: list[str] = []
     values: list[str] = []
     siblings: dict[int, list[str]] = {}
     for group, text in _walk(value, keys=True, scalars=False, strict=strict):
+        text = without_field_breaks(text)
         if group == _KEY:
             if everything:
                 everything.append(FIELD_BREAK)
@@ -251,6 +266,28 @@ def printable(text: Any, limit: int = 300) -> str:
     if cut > 0:
         shown.append(f"... (+{cut} more characters)")
     return "".join(shown)
+
+
+# --------------------------------------------------------------------------
+# Percent-encoding
+# --------------------------------------------------------------------------
+
+# A run of percent escapes, decoded as one piece of UTF-8.
+_PERCENT_RUN = re.compile(r"(?:%[0-9A-Fa-f]{2})+")
+
+
+def percent_decoded(text: str) -> str:
+    """One round of percent-decoding: what urllib.parse.unquote(text, errors="replace") returns, in linear time.
+
+    unquote splits the text at every change between ASCII and other
+    characters and decodes each ASCII piece in Python, which is several times
+    slower when the two alternate ("aéaéaé..."). Only the runs of escapes need
+    decoding, and the result is the same: a character between two escapes
+    ends any UTF-8 sequence the first one started, so each run decodes on its own.
+    """
+    if "%" not in text:
+        return text
+    return _PERCENT_RUN.sub(lambda run: bytes.fromhex(run.group().replace("%", "")).decode("utf-8", "replace"), text)
 
 
 # --------------------------------------------------------------------------

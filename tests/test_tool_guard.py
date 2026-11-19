@@ -91,7 +91,7 @@ class CheckingEveryCall(GuardTest):
     def test_with_on_block_return_the_model_gets_the_public_text(self):
         read_file = self.read_file_tool(on_block="return")
         text = read_file("../secret.txt")
-        self.assertRegex(text, r"^argument 'path' has a value the policy does not allow \(ref [0-9a-f]{8}\)$")
+        self.assertRegex(text, r"^argument 'path' has a value the policy does not permit \(ref [0-9a-f]{8}\)$")
         self.assertEqual(self.ran, [])
 
     def test_an_allowed_call_returns_the_result_itself_never_a_text_about_the_policy(self):

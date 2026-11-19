@@ -105,7 +105,8 @@ class BeforeACall(HookTest):
         self.assertEqual(code, 0)
         decision, reason = self.decision(answer)
         self.assertEqual(decision, "deny")
-        self.assertRegex(reason, r"^Blocked by agent-sentinel: an argument has a value the policy denies " + REF + "$")
+        refusal = "argument 'file_path' has a value the policy does not permit "
+        self.assertRegex(reason, r"^Blocked by agent-sentinel: " + refusal + REF + "$")
         record = self.records()[-1]
         self.assertEqual(record["rule"], "deny_args[0]")
         self.assertIn(f"(ref {record['ref']})", reason)
@@ -214,6 +215,43 @@ class FlowRulesAcrossProcesses(HookTest):
             with self.subTest(source=source):
                 self.start_session(source)
                 self.assertEqual(self.decision(self.send_mail())[0], "deny")
+
+    def use_private_reads(self, read_rule):
+        """A policy in which Read is labelled private and a sink is refused after a private read."""
+        tools = {**HOOK_POLICY["tools"], "Read": {**read_rule, "labels": ["private"]}}
+        flows = [{"after": ["private"], "then": "sink", "action": "block"}]
+        self.policy = self.write("policy.json", {**HOOK_POLICY, "tools": tools, "flows": flows})
+        self.start_session()
+
+    def test_a_tool_the_results_hooks_do_not_cover_sets_its_marks_before_it_runs(self):
+        # hook install's default PostToolUse matcher never runs for Read: no later hook would set its marks.
+        self.use_private_reads({"action": "allow"})
+        self.assertIsNone(self.send_mail())
+        self.assertIsNone(self.pre("pre_tool_use_read.json", tool_input={"file_path": "notes.txt"})[1])
+        self.assertEqual(self.decision(self.send_mail())[0], "deny")
+        record = self.records()[-1]
+        self.assertEqual(record["rule"], "flows[0]")
+        self.assertIn("Read", record["reason"])
+
+    def test_a_call_sent_to_claude_codes_prompt_also_sets_its_marks(self):
+        self.use_private_reads({"action": "ask"})
+        _, answer, _ = self.pre("pre_tool_use_read.json", tool_input={"file_path": "notes.txt"})
+        self.assertEqual(self.decision(answer)[0], "ask")
+        self.assertEqual(self.decision(self.send_mail())[0], "deny")
+
+    def test_a_tool_the_results_hooks_cover_gets_its_marks_only_when_its_output_is_delivered(self):
+        self.start_session()
+        self.assertIsNone(self.pre("pre_tool_use_mcp.json", tool_name="mcp__github__create_issue")[1])
+        self.assertIsNone(self.send_mail())
+
+    def test_a_call_whose_marks_cannot_be_recorded_is_refused(self):
+        self.use_private_reads({"action": "allow"})
+        with mock.patch("agent_sentinel.session.FileSessionStore.add", side_effect=SessionStateError("disk full")):
+            _, answer, _ = self.pre("pre_tool_use_read.json", tool_input={"file_path": "notes.txt"})
+        decision, reason = self.decision(answer)
+        self.assertEqual(decision, "deny")
+        self.assertRegex(reason, "the call could not be checked, so it was not made " + REF)
+        self.assertEqual(self.records()[-1]["rule"], "session")
 
     def test_a_clean_error_text_counts_as_read(self):
         self.start_session()
@@ -518,7 +556,7 @@ class ClaudeAgentSdkCallbacks(TempFolderTest):
     def test_a_blocked_call_is_denied(self):
         answer = self.call("PreToolUse", recorded("pre_tool_use_read.json"))
         self.assertEqual(answer["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertRegex(answer["hookSpecificOutput"]["permissionDecisionReason"], "denies " + REF)
+        self.assertRegex(answer["hookSpecificOutput"]["permissionDecisionReason"], "does not permit " + REF)
 
     def test_an_ask_goes_to_the_sdks_permission_flow_only_when_the_mode_asks(self):
         event = recorded("pre_tool_use_mcp.json", tool_name="mcp__mail__draft")

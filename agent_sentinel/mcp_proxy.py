@@ -69,7 +69,9 @@ proxy_report.py): a summary at startup, one line for each block with the
 rule that decided and the reference the agent was shown, and, with
 --verbose, one line for each call let through. Lines about traffic are
 limited (20 in 10 seconds, proxy_report.LineBudget), so a peer cannot flood
-the log. --quiet leaves only errors.
+the log. --quiet leaves only errors. What the server writes to its stderr is
+passed on, labelled "server stderr:", with a limit of its own (60 lines a
+minute), with or without --quiet.
 
 Protocol revisions
 ------------------
@@ -177,6 +179,7 @@ import dataclasses
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -215,7 +218,7 @@ from .policy import (
     Policy,
     PolicyError,
 )
-from .policy_errors import file_error_message
+from .policy_errors import file_error_message, type_name
 from .session import SessionStateError
 from .textutil import UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable
 
@@ -248,6 +251,8 @@ RESOURCE_READ = "resources/read"
 _RESOURCE_METHODS = (RESOURCE_READ, "resources/subscribe")
 # Names a tool may not have: the policy checks these requests under them, and a tool must not borrow their rules.
 _RESERVED_TOOL_NAMES = (*_RESOURCE_METHODS, PROMPTS_GET)
+# The client requests the policy decides. Each must have an id: sent as a notification, it is refused.
+_POLICY_METHODS = ("tools/call", *_RESERVED_TOOL_NAMES, protocol.SUBSCRIPTIONS_LISTEN)
 COMPLETION_COMPLETE = "completion/complete"
 # Where 2026-07-28 puts the server's serverInfo (in the _meta of a server/discover result).
 _SERVER_INFO_KEY = "io.modelcontextprotocol/serverInfo"
@@ -278,6 +283,12 @@ TOOL_NAMES_OFF = "off"  # neither the naming rules nor look-alikes are checked
 TOOL_NAME_MODES = (TOOL_NAMES_STRICT, TOOL_NAMES_WARN, TOOL_NAMES_OFF)
 
 JsonObject = dict[str, Any]
+
+# A name the proxy may put into a command line it suggests to the operator (pins diff NAME). The name
+# comes from the server, and Windows quoting (list2cmdline) does not stop cmd.exe reading "&" or
+# PowerShell reading "$(...)" in it. Any other name is left out of the command, which then lists every
+# change; the line that reports the quarantine names the entry anyway.
+_SHELL_SAFE_NAME = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_.-]{0,127}")
 
 # What the agent is told. Like every refusal, it names no rule.
 _SECRET_REFUSAL = "the request contains what looks like a secret, so it was not sent"
@@ -715,6 +726,10 @@ class Proxy:
             return self._check_client_reply(message)
         if not isinstance(method, str) or not method:
             return self._dropped("a client message with an invalid method")
+        if method in _POLICY_METHODS and "id" not in message:
+            # These are requests: a notification cannot ask for them, and one could not be
+            # held for approval, cancelled or answered like a request.
+            return self._refuse_malformed_request(message, "it has no id")
 
         # What every request must pass first: the protocol revision's rules, then the
         # secret guard on what it carries to the server besides a call's arguments
@@ -1174,7 +1189,8 @@ class Proxy:
         reason = pending.reason
         if reason.endswith(_WAITING_SUFFIX):
             reason = reason[: -len(_WAITING_SUFFIX)]
-        request = ApprovalRequest(tool, arguments, reason, pending.ref or "", self._firewall.server_name)
+        request = ApprovalRequest(tool, arguments, reason, pending.ref or "", self._firewall.server_name,
+                                  method=message["method"])
         waiting = _WaitingCall(
             message, pending, request, label, _request_description(message),
             deadline=time.monotonic() + self._approval_timeout,
@@ -1411,7 +1427,7 @@ class Proxy:
             forwarded = self._pending.pop(request_id, None) is not None
             self._tool_lists_in_flight.discard(request_id)
             self._state.notify_all()
-            held = [waiting for waiting in self._waiting.values() if waiting.message["id"] == request_id]
+            held = [waiting for waiting in self._waiting.values() if waiting.message.get("id") == request_id]
             for waiting in held:
                 waiting.cancelled = True
                 waiting.answered.set()
@@ -1908,9 +1924,23 @@ class Proxy:
         Removing the field keeps the connection usable. Instructions that stay
         are forwarded cleaned of hidden characters (_checked_for_forwarding);
         the pin is taken of the text as the server sent it.
+
+        Instructions are text. Anything else (a list, an object) is removed
+        without being forwarded: the stricter checks and the pin are made for
+        text, and a lenient client might still show the model what is inside.
+        A null is removed too; it says nothing.
         """
-        instructions = result.get("instructions")
+        if "instructions" not in result:
+            return
+        instructions = result["instructions"]
+        if instructions is None:
+            del result["instructions"]
+            return
         if not isinstance(instructions, str):
+            del result["instructions"]
+            reason = f"the server's instructions are not text but {type_name(instructions)}"
+            decision = self._firewall.refuse(source, reason, event="server_instructions", rule=RULE_MALFORMED)
+            self._report_block("removed the server's instructions", decision)
             return
         # No foreign tool names: the server's own tools are not known yet, and its
         # instructions name them ("call get_me first").
@@ -1938,14 +1968,15 @@ class Proxy:
         With a pins file, the proxy keeps the new definition beside it (see
         pins.py, "Changes waiting"), so the change can be looked at and
         accepted with the pins command. Either way the entry stays removed
-        until the proxy restarts.
+        until the proxy restarts. The server's name for the entry goes into
+        the command only when no shell can read anything into it (_SHELL_SAFE_NAME).
         """
         if self._pins.path is None:
             return "If the change is expected, restart the proxy"
         command = ["agent-sentinel", "pins", "diff", "--pins", str(self._pins.path)]
         if kind != "tools":
             command += ["--kind", KIND_WORDS[kind]]
-        if name is not None:
+        if name is not None and _SHELL_SAFE_NAME.fullmatch(name):
             command.append(name)
         return (f"If the change is expected, review it with: {shell_line(command)}; "
                 "then pins accept, and restart the proxy")
@@ -2249,22 +2280,36 @@ def _unsafe_for_batch_file(executable: str, arguments: list[str]) -> list[str]:
     return [argument for argument in arguments if _CMD_SPECIAL & set(argument)]
 
 
-def _relay_stderr(stream: BinaryIO) -> None:
-    """Print what the server writes to stderr, made safe and clearly labelled.
+def server_stderr_budget() -> proxy_report.LineBudget:
+    """The line budget for what the server writes to its stderr: its own, apart from the proxy's lines."""
+    return proxy_report.LineBudget(
+        lambda text, limit: _warn(text, limit=limit), has_audit=False,
+        limit=proxy_report.SERVER_LINES_PER_WINDOW, window=proxy_report.SERVER_WINDOW_SECONDS,
+        where="the server wrote them to its stderr: run the server by itself to see them all",
+    )
+
+
+def _relay_stderr(stream: BinaryIO, budget: proxy_report.LineBudget) -> None:
+    """Print what the server writes to stderr, made safe, clearly labelled and within `budget`.
 
     Left alone, the server would write straight to the operator's terminal:
-    escape codes, or lines dressed up as messages from this proxy.
+    escape codes, or lines dressed up as messages from this proxy. The budget
+    is not the one the proxy's own lines use: a server that writes thousands
+    of lines must not crowd out, or bury, the lines that report its blocks.
     """
-    while True:
-        try:
-            chunk = stream.readline(8192)  # bounded, in case there is never a newline
-        except (OSError, ValueError):
-            return
-        if not chunk:
-            return
-        text = chunk.decode("utf-8", errors="replace").rstrip("\r\n")
-        if text:
-            _warn(f"server stderr: {text}", limit=len(text) + 20)  # the whole line: reads are already bounded
+    try:
+        while True:
+            try:
+                chunk = stream.readline(8192)  # bounded, in case there is never a newline
+            except (OSError, ValueError):
+                return
+            if not chunk:
+                return
+            text = chunk.decode("utf-8", errors="replace").rstrip("\r\n")
+            if text:
+                budget.line(f"server stderr: {text}", limit=len(text) + 20)  # the whole line: reads are bounded
+    finally:
+        budget.flush()  # how many lines were left out, if any
 
 
 def _stop(server: subprocess.Popen, deadline: float) -> int:
@@ -2570,7 +2615,8 @@ def main(argv: list[str] | None = None) -> int:
     client_relay = threading.Thread(target=relay, args=(proxy.pump_client_to_server, sys.stdin.buffer), daemon=True)
     server_relay = threading.Thread(target=relay, args=(proxy.pump_server_to_client, server.stdout), daemon=True)
     # The stderr relay is never joined: a grandchild of the server can hold that pipe open.
-    threading.Thread(target=_relay_stderr, args=(server.stderr,), daemon=True).start()
+    server_lines = server_stderr_budget()
+    threading.Thread(target=_relay_stderr, args=(server.stderr, server_lines), daemon=True).start()
     client_relay.start()
     server_relay.start()
     while not one_side_closed.wait(0.25):  # in short waits, so that a signal handler gets to run
@@ -2583,7 +2629,9 @@ def main(argv: list[str] | None = None) -> int:
         pass
     server_relay.join(timeout=SHUTDOWN_GRACE_SECONDS)  # let it finish answering
     proxy.close_report()  # how many lines about traffic were left out, if any
-    return _stop(server, deadline)
+    exit_code = _stop(server, deadline)
+    server_lines.flush()  # and how many of the server's stderr lines, if its relay has not said so yet
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -33,7 +33,7 @@ from .cli_common import EXIT_ERROR, EXIT_FAIL, EXIT_OK, CommandError, load_polic
 from .detector import METADATA, RESULT, SEVERITY_ORDER, Finding, scan_views
 from .leaks import redact
 from .policy import Policy
-from .textutil import printable
+from .textutil import printable, without_field_breaks
 
 HELP = "scan text files (or stdin) for prompt injection"
 DESCRIPTION = (
@@ -133,7 +133,8 @@ def _scan_one(name: str, profile: str = RESULT) -> _Scanned:
         data = read_input(name)
     except CommandError as exc:
         return _Scanned(shown, error=str(exc))
-    return _Scanned(shown, findings=scan_views(readings(data), profile=profile))
+    texts = [without_field_breaks(text) for text in readings(data)]  # a file is untrusted text, read on its own
+    return _Scanned(shown, findings=scan_views(texts, profile=profile))
 
 
 def _reaches(findings: list[Finding], severity: str | None) -> bool:

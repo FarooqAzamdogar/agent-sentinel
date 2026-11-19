@@ -239,6 +239,22 @@ class PathsOnWindows(unittest.TestCase):
             with self.subTest(value=value[:40]):
                 self.assertTrue(deny.found_in(value))
 
+    def test_deny_sees_through_the_folders_windows_names_twice(self):
+        # Every Windows has these junctions; reaching a root through them needs no link of the agent's.
+        deny = PathMatcher.for_roots(["~/.ssh", r"C:\Users\me\AppData\Roaming\Claude",
+                                      r"C:\Users\me\AppData\Local\Secrets", r"C:\ProgramData\Vault"], **WINDOWS)
+        for value in (r"C:\Documents and Settings\me\.ssh\id_rsa",
+                      r"C:\Users\me\Application Data\Claude\config.json",
+                      r"C:\Documents and Settings\me\Application Data\Claude\config.json",
+                      r"C:\Users\me\Local Settings\Secrets\x",
+                      r"C:\Users\me\AppData\Local\Application Data\Secrets\x",
+                      r"C:\Users\All Users\Vault\key",
+                      r"C:\ProgramData\Application Data\Vault\key"):
+            with self.subTest(value=value):
+                self.assertTrue(deny.found_in(value))
+        self.assertFalse(deny.found_in(r"C:\Documents and Settings\me\notes.txt"))
+        self.assertFalse(deny.found_in(r"C:\Users\me\Application Data\Other\x"))
+
     def test_an_unknown_current_folder_refuses_relative_paths(self):
         def gone():
             raise FileNotFoundError("deleted")
@@ -269,6 +285,20 @@ class PathsOnPosix(unittest.TestCase):
         self.assertTrue(deny.found_in("/home/me/.SSH/id_rsa"))
         self.assertTrue(deny.found_in("~/.ssh"))
         self.assertFalse(deny.found_in("/home/me/notes"))
+
+    def test_deny_sees_through_the_folders_the_system_names_twice(self):
+        deny = PathMatcher.for_roots(["~/.ssh", "/etc", "/private/var/secrets"], **POSIX)
+        for value in ("/proc/self/root/home/me/.ssh/id_rsa", "/proc/self/cwd/../home/me/.ssh/id_rsa",
+                      "/proc/1/task/1/root/etc/passwd", "/proc/self/fd/3", "/dev/fd/3", "/x/../proc/self/cwd/..",
+                      "/private/etc/passwd", "/var/secrets/key"):
+            with self.subTest(value=value):
+                self.assertTrue(deny.found_in(value))
+        self.assertFalse(deny.found_in("/private/notes/a.txt"))
+        self.assertFalse(deny.found_in("/proc/cpuinfo"))
+
+    def test_a_path_through_another_process_is_not_accepted_either(self):
+        self.assertFalse(self.matcher.accepts("/proc/self/cwd/a.txt"))
+        self.assertFalse(self.matcher.accepts("/proc/self/root/work/app/a.txt"))
 
 
 class PathsInAPolicy(unittest.TestCase):
