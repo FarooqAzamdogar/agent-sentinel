@@ -422,6 +422,18 @@ class ListingClients(WrapTest):
         _, out, _ = run_cli("clients")
         self.assertIn("4 server(s): 2 protected, 1 remote (cannot be protected), 1 broken", out)
 
+    def test_monitor_mode_and_doubtful_entries_are_not_counted_as_protected(self):
+        self.place({"mcpServers": {"plain": {"command": "npx", "args": ["x"]}}})
+        self.assertEqual(self.wrap("--monitor", "--apply")[0], 0)
+        _, out, _ = run_cli("clients")
+        self.assertIn("1 server(s): 1 NOT protected", out)
+        self.config.unlink()
+        self.place({"mcpServers": {"short": {"command": "agent-sentinel", "args": [
+            "proxy", "--policy", str(self.policy), "--mon", "--", "x"]}, "behind": {"command": "cmd.exe", "args": [
+                "/c", "evil.py", "&", "agent-sentinel", "proxy", "--policy", str(self.policy), "--", "x"]}}})
+        _, out, _ = run_cli("clients")
+        self.assertIn("2 server(s): 2 broken", out)
+
     def test_nothing_found(self):
         code, out, _ = run_cli("clients")
         self.assertEqual(code, 0)

@@ -46,8 +46,7 @@ from .cli_common import (
     strict_json,
     without_ref,
 )
-from .firewall import Decision, Firewall
-from .leaks import redact
+from .firewall import WAITING_FOR_APPROVAL, Decision, Firewall, agent_text
 from .policy import Policy, limit_rule
 from .session import SINK, MemorySessionStore, is_label
 from .policy_errors import quoted
@@ -133,7 +132,7 @@ def run(args: argparse.Namespace) -> int:
         content, how = result
         scanned = firewall.check_result(args.tool, content, call_id=decision.call_id).decision
         result_blocked = not scanned.allowed
-        _print_result(policy, args.tool, scanned, f"{shown_path(args.result)}, read as {how}", outcome)
+        _print_result(firewall, args.tool, scanned, f"{shown_path(args.result)}, read as {how}", outcome)
 
     if outcome == "block" or result_blocked:
         return EXIT_FAIL
@@ -241,7 +240,7 @@ def _print_decision(
     if described:
         print_field("the rule", printable(described, limit=1000))
     # A pending decision's reason ends with "; waiting for approval": true in the proxy, not here.
-    print_field("reason", printable(decision.reason.removesuffix("; waiting for approval"), limit=1000))
+    print_field("reason", printable(decision.reason.removesuffix(WAITING_FOR_APPROVAL), limit=1000))
     if outcome == "ask":
         print_field("then", (
             "a person must approve the call. The library asks the Firewall's approver; the proxy asks only when "
@@ -249,7 +248,7 @@ def _print_decision(
         ))
         return
     if outcome == "block":
-        print_field("agent sees", f"{printable(without_ref(decision.public_reason), limit=500)} (ref <random>)")
+        print_field("agent sees", f"{_agent_sees(decision.public_reason)} (ref <random>)")
         hint = fix_hints.fix_hint(
             decision.rule, tool=tool, matched_arg=decision.matched_arg, args=arguments, policy=policy
         )
@@ -264,7 +263,8 @@ def _print_session_note(policy: Policy, marks: list[str]) -> None:
               "try --marks untrusted (or the labels your flow rules name).")
 
 
-def _print_result(policy: Policy, tool: str, scanned: Decision, source: str, call_outcome: str) -> None:
+def _print_result(firewall: Firewall, tool: str, scanned: Decision, source: str, call_outcome: str) -> None:
+    policy = firewall.policy
     print(f"\nResult ({source}):")
     if not scanned.allowed:
         print_field("verdict", "BLOCK (withheld from the agent)")
@@ -276,10 +276,10 @@ def _print_result(policy: Policy, tool: str, scanned: Decision, source: str, cal
         print_field("rule", printable(scanned.rule, limit=200))
     print_field("reason", printable(scanned.reason, limit=1000))
     for number, finding in enumerate(scanned.findings):
-        excerpt = printable(redact(finding.excerpt), limit=200)
+        excerpt = printable(firewall.shown_excerpt(finding.excerpt), limit=200)
         print_field("findings" if number == 0 else "", f"[{finding.severity.upper():6}] {finding.rule}: {excerpt}")
     if not scanned.allowed:
-        print_field("agent sees", f"{printable(without_ref(scanned.public_reason), limit=500)} (ref <random>)")
+        print_field("agent sees", f"{_agent_sees(scanned.public_reason)} (ref <random>)")
         print_field("to allow", fix_hints.fix_hint(scanned.rule, tool=tool, policy=policy))
     if call_outcome == "block":
         print("Note: the call itself is blocked, so no result would come back.")
@@ -348,3 +348,8 @@ def _print_tool_rules(policy: Policy, tool: str) -> None:
             print(f"    tools.{name}.allow_args[{index}]  {printable(allow.describe(), limit=300)}")
         if rule.other_args == "block":
             print(f"    tools.{name}.other_args  an argument that no allow rule names is refused")
+
+
+def _agent_sees(public_reason: str) -> str:
+    """What the agent reads for a block (the proxy's, the hook's and guard's words), without the random ref."""
+    return printable(agent_text(without_ref(public_reason)), limit=500)

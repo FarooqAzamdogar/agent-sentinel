@@ -5,7 +5,7 @@ import unittest
 
 from cli_support import TempFolderTest, run_cli
 from support import EXAMPLE_POLICY_PATH, INJECTION, POLICY
-from agent_sentinel import BlockedError, Firewall
+from agent_sentinel import BlockedError, Firewall, Policy
 from agent_sentinel.cli_explain import MAX_REF_MATCHES, parse_ref
 from agent_sentinel.cli_common import CommandError
 
@@ -66,6 +66,21 @@ class ExplainingARealLog(TempFolderTest):
         self.assertIn("WAITING FOR APPROVAL", out)
         self.assertIn("REFUSED when a person was asked", out)
         self.assertEqual(out.count("to allow:"), 1)  # the hint belongs to the answer
+        self.assertIn("it was refused there", out)
+        self.assertNotIn('"allow"', out.split("to allow:")[1])
+
+    def test_an_ask_refused_by_the_default_is_not_explained_as_a_missing_rule(self):
+        audit = self.folder / "ask.jsonl"
+        Firewall(Policy.from_dict({"default": "ask"}), audit_path=audit,
+                 approver=lambda *_: False).check_call("delete_repository", {"repo": "acme/prod"})
+        no_approver = Firewall(Policy.from_dict({"default": "ask"}), audit_path=audit).check_call("drop_table", {})
+        _, out, _ = run_cli("explain", audit, "--last", "2")
+        hints = out.split("to allow:")[1:]
+        self.assertIn("it was refused there", hints[0])
+        self.assertIn("nobody could be asked", hints[1])
+        for hint in hints:
+            self.assertNotIn('"delete_repository": "allow"', hint)
+        self.assertTrue(no_approver.ref)
 
     def test_a_withheld_result_shows_its_findings(self):
         with self.assertRaises(BlockedError) as caught:

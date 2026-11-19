@@ -42,7 +42,7 @@ from typing import Any
 
 from . import __version__, auditlog, mcp_proxy
 from .cli_common import CommandError
-from .firewall import Firewall
+from .firewall import BLOCKED_PREFIX, Firewall
 from .policy import Policy
 from .textutil import printable
 
@@ -66,8 +66,8 @@ _HINT_WORDS = {
     "idempotentHint": "idempotent", "openWorldHint": "open world",
 }
 # The events and actions of the audit records that say why the proxy removed something.
-_REMOVAL_EVENTS = ("tool_description", "tool_changed", "tool_name", "tool_lookalike")
-_PROXY_PREFIX = "Blocked by agent-sentinel:"
+_REMOVAL_EVENTS = ("tool_description", "tool_changed", "tool_name", "tool_lookalike", "tool_pins_full")
+_PROXY_PREFIX = BLOCKED_PREFIX
 
 
 class ProbeError(CommandError):

@@ -62,10 +62,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from .cli_common import CommandError, strict_json
-from .firewall import MAX_CALL_ID_CHARS, Decision, Firewall, new_ref, with_ref
+from .firewall import MAX_CALL_ID_CHARS, Decision, Firewall, agent_text, new_ref, with_ref
 from .hook_state import FileRateLimiter, RateLimitStateError
-from .policy import RULE_MALFORMED, RULE_SESSION, Policy, PolicyError
+from .jsonutil import strict_loads
+from .policy import RULE_HOOK_FAILED, RULE_MALFORMED, RULE_SESSION, Policy, PolicyError
 from .policy_errors import file_error_message
 from .session import MAX_SESSION_ID_CHARS, FileSessionStore, SessionStateError
 from .textutil import printable
@@ -107,10 +107,6 @@ PROMPTING_MODES = frozenset({"default", "plan", "acceptEdits", "auto", "dontAsk"
 
 # SessionStart sources that start a session with an empty context.
 NEW_SESSION_SOURCES = ("startup", "clear")
-
-# The rule id of a refusal because the hook itself could not finish (a policy
-# that does not load, session state that cannot be used, an error).
-RULE_HOOK_FAILED = "hook_failed"
 
 # What Claude may read when the hook cannot finish. Generic on purpose (CONTRIBUTING rule 6).
 _UNCHECKED_CALL = "the call could not be checked, so it was not made"
@@ -162,7 +158,7 @@ class HookSettings:
 # ---- reading an event ----------------------------------------------------------------------------
 
 def read_event(data: bytes) -> dict[str, Any]:
-    """Parse the bytes of one hook event (strict JSON: no repeated keys, no NaN) and check its fields."""
+    """Parse the bytes of one hook event (strict JSON, jsonutil: no repeated keys, no NaN) and check its fields."""
     if len(data) > MAX_EVENT_BYTES:
         raise MalformedEvent(f"the event is larger than {MAX_EVENT_BYTES} bytes")
     try:
@@ -170,8 +166,8 @@ def read_event(data: bytes) -> dict[str, Any]:
     except UnicodeDecodeError as exc:
         raise MalformedEvent(f"the event is not UTF-8 text (at byte {exc.start})") from exc
     try:
-        event = strict_json(text, "the hook event")
-    except CommandError as exc:
+        event = strict_loads(text, "the hook event")
+    except ValueError as exc:  # also NaN, Infinity and 1e999, which the audit log could not hold
         raise MalformedEvent(str(exc).splitlines()[0]) from exc
     return checked_event(event)
 
@@ -507,8 +503,8 @@ def _mark_as_read(firewall: Firewall, tool: str) -> None:
 # ---- texts and outputs -----------------------------------------------------------------------------
 
 def blocked_text(public_reason: str) -> str:
-    """What Claude reads for a block: the same words the proxy uses."""
-    return f"Blocked by agent-sentinel: {public_reason}"
+    """What Claude reads for a block: the same words the proxy uses (firewall.agent_text)."""
+    return agent_text(public_reason)
 
 
 def _stop_text(public_reason: str) -> str:
@@ -614,7 +610,12 @@ def claude_sdk_hooks(firewall: Firewall) -> dict[str, HookCallback]:
     (your can_use_tool callback) when the input's permission_mode is one that
     asks; otherwise it is refused. The Firewall's approver is not used. The
     checks run on the event loop, without threads.
+
+    TypeError for anything but a Firewall (a Policy given by mistake would
+    otherwise make every call fail its checks, and so be denied, silently).
     """
+    if not isinstance(firewall, Firewall):
+        raise TypeError("claude_sdk_hooks() needs a Firewall: claude_sdk_hooks(Firewall(policy, audit_path))")
 
     def callback_for(event_name: str) -> HookCallback:
         async def callback(input_data: Any, tool_use_id: Any, context: Any) -> dict[str, Any]:

@@ -101,6 +101,16 @@ class NamesThatLookLikeSecrets(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertTrue(looks_secret(name))
 
+    def test_doctor_and_the_proxy_read_a_name_the_same_way(self):
+        from agent_sentinel import cli_doctor
+        self.assertIs(cli_doctor.looks_secret, looks_secret)
+        for name in ("MYSQL_PWD", "SLACK_BOT_AUTHORIZATION", "BEARER", "COOKIES", "X-Auth-Token", "Authorization"):
+            with self.subTest(name=name):
+                self.assertTrue(looks_secret(name))
+        for name in ("PWD", "OLDPWD", "MY_SESSION", "XDG_SESSION_ID", "x" * 10_000 + "_TOKEN"):
+            with self.subTest(name=name[:20]):
+                self.assertFalse(looks_secret(name))
+
     def test_names_that_do_not(self):
         for name in ("PATH", "HOME", "KEYBOARD_LAYOUT", "GIT_AUTHOR_NAME", "MONKEY", "TOKENIZERS_PARALLELISM",
                      "PATHEXT", "SECRETARY", "AUTHOR", "LANG", "PWD", "XDG_SESSION_TYPE", "KEYRING_BACKEND"):

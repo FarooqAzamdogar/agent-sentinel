@@ -7,7 +7,7 @@ from datetime import datetime
 from unittest import mock
 
 from cli_support import TempFolderTest
-from agent_sentinel import config_file
+from agent_sentinel import config_file, filelock, wrapping
 from agent_sentinel.config_file import ConfigError, edited_text, read_config, write_config
 
 ORIGINAL = """{
@@ -89,8 +89,14 @@ class EditingInPlace(TempFolderTest):
         self.assertEqual(document["mcpServers"]["files"], NEW_FILES)
         self.assertEqual(list(document), ["globalShortcut", "mcpServers", "unknownLater"])
         self.assertEqual(list(document["mcpServers"]), ["files", "remote", "notes"])
-        # The new entry is indented like the file.
-        self.assertIn('\n    "files": {\n      "command": "python",\n      "args": [\n        "-m",', text)
+        # Only the changed values are written, each in the layout of the one it replaces.
+        self.assertIn('\n    "files": {\n      "command": "python",\n'
+                      '      "args": ["-m", "agent_sentinel", "proxy", "--", "npx"]\n    },', text)
+        # An entry that gains or loses a key is written whole, indented like the file.
+        text = edited_text(config, "mcpServers", {"files": {"command": "python"}, "remote": {"command": "x",
+                                                                                           "args": ["a"]}})
+        self.assertIn('\n    "files": {\n      "command": "python"\n    },', text)
+        self.assertIn('\n    "remote": {"command": "x", "args": ["a"]},', text)
 
     def test_several_entries_change_in_one_pass(self):
         config = read_config(self.write("c.json", ORIGINAL.encode("utf-8")))
@@ -103,7 +109,7 @@ class EditingInPlace(TempFolderTest):
     def test_a_compact_file_stays_compact(self):
         compact = '{"mcpServers":{"a":{"command":"npx"},"b":{"command":"uvx"}},"x":1}'
         text = edited_text(read_config(self.write("c.json", compact)), "mcpServers", {"a": {"command": "python"}})
-        self.assertEqual(text, '{"mcpServers":{"a":{"command": "python"},"b":{"command":"uvx"}},"x":1}')
+        self.assertEqual(text, '{"mcpServers":{"a":{"command":"python"},"b":{"command":"uvx"}},"x":1}')
 
     def test_an_entry_written_on_one_line_stays_on_one_line_and_comes_back_the_same(self):
         config = read_config(self.write("c.json", ORIGINAL.encode("utf-8")))
@@ -112,6 +118,29 @@ class EditingInPlace(TempFolderTest):
         path = self.write("c.json", text.encode("utf-8"))
         back = edited_text(read_config(path), "mcpServers", {"notes": json.loads(ORIGINAL)["mcpServers"]["notes"]})
         self.assertEqual(back, ORIGINAL.replace("2.50", "2.5"))  # JSON writes the number 2.50 as 2.5
+
+    def test_wrap_then_unwrap_gives_back_the_same_bytes_when_only_command_and_args_change(self):
+        # Only the values that change are written: an unknown key's numbers (2.50, 1e2) and an
+        # "args" list written on one line inside an entry of several lines stay as they were.
+        original = ('\ufeff{\r\n  "mcpServers": {\r\n    "caf\u00e9": {\r\n      "command": "python",\r\n'
+                    '      "args": ["server.py", "--port", "8080"],\r\n'
+                    '      "x-unknown": {"keep": [1, 2.50, 1e2]},\r\n      "env": {\r\n        "A": "1"\r\n'
+                    '      }\r\n    },\r\n    "two": {\r\n      "command": "node",\r\n      "args": [\r\n'
+                    '        "x.js"\r\n      ]\r\n    }\r\n  }\r\n}\r\n')
+        path = self.write("c.json", original.encode("utf-8"))
+        settings = wrapping.ProxySettings("C:/py/python.exe", "C:/p.json", "C:/a.jsonl", "C:/pins")
+        config = read_config(path)
+        servers = config.document["mcpServers"]
+        wrapped = {name: wrapping.wrap_entry(entry, settings, name, "PINS") for name, entry in servers.items()}
+        write_config(config, edited_text(config, "mcpServers", wrapped))
+        text = path.read_bytes().decode("utf-8-sig")
+        self.assertIn('"x-unknown": {"keep": [1, 2.50, 1e2]}', text)
+        self.assertIn('"args": ["-I", "-m", "agent_sentinel", "proxy"', text)  # one line, as it was
+        self.assertIn('"args": [\r\n        "-I",\r\n', text)  # one item per line, as it was
+        config = read_config(path)
+        unwrapped = {name: wrapping.unwrap_entry(entry) for name, entry in config.document["mcpServers"].items()}
+        write_config(config, edited_text(config, "mcpServers", unwrapped))
+        self.assertEqual(path.read_bytes(), original.encode("utf-8"))
 
     def test_windows_line_endings_tabs_and_a_byte_order_mark_are_kept(self):
         original = '{\r\n\t"servers": {\r\n\t\t"a": {\r\n\t\t\t"command": "npx"\r\n\t\t}\r\n\t}\r\n}\r\n'
@@ -159,6 +188,39 @@ class Writing(TempFolderTest):
         self.assertEqual(first.read_text(encoding="utf-8"), ORIGINAL)
         self.assertIn("Alt", second.read_text(encoding="utf-8"))
 
+    @unittest.skipUnless(os.name == "posix", "file modes are a POSIX matter")
+    def test_a_backup_can_be_read_only_by_its_owner(self):
+        path = self.write("c.json", ORIGINAL.encode("utf-8"))
+        os.chmod(path, 0o600)
+        previous = os.umask(0o022)
+        try:
+            backup = write_config(read_config(path), ORIGINAL.replace("Ctrl", "Alt"))
+        finally:
+            os.umask(previous)
+        self.assertEqual(os.stat(backup).st_mode & 0o777, 0o600)
+
+    def test_a_file_in_a_project_under_version_control_is_backed_up_outside_it(self):
+        # A project's .mcp.json is often in .gitignore because it holds tokens; a backup beside it is not.
+        home = self.folder / "sentinel-home"
+        for marker, make in ((".git", "mkdir"), (".git", "file"), (".hg", "mkdir")):
+            project = self.folder / f"project-{marker}-{make}"
+            (project / "sub").mkdir(parents=True)
+            if make == "mkdir":
+                (project / marker).mkdir()
+            else:
+                (project / marker).write_text("gitdir: elsewhere\n", encoding="utf-8")
+            path = project / "sub" / ".mcp.json"
+            path.write_bytes(ORIGINAL.encode("utf-8"))
+            with self.subTest(marker=marker, make=make), \
+                    mock.patch.dict(os.environ, {"AGENT_SENTINEL_HOME": str(home)}):
+                backup = write_config(read_config(path), ORIGINAL.replace("Ctrl", "Alt"),
+                                      now=datetime(2026, 11, 19, 14, 30, 5))
+                self.assertEqual(backup.parent, home / "backups")
+                self.assertRegex(backup.name, r"^\.mcp\.json\.[0-9a-f]{8}\.agent-sentinel-20261119-143005(-\d+)?\.bak$")
+                self.assertEqual(backup.read_bytes(), ORIGINAL.encode("utf-8"))
+                self.assertEqual(sorted(entry.name for entry in path.parent.iterdir()), [".mcp.json"])
+        self.assertFalse(config_file.in_work_tree(self.folder / "c.json"))
+
     def test_a_file_that_changed_since_it_was_read_is_not_written(self):
         path = self.write("c.json", ORIGINAL.encode("utf-8"))
         config = read_config(path)
@@ -173,7 +235,7 @@ class Writing(TempFolderTest):
         path = self.write("c.json", ORIGINAL.encode("utf-8"))
         config = read_config(path)
         with mock.patch.object(config_file.os, "replace", side_effect=PermissionError("in use")), \
-                mock.patch.object(config_file.time, "sleep"), self.assertRaises(ConfigError) as caught:
+                mock.patch.object(filelock.time, "sleep"), self.assertRaises(ConfigError) as caught:
             write_config(config, "{}")
         self.assertIn("the file was not changed", str(caught.exception))
         self.assertEqual(path.read_text(encoding="utf-8"), ORIGINAL)
@@ -190,7 +252,7 @@ class Writing(TempFolderTest):
                 raise PermissionError("in use for a moment")
             real_replace(source, target)
 
-        with mock.patch.object(config_file.os, "replace", flaky), mock.patch.object(config_file.time, "sleep"):
+        with mock.patch.object(config_file.os, "replace", flaky), mock.patch.object(filelock.time, "sleep"):
             write_config(read_config(path), "{}")
         self.assertEqual(path.read_text(encoding="utf-8"), "{}")
         self.assertEqual(len(attempts), 2)

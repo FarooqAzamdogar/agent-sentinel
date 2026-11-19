@@ -424,5 +424,27 @@ class EndToEnd(ProxyEndToEndTests):
         self.assertIn(b"cannot find the server command", proc.stderr)
 
 
+
+class TheMessageSizeLimit(unittest.TestCase):
+    def test_max_message_bytes_takes_a_bounded_whole_number(self):
+        parser = mcp_proxy._argument_parser()
+        args = parser.parse_args(["--policy", "p", "--max-message-bytes", "1024", "--", "x"])
+        self.assertEqual(args.max_message_bytes, 1024)
+        too_many = str(mcp_proxy.MAX_MAX_MESSAGE_BYTES + 1)
+        for value, expected in (("abc", "whole number of bytes"), ("0", "must be 1 to"), ("1e23", "whole number"),
+                                ("1" + "0" * 23, "must be 1 to"), (too_many, "must be")):
+            with self.subTest(value=value):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit):
+                    parser.parse_args(["--policy", "p", "--max-message-bytes", value, "--", "x"])
+                self.assertIn(expected, stderr.getvalue())
+                self.assertNotIn("_positive_int", stderr.getvalue())
+
+    def test_a_proxy_built_in_code_refuses_a_limit_the_relay_could_not_use(self):
+        for value in (10 ** 23, 0, -1, 1.5, True, "16"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                mcp_proxy.Proxy(Firewall(Policy()), io.BytesIO(), io.BytesIO(), max_message_bytes=value)
+
+
 if __name__ == "__main__":
     unittest.main()

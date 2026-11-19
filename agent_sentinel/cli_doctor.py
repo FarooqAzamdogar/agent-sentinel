@@ -47,13 +47,14 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__, clients, home, mcp_proxy
-from .cli_common import EXIT_FAIL, EXIT_OK, CommandError, shell_line, shown_path
+from .cli_common import EXIT_FAIL, EXIT_OK, CommandError, shown_command, shown_path
 from .clients import CLIENTS
 from .config_file import ConfigError, read_config
 from .firewall import SERVER_NAME
-from .leaks import find_secrets, redact
+from .leaks import find_secrets
 from .policy import Policy, PolicyError
 from .policy_errors import file_error_message
+from .server_env import looks_secret  # the proxy's own test, so that doctor and the proxy agree
 from .textutil import printable
 from .wrapping import (
     FLAG_OPTIONS,
@@ -62,7 +63,9 @@ from .wrapping import (
     command_line,
     installed_version,
     kind_of,
+    mentions_proxy,
     read_proxy_command,
+    shortened_option,
 )
 
 HELP = "check, without changing anything, that every server in your MCP client configurations is protected"
@@ -84,14 +87,6 @@ examples:
 """
 
 STATUSES = ("protected", "unprotected", "remote", "broken")
-# Words in a variable name that say it holds a secret (GITHUB_TOKEN, apiKey, X-Auth-Token),
-# and spellings found anywhere in one (DB_PASSWORD, MYSQL_PWD).
-_SECRET_WORDS = frozenset({
-    "TOKEN", "TOKENS", "SECRET", "SECRETS", "CREDENTIAL", "CREDENTIALS", "KEY", "KEYS", "APIKEY", "PAT", "AUTH",
-    "AUTHORIZATION", "BEARER", "COOKIE", "COOKIES", "DSN", "PWD", "SESSION",
-})
-_SECRET_SPELLINGS = ("PASSWORD", "PASSWD", "PASSPHRASE")
-_NAME_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+")
 _EXACT_VERSION = re.compile(r"v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?")
 # Where a PyPI package's name ends in a requirement such as "pkg>=1.0" or "pkg[extra]".
 _PYPI_NAME_END = re.compile(r"[=<>~!@ \[]")
@@ -224,6 +219,12 @@ def check_server(name: str, entry: Any, client: str | None, project: Path | None
     words = command_line(entry)
     assert words is not None
     proxy = read_proxy_command(words)
+    if proxy is None and mentions_proxy(words):
+        report = ServerReport(shown_name, "broken", [Line(
+            "fail", f"NOT protected: {_shown(words)} starts the proxy only after other words, which may run something "
+                    "else first, unchecked. Make the entry start the server directly, then run wrap")])
+        report.lines += _secret_lines(entry)
+        return report
     if proxy is None:
         fix = f"agent-sentinel wrap --client {client} --policy POLICY" if client else "agent-sentinel wrap"
         report = ServerReport(shown_name, "unprotected", [
@@ -246,16 +247,26 @@ def check_server(name: str, entry: Any, client: str | None, project: Path | None
 
 
 def _shown(words: list[str]) -> str:
-    return printable(redact(shell_line(words)), limit=120)
+    return shown_command(words, limit=120)
 
 
 def _check_wrapped(report: ServerReport, proxy: ProxyCommand, entry: dict[str, Any], project: Path | None) -> None:
     lines = report.lines
     _check_launcher(lines, proxy)
     for option, _ in proxy.options:
-        if option not in VALUE_OPTIONS and option not in FLAG_OPTIONS:
+        if option in VALUE_OPTIONS or option in FLAG_OPTIONS:
+            continue
+        shortens = shortened_option(option)
+        if shortens:
+            lines.append(Line("fail", f"the proxy option {printable(option, limit=60)!r} is a shortened "
+                                      f"{' or '.join(shortens)}: this proxy refuses it, and another version would take "
+                                      "it for the whole option. Write the option in full"))
+        else:
             lines.append(Line("warn", f"the proxy option {printable(option, limit=60)!r} is not one this version "
                                       "knows; the proxy may refuse to start"))
+    if len(proxy.values("--policy")) > 1:
+        lines.append(Line("fail", "--policy is given more than once: the proxy uses the last one, which is easy to "
+                                  "miss when reading the entry. Keep one"))
     report.policy = _policy_path(lines, proxy.value("--policy"))
     report.pins = _pins_path(lines, proxy)
     report.audit = _audit_path(lines, proxy.value("--audit"))
@@ -517,18 +528,6 @@ def _package_lines(words: list[str]) -> list[Line]:
     package, pinned = found
     return [Line("warn", f"the package {printable(package, limit=80)!r} is not pinned to an exact version: a new "
                          f"release would run without review. Pin it, for example {printable(pinned, limit=80)}")]
-
-
-def looks_secret(name: str) -> bool:
-    """Whether a variable (or header) name says that it holds a secret: GITHUB_TOKEN, apiKey, DB_PASSWORD.
-
-    By whole words, split at "_", "-" and between lower and upper case, so
-    that AUTHOR or MONKEY_COUNT are not taken for secrets.
-    """
-    upper = name.upper()
-    if any(spelling in upper for spelling in _SECRET_SPELLINGS):
-        return True
-    return any(word.upper() in _SECRET_WORDS for word in _NAME_WORD.findall(name[:200]))
 
 
 def _secret_lines(entry: Any) -> list[Line]:

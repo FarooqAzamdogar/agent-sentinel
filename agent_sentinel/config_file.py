@@ -11,7 +11,9 @@ agent-sentinel does, so this module refuses whatever it is not sure of:
     intended document, or nothing is written;
   * a file that changed after it was read is not written;
   * before writing, the original bytes are copied to a new, timestamped
-    backup file beside it, which is never overwritten;
+    backup file, which is never overwritten and only its owner can read:
+    beside the file, or in the agent-sentinel home folder when the file is
+    part of a project under version control (see backup_folder);
   * the new file is written to a temporary file in the same folder and moved
     into place in one step (os.replace), so a crash leaves the old file or
     the new one, never half of one;
@@ -20,27 +22,26 @@ agent-sentinel does, so this module refuses whatever it is not sure of:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import shutil
-import stat
-import tempfile
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from json.decoder import scanstring
 from pathlib import Path
 from typing import Any
 
+from . import home
+from .filelock import replace_file
 from .cli_common import CommandError, strict_json
 from .leaks import redact
 
 # Client configurations are small. A larger file is refused rather than read.
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
-# os.replace can fail on Windows for a moment while another program (a virus
-# scanner, a file indexer, the client itself) has the file open.
-_REPLACE_ATTEMPTS = 5
-_REPLACE_PAUSE_SECONDS = 0.1
+# Backups of files in a project under version control go to <home>/backups (see backup_folder).
+BACKUPS_FOLDER = "backups"
+_WORK_TREE_MARKERS = (".git", ".hg", ".svn", ".jj")
+MAX_FOLDER_DEPTH = 64  # how many folders up a version-control marker is looked for
 _WHITESPACE = " \t\n\r"
 
 
@@ -165,19 +166,57 @@ def _indent_unit(text: str) -> str:
     return "  "
 
 
-def _entry_text(value: Any, config: ConfigFile, member: _Member) -> str:
+def _entry_text(value: Any, old: Any, config: ConfigFile, member: _Member) -> str:
     """One entry written as JSON in the style of the one it replaces, to take its place in the text.
 
-    An entry that was on one line stays on one line (so wrapping and then
-    unwrapping gives back the same text); otherwise it is indented like the
-    file, one item per line.
+    When both are objects and only some of their values changed (what wrap
+    and unwrap do to "command" and "args"), only those values are written
+    anew: every other member of the entry, an unknown key's numbers and
+    layout included, stays byte for byte. Otherwise the whole entry is
+    written: an entry that was on one line stays on one line, and any other
+    is indented like the file, one item per line.
     """
+    in_place = _changed_members_text(value, old, config, member)
+    if in_place is not None:
+        return in_place
     lead = _lead(config.text, member.key_start)
     compact = (
         bool(lead.strip())  # the key is not at the start of its line: the file is written compactly
         or "\n" not in config.text[member.value_start:member.value_end]
     )
     return _json_text(value, config, lead, compact)
+
+
+def _changed_members_text(value: Any, old: Any, config: ConfigFile, member: _Member) -> str | None:
+    """The entry's own text with only its changed values replaced, or None when that is not possible.
+
+    Possible when the entry keeps the same keys in the same order; None when
+    a key is added or removed (wrap adds "args" to an entry that had none),
+    or the entry is not an object.
+    """
+    if not isinstance(value, dict) or not isinstance(old, dict) or list(value) != list(old):
+        return None
+    try:
+        parts = _members(config.text, member.value_start)
+    except (ValueError, IndexError, RecursionError):
+        return None
+    if [part.key for part in parts] != list(old):
+        return None
+    pieces, position = [], member.value_start
+    for part in parts:
+        if _same_json(value[part.key], old[part.key]):
+            continue
+        lead = _lead(config.text, part.key_start)
+        compact = bool(lead.strip()) or "\n" not in config.text[part.value_start:part.value_end]
+        pieces += [config.text[position:part.value_start], _json_text(value[part.key], config, lead, compact)]
+        position = part.value_end
+    pieces.append(config.text[position:member.value_end])
+    return "".join(pieces)
+
+
+def _same_json(one: Any, other: Any) -> bool:
+    """Whether two values are written the same as JSON (1 and True, or 1 and 1.0, are not the same)."""
+    return json.dumps(one) == json.dumps(other)
 
 
 def _lead(text: str, key_start: int) -> str:
@@ -216,7 +255,8 @@ def edited_text(config: ConfigFile, servers_key: str, entries: dict[str, Any]) -
     pieces = []
     position = 0
     for member in sorted((spans[name] for name in entries), key=lambda member: member.value_start):
-        pieces += [config.text[position:member.value_start], _entry_text(entries[member.key], config, member)]
+        old = config.document[servers_key][member.key]
+        pieces += [config.text[position:member.value_start], _entry_text(entries[member.key], old, config, member)]
         position = member.value_end
     pieces.append(config.text[position:])
     text = "".join(pieces)
@@ -311,14 +351,50 @@ def write_config(config: ConfigFile, text: str, now: datetime | None = None) -> 
     return backup
 
 
+def in_work_tree(path: Path) -> bool:
+    """Whether a folder above `path` holds .git, .hg, .svn or .jj: the file is in a project under version control."""
+    for folder in list(path.parents)[:MAX_FOLDER_DEPTH]:
+        if any(os.path.lexists(folder / marker) for marker in _WORK_TREE_MARKERS):
+            return True
+    return False
+
+
+def backup_folder(path: Path) -> tuple[Path, str]:
+    """Where the backup of `path` goes, and how its name starts.
+
+    Beside the file, as <file>.agent-sentinel-<time>.bak, unless the file is
+    in a project under version control. A project's .mcp.json or
+    .claude/settings.local.json often holds tokens and is ignored by name
+    (.gitignore), but a backup beside it is not, and `git add -A` would
+    commit it. So those backups go to the agent-sentinel home folder,
+    <home>/backups/<file>.<8 hex of its full path>.agent-sentinel-<time>.bak.
+    """
+    if not in_work_tree(path):
+        return path.parent, f"{path.name}.agent-sentinel-"
+    folder = home.home_folder() / BACKUPS_FOLDER
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ConfigError(f"cannot create the folder {folder} for the backup: {exc.strerror or exc}; "
+                          "nothing was changed") from exc
+    code = hashlib.sha256(os.path.normcase(str(path)).encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    return folder, f"{path.name}.{code}.agent-sentinel-"
+
+
 def _backup(config: ConfigFile, now: datetime) -> Path:
-    """Copy the original bytes to <file>.agent-sentinel-<time>.bak. Never overwrites: a clash gets -2, -3, ..."""
+    """Copy the original bytes to a new backup file (see backup_folder). Never overwrites: a clash gets -2, -3, ...
+
+    The backup holds every token the original does, so only its owner may
+    read it (0600 on POSIX), whatever the permissions of a new file would be.
+    """
+    folder, start = backup_folder(config.path)
     stamp = now.strftime("%Y%m%d-%H%M%S")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     for number in range(1, 100):
         suffix = "" if number == 1 else f"-{number}"
-        backup = config.path.with_name(f"{config.path.name}.agent-sentinel-{stamp}{suffix}.bak")
+        backup = folder / f"{start}{stamp}{suffix}.bak"
         try:
-            with open(backup, "xb") as handle:
+            with os.fdopen(os.open(backup, flags, 0o600), "wb") as handle:
                 handle.write(config.raw)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -327,37 +403,14 @@ def _backup(config: ConfigFile, now: datetime) -> Path:
             continue
         except OSError as exc:
             raise ConfigError(
-                f"cannot write a backup beside {config.path}: {exc.strerror or exc}; nothing was changed"
+                f"cannot write a backup of {config.path} in {folder}: {exc.strerror or exc}; nothing was changed"
             ) from exc
     raise ConfigError(f"too many backups of {config.path} with the same time; nothing was changed")
 
 
 def _replace(path: Path, data: bytes) -> None:
-    """Write `data` to a temporary file beside `path`, then move it into place in one step."""
-    handle, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    """Replace the file in one step (filelock.replace_file), keeping its permissions."""
     try:
-        with os.fdopen(handle, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            shutil.copymode(path, temporary)  # keep the file's permissions (POSIX)
-        except OSError:
-            pass
-        for attempt in range(_REPLACE_ATTEMPTS):
-            try:
-                os.replace(temporary, path)
-                return
-            except PermissionError:
-                if attempt == _REPLACE_ATTEMPTS - 1:
-                    raise
-                time.sleep(_REPLACE_PAUSE_SECONDS)
+        replace_file(path, data, keep_mode=True)
     except OSError as exc:
         raise ConfigError(f"cannot write {path}: {exc.strerror or exc}; the file was not changed") from exc
-    finally:
-        if os.path.exists(temporary):
-            try:
-                os.chmod(temporary, stat.S_IWRITE)
-                os.remove(temporary)
-            except OSError:
-                pass

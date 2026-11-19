@@ -19,30 +19,46 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .policy import Policy
+from .policy import (
+    RULE_CALLER,
+    RULE_DEFAULT,
+    RULE_HOOK_FAILED,
+    RULE_INDEX,
+    RULE_INJECTION,
+    RULE_MALFORMED,
+    RULE_QUARANTINE,
+    RULE_SECRETS,
+    RULE_SECRETS_CANARIES,
+    RULE_SECRETS_IN_RESULTS,
+    RULE_SECRETS_KNOWN_VALUES,
+    RULE_SESSION,
+    RULE_UNSCANNABLE,
+    Policy,
+)
 from .textutil import printable
 
 # A rule id longer than this is not one the firewall writes (tool names in the log are at most 200 characters).
 MAX_RULE_ID_CHARS = 600
 
-# A position as rule ids write it: no leading zeros, at most nine digits (as policy.py reads them).
-_INDEX = r"\[(?:0|[1-9][0-9]{0,8})\]"
+# A position as rule ids write it (policy.RULE_INDEX): "[3]", no leading zeros, at most nine digits.
+_INDEX = RULE_INDEX
 _TOOL_PART = re.compile(rf"tools\.(.+)\.(deny_args{_INDEX}|allow_args{_INDEX}|other_args|max_calls_per_minute)")
 
+# The fixed rule ids (policy.RULE_*) and the kind of hint each gets.
 _FIXED_KINDS = {
-    "default": "default",
+    RULE_DEFAULT: "default",
     "limits.max_calls_per_minute": "limit_global",
-    "secrets": "secrets",
-    "secrets.in_results": "secrets_results",
-    "secrets.canaries": "canary",
-    "secrets.known_values_from_env": "known_value",
-    "injection": "injection",
-    "unscannable": "unscannable",
-    "malformed": "malformed",
-    "quarantine": "quarantine",
-    "session": "session",
-    "caller": "caller",
-    "hook_failed": "hook_failed",
+    RULE_SECRETS: "secrets",
+    RULE_SECRETS_IN_RESULTS: "secrets_results",
+    RULE_SECRETS_CANARIES: "canary",
+    RULE_SECRETS_KNOWN_VALUES: "known_value",
+    RULE_INJECTION: "injection",
+    RULE_UNSCANNABLE: "unscannable",
+    RULE_MALFORMED: "malformed",
+    RULE_QUARANTINE: "quarantine",
+    RULE_SESSION: "session",
+    RULE_CALLER: "caller",
+    RULE_HOOK_FAILED: "hook_failed",
 }
 _INDEXED_KINDS = (
     (re.compile(rf"deny_args{_INDEX}"), "deny_global"),
@@ -111,6 +127,7 @@ def fix_hint(
     matched_arg: Any = None,
     args: Any = None,
     policy: Policy | None = None,
+    approval: Any = None,
 ) -> str:
     """One or two sentences on what the operator can do about a block decided by `rule`.
 
@@ -118,8 +135,20 @@ def fix_hint(
     matched_arg: the argument the rule matched, if known
     args:        the call's arguments, if they were logged; tells "missing" from "not accepted"
     policy:      the current policy, if known; lets the hint say what a tool rule's action is
+    approval:    the record's "approval": the rule said ask, and the call was "refused" by the
+                 person asked, or nobody could be asked ("unavailable")
     """
     rule_id = classify(rule)
+    if approval == "refused":
+        return (
+            "The policy sends this call to a person, and it was refused there: the person said no, or did not "
+            "answer in time. That is the policy working as meant; change the rule only if such calls need no review."
+        )
+    if approval == "unavailable":
+        return (
+            "The policy sends this call to a person, and nobody could be asked: the proxy needs an approver "
+            "(--approve-with), and an approver that fails refuses. Set one up rather than allowing the call."
+        )
     argument = f" in argument {_name(matched_arg)}" if isinstance(matched_arg, str) else ""
     kind = rule_id.kind
 

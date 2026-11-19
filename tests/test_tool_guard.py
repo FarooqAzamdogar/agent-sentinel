@@ -91,7 +91,8 @@ class CheckingEveryCall(GuardTest):
     def test_with_on_block_return_the_model_gets_the_public_text(self):
         read_file = self.read_file_tool(on_block="return")
         text = read_file("../secret.txt")
-        self.assertRegex(text, r"^argument 'path' has a value the policy does not permit \(ref [0-9a-f]{8}\)$")
+        self.assertRegex(text, r"^Blocked by agent-sentinel: argument 'path' has a value the policy does not permit "
+                               r"\(ref [0-9a-f]{8}\)$")
         self.assertEqual(self.ran, [])
 
     def test_an_allowed_call_returns_the_result_itself_never_a_text_about_the_policy(self):
@@ -107,7 +108,8 @@ class CheckingEveryCall(GuardTest):
         self.assertIn("possible prompt injection", str(caught.exception))
         self.assertEqual(caught.exception.decision.rule, "injection")
         returned = guard(self.firewall, on_block="return")(search.__wrapped__)("x")
-        self.assertRegex(returned, r"^possible prompt injection; the content was withheld \(ref [0-9a-f]{8}\)$")
+        self.assertRegex(returned, r"^Blocked by agent-sentinel: possible prompt injection; the content was withheld "
+                                   r"\(ref [0-9a-f]{8}\)$")
 
     def test_the_text_of_an_error_the_tool_raises_is_scanned(self):
         @guard(self.firewall)

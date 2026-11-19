@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 import os
 import re
 import sys
@@ -122,6 +123,13 @@ MAX_ERROR_PARTS = 50
 # Calls waiting for finish_approval. A caller that never finishes them cannot grow
 # memory without bound: the oldest is forgotten (and refused if it is finished later).
 MAX_PENDING_APPROVALS = 1_000
+# How a Decision's reason says two states, written here only: callers that need the state read
+# Decision.pending and Decision.would_block, and strip these with the constants, never with copies.
+WAITING_FOR_APPROVAL = "; waiting for approval"  # the end of a pending decision's reason
+WOULD_BLOCK_PREFIX = "monitor mode, would block: "  # the start of the reason of a block monitor mode let through
+# Decision.approval, and "approval" in an audit record: how an "ask" ended that was not approved.
+APPROVAL_REFUSED = "refused"  # the person (or program) asked said no, or did not answer in time
+APPROVAL_UNAVAILABLE = "unavailable"  # nobody could be asked: no approver, or it failed
 # Tools whose MCP annotations are remembered. Past this, every unknown tool counts as untrusted and a sink.
 MAX_ANNOTATED_TOOLS = 10_000
 # A server name, as `proxy --name` accepts it: it is written into every audit record.
@@ -171,9 +179,19 @@ def new_call_id() -> str:
 
 
 def with_ref(text: str, ref: str) -> str:
-    """The text an agent is shown for a block: the public reason, then the reference."""
+    """The public reason of a block, then the reference."""
     suffix = f" (ref {ref})"
     return text if text.endswith(suffix) else text + suffix
+
+
+# What the agent reads for a block, wherever it reads it (the proxy, the Claude Code hook,
+# guard(on_block="return")): it must be plain that this is a refusal, not what the tool returned.
+BLOCKED_PREFIX = "Blocked by agent-sentinel: "
+
+
+def agent_text(public_reason: str) -> str:
+    """The text an agent is given for a block: "Blocked by agent-sentinel: <public reason> (ref ...)"."""
+    return BLOCKED_PREFIX + public_reason
 
 
 @dataclass(frozen=True)
@@ -191,6 +209,13 @@ class Decision:
     it is not allowed (so `bool(decision)` is False), and `finish_approval`
     gives the final answer. `redacted` names the kinds of secret that
     `check_result` replaced in a result (never the secrets themselves).
+    `approval` is set on a call the policy said "ask" for and that was not
+    approved: "refused" (the person or program asked said no, or did not
+    answer in time) or "unavailable" (nobody could be asked: no approver, or
+    it failed). The audit record carries it, so that `suggest` never takes a
+    refused ask for a gap in the policy. `would_block` is True on the
+    allowed decision monitor mode gives for what it would have blocked (its
+    reason starts with WOULD_BLOCK_PREFIX).
     """
 
     allowed: bool
@@ -203,6 +228,8 @@ class Decision:
     call_id: str | None = None  # shared by the audit records of one call
     pending: bool = False  # waiting for a human: see Firewall.check_call(defer_ask=True) and finish_approval
     redacted: tuple[str, ...] = ()  # kinds of secret replaced in a result, e.g. ("GitHub token",)
+    approval: str | None = None  # an "ask" that was not approved: APPROVAL_REFUSED or APPROVAL_UNAVAILABLE
+    would_block: bool = False  # monitor mode let through a call or result that would have been blocked
 
     def __post_init__(self) -> None:
         if self.pending and self.allowed:
@@ -272,6 +299,14 @@ class _RateLimiter:
 
 
 class Firewall:
+    """The firewall: checks calls against a policy, scans what tools return, and writes the audit log.
+
+    One Firewall is one session: its flow marks, rate-limit counts and
+    waiting approvals belong to it (unless session_store and rate_limiter
+    put them somewhere shared). Its methods may be called from several
+    threads.
+    """
+
     def __init__(
         self,
         policy: Policy,
@@ -285,6 +320,15 @@ class Firewall:
         rate_limiter: Any = None,
     ) -> None:
         """
+        policy:        the Policy that decides each call (Policy.from_file, or built in code).
+        audit_path:    the audit log, one JSON record per line, appended to (several
+                       processes may share it). None: nothing is logged.
+        approver:      asked about calls the policy says "ask" for, when check_call
+                       is not deferring them: (tool, args, reason) -> exactly True to
+                       approve; anything else, or an error, refuses. None: such calls
+                       are refused (see Approver above).
+        log_args:      write the call's arguments into the audit record (secrets
+                       redacted, oversized arguments left out). False leaves them out.
         monitor:       record what the policy and the detector WOULD block (audit
                        action "would_block") but allow it. For tuning a new policy;
                        it protects nothing. Calls and results that cannot be checked
@@ -320,7 +364,6 @@ class Firewall:
         self.session_id = session_id if session_id is not None else token_hex(8)
         self.session_store: SessionStore = session_store if session_store is not None else MemorySessionStore()
         self._limiter = rate_limiter if rate_limiter is not None else _RateLimiter()
-        self._audit_lock = threading.Lock()
         self._audit_failed = False
         # Guards the two collections below; each check takes it only briefly.
         self._state_lock = threading.Lock()
@@ -381,12 +424,12 @@ class Firewall:
             return decision
         return self._finish("call", tool, decision, args=args)
 
-    def finish_approval(self, decision: Decision, approved: bool, approver: str) -> Decision:
+    def finish_approval(self, decision: Decision, approved: bool, answered_by: str) -> Decision:
         """Turn a human's answer to a pending call into the final Decision, and log it.
 
         decision: the pending Decision that check_call(..., defer_ask=True) returned.
         approved: the answer. Only exactly True approves; anything else refuses.
-        approver: who or what answered, for the audit log, e.g. "dialog",
+        answered_by: who or what answered, for the audit log, e.g. "dialog",
                   "elicitation" or "timeout". Shortened and made printable.
 
         An approved call is allowed (rule: the rule that said ask). A refused one
@@ -403,7 +446,7 @@ class Firewall:
         """
         if not isinstance(decision, Decision) or not decision.pending:
             raise ValueError("finish_approval takes a pending Decision from check_call(..., defer_ask=True)")
-        who = printable(str(approver), limit=100)
+        who = printable(str(answered_by), limit=100)
         with self._state_lock:
             entry = self._pending_approvals.get(decision.call_id or "")
             if entry is not None and entry[0] is decision:
@@ -587,6 +630,10 @@ class Firewall:
         decision = Decision(False, reason, public_reason=public_reason, rule=rule, call_id=call_id)
         self._audit(event, tool, "block", decision, None)
         return decision
+
+    def shown_excerpt(self, excerpt: str) -> str:
+        """A finding's excerpt as a person may see it (the module's shown_excerpt), with this policy's secret guard."""
+        return shown_excerpt(excerpt, self._secret_guard())
 
     def withhold(self, tool: str, error: SessionStateError, call_id: str | None = None) -> Decision:
         """Record and return the refusal of a result whose flow marks could not be recorded.
@@ -782,7 +829,7 @@ class Firewall:
         if verdict.action == "ask":
             if defer_ask:
                 return Decision(
-                    False, f"{verdict.reason}; waiting for approval", public_reason=verdict.public,
+                    False, verdict.reason + WAITING_FOR_APPROVAL, public_reason=verdict.public,
                     rule=verdict.rule, matched_arg=verdict.matched_arg, call_id=call_id, pending=True,
                 )
             return self._ask_human(tool, args, verdict, call_id)
@@ -831,10 +878,13 @@ class Firewall:
         return self.policy.evaluate(tool, args, marks=self.session_marks(), extra_labels=self.tool_labels(tool))
 
     @staticmethod
-    def _refused_ask(verdict: Verdict, why: str, call_id: str | None) -> Decision:
+    def _refused_ask(
+        verdict: Verdict, why: str, call_id: str | None, approval: str = APPROVAL_UNAVAILABLE
+    ) -> Decision:
         # The rule is the one that said "ask": that is what the operator would change.
         return Decision(
-            False, f"{verdict.reason}; {why}", public_reason=verdict.public, rule=verdict.rule, call_id=call_id
+            False, f"{verdict.reason}; {why}", public_reason=verdict.public, rule=verdict.rule, call_id=call_id,
+            approval=approval,
         )
 
     def _ask_human(self, tool: str, args: dict[str, Any], verdict: Verdict, call_id: str) -> Decision:
@@ -851,13 +901,13 @@ class Firewall:
         if answer is True:  # exactly True: a truthy "no" or an un-awaited coroutine must not approve
             return Decision(True, f"{verdict.reason}; approved by a human", rule=verdict.rule, call_id=call_id)
         if answer is False:
-            return self._refused_ask(verdict, "rejected by a human", call_id)
+            return self._refused_ask(verdict, "rejected by a human", call_id, APPROVAL_REFUSED)
         return self._refused_ask(verdict, "the approver did not return True or False", call_id)
 
     # ---- internals: deferred approval -------------------------------------------
 
     def _remember_pending(self, decision: Decision, tool: str) -> None:
-        base = decision.reason[: -len("; waiting for approval")]
+        base = decision.reason[: -len(WAITING_FOR_APPROVAL)]
         with self._state_lock:
             self._pending_approvals[decision.call_id or ""] = (decision, tool, base)
             while len(self._pending_approvals) > MAX_PENDING_APPROVALS:
@@ -868,7 +918,7 @@ class Firewall:
     def _refused_approval(pending: Decision, reason: str) -> Decision:
         return Decision(
             False, reason, public_reason=pending.public_reason, rule=pending.rule, matched_arg=pending.matched_arg,
-            ref=pending.ref, call_id=pending.call_id,
+            ref=pending.ref, call_id=pending.call_id, approval=APPROVAL_REFUSED,
         )
 
     def _approved_unless_a_flow_blocks(self, pending: Decision, tool: str, base: str, who: str) -> Decision:
@@ -1050,10 +1100,10 @@ class Firewall:
         """Write the audit record and apply monitor mode."""
         if self.monitor and not decision.allowed:
             self._audit(event, tool, "would_block", decision, args)
-            reason = f"monitor mode, would block: {decision.reason}"
             return Decision(
-                True, reason, decision.findings, rule=decision.rule, matched_arg=decision.matched_arg,
-                call_id=decision.call_id, redacted=decision.redacted,
+                True, WOULD_BLOCK_PREFIX + decision.reason, decision.findings, rule=decision.rule,
+                matched_arg=decision.matched_arg, call_id=decision.call_id, redacted=decision.redacted,
+                would_block=True,
             )
         if log:
             self._audit(event, tool, "allow" if decision.allowed else "block", decision, args)
@@ -1079,18 +1129,24 @@ class Firewall:
         record["reason"] = decision.reason
         if decision.redacted:
             record["redacted"] = list(decision.redacted)
+        if decision.approval is not None:
+            record["approval"] = decision.approval
         if args is not None and self.log_args:
             record["args"] = args
         if decision.findings:
             guard = self._secret_guard()
-            record["findings"] = [dict(asdict(f), excerpt=_logged_excerpt(f.excerpt, guard)) for f in decision.findings]
+            record["findings"] = [dict(asdict(f), excerpt=shown_excerpt(f.excerpt, guard)) for f in decision.findings]
         try:
             _append_line(self.audit_path, _audit_line(record, self._secret_guard()))
         except OSError as exc:
             # A broken log must not stop the firewall from enforcing decisions.
             if not self._audit_failed:
                 self._audit_failed = True
-                print(f"agent-sentinel: cannot write audit log {self.audit_path}: {exc}", file=sys.stderr)
+                # Named like the proxy's own lines (agent-sentinel[NAME]:), so that in a client log with
+                # several proxies the line can be traced to its server; the path and error made printable.
+                who = f"agent-sentinel[{self.server_name}]" if self.server_name else "agent-sentinel"
+                print(f"{who}: cannot write audit log {printable(str(self.audit_path), limit=500)}: "
+                      f"{printable(exc, limit=500)}", file=sys.stderr)
 
 
 def _checked_call_id(call_id: Any) -> str:
@@ -1199,6 +1255,20 @@ def secret_rule(found: list[Found]) -> str:
     return RULE_SECRETS
 
 
+def shown_excerpt(excerpt: str, guard: SecretGuard | None = None) -> str:
+    """A detector finding's excerpt as a person may see it: in the audit log, or printed by scan, check, pins, explain.
+
+    An excerpt is a window of about 30 characters around a match, so it
+    often cuts a token in half, and redaction no longer recognises half a
+    token: long runs of letters and digits become "[...]", an excerpt that
+    may show a known value or canary is left out (_logged_excerpt), and what
+    is left is redacted. `guard` is the policy's (Firewall.shown_excerpt);
+    without one, the built-in formats only. Not made printable: callers do that.
+    """
+    guard = guard if guard is not None else SecretGuard()
+    return guard.redact(_logged_excerpt(excerpt, guard))
+
+
 def _logged_excerpt(excerpt: str, guard: SecretGuard) -> str:
     """A detector finding's excerpt as the audit log keeps it.
 
@@ -1235,7 +1305,31 @@ def _audit_line(record: dict[str, Any], guard: SecretGuard) -> str:
             record["args"] = f"[{size} characters of arguments not logged]"
         elif guard.find_in_texts(_call_spellings(None, args)):
             record["args"] = "[arguments not logged: they hold a secret split over several values]"
-    return _log_safe(json.dumps(record, ensure_ascii=False, default=lambda value: guard.redact(str(value))))
+
+    def written(value: dict[str, Any]) -> str:
+        # allow_nan=False: NaN and Infinity are not JSON, and a line with them is one that jq,
+        # a SIEM or `report` cannot read. A program can pass float("nan") as an argument.
+        return json.dumps(value, ensure_ascii=False, allow_nan=False, default=lambda found: guard.redact(str(found)))
+
+    try:
+        return _log_safe(written(record))
+    except ValueError:
+        if "args" in record:
+            record["args"] = "[arguments not logged: they hold NaN or Infinity, which JSON cannot hold]"
+        return _log_safe(written(_finite(record)))
+
+
+def _finite(value: Any, depth: int = 0) -> Any:
+    """A copy of a record's value in which NaN and Infinity are written as text ("nan", "inf")."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if depth > 20:
+        return value if isinstance(value, (str, int, float, bool)) or value is None else str(value)
+    if isinstance(value, dict):
+        return {key: _finite(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(item, depth + 1) for item in value]
+    return value
 
 
 def _log_safe(json_line: str) -> str:

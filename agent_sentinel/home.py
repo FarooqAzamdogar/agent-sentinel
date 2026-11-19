@@ -8,6 +8,7 @@
     <home>/audit.jsonl      the audit log that `wrap` gives every wrapped server
     <home>/pins/            one tool pins file per wrapped server
     <home>/hook-state/      the Claude Code hook's session state: flow marks and rate-limit counts
+    <home>/backups/         backups of configuration files in a project under version control (config_file.py)
 
 Why not %APPDATA% on Windows: Claude Desktop installed from the Microsoft
 Store (an MSIX package) sees a private copy of AppData. Files that a proxy

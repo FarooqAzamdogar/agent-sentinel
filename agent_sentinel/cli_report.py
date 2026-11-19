@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from . import auditlog, fix_hints
-from .auditlog import ACTIONS, BLOCK_ACTIONS, RecordFilter, field_text, text_of
+from .auditlog import BLOCK_ACTIONS, RECORD_ACTIONS, RecordFilter, field_text, text_of
 from .cli_common import EXIT_OK, CommandError, non_negative_int, print_field, shown_args
 from .textutil import printable
 
@@ -67,7 +67,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     choose.add_argument("--tool", metavar="GLOB", help="only these tools; '*' stands for anything ('read_*')")
     choose.add_argument("--server", action="append", default=[], metavar="NAME",
                         help="only records of this server (proxy --name); repeat for several")
-    choose.add_argument("--action", action="append", default=[], choices=ACTIONS,
+    choose.add_argument("--action", action="append", default=[], choices=RECORD_ACTIONS,
                         help="only records with this action; repeat for several")
     choose.add_argument("--event", action="append", default=[], metavar="EVENT",
                         help="only records of this kind: call, result, tool_description, ...; repeat for several")
@@ -189,7 +189,8 @@ def summarize(path: str, chosen: RecordFilter, by: str, last: int) -> Summary:
 
 def _action(record: dict[str, Any]) -> str:
     value = record.get("action")
-    return value if isinstance(value, str) and value in ACTIONS else "other"  # anything unexpected is still counted
+    # Anything unexpected is still counted, as "other".
+    return value if isinstance(value, str) and value in RECORD_ACTIONS else "other"
 
 
 def _count(summary: Summary, record: dict[str, Any]) -> None:

@@ -104,6 +104,14 @@ class AuditLog(unittest.TestCase):
             self.assertFalse(firewall.check_call("delete_file", {"path": "a.txt"}).allowed)
         self.assertEqual(stderr.getvalue().count("cannot write audit log"), 1)  # warns once, not per call
 
+    def test_the_unwritable_log_line_names_the_server_and_is_printable(self):
+        hostile = Path(self.tmp.name) / "missing\x1b[31m" / "audit.jsonl"
+        firewall = Firewall(POLICY, audit_path=hostile, server_name="github")
+        with contextlib.redirect_stderr(io.StringIO()) as stderr:
+            firewall.check_call("read_file", {"path": "a.txt"})
+        self.assertTrue(stderr.getvalue().startswith("agent-sentinel[github]: cannot write audit log "))
+        self.assertNotIn("\x1b", stderr.getvalue())
+
 
     def test_control_and_direction_characters_are_escaped_in_the_file(self):
         hostile = "evil\x9b2J‮ \x7ftool"

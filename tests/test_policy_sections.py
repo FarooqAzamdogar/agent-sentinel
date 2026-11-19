@@ -32,7 +32,7 @@ def load_error(data):
 
 class ClientRequests(unittest.TestCase):
     def test_without_the_section_every_method_is_allowed_as_before(self):
-        verdict = POLICY.client_request_action("completion/complete")
+        verdict = POLICY.client_request_verdict("completion/complete")
         self.assertEqual((verdict.action, verdict.rule), ("allow", None))
         self.assertIsNone(POLICY.client_requests)
         self.assertFalse(POLICY.checks_prompts)
@@ -41,28 +41,36 @@ class ClientRequests(unittest.TestCase):
         policy = Policy.from_dict({"client_requests": {
             "*": "allow", "completion/*": "block", "completion/complete": "allow", "logging/*": "block",
         }})
-        allowed = policy.client_request_action("completion/complete")
-        blocked = policy.client_request_action("logging/setLevel")
+        allowed = policy.client_request_verdict("completion/complete")
+        blocked = policy.client_request_verdict("logging/setLevel")
         self.assertEqual((allowed.action, allowed.rule), ("allow", "client_requests.completion/complete"))
         self.assertEqual((blocked.action, blocked.rule), ("block", "client_requests.logging/*"))
         self.assertEqual(blocked.public, NOT_PERMITTED)
-        self.assertEqual(policy.client_request_action("ping").rule, "client_requests.*")
+        self.assertEqual(policy.client_request_verdict("ping").rule, "client_requests.*")
 
     def test_a_method_no_rule_matches_is_allowed_and_names_no_rule(self):
         policy = Policy.from_dict({"client_requests": {"completion/complete": "block"}})
-        verdict = policy.client_request_action("ping")
+        verdict = policy.client_request_verdict("ping")
         self.assertEqual((verdict.action, verdict.rule, verdict.public), ("allow", None, PERMITTED))
 
     def test_calls_are_left_to_the_tools_rules(self):
         policy = Policy.from_dict({"client_requests": {"*": "block"}})
         for method in ("tools/call", "resources/read", "resources/subscribe"):
             with self.subTest(method=method):
-                self.assertEqual(policy.client_request_action(method).action, "allow")
+                self.assertEqual(policy.client_request_verdict(method).action, "allow")
         self.assertIn("decided by the tools rules", load_error({"client_requests": {"tools/call": "block"}}))
 
     def test_a_method_that_is_not_text_is_blocked_as_malformed(self):
-        verdict = POLICY.client_request_action(None)
+        verdict = POLICY.client_request_verdict(None)
         self.assertEqual((verdict.action, verdict.rule), ("block", "malformed"))
+
+    def test_the_action_is_a_word_as_for_server_requests(self):
+        # Comparing a Verdict with "block" is always False, so a name that suggests a word must return one.
+        policy = Policy.from_dict({"client_requests": {"completion/complete": "block"},
+                                   "server_requests": {"sampling/createMessage": "block"}})
+        self.assertEqual(policy.client_request_action("completion/complete"), "block")
+        self.assertEqual(policy.client_request_action("ping"), "allow")
+        self.assertEqual(policy.server_request_action("sampling/createMessage"), "block")
 
     def test_mistakes_are_errors(self):
         cases = {

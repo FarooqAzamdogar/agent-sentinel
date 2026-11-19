@@ -148,5 +148,19 @@ class Version(unittest.TestCase):
         self.assertIn(__version__.encode(), cli("--version").stdout)
 
 
+
+class PrintingAServerCommand(unittest.TestCase):
+    def test_every_command_prints_a_server_command_the_same_way_with_tokens_redacted(self):
+        from agent_sentinel import proxy_report
+        from agent_sentinel.cli_common import shown_command
+        token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        words = ["npx", "-y", "@acme/server", "--token", token]
+        for shown in (shown_command(words), proxy_report.shown_server_command(words)):
+            with self.subTest(shown=shown):
+                self.assertNotIn(token, shown)
+                self.assertIn("[redacted GitHub token]", shown)
+                self.assertTrue(shown.startswith("npx -y @acme/server --token"))
+
+
 if __name__ == "__main__":
     unittest.main()

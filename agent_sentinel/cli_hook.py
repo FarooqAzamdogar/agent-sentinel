@@ -43,7 +43,7 @@ from .firewall import new_ref
 from .leaks import redact_value
 from .policy import Policy
 from .textutil import printable
-from .wrapping import ISOLATED_MODULE, PLAIN_MODULE, PythonCheck
+from .wrapping import ISOLATED_MODULE, PACKAGE, PLAIN_MODULE, PythonCheck
 
 HELP = "enforce the policy inside Claude Code through its hooks (hook claude-code, hook install claude-code)"
 DESCRIPTION = (
@@ -266,7 +266,9 @@ def is_our_handler(handler: Any) -> bool:
     names = [re.split(r"[\\/]", word)[-1].lower() for word in words if isinstance(word, str)]
     for index in range(len(names) - 1):
         if names[index] == "hook" and names[index + 1] == "claude-code":
-            return any(name.split(".")[0] in ("agent_sentinel", "agent-sentinel") for name in names[:index])
+            # The same names as a wrapped proxy entry (wrapping.PACKAGE): the script, the module, or a
+            # package with its version, as uvx and pipx run it ("agent-sentinel@0.5.0", "agent-sentinel==0.5.0").
+            return any(PACKAGE.fullmatch(name) or name.split(".")[0] == "agent_sentinel" for name in names[:index])
     return False
 
 

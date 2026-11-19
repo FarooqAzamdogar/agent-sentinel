@@ -561,7 +561,9 @@ class ElicitationApprover:
         return Answer(False, "an answer the proxy cannot read")
 
 
-Approver = Union[DialogApprover, CommandApprover, ElicitationApprover]
+# One of the proxy's ways to ask a person (--approve-with). Not firewall.Approver, which is the
+# callable a library user gives a Firewall.
+ApprovalBackend = Union[DialogApprover, CommandApprover, ElicitationApprover]
 
 
 def declares_form_elicitation(capabilities: Any) -> bool:
@@ -576,7 +578,7 @@ def declares_form_elicitation(capabilities: Any) -> bool:
     return not elicitation or isinstance(elicitation.get("form"), dict)
 
 
-def parse_backend(text: str, resolve: Callable[[str], str | None]) -> Approver:
+def parse_backend(text: str, resolve: Callable[[str], str | None]) -> ApprovalBackend:
     """Read one --approve-with value: "dialog", "elicitation" or "command:<program>".
 
     resolve: finds a program named without a folder on PATH (never in the

@@ -13,7 +13,10 @@ What it will not do, by design:
 
   * loosen a block that has a reason: a deny rule, an allow rule, a tool rule
     that says block, the secret guard, the injection detector, quarantine, a
-    flow rule, a rate limit. Those are listed for review by hand;
+    flow rule, a rate limit, or an "ask" that a person refused or that nobody
+    could be asked about (the record's "approval"). Those are listed for
+    review by hand. With a default of "ask" nothing is proposed at all: any
+    rule for a tool without one would take the person out of the loop;
   * propose a wildcard, or invent an argument rule. Tool names come from the
     log, where the agent or the server chose them, so only plain names
     (letters, digits, "_", ".", "-"; at most 128) become rules, written exactly.
@@ -166,6 +169,10 @@ def run(args: argparse.Namespace) -> int:
     if policy.default == "allow":
         proposed = []
         print('\nThe policy\'s default is "allow" now, so these tools need no rule to be called.')
+    elif policy.default == "ask" and proposed:
+        proposed = []
+        print('\nThe policy\'s default is "ask": a call without a rule goes to a person, and suggest never turns that '
+              'into "allow". Write a rule by hand for a tool that needs no review.')
     _print_proposed(proposed, log)
     _print_left_out(left_out, log.unnamed)
     _print_held(log)
@@ -210,7 +217,7 @@ def read_log(path: str, servers: tuple[str, ...] = ()) -> _Log:
         if event != "call":
             continue
         log.calls_blocked += 1
-        if fix_hints.classify(record.get("rule")).kind != "default":
+        if fix_hints.classify(record.get("rule")).kind != "default" or "approval" in record:
             _add_held(log, record)
         elif tool is None:
             log.unnamed += 1
@@ -231,6 +238,8 @@ def _add_default_block(log: _Log, tool: str, record: dict[str, Any]) -> None:
 
 def _add_held(log: _Log, record: dict[str, Any]) -> None:
     rule = field_text(record, "rule", 200) if "rule" in record else "(no rule named)"
+    if "approval" in record:  # an "ask": the person asked said no, or nobody could be asked
+        rule += f" (ask, {field_text(record, 'approval', 20)})"
     if rule not in log.held and len(log.held) >= MAX_TOOLS:
         rule = "(other rules)"
     log.held[rule] += 1

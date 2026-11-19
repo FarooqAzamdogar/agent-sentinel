@@ -233,10 +233,12 @@ class FileStore(FileStoreSetup):
     def test_marks_that_cannot_be_written_raise(self):
         store = self.store()
         store.begin()
-        with mock.patch.object(Path, "write_bytes", side_effect=PermissionError("read-only")):
+        with mock.patch("agent_sentinel.filelock.os.replace", side_effect=PermissionError("read-only")), \
+                mock.patch("agent_sentinel.filelock.time.sleep"):
             with self.assertRaises(SessionStateError):
                 store.add(["untrusted"], "fetch_page")
         self.assertEqual(self.store().read().labels, frozenset())  # the old file is intact
+        self.assertEqual([path.name for path in store.path.parent.iterdir() if path.suffix == ".tmp"], [])
 
     def test_begin_reports_a_folder_that_cannot_be_made(self):
         blocker = Path(self.tmp.name) / "a_file"

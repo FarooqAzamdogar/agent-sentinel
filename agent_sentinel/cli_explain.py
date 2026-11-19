@@ -36,7 +36,7 @@ from .cli_common import (
     print_field,
     shown_args,
 )
-from .leaks import redact
+from .firewall import shown_excerpt
 from .policy import Policy
 from .policy_errors import quoted
 from .textutil import printable
@@ -177,9 +177,10 @@ def explain_record(record: dict[str, Any], policy: Policy | None) -> None:
         _print_policy_now(record, policy)
     # Not for an "ask" record: the call was still waiting; the answer has a record of its own.
     if action in ("block", "would_block"):
+        approval = text_of(record, "approval") or ("refused" if record.get("event") == "approval" else None)
         hint = fix_hints.fix_hint(
             rule, tool=text_of(record, "tool"), matched_arg=text_of(record, "matched_arg"),
-            args=record.get("args"), policy=policy,
+            args=record.get("args"), policy=policy, approval=approval,
         )
         print_field("to allow", hint)
 
@@ -191,7 +192,7 @@ def _print_findings(record: dict[str, Any]) -> None:
     readable = [finding for finding in findings[:MAX_FINDINGS_SHOWN] if isinstance(finding, dict)]
     for number, finding in enumerate(readable):
         severity = printable(finding.get("severity", "?"), limit=10).upper()
-        excerpt = printable(redact(str(finding.get("excerpt", ""))), limit=200)
+        excerpt = printable(shown_excerpt(str(finding.get("excerpt", ""))), limit=200)
         rule = printable(finding.get("rule", "?"), limit=60)
         print_field("findings" if number == 0 else "", f"[{severity:6}] {rule}: {excerpt}")
     if len(findings) > MAX_FINDINGS_SHOWN:

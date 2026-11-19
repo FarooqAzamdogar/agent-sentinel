@@ -140,6 +140,30 @@ class Suggesting(TempFolderTest):
         self.assertIn("files_tool", out)
         self.assertNotIn("mail_tool", out)
 
+    def test_an_ask_that_was_refused_or_could_not_be_asked_is_never_turned_into_allow(self):
+        # A firewall with default "ask" logs a refused ask as a block by rule "default".
+        audit = self.folder / "real.jsonl"
+        refusing = Firewall(Policy.from_dict({"default": "ask"}), audit_path=audit, approver=lambda *_: False)
+        refusing.check_call("delete_repository", {"repo": "acme/prod"})
+        Firewall(Policy.from_dict({"default": "ask"}), audit_path=audit).check_call("drop_table", {})
+        records = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([record.get("approval") for record in records], ["refused", "unavailable"])
+        out = self.suggest(records)  # judged against a policy whose default is "block"
+        self.assertIn("Nothing to suggest", out)
+        held = out.split("Blocked for a reason")[1]
+        self.assertIn("default (ask, refused)  (delete_repository)", held)
+        self.assertIn("default (ask, unavailable)  (drop_table)", held)
+        self.assertNotIn("+    ", out)
+
+    def test_a_policy_whose_default_is_ask_gets_no_rules_proposed(self):
+        self.policy = self.write("ask.json", {"default": "ask"})
+        for action in ("allow", "ask"):
+            with self.subTest(action=action):
+                out = self.suggest([call("delete_repository")], "--as", action)
+                self.assertIn('default is "ask"', out)
+                self.assertIn("Nothing to suggest", out)
+                self.assertNotIn("+    ", out)
+
     def test_a_policy_whose_default_is_allow_needs_no_rules(self):
         self.policy = self.write("allow.json", {"default": "allow"})
         out = self.suggest([call("x")])

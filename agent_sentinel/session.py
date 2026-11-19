@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import threading
 import time
@@ -55,7 +54,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Iterator, Mapping
 
-from .filelock import locked
+from . import jsonutil
+from .filelock import locked, replace_file
 
 UNTRUSTED = "untrusted"
 PRIVATE = "private"
@@ -76,11 +76,6 @@ MAX_STATE_FILE_BYTES = 256 * 1024
 FILE_FORMAT = "agent-sentinel-session"
 FILE_VERSION = 1
 LOCK_FILE_NAME = "sessions.lock"
-
-# os.replace can fail on Windows while another program (a virus scanner, an
-# indexer) has the file open for a moment. Retried this many times.
-_REPLACE_ATTEMPTS = 5
-_REPLACE_PAUSE_SECONDS = 0.05
 
 _MISSING = "the session file is missing (the session was never begun, or it was deleted)"
 
@@ -358,7 +353,7 @@ class FileSessionStore(SessionStore):
     def _parse(self, data: bytes) -> tuple[str | None, dict[str, Mark]]:
         """Read the file's bytes. Returns (what is wrong, or None; the marks)."""
         try:
-            document = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_keys)
+            document = jsonutil.loads(data.decode("utf-8"))
         except (ValueError, RecursionError):  # includes UnicodeDecodeError and a repeated key
             return "not JSON", {}
         if not isinstance(document, dict) or set(document) != {"format", "version", "session", "started", "marks"}:
@@ -390,17 +385,7 @@ class FileSessionStore(SessionStore):
             "marks": {label: {"tool": mark.tool, "time": mark.time} for label, mark in marks.items()},
         }
         # ensure_ascii: a tool name with a lone surrogate must not stop the file from being written.
-        data = json.dumps(document, ensure_ascii=True, indent=1).encode("ascii")
-        temporary = self.path.with_name(self.path.name + ".tmp")
-        temporary.write_bytes(data)
-        for attempt in range(_REPLACE_ATTEMPTS):
-            try:
-                os.replace(temporary, self.path)
-                return
-            except PermissionError:
-                if attempt == _REPLACE_ATTEMPTS - 1:
-                    raise
-                time.sleep(_REPLACE_PAUSE_SECONDS)
+        replace_file(self.path, json.dumps(document, ensure_ascii=True, indent=1).encode("ascii"))
 
 
 def _valid_cause(cause: Any) -> bool:
@@ -411,11 +396,3 @@ def _valid_cause(cause: Any) -> bool:
     )
 
 
-def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """A JSON object in which no key repeats (a repeated key would hide one of two values)."""
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("repeated key")
-        result[key] = value
-    return result

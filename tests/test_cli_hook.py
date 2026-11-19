@@ -220,6 +220,10 @@ class RecognisingOurEntries(InstallTest):
             {"type": "command", "command": "python -m agent_sentinel hook claude-code --policy p.json"},
             {"type": "command", "command": "C:\\py\\Scripts\\agent-sentinel.exe", "args": ["hook", "claude-code"]},
             {"type": "command", "command": "/usr/bin/agent-sentinel", "args": ["hook", "claude-code"]},
+            {"type": "command", "command": "uvx agent-sentinel@0.5.0 hook claude-code --policy p"},
+            {"type": "command", "command": "uvx", "args": ["agent-sentinel==0.5.0", "hook", "claude-code"]},
+            {"type": "command", "command": "pipx run agent-sentinel hook claude-code"},
+            {"type": "command", "command": "python -m agent_sentinel.__main__ hook claude-code"},
         )
         others = (
             {"type": "command", "command": "/usr/local/bin/my-check"},

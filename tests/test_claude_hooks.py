@@ -400,6 +400,7 @@ class FailingClosed(HookTest):
             ("a number as event name", b'{"hook_event_name": 5}'),
             ("a repeated key", b'{"hook_event_name": "PreToolUse", "hook_event_name": "Stop"}'),
             ("NaN", b'{"hook_event_name": "PostToolUse", "x": NaN}'),
+            ("a number too large to be one", b'{"hook_event_name": "PreToolUse", "tool_name": "Bash", "x": 1e999}'),
             ("not UTF-8", b'{"hook_event_name": "\xff"}'),
             ("deep nesting", b"[" * 100_000 + b"]" * 100_000),
             ("a huge number", b'{"x": ' + b"9" * 5000 + b"}"),
@@ -544,6 +545,11 @@ class ClaudeAgentSdkCallbacks(TempFolderTest):
 
     def records(self):
         return [json.loads(line) for line in self.audit.read_text(encoding="utf-8").splitlines()]
+
+    def test_anything_but_a_firewall_is_refused_at_once(self):
+        for wrong in (Policy.from_dict(HOOK_POLICY), None, "policy.json"):
+            with self.subTest(wrong=type(wrong).__name__), self.assertRaisesRegex(TypeError, "needs a Firewall"):
+                claude_sdk_hooks(wrong)
 
     def test_there_is_an_async_callback_for_each_tool_event(self):
         self.assertEqual(set(self.hooks), {"PreToolUse", "PostToolUse", "PostToolUseFailure"})

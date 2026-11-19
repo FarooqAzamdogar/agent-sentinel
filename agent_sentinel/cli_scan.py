@@ -28,10 +28,11 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass, field
+from typing import Callable
 
 from .cli_common import EXIT_ERROR, EXIT_FAIL, EXIT_OK, CommandError, load_policy, read_input, readings
 from .detector import METADATA, RESULT, SEVERITY_ORDER, Finding, scan_views
-from .leaks import redact
+from .firewall import Firewall, shown_excerpt
 from .policy import Policy
 from .textutil import printable, without_field_breaks
 
@@ -74,6 +75,7 @@ class _Threshold:
     severity: str | None  # None: the policy blocks no content
     source: str  # "policy", "fail-on" or "default"
     label: str  # for the verdict line
+    policy: Policy | None = None  # with --policy: its secret guard also masks the excerpts
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -101,10 +103,11 @@ def run(args: argparse.Namespace) -> int:
         return EXIT_ERROR
     scanned = [_scan_one(name, PROFILES[args.read_as]) for name in names]
     blocked = [item for item in scanned if _reaches(item.findings, threshold.severity)]
+    show = Firewall(threshold.policy).shown_excerpt if threshold.policy is not None else shown_excerpt
     if args.format == "json":
-        _print_json(scanned, blocked, threshold)
+        _print_json(scanned, blocked, threshold, show)
     else:
-        _print_text(scanned, blocked, threshold)
+        _print_text(scanned, blocked, threshold, show)
 
     if any(item.error for item in scanned):
         return EXIT_ERROR
@@ -121,7 +124,7 @@ def _threshold(args: argparse.Namespace) -> _Threshold | None:
             return None
         severity = policy.block_severity
         label = f"block_severity={severity}" if severity else "this policy blocks no content (block_severity null)"
-        return _Threshold(severity, "policy", label)
+        return _Threshold(severity, "policy", label, policy)
     if args.fail_on is not None:
         return _Threshold(args.fail_on, "fail-on", f"--fail-on {args.fail_on}")
     return _Threshold(DEFAULT_THRESHOLD, "default", f"the default block_severity={DEFAULT_THRESHOLD}")
@@ -143,12 +146,14 @@ def _reaches(findings: list[Finding], severity: str | None) -> bool:
     return any(SEVERITY_ORDER[finding.severity] >= SEVERITY_ORDER[severity] for finding in findings)
 
 
-def _excerpt(finding: Finding) -> str:
-    # Excerpts end up in CI logs and terminals: secrets are redacted, control codes escaped.
-    return printable(redact(finding.excerpt), limit=200)
+def _excerpt(finding: Finding, show: Callable[[str], str]) -> str:
+    # Excerpts end up in CI logs and terminals: secrets masked as in the audit log (even half a
+    # token, cut by the excerpt's edge), control codes escaped.
+    return printable(show(finding.excerpt), limit=200)
 
 
-def _print_text(scanned: list[_Scanned], blocked: list[_Scanned], threshold: _Threshold) -> None:
+def _print_text(scanned: list[_Scanned], blocked: list[_Scanned], threshold: _Threshold,
+                show: Callable[[str], str]) -> None:
     single = len(scanned) == 1
     for item in scanned:
         if item.error:
@@ -160,7 +165,7 @@ def _print_text(scanned: list[_Scanned], blocked: list[_Scanned], threshold: _Th
             print(_CLEAN)
         for finding in item.findings:
             indent = "" if single else "  "
-            print(f"{indent}[{finding.severity.upper():6}] {finding.rule}: {_excerpt(finding)}")
+            print(f"{indent}[{finding.severity.upper():6}] {finding.rule}: {_excerpt(finding, show)}")
     print(_verdict(scanned, blocked, threshold))
 
 
@@ -178,13 +183,14 @@ def _verdict(scanned: list[_Scanned], blocked: list[_Scanned], threshold: _Thres
     return f"Verdict: would pass ({threshold.label}); nothing found{unread}"
 
 
-def _print_json(scanned: list[_Scanned], blocked: list[_Scanned], threshold: _Threshold) -> None:
+def _print_json(scanned: list[_Scanned], blocked: list[_Scanned], threshold: _Threshold,
+                show: Callable[[str], str]) -> None:
     files = []
     for item in scanned:
         files.append({
             "file": printable(item.name, limit=500),
             "findings": [
-                {"rule": f.rule, "severity": f.severity, "excerpt": _excerpt(f)} for f in item.findings
+                {"rule": f.rule, "severity": f.severity, "excerpt": _excerpt(f, show)} for f in item.findings
             ],
             "blocked": _reaches(item.findings, threshold.severity),
             "error": printable(item.error, limit=500) if item.error else None,

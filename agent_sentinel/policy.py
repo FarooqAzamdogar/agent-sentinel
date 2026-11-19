@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence, TypeVar
 
-from . import matchers
+from . import jsonutil, matchers
 from .detector import SEVERITY_ORDER
 from .matchers import Matcher, PathMatcher, PatternMatcher, decoded_spellings
 from .policy_errors import (
@@ -97,6 +97,7 @@ RULE_MALFORMED = "malformed"  # a call or message whose shape cannot be checked
 RULE_QUARANTINE = "quarantine"  # a tool removed from the tool list, or one that cannot be vouched for yet
 RULE_CALLER = "caller"  # Firewall.block() called by the program that uses the firewall
 RULE_SESSION = "session"  # a result withheld because the session's marks could not be recorded (see session.py)
+RULE_HOOK_FAILED = "hook_failed"  # the Claude Code hook could not finish its checks (claude_hooks.py)
 # Fixed ids for the parts of the secret guard, for code that wants to say which part refused
 # (RULE_SECRETS stays the id for the guard as a whole). A custom format is "secrets.patterns[<i>]".
 RULE_SECRETS_IN_RESULTS = "secrets.in_results"
@@ -164,6 +165,16 @@ def limit_rule(bucket: str) -> str:
 
 
 # ---- names with wildcards -----------------------------------------------------
+
+def glob_matches(pattern: str, text: str) -> bool:
+    """True if `text` matches `pattern`, in which only "*" is special (anything, or nothing). Case matters.
+
+    The rule for tool names in a policy, for code that matches a name once
+    (auditlog's --tool filter). A rule splits its name once instead and calls
+    _glob_matches with the pieces.
+    """
+    return _glob_matches(tuple(pattern.split("*")), text)
+
 
 def _glob_matches(pieces: tuple[str, ...], text: str) -> bool:
     """True if `text` is the pieces in order, with anything (or nothing) where each "*" stood.
@@ -372,7 +383,7 @@ class Policy:
                                      refused. Never print them: an agent that learns one can strip it.
     secrets_patterns                 custom secret formats (SecretPattern), with a compiled `regex` each.
     client_requests                  None when the section is absent; otherwise its rules (may be empty).
-                                     See client_request_action and checks_prompts.
+                                     See client_request_verdict and checks_prompts.
     flows                            flow rules (FlowRule); see flow_verdict and session.py.
     classify_by_annotations          whether MCP tool annotations may add flow labels (default true).
     hide_blocked_tools               whether the proxy hides tools that tool_level_action says "block"
@@ -459,12 +470,12 @@ class Policy:
         except UnicodeDecodeError as exc:
             raise PolicyError(unicode_error_message(label, exc)) from exc
         try:
-            data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
-        except PolicyError as exc:  # a repeated key: say so, instead of "not valid JSON"
-            raise PolicyError(f"{label}: {exc}") from exc
+            data = jsonutil.loads(text)  # json.loads keeps the last of two equal keys without a word
+        except jsonutil.RepeatedKeyError as exc:  # say so, instead of "not valid JSON"
+            raise PolicyError(f"{label}: duplicate key {exc.key!r}: a key may appear only once in an object") from exc
         except json.JSONDecodeError as exc:
             raise PolicyError(json_error_message(label, exc)) from exc
-        except (ValueError, RecursionError) as exc:  # absurd nesting, or a number Python cannot hold
+        except (ValueError, RecursionError) as exc:  # absurd nesting, a huge number, NaN or Infinity
             raise PolicyError(f"{label}: not valid JSON ({exc})") from exc
         try:
             return cls.from_dict(data)
@@ -604,7 +615,7 @@ class Policy:
         """Return "allow" or "block" for a request the server sends to the client (see server_request_verdict)."""
         return self.server_request_verdict(method).action
 
-    def client_request_action(self, method: str) -> Verdict:
+    def client_request_verdict(self, method: str) -> Verdict:
         """Decide whether the client may send the server a request or notification with this method.
 
         The "client_requests" section, which mirrors "server_requests": an
@@ -627,6 +638,10 @@ class Policy:
             return Verdict("allow", f"{method} is decided by the tools rules, not client_requests", PERMITTED)
         return _method_verdict(self.client_requests or (), method, "client_requests")
 
+    def client_request_action(self, method: str) -> str:
+        """Return "allow" or "block" for a request the client sends to the server (see client_request_verdict)."""
+        return self.client_request_verdict(method).action
+
     @property
     def checks_prompts(self) -> bool:
         """Whether prompts/get must be checked like a tool call named "prompts/get".
@@ -638,7 +653,7 @@ class Policy:
         judged like any call: deny_args, the secret guard, the tools rules
         (wildcards included), the default, rate limits and flows.
 
-        The proxy checks it after client_request_action, as
+        The proxy checks it after client_request_verdict, as
         `firewall.check_call("prompts/get", {"name": <prompt name>, "arguments": <its arguments, or {}>})`,
         so a policy can allow prompts by name ({"arg": "name", "one_of": [...]})
         and deny values in any argument ("arg": "*").
@@ -760,6 +775,8 @@ class Policy:
                              "after it was first seen, or its list could not be checked)",
             RULE_CALLER: "the program that uses the firewall blocked it (Firewall.block)",
             RULE_SESSION: "the session state of the flow rules could not be recorded, so the result was withheld",
+            RULE_HOOK_FAILED: "the Claude Code hook could not finish its checks (a policy that does not load, or "
+                              "session state that cannot be used), so it refused",
         }
         if rule_id in fixed:
             return fixed[rule_id]
@@ -970,7 +987,9 @@ def _scalar_text(value: Any) -> str | None:
 # A position as rule ids write it: "[0]", "[12]". No leading zeros, so each entry
 # has one id; at most nine digits, so a hostile id cannot make int() do much work
 # (or fail: Python refuses to read a number of more than 4300 digits).
-_INDEX = r"\[(0|[1-9][0-9]{0,8})\]"
+# A position in a rule id, "[3]": no leading zeros, at most nine digits. Shared with fix_hints.
+RULE_INDEX = r"\[(0|[1-9][0-9]{0,8})\]"
+_INDEX = RULE_INDEX
 
 
 def _entry(entries: tuple[Any, ...], index: str) -> Any:
@@ -1117,10 +1136,10 @@ def _client_request_warnings(policy: Policy) -> list[str]:
     found = []
     if policy.client_requests is not None:
         for method in ("initialize", "notifications/initialized"):
-            if policy.client_request_action(method).action == "block":
+            if policy.client_request_action(method) == "block":
                 found.append(f"client_requests blocks '{method}', so no client can connect")
     prompts_reach_the_policy = (
-        policy.checks_prompts and policy.client_request_action(PROMPTS_GET).action == "allow"
+        policy.checks_prompts and policy.client_request_action(PROMPTS_GET) == "allow"
     )
     if prompts_reach_the_policy and not _deciding_rules(policy.tools, PROMPTS_GET) and policy.default != "allow":
         found.append(
@@ -1146,21 +1165,6 @@ def known_value_warnings(policy: Policy) -> list[str]:
 
 
 # ---- validation helpers -------------------------------------------------------
-
-def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """Build one JSON object, refusing a key that appears twice.
-
-    json.loads keeps the last of two equal keys without a word, so a second
-    "run_shell": "allow" further down a long file would replace the block
-    above it.
-    """
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise PolicyError(f"duplicate key {key!r}: a key may appear only once in an object")
-        result[key] = value
-    return result
-
 
 def _tool_rule(name: Any, spec: Any) -> ToolRule:
     _expect_name(name, "tool name")

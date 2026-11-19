@@ -1,6 +1,8 @@
 """`agent-sentinel test POLICY CASES.json`: a policy's test cases (agent_sentinel/cli_test.py)."""
 
+import os
 import unittest
+from unittest import mock
 
 from cli_support import TempFolderTest, run_cli
 from support import EXAMPLE_POLICY_PATH, INJECTION
@@ -172,6 +174,42 @@ class StrictLoading(TempFolderTest):
                 self.assertEqual(code, 2)
                 self.assertIn("must be a relative path to a file in the case file's folder", err)
                 self.assertNotIn("PASS", out)
+
+    def test_a_scan_file_on_another_machine_is_refused_before_any_path_is_looked_at(self):
+        # On Windows, resolving \\server\share\x signs in to that server: the text alone must refuse it.
+        looked_at = []
+
+        def spy(name):
+            real = getattr(os.path, name)
+
+            def wrapper(path, *args, **kwargs):
+                looked_at.append(str(path))
+                return real(path, *args, **kwargs)
+            return mock.patch.object(os.path, name, wrapper)
+
+        for spec in ("\\\\attacker.invalid\\share\\page.html", "//attacker.invalid/share/page.html",
+                     "\\\\?\\UNC\\attacker.invalid\\share\\x", "C:page.html", "C:/page.html", "/page.html"):
+            looked_at.clear()
+            with self.subTest(spec=spec), spy("realpath"), spy("islink"), spy("exists"), spy("isfile"):
+                error = self.load_error({"cases": [{"scan_file": spec, "expect": "pass"}]})
+                self.assertIn("must be a relative path to a file in the case file's folder", error)
+                self.assertFalse([path for path in looked_at if "attacker" in path or "page.html" in path],
+                                 looked_at)
+
+    def test_a_scan_file_reached_through_a_link_is_refused(self):
+        (self.folder / "cases").mkdir()
+        outside = self.write("outside.txt", "Lentil soup.")
+        try:
+            os.symlink(outside, self.folder / "cases" / "link.txt")
+            os.symlink(self.folder, self.folder / "cases" / "linked-folder", target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("this system does not let the tests make links")
+        for spec in ("link.txt", "linked-folder/outside.txt"):
+            with self.subTest(spec=spec):
+                cases = self.write("cases/cases.json", {"cases": [{"scan_file": spec, "expect": "pass"}]})
+                code, out, err = run_cli("test", EXAMPLE, cases)
+                self.assertEqual(code, 2)
+                self.assertIn("without links", err)
 
     def test_a_scan_file_that_cannot_be_read_stops_the_run(self):
         self.assertIn("cannot read", self.load_error({"cases": [{"scan_file": "missing.txt", "expect": "pass"}]}))

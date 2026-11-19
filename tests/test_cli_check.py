@@ -34,7 +34,8 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("verdict:     BLOCK", out)
         self.assertIn("tools.send_email.allow_args[0], argument 'to'", out)
-        self.assertIn("agent sees:  argument 'to' has a value the policy does not permit (ref <random>)", out)
+        self.assertIn("agent sees:  Blocked by agent-sentinel: argument 'to' has a value the policy does not permit "
+                      "(ref <random>)", out)
         self.assertIn("to allow:", out)
         self.assertIn("WHOLE value", out)
 
@@ -48,7 +49,7 @@ class Verdicts(unittest.TestCase):
         code, out, _ = check(EXAMPLE, "send_email", "to=bob@example.com", "--proxy")
         self.assertEqual(code, 1)
         self.assertIn("BLOCK (the rule says ask", out)
-        self.assertIn(f"agent sees:  {NOT_PERMITTED} (ref <random>)", out)
+        self.assertIn(f"agent sees:  Blocked by agent-sentinel: {NOT_PERMITTED} (ref <random>)", out)
 
     def test_the_default_is_named_and_the_agent_is_not_told_it(self):
         code, out, _ = check(EXAMPLE, "unknown_tool")
@@ -127,7 +128,7 @@ class Marks(TempFolderTest):
         code, out, _ = check(self.policy, "send_email", "to=a@example.com", "--marks", "untrusted")
         self.assertEqual(code, 1, out)
         self.assertIn("rule:        flows[0]", out)
-        self.assertIn(f"agent sees:  {NOT_PERMITTED}", out)
+        self.assertIn(f"agent sees:  Blocked by agent-sentinel: {NOT_PERMITTED}", out)
 
     def test_without_marks_the_call_is_checked_as_the_first_of_a_session(self):
         code, out, _ = check(self.policy, "send_email", "to=a@example.com")

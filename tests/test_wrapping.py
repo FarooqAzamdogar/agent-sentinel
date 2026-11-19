@@ -176,6 +176,82 @@ class ReadingTheProxyCommand(unittest.TestCase):
     def test_the_launcher_is_looked_for_only_near_the_start(self):
         words = ["x"] * 20 + ["agent-sentinel", "proxy", "--", "y"]
         self.assertIsNone(read_proxy_command(words))
+        self.assertFalse(wrapping.mentions_proxy(words))
+
+    def test_only_the_known_launcher_shapes_start_the_proxy(self):
+        for launcher in (["agent-sentinel"], [r"C:\Py\Scripts\agent-sentinel.exe"], ["agent_sentinel.cmd"],
+                         ["python", "-m", "agent_sentinel"], ["/usr/bin/python3.12", "-I", "-m", "agent_sentinel"],
+                         ["py", "-3.12", "-X", "utf8", "-IB", "-m", "agent_sentinel"],
+                         [r"C:\venv\Scripts\pythonw.exe", "-m", "agent_sentinel"],
+                         ["uvx", "agent-sentinel@0.5.0"], ["uvx.exe", "agent-sentinel==0.5.0"],
+                         ["uvx", "--from", "agent-sentinel==0.5.0", "agent-sentinel"],
+                         ["uv", "tool", "run", "agent-sentinel"],
+                         ["pipx", "run", "--spec", "agent-sentinel", "agent-sentinel"]):
+            with self.subTest(launcher=launcher):
+                found = read_proxy_command([*launcher, "proxy", "--policy", "p.json", "--", "server"])
+                self.assertEqual(found.launcher, [*launcher, "proxy"])
+                self.assertEqual(found.server, ["server"])
+
+    def test_a_command_that_runs_something_else_before_the_proxy_does_not_start_it(self):
+        for before in (["C:/Windows/System32/cmd.exe", "/c", "python", "evil.py", "&"], ["node", "evil.js"],
+                       ["bash", "-c", "evil", "x"], ["python", "evil.py"], ["python", "-c", "import evil", "x"],
+                       ["uvx", "--from", "evil-package"], ["npx", "-y"], ["sudo"]):
+            for launcher in (["agent-sentinel"], ["agent_sentinel"]):
+                words = [*before, *launcher, "proxy", "--policy", "p.json", "--", "server"]
+                with self.subTest(words=words):
+                    self.assertIsNone(read_proxy_command(words))
+                    self.assertTrue(wrapping.mentions_proxy(words))
+                    self.assertEqual(wrapping.status_of({"command": words[0], "args": words[1:]}), "broken")
+        for words in (["python", "-c", "x", "-m", "agent_sentinel", "proxy", "--", "s"],
+                      ["bash", "-m", "agent_sentinel", "proxy", "--", "s"],
+                      ["python", "-m", "agent_sentinel.__main__", "proxy", "--", "s"]):
+            with self.subTest(words=words):
+                self.assertIsNone(read_proxy_command(words))
+
+    def test_a_shortened_proxy_option_is_recognised(self):
+        self.assertEqual(wrapping.shortened_option("--mon"), ["--monitor"])
+        self.assertEqual(wrapping.shortened_option("--polic"), ["--policy"])
+        self.assertEqual(wrapping.shortened_option("--polic=weak.json"), ["--policy"])
+        self.assertEqual(wrapping.shortened_option("--p"), ["--pass-env", "--pins", "--policy"])
+        for word in ("--monitor", "--policy=x", "--frobnicate", "-m", "--", "weak.json", "-"):
+            with self.subTest(word=word):
+                self.assertEqual(wrapping.shortened_option(word), [])
+
+
+class TheProxysOwnOptions(unittest.TestCase):
+    """The proxy's parser must read options exactly as wrap writes them and doctor reads them."""
+
+    def parse(self, *words):
+        from agent_sentinel import mcp_proxy
+        with mock.patch("sys.stderr"):
+            return mcp_proxy._argument_parser().parse_args(list(words))
+
+    def test_a_shortened_option_is_refused_so_the_proxy_does_not_start(self):
+        for words in (("--policy", "p.json", "--mon", "--", "python", "server.py"),
+                      ("--policy", "good.json", "--polic", "weak.json", "--", "python", "server.py"),
+                      ("--policy", "good.json", "--polic=weak.json", "--", "python", "server.py")):
+            with self.subTest(words=words), self.assertRaises(SystemExit):
+                self.parse(*words)
+
+    def test_options_written_in_full_are_read(self):
+        args = self.parse("--policy", "p.json", "--monitor", "--", "python", "server.py", "--mon")
+        self.assertTrue(args.monitor)
+        self.assertEqual(args.policy, "p.json")
+        self.assertEqual(args.command, ["--", "python", "server.py", "--mon"])  # the server's own words
+
+
+class StatusFromTheEntryAlone(unittest.TestCase):
+    def test_what_clients_counts(self):
+        good = wrapped({"command": "npx", "args": ["x"]})
+        monitor = wrap_entry({"command": "npx"}, ProxySettings(SETTINGS.python, SETTINGS.policy, SETTINGS.audit,
+                                                               SETTINGS.pins_folder, monitor=True), "x", "PINS")
+        shortened = {"command": "agent-sentinel", "args": ["proxy", "--policy", "p.json", "--mon", "--", "s"]}
+        twice = {"command": "agent-sentinel", "args": ["proxy", "--policy", "p.json", "--policy", "q.json", "--", "s"]}
+        for entry, expected in ((good, "protected"), (monitor, "unprotected"), (shortened, "broken"),
+                                (twice, "broken"), ({"command": "npx"}, "unprotected"),
+                                ({"url": "https://x"}, "remote"), ({"args": []}, "broken")):
+            with self.subTest(entry=entry):
+                self.assertEqual(wrapping.status_of(entry), expected)
 
 
 class NamesAndPinsFiles(unittest.TestCase):

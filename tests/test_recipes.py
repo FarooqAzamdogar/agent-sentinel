@@ -157,9 +157,11 @@ class LangChainRecipe(TempFolderTest):
 
     def test_a_refused_call_or_an_injected_note_gives_the_model_a_short_text(self):
         refused = self.read_note.invoke({"name": "../secret.txt"})
-        self.assertRegex(refused, r"^argument 'name' has a value the policy does not permit \(ref [0-9a-f]{8}\)$")
+        self.assertRegex(refused, r"^Blocked by agent-sentinel: argument 'name' has a value the policy does not "
+                                  r"permit \(ref [0-9a-f]{8}\)$")
         withheld = self.read_note.invoke({"name": "trap.txt"})
-        self.assertRegex(withheld, r"^possible prompt injection; the content was withheld \(ref [0-9a-f]{8}\)$")
+        self.assertRegex(withheld, r"^Blocked by agent-sentinel: possible prompt injection; the content was "
+                                   r"withheld \(ref [0-9a-f]{8}\)$")
 
     def test_the_recipes_policy_rule_is_the_one_its_docstring_shows(self):
         docstring = ast.get_docstring(ast.parse((EXAMPLES / "langchain_guarded_tools.py").read_text(encoding="utf-8")))

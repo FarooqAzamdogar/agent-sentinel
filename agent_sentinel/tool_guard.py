@@ -14,8 +14,10 @@ tool): the secret guard, the policy, flow rules and rate limits; then the
 function; then its result, or the text of an error it raises, is scanned
 before it is returned. A blocked call raises BlockedError, whose text is
 safe to hand to the model. With on_block="return", the decorated function
-returns that text instead, for frameworks that pass a tool's return value
-to the model and stop on an exception.
+returns "Blocked by agent-sentinel: <that text>" instead (the words the
+proxy and the Claude Code hook use), for frameworks that pass a tool's
+return value to the model and stop on an exception: the prefix keeps the
+model from taking the refusal for what the tool returned.
 
 The positional and keyword arguments of a call are bound to the
 function's parameters, defaults included, so the policy always sees every
@@ -40,7 +42,7 @@ import functools
 import inspect
 from typing import Any, Callable, TypeVar
 
-from .firewall import BlockedError, Firewall
+from .firewall import BlockedError, Firewall, agent_text
 
 ON_BLOCK = ("raise", "return")
 
@@ -74,7 +76,7 @@ def guard(firewall: Firewall, name: str | None = None, *, on_block: str = "raise
                     return await firewall.run_async(tool, arguments, function)
                 except BlockedError as error:
                     if on_block == "return":
-                        return str(error)
+                        return agent_text(str(error))
                     raise
 
             return guarded_coroutine  # type: ignore[return-value]
@@ -86,7 +88,7 @@ def guard(firewall: Firewall, name: str | None = None, *, on_block: str = "raise
                 return firewall.run(tool, arguments, function)
             except BlockedError as error:
                 if on_block == "return":
-                    return str(error)
+                    return agent_text(str(error))
                 raise
 
         return guarded  # type: ignore[return-value]

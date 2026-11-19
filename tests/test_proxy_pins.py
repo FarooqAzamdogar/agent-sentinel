@@ -6,6 +6,7 @@ Harness of test_proxy.py, and the last one runs the real proxy.
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -15,7 +16,7 @@ from unittest import mock
 
 from support import EXAMPLE_POLICY_PATH, INJECTION, POLICY, ROOT
 from test_proxy import Harness, call, initialize, reply, request
-from agent_sentinel import Firewall
+from agent_sentinel import Firewall, Policy
 from agent_sentinel import pins as pins_module
 from agent_sentinel.pins import PinsFileError, ToolPins, fingerprint, read_pins_file, v1_fingerprint
 
@@ -114,6 +115,31 @@ class ThePinsFile(WithATemporaryFolder):
         pins.save()
         self.assertTrue(self.pins_file.read_bytes().isascii())
 
+    def test_a_file_held_open_for_a_moment_is_written_after_a_retry_and_no_temporary_file_is_left(self):
+        # A virus scanner or a `pins diff` holding the file makes os.replace fail for a moment on Windows.
+        real_replace, attempts = os.replace, []
+
+        def busy_once(source, target):
+            attempts.append(target)
+            if len(attempts) == 1:
+                raise PermissionError("in use for a moment")
+            real_replace(source, target)
+
+        pins = ToolPins(self.pins_file)
+        pins.check("search_web", TOOL)
+        with mock.patch("agent_sentinel.filelock.os.replace", busy_once), \
+                mock.patch("agent_sentinel.filelock.time.sleep"):
+            pins.save()
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(ToolPins(self.pins_file).check("search_web", TOOL), "same")
+        self.assertEqual(sorted(path.name for path in self.folder.iterdir()), ["pins.json"])
+
+    def test_a_write_that_keeps_failing_leaves_no_temporary_file(self):
+        with mock.patch("agent_sentinel.filelock.os.replace", side_effect=PermissionError("in use")), \
+                mock.patch("agent_sentinel.filelock.time.sleep"), self.assertRaises(OSError):
+            pins_module.write_pins_file(self.pins_file, pins_module.PinsFile())
+        self.assertEqual(list(self.folder.iterdir()), [])
+
     def test_nothing_is_written_when_nothing_was_pinned(self):
         ToolPins(self.pins_file).save()
         self.assertFalse(self.pins_file.exists())
@@ -130,6 +156,19 @@ class ThePinsFile(WithATemporaryFolder):
             pins = ToolPins()
             self.assertEqual(pins.check("a", dict(TOOL, name="a")), "new")
             self.assertEqual(pins.check("b", dict(TOOL, name="b")), "full")
+
+
+class APinsFileThatIsFull(WithATemporaryFolder):
+    def test_a_tool_removed_because_the_pins_are_full_has_an_audit_record_with_a_ref(self):
+        audit = self.folder / "audit.jsonl"
+        tools = [dict(TOOL, name="read_file"), dict(TOOL, name="write_file")]
+        with mock.patch.object(pins_module, "MAX_PINS_PER_LIST", 1):
+            h = Harness(Firewall(Policy.from_dict({"default": "allow"}), audit_path=audit))
+            self.assertEqual(listed(h, 1, "tools/list", "tools", tools), ["read_file"])
+        (record,) = [record for record in read_audit(audit) if record["tool"] == "write_file"]
+        self.assertEqual((record["event"], record["action"], record["rule"]), ("tool_pins_full", "block", "quarantine"))
+        self.assertRegex(record["ref"], r"^[0-9a-f]{8}$")
+        self.assertIn("too many tools to keep track of", record["reason"])
 
 
 class TheLoaderIsStrict(WithATemporaryFolder):

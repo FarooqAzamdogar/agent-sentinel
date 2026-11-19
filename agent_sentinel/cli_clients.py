@@ -18,7 +18,7 @@ from .cli_common import EXIT_OK, shown_path
 from .clients import CLIENTS, Location
 from .config_file import ConfigError, read_config
 from .textutil import printable
-from .wrapping import kind_of, proxy_command_of
+from .wrapping import status_of
 
 HELP = "list the MCP client configurations on this machine and in this folder, and how many servers are protected"
 DESCRIPTION = (
@@ -32,14 +32,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def server_counts(servers: Any) -> Counter:
-    """How many entries are protected, unprotected, remote and broken."""
-    counts: Counter = Counter()
-    for entry in servers.values() if isinstance(servers, dict) else ():
-        kind = kind_of(entry)
-        if kind == "stdio":
-            kind = "protected" if proxy_command_of(entry) is not None else "unprotected"
-        counts[kind] += 1
-    return counts
+    """How many entries are protected, unprotected (monitor mode included), remote and broken (wrapping.status_of)."""
+    return Counter(status_of(entry) for entry in (servers.values() if isinstance(servers, dict) else ()))
 
 
 def describe_counts(counts: Counter) -> str:

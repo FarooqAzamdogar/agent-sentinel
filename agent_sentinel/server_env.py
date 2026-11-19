@@ -53,17 +53,22 @@ MAX_VALUE_CHARS = 32767  # what Windows allows for one variable
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,255}")
 _PASS_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,255}\*?")
 
-# Words that, as a whole part of a variable's name, say that its value is a secret (or,
-# for SSH_AUTH_SOCK, a way to use one): GITHUB_TOKEN, OPENAI_API_KEY, DB_PASSWORD,
-# AWS_SECRET_ACCESS_KEY, GITHUB_PAT, SENTRY_DSN.
+# Words that, as a whole part of a variable's (or a header's) name, say that its value is a
+# secret (or, for SSH_AUTH_SOCK, a way to use one): GITHUB_TOKEN, OPENAI_API_KEY,
+# AWS_SECRET_ACCESS_KEY, GITHUB_PAT, SENTRY_DSN, Authorization, MYSQL_PWD. One list for the
+# proxy's report and for `doctor`, so that the two never disagree about a name. SESSION is not
+# one: XDG_SESSION_TYPE and the like are everywhere and hold nothing secret.
 _SECRET_WORDS = frozenset((
     "TOKEN", "TOKENS", "SECRET", "SECRETS", "CREDENTIAL", "CREDENTIALS", "KEY", "KEYS", "APIKEY", "PAT", "AUTH",
-    "COOKIE", "DSN",
+    "AUTHORIZATION", "BEARER", "COOKIE", "COOKIES", "DSN", "PWD",
 ))
-# These mean a secret even inside a longer word, as in PGPASSWORD. (PWD does not: on
-# POSIX it is the current folder, so MYSQL_PWD is not recognised.)
+# These mean a secret even inside a longer word, as in PGPASSWORD.
 _SECRET_INSIDE_WORDS = ("PASSWORD", "PASSWD", "PASSPHRASE")
+# PWD on its own is the current folder (POSIX shells set it); only as part of a longer name,
+# as in MYSQL_PWD, is it a password.
+_NOT_SECRET_NAMES = frozenset(("PWD",))
 _NAME_PARTS = re.compile(r"[A-Z][a-z0-9]+|[A-Z0-9]+(?![a-z])|[a-z0-9]+")
+MAX_NAME_CHARS_READ = 200  # a name chosen by someone else is read this far
 
 
 class EnvFileError(ValueError):
@@ -162,14 +167,19 @@ def missing_names(inherited: Mapping[str, str], pass_names: Iterable[str], windo
 
 
 def looks_secret(name: str) -> bool:
-    """Whether a variable's name says that its value is a secret: one of its words is TOKEN, KEY, AUTH, ...,
-    or it has PASSWORD, PASSWD or PASSPHRASE anywhere in it.
+    """Whether a variable's (or a header's) name says that its value is a secret: one of its words is TOKEN,
+    KEY, AUTH, PWD, ..., or it has PASSWORD, PASSWD or PASSPHRASE anywhere in it.
 
-    Names are split into words at "_" and where lower case turns to upper
-    case, so GITHUB_TOKEN, githubToken, OPENAI_API_KEY and PGPASSWORD look
-    secret; KEYBOARD_LAYOUT, TOKENIZERS_PARALLELISM, GIT_AUTHOR_NAME and PATH do not.
+    Names are split into words at "_", "-" and where lower case turns to
+    upper case, so GITHUB_TOKEN, githubToken, X-Auth-Token, OPENAI_API_KEY,
+    MYSQL_PWD and PGPASSWORD look secret; KEYBOARD_LAYOUT,
+    TOKENIZERS_PARALLELISM, GIT_AUTHOR_NAME, PWD and PATH do not. The one
+    test for both the proxy's startup report and `doctor`.
     """
+    name = name[:MAX_NAME_CHARS_READ]
     upper = name.upper()
+    if upper in _NOT_SECRET_NAMES:
+        return False
     if any(word in upper for word in _SECRET_INSIDE_WORDS):
         return True
     return any(part.upper() in _SECRET_WORDS for part in _NAME_PARTS.findall(name))

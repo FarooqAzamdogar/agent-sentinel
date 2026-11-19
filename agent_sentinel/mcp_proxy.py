@@ -148,7 +148,7 @@ and refused.
 Requests other than tool calls
 ------------------------------
 The policy's client_requests section may refuse any other method the client
-sends (Policy.client_request_action), with "method not found". Once the
+sends (Policy.client_request_verdict), with "method not found". Once the
 policy opts in (Policy.checks_prompts), prompts/get is checked like a call of
 a tool named "prompts/get", with arguments {"name", "arguments"}.
 completion/complete passes the secret guard, since it carries what the user
@@ -177,7 +177,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import math
 import os
 import re
 import signal
@@ -196,16 +195,24 @@ from .approvers import (
     APPROVAL_ID_PREFIX,
     ELICITATION_VERSIONS,
     Answer,
+    ApprovalBackend,
     ApprovalRequest,
-    Approver,
     ElicitationApprover,
     NotShowable,
     check_showable,
     declares_form_elicitation,
     parse_backend,
 )
-from .cli_common import shell_line
-from .firewall import SERVER_NAME, CheckedResult, Decision, Firewall, secret_rule
+from .firewall import (
+    SERVER_NAME,
+    WAITING_FOR_APPROVAL,
+    CheckedResult,
+    Decision,
+    Firewall,
+    agent_text,
+    secret_rule,
+)
+from .jsonutil import finite_float, no_constant
 from .leaks import Found
 from .mcp_protocol import ShapeError
 from .pins import CHANGED, FULL, KIND_WORDS, PINNED_LISTS, ToolPins, definition_of, fingerprint
@@ -232,6 +239,7 @@ SHUTDOWN_GRACE_SECONDS = 1.5
 
 # Resource limits. Each bounds something a hostile peer could otherwise grow forever.
 DEFAULT_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+MAX_MAX_MESSAGE_BYTES = 1024 * 1024 * 1024  # the most --max-message-bytes may be: 1 GiB
 MAX_PENDING_REQUESTS = 10_000  # client requests waiting for a reply
 MAX_SERVER_REQUESTS = 1_000  # server requests waiting for the client's reply
 MAX_QUARANTINED = 10_000  # tools, prompts and resource templates together
@@ -301,8 +309,6 @@ _UNSUPPORTED_VERSION = "the server chose a protocol version this proxy does not 
 _UNCHECKED_CONTENT = "the content could not be checked, so it was withheld"
 # What a refused server is told: nothing about why.
 _SERVER_REFUSAL = "request refused"
-# How the reason of a pending decision ends (Firewall.check_call with defer_ask).
-_WAITING_SUFFIX = "; waiting for approval"
 
 # The protocol era of the session (see mcp_protocol.py), once the client has shown it.
 _LEGACY = "legacy"
@@ -373,21 +379,14 @@ def _name_stderr(name: str) -> None:
     _stderr_label = f"agent-sentinel[{name}]"
 
 
-def _reject_constant(name: str) -> Any:
-    raise ValueError(f"{name} is not valid JSON")
-
-
-def _finite_float(text: str) -> float:
-    # "1e999" is valid JSON but becomes infinity, which cannot be written back as JSON.
-    value = float(text)
-    if not math.isfinite(value):
-        raise ValueError(f"{text[:20]} is too large for a number")
-    return value
-
-
 def _parse(line: bytes) -> Any:
-    """Parse one line of strict JSON (Python would otherwise accept NaN and Infinity)."""
-    return json.loads(line, parse_constant=_reject_constant, parse_float=_finite_float)
+    """Parse one line of JSON, refusing NaN, Infinity and 1e999 (jsonutil), which cannot be written back as JSON.
+
+    A repeated key is not refused here: the proxy forwards what it parsed and
+    checked, written anew, never the original bytes, so the server sees the
+    same single value the proxy checked.
+    """
+    return json.loads(line, parse_constant=no_constant, parse_float=finite_float)
 
 
 def _valid_id(value: Any) -> bool:
@@ -422,7 +421,7 @@ def _tool_error(msg_id: Any, reason: str, modern: bool = False) -> JsonObject:
             result must say what kind of result it is.
     """
     result: JsonObject = {
-        "content": [{"type": "text", "text": f"Blocked by agent-sentinel: {reason}"}],
+        "content": [{"type": "text", "text": agent_text(reason)}],
         "isError": True,
     }
     if modern:
@@ -431,7 +430,7 @@ def _tool_error(msg_id: Any, reason: str, modern: bool = False) -> JsonObject:
 
 
 def _rpc_error(msg_id: Any, reason: str, code: int = -32000) -> JsonObject:
-    return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": f"Blocked by agent-sentinel: {reason}"}}
+    return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": agent_text(reason)}}
 
 
 def _refusal_reply(method: str, msg_id: Any, reason: str, modern: bool) -> JsonObject:
@@ -538,7 +537,7 @@ class Proxy:
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
         tool_names: str = TOOL_NAMES_WARN,
         elicitation_hosts: Sequence[str] = (),
-        approvers: Sequence[Approver] = (),
+        approvers: Sequence[ApprovalBackend] = (),
         approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT,
         report: str = proxy_report.NORMAL,
     ) -> None:
@@ -561,6 +560,8 @@ class Proxy:
             raise ValueError("report must be proxy_report.QUIET, NORMAL or VERBOSE")
         if not 0 < approval_timeout <= MAX_APPROVAL_TIMEOUT:
             raise ValueError(f"approval_timeout must be more than 0 and at most {MAX_APPROVAL_TIMEOUT} seconds")
+        if type(max_message_bytes) is not int or not 1 <= max_message_bytes <= MAX_MAX_MESSAGE_BYTES:
+            raise ValueError(f"max_message_bytes must be a whole number from 1 to {MAX_MAX_MESSAGE_BYTES}")
         self._firewall = firewall
         self._client_out = client_out
         self._server_in = server_in
@@ -702,7 +703,7 @@ class Proxy:
 
     def _report_allowed(self, what: str, decision: Decision) -> None:
         """A line for a call that was let through: with --verbose, or when monitor mode lifted a block."""
-        lifted = self._firewall.monitor and decision.reason.startswith(proxy_report.WOULD_BLOCK_PREFIX)
+        lifted = decision.would_block
         if lifted or self._report_level == proxy_report.VERBOSE:
             self._report(proxy_report.allowed_line(what, decision), limit=1000)
 
@@ -897,7 +898,7 @@ class Proxy:
         requests are always allowed here: the tools rules decide them, call by call.
         """
         method = message["method"]
-        verdict = self._firewall.policy.client_request_action(method)
+        verdict = self._firewall.policy.client_request_verdict(method)
         if verdict.action != "block":
             return None
         decision = self._firewall.block(
@@ -1186,9 +1187,7 @@ class Proxy:
         messages: they are handled while the person decides.
         """
         # The person is told why the policy asks; that the call is waiting, they can see.
-        reason = pending.reason
-        if reason.endswith(_WAITING_SUFFIX):
-            reason = reason[: -len(_WAITING_SUFFIX)]
+        reason = pending.reason.removesuffix(WAITING_FOR_APPROVAL)
         request = ApprovalRequest(tool, arguments, reason, pending.ref or "", self._firewall.server_name,
                                   method=message["method"])
         waiting = _WaitingCall(
@@ -1266,7 +1265,7 @@ class Proxy:
             self._approval_turn.release()
         return answer, approver.name
 
-    def _choose_approver(self) -> tuple[Approver | None, str]:
+    def _choose_approver(self) -> tuple[ApprovalBackend | None, str]:
         """The first approver that can ask now, or None and why none can."""
         reasons = []
         for approver in self._approvers:
@@ -1276,7 +1275,7 @@ class Proxy:
             reasons.append(f"{approver.name}: {why}")
         return None, "; ".join(reasons)
 
-    def _why_cannot_ask(self, approver: Approver) -> str | None:
+    def _why_cannot_ask(self, approver: ApprovalBackend) -> str | None:
         """Why this approver cannot ask about a call now, or None.
 
         An elicitation needs a session opened with initialize (a 2026-07-28
@@ -1296,7 +1295,7 @@ class Proxy:
             return "the client did not declare that it can show an elicitation form"
         return None
 
-    def _ask_on_this_machine(self, approver: Approver, waiting: _WaitingCall) -> Answer:
+    def _ask_on_this_machine(self, approver: ApprovalBackend, waiting: _WaitingCall) -> Answer:
         """Ask through a dialog or the operator's program, in a thread of its own.
 
         The answer is awaited only until the deadline, so a dialog or program
@@ -1978,7 +1977,7 @@ class Proxy:
             command += ["--kind", KIND_WORDS[kind]]
         if name is not None and _SHELL_SAFE_NAME.fullmatch(name):
             command.append(name)
-        return (f"If the change is expected, review it with: {shell_line(command)}; "
+        return (f"If the change is expected, review it with: {proxy_report.shell_line(command)}; "
                 "then pins accept, and restart the proxy")
 
     def _clean_items(self, items: list[Any], items_key: str) -> list[Any]:
@@ -2169,7 +2168,9 @@ class Proxy:
             )
             return self._firewall.block(label, reason, event=f"{_ENTRY_NAME[kind]}_changed", rule=RULE_QUARANTINE)
         if status == FULL:
-            return Decision(False, f"too many {kind} to keep track of", rule=RULE_QUARANTINE)
+            # Logged like every other removal, with a ref, so that `explain` and `report` can say why.
+            return self._firewall.refuse(label, f"too many {kind} to keep track of",
+                                         event=f"{_ENTRY_NAME[kind]}_pins_full", rule=RULE_QUARANTINE)
         return Decision(True, "the definition is unchanged or new")
 
     def _save_pins(self) -> None:
@@ -2352,10 +2353,14 @@ def exit_process(code: int) -> None:
     os._exit(code)
 
 
-def _positive_int(text: str) -> int:
-    value = int(text)
-    if value < 1:
-        raise argparse.ArgumentTypeError("must be 1 or more")
+def _message_bytes(text: str) -> int:
+    """--max-message-bytes: a whole number of bytes, 1 to MAX_MAX_MESSAGE_BYTES."""
+    try:
+        value = int(text) if len(text) <= 12 else 0
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a whole number of bytes") from None
+    if not 1 <= value <= MAX_MAX_MESSAGE_BYTES:
+        raise argparse.ArgumentTypeError(f"must be 1 to {MAX_MAX_MESSAGE_BYTES} bytes")
     return value
 
 
@@ -2372,7 +2377,7 @@ def _pass_env_name(text: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-def _approver(text: str) -> Approver:
+def _approver(text: str) -> ApprovalBackend:
     """One --approve-with value (approvers.parse_backend). A program is looked up as the server command is."""
     try:
         return parse_backend(text, _resolve_executable)
@@ -2395,7 +2400,10 @@ def _say_nothing(message: str, limit: int = 300) -> None:
 
 
 def _argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="agent-sentinel proxy", description="Run an MCP server behind the firewall.")
+    # allow_abbrev=False: "--mon" is not --monitor, and "--polic weak.json" is not another --policy. A config
+    # file is read by people and by `doctor`, and both must see the options the proxy really uses.
+    parser = argparse.ArgumentParser(prog="agent-sentinel proxy", description="Run an MCP server behind the firewall.",
+                                     allow_abbrev=False)
     parser.add_argument("--policy", required=True, help="path to the policy JSON file")
     parser.add_argument("--audit", default=None, help="path of the audit log (JSON lines)")
     parser.add_argument("--no-log-args", action="store_true", help="leave tool arguments out of the audit log")
@@ -2409,8 +2417,9 @@ def _argument_parser() -> argparse.ArgumentParser:
                         help="do not quarantine a tool whose definition changes (for servers that change them often)")
     parser.add_argument("--monitor", action="store_true",
                         help="log what the policy and the scanner would block, but block nothing (for tuning a policy)")
-    parser.add_argument("--max-message-bytes", type=_positive_int, default=DEFAULT_MAX_MESSAGE_BYTES,
-                        help=f"drop any message larger than this (default {DEFAULT_MAX_MESSAGE_BYTES})")
+    parser.add_argument("--max-message-bytes", type=_message_bytes, default=DEFAULT_MAX_MESSAGE_BYTES, metavar="BYTES",
+                        help=f"drop any message larger than this (default {DEFAULT_MAX_MESSAGE_BYTES}, "
+                             f"at most {MAX_MAX_MESSAGE_BYTES})")
     parser.add_argument("--tool-names", choices=TOOL_NAME_MODES, default=TOOL_NAMES_WARN,
                         help="a tool or prompt whose name breaks the MCP naming rules is removed (strict), "
                              "reported (warn, the default) or let be (off)")

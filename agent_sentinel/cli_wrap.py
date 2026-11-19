@@ -37,10 +37,10 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__, clients, home, mcp_proxy
-from .cli_common import EXIT_ERROR, EXIT_OK, CommandError, load_policy, shell_line, shown_path
+from .cli_common import EXIT_ERROR, EXIT_OK, CommandError, load_policy, shown_command, shown_path
 from .clients import CLIENTS
 from .config_file import ConfigFile, edited_text, read_config, write_config
-from .leaks import redact, redact_value
+from .leaks import redact_value
 from .policy import Policy
 from .textutil import printable
 from .wrapping import (
@@ -272,7 +272,7 @@ def _wrap_step(config: ConfigFile, client: str, name: str, entry: Any, settings:
         return Step(name, entry, None, "skipped: already wrapped")
     words = command_line(entry)
     assert words is not None
-    shown = printable(redact(shell_line(words)), limit=120)
+    shown = shown_command(words, limit=120)
     executable = mcp_proxy._resolve_executable(words[0])
     if executable is not None:
         unsafe = mcp_proxy._unsafe_for_batch_file(executable, words[1:])

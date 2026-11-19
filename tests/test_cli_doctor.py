@@ -121,7 +121,7 @@ class WhyAServerIsBroken(DoctorTest):
         status, text = self.reasons(self.wrapped("s", server=["no-such-server-command-anywhere"]))
         self.assertEqual(status, "broken")
         self.assertIn("is not on this terminal's PATH", text)
-        status, text = self.reasons({"command": str(self.folder / "missing-python"),
+        status, text = self.reasons({"command": str(self.folder / "missing" / "python.exe"),
                                      "args": ["-m", "agent_sentinel", "proxy", "--policy", str(self.policy),
                                               "--", "x"]})
         self.assertIn("the program that starts the proxy", text)
@@ -129,6 +129,35 @@ class WhyAServerIsBroken(DoctorTest):
                                                                          str(self.policy)]})
         self.assertEqual(status, "broken")
         self.assertIn("no server command after '--'", text)
+
+    def test_a_shortened_proxy_option_is_broken_not_protected(self):
+        weak = self.write("weak.json", {"default": "allow"})
+        for extra, expected in ((["--mon"], "'--mon' is a shortened --monitor"),
+                                (["--polic", str(weak)], "'--polic' is a shortened --policy"),
+                                ([f"--polic={weak}"], "is a shortened --policy")):
+            with self.subTest(extra=extra):
+                code, servers, _ = self.statuses(self.config({"s": self.wrapped("s", *extra)}))
+                self.assertEqual(code, 1)
+                self.assertEqual(servers["s"]["status"], "broken")
+                texts = " | ".join(finding["text"] for finding in servers["s"]["findings"])
+                self.assertIn(expected, texts)
+                self.assertNotIn("protected:", texts)
+
+    def test_a_policy_given_twice_is_broken(self):
+        weak = self.write("weak.json", {"default": "allow"})
+        status, text = self.reasons(self.wrapped("s", "--policy", str(weak)))
+        self.assertEqual(status, "broken")
+        self.assertIn("--policy is given more than once", text)
+
+    def test_a_command_that_runs_something_before_the_proxy_is_not_protected(self):
+        entry = self.wrapped("np")
+        for before in (["/c", "python", "evil.py", "&"], ["evil.js"]):
+            words = [*before, "agent-sentinel", *entry["args"][3:]]  # ... agent-sentinel proxy --policy ...
+            with self.subTest(before=before):
+                code, servers, _ = self.statuses(self.config({"np": {"command": "cmd.exe", "args": words}}))
+                self.assertEqual(code, 1)
+                self.assertEqual(servers["np"]["status"], "broken")
+                self.assertIn("starts the proxy only after other words", servers["np"]["findings"][0]["text"])
 
     def test_a_python_without_agent_sentinel_cannot_start_the_proxy(self):
         self.installed_version.return_value = None
@@ -142,7 +171,7 @@ class WhyAServerIsBroken(DoctorTest):
 
     def test_a_program_named_in_a_configuration_is_never_run(self):
         # A checked-in .mcp.json could name any program as "the Python that starts the proxy".
-        program = self.write("not-python.exe", "MZ")
+        program = self.write("other/python.exe", "MZ")  # named like a Python, and not the one running doctor
         entry = {"command": str(program), "args": ["-m", "agent_sentinel", "proxy", "--policy", str(self.policy),
                                                    "--", sys.executable, "server.py"]}
         status, _ = self.reasons(entry)

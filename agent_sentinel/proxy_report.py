@@ -43,6 +43,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
+from .firewall import WOULD_BLOCK_PREFIX
 from .leaks import redact
 from .policy import ACTIONS, Policy, known_value_warnings
 from .textutil import printable
@@ -60,8 +61,6 @@ SERVER_LINES_PER_WINDOW = 60
 SERVER_WINDOW_SECONDS = 60.0
 # The policy's own warnings (Policy.warnings, as `validate` prints them) shown at startup.
 MAX_POLICY_WARNINGS_SHOWN = 10
-# What the firewall's reason says when monitor mode let a block through (firewall.Firewall._finish).
-WOULD_BLOCK_PREFIX = "monitor mode, would block: "
 
 
 # ---- one line per decision ------------------------------------------------------
@@ -85,8 +84,8 @@ def rule_and_ref(decision: Any) -> str:
 def allowed_line(what: str, decision: Any) -> str:
     """The line for a call that was let through (shown with --verbose), or that monitor mode let through."""
     rule = printable(decision.rule or "?", limit=100)
-    if decision.reason.startswith(WOULD_BLOCK_PREFIX):
-        reason = printable(decision.reason[len(WOULD_BLOCK_PREFIX):], limit=300)
+    if getattr(decision, "would_block", False):
+        reason = printable(decision.reason.removeprefix(WOULD_BLOCK_PREFIX), limit=300)
         return f"would block {what} (monitor mode lets it through): {reason} [rule {rule}]"
     return f"allowed {what} [rule {rule}]"
 
@@ -132,7 +131,7 @@ def startup_lines(start: Startup) -> list[str]:
         lines.append(f"  pins      {os.path.abspath(start.pins_path)}")
     else:
         lines.append("  pins      in memory: definitions are compared with those first seen since the proxy started")
-    lines.append(f"  server    {command_line(start.server_command)}")
+    lines.append(f"  server    {shown_server_command(start.server_command)}")
     if start.approvers:
         backends = ", else ".join(description for description, _ in start.approvers)
         lines.append(f"  approval  {backends}; no answer within {start.approval_timeout} s refuses the call")
@@ -221,21 +220,32 @@ def hidden_tools(policy: Policy) -> list[str]:
     return hidden
 
 
-def command_line(argv: Sequence[str]) -> str:
+def shell_line(words: Sequence[str], platform: str | None = None) -> str:
+    """Words as one command line for this system's shell, quoted where a word needs it. Not made printable."""
+    if (platform or sys.platform) == "win32":
+        return subprocess.list2cmdline(list(words))
+    return shlex.join(words)
+
+
+def shown_server_command(argv: Sequence[str]) -> str:
     """The server command as a person would type it, with anything that looks like a key or token redacted.
 
     A token passed on the command line would otherwise be copied into the
     client's log.
     """
-    joined = subprocess.list2cmdline(list(argv)) if sys.platform == "win32" else shlex.join(argv)
-    return printable(redact(joined), limit=1000)
+    return printable(redact(shell_line(argv)), limit=1000)
 
 
 def missing_policy_hint(path: str) -> str | None:
     """Advice for a policy file that was not found, when its path is relative; None otherwise."""
     if os.path.isabs(path):
         return None
-    example = os.path.join(os.path.expanduser("~"), ".agent-sentinel", "policy.json")
+    from . import home  # here, not at the top: home imports cli_common, which imports this module
+
+    try:  # where `init` writes the policy: the home folder, which AGENT_SENTINEL_HOME may move
+        example = str(home.policy_file(home.home_folder()))
+    except home.HomeError:
+        example = "/full/path/to/policy.json"
     return (
         "MCP clients start servers in a folder of their own choosing, often not the one you expect, "
         f"so give the policy's full path, for example --policy {example}"

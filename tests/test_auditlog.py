@@ -50,6 +50,28 @@ class Times(unittest.TestCase):
         start = parse_when("2026-11-18")
         self.assertEqual(parse_when("2026-11-18", end_of_day=True) - start, timedelta(days=1))
 
+    def test_the_same_times_are_read_on_every_python_version(self):
+        # Python 3.11+ would read 20261118 and 2026-W47-3 through fromisoformat; 3.10 would not.
+        for text in ("20261118", "2026-W47-3", "2026-11-18T1430", "2026-11-18T14", "2026-11-18Z",
+                     "2026-11-18T14:30+0500", "2026-11-18T14:30:00+24:00", "\uff12026-11-18"):
+            with self.subTest(text=text):
+                with self.assertRaises(ValueError):
+                    parse_when(text)
+                self.assertIsNone(record_time({"time": text}))
+        utc = timezone.utc
+        for text, expected in (
+            ("2026-11-18 14:30:00.5z", datetime(2026, 11, 18, 14, 30, 0, 500000, tzinfo=utc)),
+            ("2026-11-18t14:30Z", datetime(2026, 11, 18, 14, 30, tzinfo=utc)),
+            ("2026-11-18T14:30:05-05:30", datetime(2026, 11, 18, 20, 0, 5, tzinfo=utc)),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(parse_when(text), expected)
+                self.assertEqual(record_time({"time": text}), expected)
+
+    def test_until_a_date_means_its_end_and_until_a_time_means_that_time(self):
+        self.assertEqual(parse_when("2026-11-18", end_of_day=True) - parse_when("2026-11-18"), timedelta(days=1))
+        self.assertEqual(parse_when("2026-11-18T00:00", end_of_day=True), parse_when("2026-11-18"))
+
     def test_a_time_that_cannot_be_read_raises_a_readable_error(self):
         for text in ("soon", "2026-13-01", "999999w", "9" * 50, "2h ago"):
             with self.subTest(text=text):
@@ -67,6 +89,11 @@ class Names(unittest.TestCase):
         self.assertFalse(glob_matches("read_?", "read_x"))
         self.assertTrue(glob_matches("read_[x]", "read_[x]"))
         self.assertFalse(glob_matches("Read_*", "read_file"))
+
+    def test_the_filter_uses_the_policys_own_rule_for_names(self):
+        from agent_sentinel import auditlog, policy
+        self.assertIs(auditlog.glob_matches, policy.glob_matches)
+        self.assertIn("note", auditlog.RECORD_ACTIONS)  # what Firewall.note writes
 
     def test_a_long_hostile_name_is_matched_quickly(self):
         started = time.perf_counter()

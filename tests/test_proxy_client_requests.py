@@ -1,6 +1,6 @@
 """Tests for what the proxy does with client requests other than tool calls and resource reads.
 
-* the policy's client_requests section (Policy.client_request_action);
+* the policy's client_requests section (Policy.client_request_verdict);
 * prompts/get, checked like a call of a tool named "prompts/get" once the policy opts in;
 * the secret guard on completion/complete, which carries what the user is typing.
 """

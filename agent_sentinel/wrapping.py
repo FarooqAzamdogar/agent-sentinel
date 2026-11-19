@@ -18,8 +18,10 @@ Wrapped, the same entry starts the proxy, which starts the program:
 Every other key of the entry, known or not, stays where it was. Unwrapping
 rebuilds "command" and "args" from what follows the "--", so no record of the
 original needs to be kept anywhere else (the backup `wrap` makes covers an
-exact restore). Every path is absolute: the client starts the proxy in a
-folder of its own choosing.
+exact restore). One thing cannot be told apart that way: an entry written
+with "args": [] and one without "args" wrap the same, and both come back
+without "args" (they mean the same to a client). Every path is absolute: the
+client starts the proxy in a folder of its own choosing.
 
 Why "-I" (isolated mode): `python -m` imports from the current folder first,
 and clients start servers in folders they choose, often the project the
@@ -52,9 +54,21 @@ VALUE_OPTIONS = frozenset({
     "--approval-timeout", "--max-message-bytes", "--tool-names", "--elicitation-host",
 })
 FLAG_OPTIONS = frozenset({"--no-log-args", "--no-pins", "--monitor", "--clean-env", "--quiet", "--verbose"})
-# What starts the proxy: "python -I -m agent_sentinel proxy", "agent-sentinel proxy", "uvx agent-sentinel@0.5 proxy".
-_LAUNCHER = re.compile(r"agent[-_]sentinel(\.exe|\.cmd|\.bat)?([=@].*)?", re.IGNORECASE)
-_LAUNCHER_REACH = 8  # how far into the command the launcher is looked for
+# The shapes of command that start the proxy (read_proxy_command), each followed by "proxy":
+#   agent-sentinel                        the script (agent-sentinel.exe, .cmd, .bat)
+#   PYTHON [-I] -m agent_sentinel         a Python, with only harmless options of its own before -m
+#   uvx / uv tool run / pipx run PACKAGE  a package runner, PACKAGE being agent-sentinel[@==VERSION]
+_SCRIPT = re.compile(r"agent[-_]sentinel(\.exe|\.cmd|\.bat)?", re.IGNORECASE)
+PACKAGE = re.compile(r"agent[-_]sentinel(\.exe|\.cmd|\.bat)?([=@].*)?", re.IGNORECASE)
+_PYTHON = re.compile(r"(python[0-9.]*t?w?|pyw?)(\.exe)?", re.IGNORECASE)  # python3.13t, pythonw.exe, py
+# Options a Python may get before "-m agent_sentinel" that cannot make it run anything else
+# (not -c, not another -m, not a script): -I, -E, -s, -S, -B, -u, -O, -q, -b; -X and -W
+# with their value; the Windows py launcher's version, such as -3.12.
+_PYTHON_FLAGS = re.compile(r"-[IEsSBuOqb]+|-[0-9][0-9.]*(-(32|64))?")
+_PYTHON_VALUE_FLAGS = frozenset({"-X", "-W"})
+_RUNNERS = (["uvx"], ["uv", "tool", "run"], ["pipx", "run"])
+_RUNNER_PACKAGE_OPTIONS = frozenset({"--from", "--spec"})  # uvx --from agent-sentinel==0.5.0 agent-sentinel
+_LAUNCHER_REACH = 8  # how far into the command a mention of the proxy is looked for (mentions_proxy)
 # How a Python is told to run agent-sentinel: isolated (see the module docstring) or not.
 ISOLATED_MODULE = ["-I", "-m", "agent_sentinel"]
 PLAIN_MODULE = ["-m", "agent_sentinel"]
@@ -129,20 +143,83 @@ class ProxyCommand:
         return None
 
 
-def read_proxy_command(words: list[str]) -> ProxyCommand | None:
-    """The proxy part of a command line, or None if the command does not start the proxy.
+def _program(word: str) -> str:
+    """The file name of a program, whichever slash its path uses: "C:\\py\\python.exe" -> "python.exe"."""
+    return os.path.basename(word.replace("\\", "/"))
 
-    Lenient on purpose, because `doctor` reads entries written by hand and by
-    newer versions: an option it does not know is kept as a flag. The
-    server command is everything after the first "--" that is not the value
-    of an option.
+
+def _launcher_length(words: list[str]) -> int | None:
+    """How many words start the proxy, "proxy" included, when the command has one of the known shapes; else None.
+
+    Only these shapes count: whatever runs before the proxy in any other
+    command (`cmd /c evil.py & agent-sentinel proxy ...`, `node x.js
+    agent-sentinel proxy ...`) is not checked by anything, so such a command
+    must never be taken for a protected one.
     """
+    if not words:
+        return None
     at = None
-    for index in range(min(len(words) - 1, _LAUNCHER_REACH)):
-        word = os.path.basename(words[index].replace("\\", "/"))
-        if words[index + 1] == "proxy" and _LAUNCHER.fullmatch(word):
-            at = index + 2
-            break
+    program = _program(words[0])
+    if _SCRIPT.fullmatch(program):
+        at = 1
+    elif _PYTHON.fullmatch(program):
+        at = _after_python_options(words)
+    else:
+        name = program.lower()
+        name = name[:-len(".exe")] if name.endswith(".exe") else name
+        for runner in _RUNNERS:
+            if [name, *words[1:len(runner)]] == runner:
+                at = _after_runner_options(words, len(runner))
+                break
+    if at is None or words[at:at + 1] != ["proxy"]:
+        return None
+    return at + 1
+
+
+def _after_python_options(words: list[str]) -> int | None:
+    """Where "proxy" must be after `PYTHON [harmless options] -m agent_sentinel`; None for any other Python command."""
+    index = 1
+    while index < len(words) and words[index] != "-m":
+        if words[index] in _PYTHON_VALUE_FLAGS:
+            index += 2
+        elif _PYTHON_FLAGS.fullmatch(words[index]):
+            index += 1
+        else:
+            return None
+    return index + 2 if words[index + 1:index + 2] == ["agent_sentinel"] else None
+
+
+def _after_runner_options(words: list[str], index: int) -> int | None:
+    """Where "proxy" must be after `uvx [--from PACKAGE] PACKAGE`; None when the runner runs anything else."""
+    if words[index:index + 1] and words[index] in _RUNNER_PACKAGE_OPTIONS:
+        if not PACKAGE.fullmatch(words[index + 1] if index + 1 < len(words) else ""):
+            return None
+        index += 2
+    return index + 1 if index < len(words) and PACKAGE.fullmatch(words[index]) else None
+
+
+def mentions_proxy(words: list[str]) -> bool:
+    """Whether "agent-sentinel proxy" appears near the start of a command that read_proxy_command does not accept.
+
+    Such a command may run something else first, so it is not protected; doctor
+    says why instead of calling it a plain unprotected server.
+    """
+    if read_proxy_command(words) is not None:
+        return False
+    return any(words[index + 1] == "proxy" and PACKAGE.fullmatch(_program(words[index]))
+               for index in range(min(len(words) - 1, _LAUNCHER_REACH)))
+
+
+def read_proxy_command(words: list[str]) -> ProxyCommand | None:
+    """The proxy part of a command line, or None if the command does not start the proxy in a known shape.
+
+    The launcher must have one of the shapes _launcher_length accepts. The
+    options are read leniently, because `doctor` reads entries written by
+    hand and by newer versions: an option it does not know is kept as a flag
+    (see shortened_option). The server command is everything after the first
+    "--" that is not the value of an option.
+    """
+    at = _launcher_length(words)
     if at is None:
         return None
     found = ProxyCommand(launcher=words[:at])
@@ -168,6 +245,42 @@ def proxy_command_of(entry: Any) -> ProxyCommand | None:
     """The proxy part of an entry's command, or None if it is not wrapped (or not a stdio entry)."""
     words = command_line(entry)
     return read_proxy_command(words) if words is not None else None
+
+
+def shortened_option(word: str) -> list[str]:
+    """The proxy options that `word` is a shortened form of ("--mon" -> ["--monitor"]); empty for any other word.
+
+    argparse takes a shortened option for the whole one unless told not to.
+    This proxy refuses them (allow_abbrev=False), but a proxy of another
+    version may not, and an entry with "--mon" or "--polic weak.json" would
+    then run in monitor mode, or with another policy than the one it seems to
+    name.
+    """
+    name = word.partition("=")[0]
+    if not name.startswith("--") or len(name) < 3 or name in VALUE_OPTIONS or name in FLAG_OPTIONS:
+        return []
+    return sorted(option for option in VALUE_OPTIONS | FLAG_OPTIONS if option.startswith(name))
+
+
+def status_of(entry: Any) -> str:
+    """"protected", "unprotected", "remote" or "broken", from the entry alone (no file is looked at).
+
+    What `clients` counts; doctor checks the same and more (does the policy
+    load, does the program exist). Monitor mode blocks nothing, so it is not
+    protected. A proxy option written shortened, or --policy given twice,
+    is broken: the proxy refuses the first, and a reader of the entry would
+    take the wrong --policy for the one that counts.
+    """
+    kind = kind_of(entry)
+    if kind != "stdio":
+        return kind
+    words = command_line(entry) or []
+    proxy = read_proxy_command(words)
+    if proxy is None:
+        return "broken" if mentions_proxy(words) else "unprotected"
+    if any(shortened_option(option) for option, _ in proxy.options) or len(proxy.values("--policy")) > 1:
+        return "broken"
+    return "unprotected" if proxy.has("--monitor") else "protected"
 
 
 # ---- wrapping ------------------------------------------------------------------------------

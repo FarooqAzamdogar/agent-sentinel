@@ -26,7 +26,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, BinaryIO, Callable, Iterator
 
-from .cli_common import bounded_int
+from .jsonutil import bounded_int
+from .policy import glob_matches
 from .policy_errors import quoted
 from .textutil import printable
 
@@ -35,11 +36,21 @@ from .textutil import printable
 MAX_LINE_BYTES = 4 * 1024 * 1024
 
 BLOCK_ACTIONS = ("block", "would_block")
-ACTIONS = ("allow", "ask", "block", "would_block")
+# The "action" of an audit record (not policy.ACTIONS, which are what a rule may say): "note" is a
+# record that blocks nothing (Firewall.note), "would_block" a block that monitor mode let through.
+RECORD_ACTIONS = ("allow", "ask", "block", "would_block", "note")
 
 _RELATIVE_TIME = re.compile(r"([0-9]{1,6})\s*([mhdw])")
-_PLAIN_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _UNITS = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
+# The only ways a time is read, on every Python version: a date (2026-11-18), or a date and a
+# time of day (2026-11-18T14:30, 2026-11-18 14:30:05.5), with a zone or not (Z, z, +05:00).
+# datetime.fromisoformat is not used: Python 3.11 and later accept far more (20261118,
+# 2026-W47-3) than 3.10, so the same command line would mean something on one and fail on the other.
+_TIMESTAMP = re.compile(
+    r"(?P<date>[0-9]{4}-[0-9]{2}-[0-9]{2})"
+    r"(?:[Tt ](?P<clock>[0-9]{2}:[0-9]{2})(?::(?P<seconds>[0-9]{2})(?:\.(?P<fraction>[0-9]{1,6}))?)?"
+    r"(?P<zone>[Zz]|[+-][0-9]{2}:[0-9]{2})?)?"
+)
 
 
 # ---- lines and records ---------------------------------------------------------------
@@ -157,15 +168,44 @@ def is_block(record: dict[str, Any]) -> bool:
     return record.get("action") in BLOCK_ACTIONS
 
 
+def parse_timestamp(text: str) -> tuple[datetime, bool] | None:
+    """(the time, whether it is a plain date) for a text _TIMESTAMP accepts; None for any other text.
+
+    A time written without a zone comes back without one (naive): what that
+    means is the caller's choice (UTC in a record, local time on a command line).
+    """
+    found = _TIMESTAMP.fullmatch(text)
+    if found is None:
+        return None
+    year, month, day = (int(part) for part in found["date"].split("-"))
+    hour = minute = second = microsecond = 0
+    if found["clock"] is not None:
+        hour, minute = (int(part) for part in found["clock"].split(":"))
+        second = int(found["seconds"] or 0)
+        microsecond = int((found["fraction"] or "0").ljust(6, "0"))
+    try:
+        zone = _zone(found["zone"])
+        return datetime(year, month, day, hour, minute, second, microsecond, tzinfo=zone), found["clock"] is None
+    except ValueError:  # month 13, hour 25, an offset of a day or more
+        return None
+
+
+def _zone(text: str | None) -> timezone | None:
+    if text is None:
+        return None
+    if text in ("Z", "z"):
+        return timezone.utc
+    offset = timedelta(hours=int(text[1:3]), minutes=int(text[4:6]))
+    return timezone(-offset if text[0] == "-" else offset)
+
+
 def record_time(record: dict[str, Any]) -> datetime | None:
     """When the record was written, or None if its "time" cannot be read. A time without a zone is UTC."""
     text = text_of(record, "time")
-    if text is None or len(text) > 64:
+    parsed = parse_timestamp(text) if text is not None and len(text) <= 64 else None
+    if parsed is None:
         return None
-    try:
-        when = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
-    except ValueError:
-        return None
+    when = parsed[0]
     return when if when.tzinfo is not None else when.replace(tzinfo=timezone.utc)
 
 
@@ -198,15 +238,15 @@ def parse_when(text: str, now: datetime | None = None, end_of_day: bool = False)
             raise ValueError(f"{quoted(spelled, limit=40)} reaches back before the year 1") from None
     if len(spelled) > 40:
         raise ValueError("a time is at most 40 characters")
-    try:
-        when = datetime.fromisoformat(spelled[:-1] + "+00:00" if spelled.endswith(("Z", "z")) else spelled)
-    except ValueError:
+    parsed = parse_timestamp(spelled)
+    if parsed is None:
         raise ValueError(
             f"cannot read {quoted(spelled, limit=40)} as a time: write a number with m, h, d or w "
             "(for example 2h), or a date such as 2026-11-18 or 2026-11-18T14:30"
-        ) from None
+        )
+    when, plain_date = parsed
     try:
-        if end_of_day and _PLAIN_DATE.fullmatch(spelled):
+        if end_of_day and plain_date:
             when += timedelta(days=1)
         return when if when.tzinfo is not None else when.astimezone()  # a time without a zone is the local time
     except (OverflowError, OSError, ValueError):  # a date at the very edge of what the clock can show
@@ -215,25 +255,8 @@ def parse_when(text: str, now: datetime | None = None, end_of_day: bool = False)
 
 # ---- names with wildcards ----------------------------------------------------------------
 
-def glob_matches(pattern: str, text: str) -> bool:
-    """True if `text` matches `pattern`, in which only "*" is special (anything, or nothing). Case matters.
-
-    The same rule as tool names in a policy. Plain string search, so a long
-    hostile name cannot make it slow.
-    """
-    pieces = pattern.split("*")
-    if len(pieces) == 1:
-        return text == pattern
-    first, last = pieces[0], pieces[-1]
-    if len(text) < len(first) + len(last) or not text.startswith(first) or not text.endswith(last):
-        return False
-    position, end = len(first), len(text) - len(last)
-    for piece in pieces[1:-1]:
-        found = text.find(piece, position, end)
-        if found < 0:
-            return False
-        position = found + len(piece)
-    return True
+# glob_matches (imported above) is the policy's own rule for tool names: only "*" is special, and
+# plain string search, so a long hostile name cannot make it slow.
 
 
 # ---- filters -----------------------------------------------------------------------------

@@ -32,13 +32,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-from .filelock import locked
+from . import jsonutil
+from .filelock import locked, replace_file
 from .firewall import RATE_WINDOW_SECONDS
 from .session import LOCK_FILE_NAME, MAX_SESSION_ID_CHARS
 
@@ -49,10 +49,6 @@ MAX_RATE_FILE_BYTES = 256 * 1024
 MAX_BUCKETS = 1_000
 MAX_BUCKET_NAME_CHARS = 1_000
 MAX_COUNT = 1_000_000_000
-
-# os.replace can fail on Windows for a moment while another program has the file open.
-_REPLACE_ATTEMPTS = 5
-_REPLACE_PAUSE_SECONDS = 0.05
 
 
 class RateLimitStateError(Exception):
@@ -127,7 +123,7 @@ class FileRateLimiter:
     def _parse(self, data: bytes) -> tuple[str | None, dict[str, list[list[int]]]]:
         """Read the file's bytes. Returns (what is wrong, or None; the buckets)."""
         try:
-            document = json.loads(data.decode("utf-8"), object_pairs_hook=_unique_keys)
+            document = jsonutil.loads(data.decode("utf-8"))
         except (ValueError, RecursionError):  # includes UnicodeDecodeError and a repeated key
             return "not JSON", {}
         if not isinstance(document, dict) or set(document) != {"format", "version", "session", "buckets"}:
@@ -152,16 +148,7 @@ class FileRateLimiter:
         data = json.dumps(document, ensure_ascii=True).encode("ascii")
         if len(data) > MAX_RATE_FILE_BYTES:
             raise RateLimitStateError("the rate-limit counts would not fit in the rate-limit file")
-        temporary = self.path.with_name(self.path.name + ".tmp")
-        temporary.write_bytes(data)
-        for attempt in range(_REPLACE_ATTEMPTS):
-            try:
-                os.replace(temporary, self.path)
-                return
-            except PermissionError:
-                if attempt == _REPLACE_ATTEMPTS - 1:
-                    raise
-                time.sleep(_REPLACE_PAUSE_SECONDS)
+        replace_file(self.path, data)
 
 
 def _valid_entries(entries: Any) -> bool:
@@ -206,12 +193,3 @@ def _counted(entries: list[list[int]], second: int) -> list[list[int]]:
         return [*entries[:-1], [second, min(entries[-1][1] + 1, MAX_COUNT)]]
     return [*entries, [second, 1]]
 
-
-def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    """A JSON object in which no key repeats (a repeated key would hide one of two values)."""
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("repeated key")
-        result[key] = value
-    return result

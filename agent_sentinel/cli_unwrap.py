@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import argparse
 
-from .cli_common import EXIT_OK, shell_line, shown_path
+from .cli_common import EXIT_OK, shown_command, shown_path
 from .cli_wrap import (
     Step,
     add_config_arguments,
@@ -26,8 +26,6 @@ from .cli_wrap import (
 )
 from .clients import CLIENTS
 from .config_file import ConfigFile
-from .leaks import redact
-from .textutil import printable
 from .wrapping import WrapError, proxy_command_of, unwrap_entry
 
 HELP = "take the proxy out of a client's configuration again (shows a diff; writes with --apply)"
@@ -82,8 +80,8 @@ def _unwrap_step(name: str, entry: object, explicit: bool) -> Step | None:
         new = unwrap_entry(entry)  # type: ignore[arg-type]  (proxy_command_of returned a value, so it is a dict)
     except WrapError as exc:
         return Step(name, entry, None, f"skipped: {exc}")
-    command = shell_line([new["command"], *new.get("args", [])])
-    return Step(name, entry, new, f"will start {printable(redact(command), limit=120)} directly again: NOT protected")
+    command = shown_command([new["command"], *new.get("args", [])], limit=120)
+    return Step(name, entry, new, f"will start {command} directly again: NOT protected")
 
 
 def _apply(config: ConfigFile, client: str, changes: dict) -> int:

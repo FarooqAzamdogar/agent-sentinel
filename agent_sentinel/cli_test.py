@@ -39,6 +39,7 @@ Exit code 1 when any case fails, 0 when all pass.
 from __future__ import annotations
 
 import argparse
+import ntpath
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -216,20 +217,43 @@ def _scan_file(spec: Any, where: str, folder: str, budget: list[int]) -> str:
     """The text of a scan_file, read now, so that a missing file stops the run before any case is checked."""
     if not isinstance(spec, str) or not spec:
         raise CommandError(f"{where}.scan_file must be a file path (text), got {quoted(spec)}")
-    # Inside the case file's folder only, links resolved: a case file, perhaps from someone
-    # else's pull request, must not be able to make `test` read files from elsewhere.
-    root = os.path.realpath(folder)
-    path = os.path.realpath(os.path.join(root, spec))
-    if os.path.isabs(spec) or not _is_inside(path, root):
-        raise CommandError(
-            f"{where}.scan_file must be a relative path to a file in the case file's folder or below it, "
-            f"got {quoted(spec)}"
-        )
-    data = read_input(path, limit=MAX_INPUT_BYTES)
+    data = read_input(_scan_file_path(spec, where, folder), limit=MAX_INPUT_BYTES)
     budget[0] -= len(data)
     if budget[0] < 0:
         raise CommandError(f"{where}: the scan_file files together are larger than {MAX_SCAN_FILE_BYTES} bytes")
     return decode_utf8(data, f"{where}.scan_file")
+
+
+def _scan_file_path(spec: str, where: str, folder: str) -> str:
+    """The full path of a scan_file, which must be inside the case file's folder, reached without a link.
+
+    A case file, perhaps from someone else's pull request, must not be able to
+    make `test` read files from elsewhere. Everything is decided from the text
+    before the file system is asked anything: on Windows, merely resolving a
+    path on another machine (\\\\server\\share, or a drive) makes Windows sign
+    in to that machine with the user's credentials. A link inside the folder
+    could lead there too, so no part of the path may be a link (each part is
+    looked at without following it).
+    """
+    refused = CommandError(
+        f"{where}.scan_file must be a relative path to a file in the case file's folder or below it, "
+        f"without links, got {quoted(spec)}"
+    )
+    if os.path.isabs(spec) or ntpath.splitdrive(spec)[0] or spec[:1] in ("\\", "/"):
+        raise refused
+    root = os.path.realpath(folder)
+    joined = os.path.normpath(os.path.join(root, spec))
+    if not _is_inside(joined, root):
+        raise refused
+    current = root
+    for part in os.path.relpath(joined, root).split(os.sep):
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            raise refused
+    path = os.path.realpath(joined)
+    if not _is_inside(path, root):  # a junction or another kind of redirection
+        raise refused
+    return path
 
 
 def _is_inside(path: str, root: str) -> bool:

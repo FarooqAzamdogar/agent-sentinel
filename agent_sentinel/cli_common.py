@@ -26,15 +26,16 @@ import codecs
 import json
 import os
 import re
-import shlex
-import subprocess
 import sys
 import textwrap
 from pathlib import Path
 from typing import Any
 
+from .jsonutil import MAX_INT_DIGITS, bounded_int, strict_loads  # noqa: F401  (MAX_INT_DIGITS, bounded_int: shared)
+from .leaks import redact
 from .policy import Policy, PolicyError
-from .policy_errors import file_error_message, json_error_message, quoted
+from .policy_errors import file_error_message, quoted
+from .proxy_report import shell_line  # noqa: F401  (shared by the commands)
 from .textutil import printable
 
 EXIT_OK = 0
@@ -45,11 +46,6 @@ EXIT_ASK = 3
 # The largest file a command reads whole (a file to scan, a case file, a result).
 # The proxy drops messages larger than this by default, so nothing larger reaches an agent through it.
 MAX_INPUT_BYTES = 16 * 1024 * 1024
-
-# Python 3.11 and later refuse to read an integer of more digits than this
-# (reading one is slow: the work grows with the square of its length). The
-# same limit is applied on 3.10, so that a file reads the same everywhere.
-MAX_INT_DIGITS = 4300
 
 # Byte order marks, longest first: the UTF-32-LE mark begins with the UTF-16-LE one.
 _BYTE_ORDER_MARKS = (
@@ -138,48 +134,18 @@ def readings(data: bytes) -> list[str]:
     return list(dict.fromkeys(found))
 
 
-def bounded_int(text: str) -> int:
-    """json's parse_int: an integer, unless it has more digits than MAX_INT_DIGITS (then ValueError)."""
-    if len(text) > MAX_INT_DIGITS + 1:  # +1 for a minus sign
-        raise ValueError(f"a number with more than {MAX_INT_DIGITS} digits")
-    return int(text)
-
-
-def _no_constants(name: str) -> Any:
-    raise ValueError(f"{name} is not valid JSON")
-
-
-class _RepeatedKey(ValueError):
-    pass
-
-
-def _no_repeated_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise _RepeatedKey(f"the key {quoted(key, limit=60)} appears twice in one object")
-        result[key] = value
-    return result
-
-
 def strict_json(text: str, label: str) -> Any:
-    """Parse JSON the way policies are parsed: a repeated key is an error, and errors show where.
+    """Parse strict JSON (jsonutil.strict_loads), or raise CommandError saying what is wrong and where.
 
-    Also refused: NaN and Infinity (Python accepts them, JSON does not) and
-    integers longer than MAX_INT_DIGITS. Raises CommandError. A JSON syntax
-    error names the line and column, shows the line with a caret, and adds a
-    hint for the common mistakes.
+    Refused: a repeated key, NaN and Infinity, a number too large to be one
+    (1e999), and integers longer than MAX_INT_DIGITS. A syntax error names
+    the line and column, shows the line with a caret, and adds a hint for the
+    common mistakes.
     """
     try:
-        return json.loads(
-            text, object_pairs_hook=_no_repeated_keys, parse_int=bounded_int, parse_constant=_no_constants
-        )
-    except json.JSONDecodeError as exc:
-        raise CommandError(json_error_message(label, exc)) from exc
-    except _RepeatedKey as exc:
-        raise CommandError(f"{label}: {exc}") from exc
-    except (ValueError, RecursionError) as exc:  # absurd nesting, a huge number, NaN
-        raise CommandError(f"{label}: not valid JSON ({printable(exc, limit=100)})") from exc
+        return strict_loads(text, label)
+    except ValueError as exc:
+        raise CommandError(str(exc)) from exc
 
 
 def decode_utf8(data: bytes, label: str) -> str:
@@ -200,16 +166,14 @@ def shown_path(path: str | Path) -> str:
     return f'"{text}"' if " " in text else text
 
 
-def shell_line(words: list[str], platform: str | None = None) -> str:
-    """Words as one command line for this system's shell, quoted where a word needs it."""
-    if (platform or sys.platform) == "win32":
-        return subprocess.list2cmdline(words)
-    return shlex.join(words)
-
-
 def shown_command(words: list[str], limit: int = 2000) -> str:
-    """A command (a server's, from the command line or a configuration) to print: quoted, then made printable."""
-    return printable(shell_line(words), limit=limit)
+    """A command (a server's, from the command line or a configuration) to print: quoted, redacted, printable.
+
+    The one way the commands print a server command: anything in it that
+    looks like a key or token (a --token argument) is redacted, as the
+    proxy's own startup line does.
+    """
+    return printable(redact(shell_line(words)), limit=limit)
 
 
 def shown_value(value: Any, limit: int = 80) -> str:

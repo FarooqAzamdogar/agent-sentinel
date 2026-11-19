@@ -13,6 +13,7 @@ Module map:
     firewall.py       combines the three and writes the audit log   (the public core)
     tool_guard.py     guard(): the firewall around a tool function
     textutil.py       helpers shared by the above
+    jsonutil.py       strict JSON reading (no repeated keys, NaN or Infinity), for every file and event
 
   The MCP proxy
     mcp_proxy.py      puts the firewall in front of an MCP server

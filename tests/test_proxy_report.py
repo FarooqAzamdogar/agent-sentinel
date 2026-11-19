@@ -296,6 +296,12 @@ class AdviceForAMissingPolicy(unittest.TestCase):
     def test_a_relative_path_gets_advice_and_an_absolute_one_does_not(self):
         self.assertIn("MCP clients start servers in a folder of their own choosing", missing_policy_hint("policy.json"))
         self.assertIn(os.path.join(".agent-sentinel", "policy.json"), missing_policy_hint("policy.json"))
+        # The folder `init` writes to, also when AGENT_SENTINEL_HOME moves it.
+        moved = os.path.join(os.path.abspath(os.sep), "as-home-probe")
+        with mock.patch.dict(os.environ, {"AGENT_SENTINEL_HOME": moved}):
+            self.assertIn(os.path.join(moved, "policy.json"), missing_policy_hint("policy.json"))
+        with mock.patch.dict(os.environ, {"AGENT_SENTINEL_HOME": "relative"}):
+            self.assertIn("/full/path/to/policy.json", missing_policy_hint("policy.json"))
         self.assertIsNone(missing_policy_hint(str(ROOT / "nope.json")))
 
 

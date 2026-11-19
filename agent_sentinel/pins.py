@@ -86,7 +86,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import threading
 from dataclasses import dataclass, field
@@ -94,6 +93,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import jsonutil
+from .filelock import replace_file
 from .textutil import printable
 
 PINS_VERSION = 2
@@ -192,7 +193,7 @@ def read_pins_file(path: str | Path) -> PinsFile:
     except UnicodeDecodeError as exc:
         raise PinsFileError(f"{path}: the pins file is not UTF-8 text") from exc
     try:
-        data = json.loads(text, object_pairs_hook=_no_repeated_keys, parse_constant=_no_constant)
+        data = jsonutil.loads(text)
     except (ValueError, RecursionError) as exc:
         raise PinsFileError(f"{path}: the pins file is not valid JSON ({exc})") from exc
     try:
@@ -203,11 +204,8 @@ def read_pins_file(path: str | Path) -> PinsFile:
 
 def write_pins_file(path: str | Path, pins: PinsFile) -> None:
     """Write a pins file as version 2, atomically: a crash cannot leave half a file. Raises OSError."""
-    path = Path(path)
     text = json.dumps(pins_document(pins), indent=1, ensure_ascii=True)  # ASCII: safe to look at in a terminal
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(text + "\n", encoding="utf-8")
-    os.replace(temporary, path)
+    replace_file(path, (text + "\n").encode("ascii"))
 
 
 def pins_document(pins: PinsFile) -> dict[str, Any]:
@@ -229,19 +227,6 @@ def _pin_document(pin: Pin) -> dict[str, Any]:
     if pin.definition is not None:
         document["definition"] = pin.definition
     return document
-
-
-def _no_repeated_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    found: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in found:
-            raise ValueError(f"the key '{printable(key, limit=80)}' appears twice in one object")
-        found[key] = value
-    return found
-
-
-def _no_constant(name: str) -> Any:
-    raise ValueError(f"{name} is not valid JSON")
 
 
 def _pins_from(data: Any) -> PinsFile:

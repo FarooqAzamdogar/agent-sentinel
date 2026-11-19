@@ -402,7 +402,7 @@ def _print_findings(target: Target, definition: dict[str, Any], judge: _Judge) -
     threshold = judge.threshold or "nothing (block_severity is null)"
     print(f"  Scanner, on the new definition (the policy blocks from {threshold}):")
     for finding in findings:
-        excerpt = printable(finding.excerpt, limit=MAX_EXCERPT_CHARS)
+        excerpt = printable(judge.firewall.shown_excerpt(finding.excerpt), limit=MAX_EXCERPT_CHARS)
         print(f"    {finding.severity:6}  {printable(finding.rule, limit=60)}: {excerpt}")
     if blocks:
         print("  The proxy would remove it for these findings even if it were accepted.")
