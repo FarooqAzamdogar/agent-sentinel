@@ -154,6 +154,11 @@ MAX_JOINED_ARGUMENT_CHARS = 100_000
 # out of the text around a match, and the cut can go through the middle of a
 # token, leaving most of it in a form the redaction no longer recognises.
 _LONG_RUN = re.compile(r"[A-Za-z0-9_+/=-]{20,}")
+# A shorter run at either end of an excerpt, where the cut may have gone
+# through a token and left a piece of it ("... use the key ghp_A1b2C3d4E").
+# A piece of 6 or more characters with a digit, or with a capital letter
+# after its first character, is treated as part of a key (_cut_piece).
+_EDGE_RUN = re.compile(r"^[A-Za-z0-9_+/=-]{6,}|[A-Za-z0-9_+/=-]{6,}$")
 # The marker of the view an excerpt was found in, such as "[base64] " (detector._marked).
 _VIEW_MARKER = re.compile(r"\[[a-z0-9]+\] ")
 # What the log keeps of an excerpt that may show a known value or canary (see _logged_excerpt).
@@ -1278,13 +1283,22 @@ def _logged_excerpt(excerpt: str, guard: SecretGuard) -> str:
     at either end may go through one. The log's redaction matches values
     exactly and would miss both: an excerpt that may show a value is left
     out. Long runs of letters and digits (most of a token the cut went
-    through, which redaction no longer recognises) become "[...]".
+    through, which redaction no longer recognises) become "[...]", and so
+    does a shorter piece at either end that looks like part of a key.
     """
-    if guard.has_values:
-        marker = _VIEW_MARKER.match(excerpt)
-        if guard.shows_a_value(excerpt[marker.end():] if marker else excerpt, folded_for_comparison):
-            return _EXCERPT_LEFT_OUT
-    return _LONG_RUN.sub("[...]", excerpt)
+    marker = _VIEW_MARKER.match(excerpt)
+    head, body = (excerpt[: marker.end()], excerpt[marker.end() :]) if marker else ("", excerpt)
+    if guard.has_values and guard.shows_a_value(body, folded_for_comparison):
+        return _EXCERPT_LEFT_OUT
+    return head + _EDGE_RUN.sub(_cut_piece, _LONG_RUN.sub("[...]", body))
+
+
+def _cut_piece(match: re.Match[str]) -> str:
+    """A run at an end of an excerpt: "[...]" if it may be part of a key, else unchanged."""
+    piece = match.group()
+    if any(ch.isdigit() for ch in piece) or any(ch.isupper() for ch in piece[1:]):
+        return "[...]"
+    return piece
 
 
 def _audit_line(record: dict[str, Any], guard: SecretGuard) -> str:

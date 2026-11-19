@@ -94,6 +94,8 @@ The biggest release so far: commands that set up real MCP clients, Claude Code h
 - Percent-decoding no longer slows down on hostile input: a megabyte of crafted text took 5 to 14 seconds.
 - The audit log is always valid JSON: NaN and Infinity in arguments are replaced by a note.
 - A secret split over several arguments is no longer written to the log in pieces.
+- A finding's excerpt no longer shows the first characters of a token that the excerpt window cut off at either end.
+- When the client cancels a call that waits for approval, the record says the client refused it, not the approver.
 - The Windows file lock no longer fails when many processes write the audit log at once.
 - Every refusal the proxy makes is audited and carries a reference, including "too many requests are waiting" and internal errors.
 - Server instructions that are not text are removed.

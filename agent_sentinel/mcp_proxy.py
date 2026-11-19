@@ -337,6 +337,8 @@ class _Outcome:
 
 
 _DROP = _Outcome()
+# The answer for a held call the client cancelled; compared by identity (_ask_someone).
+_CANCELLED = Answer(False, "the client cancelled the request")
 
 
 @dataclass
@@ -1270,7 +1272,8 @@ class Proxy:
                 answer = self._ask_on_this_machine(approver, waiting)
         finally:
             self._approval_turn.release()
-        return answer, approver.name
+        # Nobody refused a call the client withdrew: the record names the client, not the approver.
+        return answer, ("the client" if answer is _CANCELLED else approver.name)
 
     def _choose_approver(self) -> tuple[ApprovalBackend | None, str]:
         """The first approver that can ask now, or None and why none can."""
@@ -1354,7 +1357,7 @@ class Proxy:
         waiting.answered.wait(max(0.0, waiting.deadline - time.monotonic()))
         with self._state:
             if waiting.cancelled:
-                return Answer(False, "the client cancelled the request")
+                return _CANCELLED
             if waiting.answer is None:  # from now on a late answer changes nothing
                 waiting.answer = Answer(False, f"no answer within {self._approval_timeout:g} seconds")
             return waiting.answer

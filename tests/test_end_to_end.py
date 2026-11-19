@@ -1260,6 +1260,8 @@ class TheProxyInALegacySession(EndToEndTest):
         proxy.stop()
         approval = next(r for r in self.records(audit) if r["event"] == "approval")
         self.assertIn("the client cancelled the request", approval["reason"])
+        self.assertIn("refused by the client", approval["reason"])  # not by the approver, which never answered
+        self.assertNotIn("by command", approval["reason"])
 
 
 # ---- the proxy: MCP 2026-07-28 ---------------------------------------------------------------------------------

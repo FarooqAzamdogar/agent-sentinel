@@ -116,7 +116,7 @@ These are not guarantees, and reports about them are not vulnerabilities.
 - **Canaries are never removed from results** (by design: they must reach the agent so that sending them trips the guard). In calls they are found as written (any case), percent-encoded, or in base64 or hex.
 - **JWTs never cause a refusal.** They are only redacted.
 - **`secrets.in_results` covers replies**, not tool descriptions, list entries, server instructions or server requests. Under `redact`, a secret split over several strings, or inside a value that cannot be rebuilt, makes the whole result refused instead. In hook mode, a built-in tool's redacted output relies on Claude Code accepting a replacement of the same shape, and an error text cannot be redacted: the agent is stopped instead.
-- **The audit log** leaves out a finding's excerpt when it may show a known value or canary, but a value with fewer than 6 letters and digits can still appear. Arguments that hold a secret split over several values are left out of the record.
+- **The audit log** leaves out a finding's excerpt when it may show a known value or canary, but a value with fewer than 6 letters and digits can still appear. Where the excerpt window cuts through a token, runs of 20 or more letters and digits, and a piece of 6 or more at either end that has a digit or an inner capital, become `[...]`; a shorter piece of a token can still show. `scan`, `check`, `pins` and `explain` mask excerpts the same way. Arguments that hold a secret split over several values are left out of the record.
 - **Cost:** with the maximum of 100 known values and 100 canaries, checking 1 MB of text takes one to two seconds.
 
 ### The server's environment
@@ -149,7 +149,7 @@ These are not guarantees, and reports about them are not vulnerabilities.
 
 ### Resources and processes
 
-- **Resource limits are simple.** Messages over a size limit are dropped and the proxy caps what it remembers, but a server can still keep the proxy busy with a flood of valid messages. A reply that is dropped for its size leaves the client's request unanswered.
+- **Resource limits are simple.** Messages over a size limit are dropped and the proxy caps what it remembers, but a server can still keep the proxy busy with a flood of valid messages. A message dropped for its size is not answered: a client request dropped this way, or one whose reply was dropped, waits until the client's own timeout.
 - **stderr is rate-limited.** Past 20 lines in 10 seconds, the proxy's own lines are counted instead of printed, and the server's stderr is relayed at most 60 lines a minute. The audit log has every block; without `--audit` the rest are lost.
 - **A killed proxy cannot stop its server.** If the host application kills the proxy outright, the server is left running. The proxy stops the server itself when its input closes or it is asked to terminate.
 - **A tool call waits for a tool list that is being checked.** A server that never answers a list request delays tool calls by up to 15 seconds before they are refused.
