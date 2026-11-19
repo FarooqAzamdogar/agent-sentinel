@@ -22,7 +22,7 @@ The biggest release so far: commands that set up real MCP clients, Claude Code h
 - `demo`: the library and the proxy at work, in a temporary folder.
 - `report` gained filters (`--tool`, `--server`, `--action`, `--event`, `--since`, `--until`), `--by server`, `--show-args`, the top reasons for blocks with how to fix each, `--format json` and `--follow`.
 - `scan` takes several files, `--policy` or `--fail-on` for the threshold, `--as description|instructions` for the stricter rules, and `--format json`.
-- `validate` prints flow rules, labels, secret settings and hidden tools, and its errors name the file, line and column, show a caret, and suggest the word you probably meant.
+- `validate` prints flow rules, labels, secret settings and hidden tools, and its errors name the file and the setting and suggest the word you probably meant; a JSON syntax error also shows the line, the column and a caret.
 - A home folder for one user's files: `~/.agent-sentinel` (`%USERPROFILE%\.agent-sentinel` on Windows), or `AGENT_SENTINEL_HOME`.
 
 ### Proxy and protocol

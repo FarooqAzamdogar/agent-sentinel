@@ -557,7 +557,7 @@ Tool calls and resource reads are never decided by `client_requests`; the tool r
 - **Argument names are exact.** Only tool names take `*`. In `deny_args`, `"arg": "*"` means every argument.
 - **When several wildcard rules match a tool, the strictest wins** (block over ask over allow). A rule with the exact tool name beats all wildcards. Use `default` for the fallback, not a `"*"` rule.
 - **MCP resource reads and subscriptions** are checked as a tool named `resources/read` with one argument, `uri`. With `"default": "block"` they need a rule.
-- **Loading is strict.** An unknown key, a duplicate key, a wrong type or a missing `action` is an error, so a typo cannot quietly weaken a policy. The error message names the file, line and column, and suggests the word you probably meant.
+- **Loading is strict.** An unknown key, a duplicate key, a wrong type or a missing `action` is an error, so a typo cannot quietly weaken a policy. The error message names the file and the setting (such as `tools.read_file.action`) and suggests the word you probably meant; a JSON syntax error also shows the line, the column and a caret.
 - **Paths are judged as text.** A deny rule for `.ssh` catches `notes/../.ssh/id_rsa` but not a symbolic link to that file. Use the tool's own access controls as well.
 - **Test your policy in CI** with `agent-sentinel test policy.json cases.json` (see [Commands](#commands)).
 
