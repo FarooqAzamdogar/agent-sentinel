@@ -920,6 +920,10 @@ class _ForeignTools:
         for name in itertools.islice(names, MAX_FOREIGN_TOOLS):
             if isinstance(name, str) and _TOOL_NAME.fullmatch(name):
                 (self.plain if _PLAIN_WORD.fullmatch(name) else self.distinctive).add(name.lower())
+        # A token that ends with a distinctive name after a prefix ("mcp_tool_send_email") is at least
+        # two characters longer than the name (one for the prefix, one for the separator). Shorter
+        # tokens, the common case, skip that search.
+        self._shortest_prefixed = min(map(len, self.distinctive), default=0) + 2
 
     def __bool__(self) -> bool:
         return bool(self.distinctive or self.plain)
@@ -937,7 +941,7 @@ class _ForeignTools:
             end = start + len(name)
             if name in self.distinctive or (name in self.plain and _called_a_tool(view, start, end)):
                 yield start, end
-            elif self.distinctive and self._ends_with_a_name(name):
+            elif self.distinctive and len(name) >= self._shortest_prefixed and self._ends_with_a_name(name):
                 yield start, end
 
     def _ends_with_a_name(self, token: str) -> bool:

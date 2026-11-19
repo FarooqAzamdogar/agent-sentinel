@@ -6,23 +6,28 @@ each with the repository, commit and line it came from. None of them may be
 high in any way the proxy reads them: a high finding in a tool description
 removes the tool for the life of the proxy.
 
-tool_poisoning.json holds the published attacks, written in our own words
-with the same moves, and what the firewall must find in each. Entries whose
-expectation is "nothing found" are known misses, kept so the coverage stays
-honest.
+published/ holds one file per published attack, written in our own words
+with the same moves (see make_published.py for the format), and the outcome
+the firewall must give: stopped, redacted, flagged (logged only) or a known
+miss with the reason. Known misses are kept so the coverage stays honest:
+fixing one means changing its file on purpose.
 """
 
+import importlib.util
 import json
 import unittest
 from pathlib import Path
 
 import support  # noqa: F401  (sets up the import path)
-from agent_sentinel import Firewall, Policy
+from agent_sentinel import BlockedError, Firewall, Policy
 from agent_sentinel.detector import max_severity
 
 CORPUS = Path(__file__).resolve().parent / "attack_corpus"
 BENIGN = json.loads((CORPUS / "benign_tool_metadata.json").read_text(encoding="utf-8"))
-ATTACKS = json.loads((CORPUS / "tool_poisoning.json").read_text(encoding="utf-8"))
+PUBLISHED = CORPUS / "published"
+ATTACKS = [json.loads(path.read_text(encoding="ascii")) for path in sorted(PUBLISHED.glob("*.json"))]
+OUTCOMES = ("stopped", "redacted", "flagged", "known_miss")
+READ_SURFACES = ("tool_description", "list_item", "server_instructions", "result", "tool_error", "server_request")
 
 # Tool names a policy might give for OTHER servers, passed as foreign tools while
 # the harmless descriptions are read. Plain words ("search") and snake_case names
@@ -100,34 +105,108 @@ class TheBenignSet(unittest.TestCase):
             self.assertEqual(guard.scan_result("t", entry["text"]).findings, [], entry["text"][:80])
 
 
+def firewall_for(case):
+    """A firewall with the case's policy, and its environment for secrets.known_values_from_env."""
+    guard = Firewall(Policy.from_dict(case.get("policy", {"default": "allow"})))
+    if "environment" in case:
+        guard.set_secret_environment(case["environment"])
+    return guard
+
+
+def run_case(case):
+    """Put the case's attack through the firewall. Returns (decision, what reaches the agent or the tool)."""
+    guard = firewall_for(case)
+    surface = case["surface"]
+    if surface in READ_SURFACES:
+        checked = guard.check_result(
+            "t", case["content"], event=surface, foreign_tools=case.get("foreign_tools", ()), call_id="corpus"
+        )
+        return checked.decision, checked.content
+    if surface == "call":
+        decision = guard.check_call(case["call"]["tool"], case["call"]["arguments"])
+        return decision, case["call"]["arguments"] if decision.allowed else None
+    if surface == "session":
+        # Every step but the last must go through; the last is the attack.
+        *before, last = case["steps"]
+        for step in before:
+            guard.run(step["tool"], step["arguments"], lambda step=step, **_: step["result"])
+        try:
+            delivered = guard.run(last["tool"], last["arguments"], lambda **_: last["result"])
+        except BlockedError as blocked:
+            return blocked.decision, None
+        return guard.check_call(last["tool"], last["arguments"]), delivered
+    raise AssertionError(f"unknown surface {surface!r} in {case['id']}")
+
+
+def load_generator():
+    """make_published.py, loaded from its path (tests/attack_corpus is not a package)."""
+    spec = importlib.util.spec_from_file_location("make_published", CORPUS / "make_published.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class PublishedAttacks(unittest.TestCase):
-    def test_each_attack_gets_the_findings_it_should(self):
-        guard = firewall()
-        for case in ATTACKS["cases"]:
+    def test_each_attack_gets_its_expected_outcome(self):
+        for case in ATTACKS:
             with self.subTest(case=case["id"]):
-                decision = guard.scan_result(
-                    "t", case["content"], event=case["event"], foreign_tools=case.get("foreign_tools", ())
-                )
+                expect = case["expect"]
+                decision, delivered = run_case(case)
+                if expect["outcome"] == "stopped":
+                    self.assertFalse(decision.allowed, decision.reason)
+                    self.assertEqual(decision.rule, expect["rule"])
+                    self.assertIsNone(delivered)
+                    continue
+                self.assertTrue(decision.allowed, decision.reason)
+                if expect["outcome"] == "redacted":
+                    self.assertEqual(decision.rule, expect["rule"])
+                    self.assertTrue(decision.redacted)
+                    for removed in expect["removed"]:
+                        self.assertNotIn(removed, json.dumps(delivered))
+                else:
+                    self.assertEqual(decision.redacted, ())
+
+    def test_each_attack_that_is_read_gets_the_findings_it_should(self):
+        for case in ATTACKS:
+            if case["surface"] not in READ_SURFACES:
+                continue
+            with self.subTest(case=case["id"]):
+                decision, _ = run_case(case)
                 found = {finding.rule for finding in decision.findings}
                 self.assertEqual(max_severity(decision.findings), case["expect"]["worst"], decision.findings)
                 self.assertLessEqual(set(case["expect"]["rules"]), found)
+                outcome = case["expect"]["outcome"]
+                if outcome == "flagged":
+                    self.assertIn(case["expect"]["worst"], ("medium", "low"))
+                if outcome == "known_miss":
+                    self.assertIsNone(case["expect"]["worst"])
 
-    def test_each_high_attack_is_blocked_and_the_rest_are_let_through(self):
-        guard = firewall()
-        for case in ATTACKS["cases"]:
-            with self.subTest(case=case["id"]):
-                decision = guard.scan_result(
-                    "t", case["content"], event=case["event"], foreign_tools=case.get("foreign_tools", ())
-                )
-                self.assertEqual(decision.allowed, case["expect"]["worst"] != "high")
-
-    def test_every_attack_names_its_source(self):
-        for case in ATTACKS["cases"]:
-            with self.subTest(case=case["id"]):
+    def test_every_file_names_its_source_and_says_why_a_miss_is_a_miss(self):
+        self.assertGreaterEqual(len(ATTACKS), 40)
+        for path, case in zip(sorted(PUBLISHED.glob("*.json")), ATTACKS):
+            with self.subTest(case=path.name):
+                self.assertEqual(path.stem, case["id"])
                 self.assertTrue(case["source"].startswith("https://"))
                 self.assertTrue(case["about"])
-        ids = [case["id"] for case in ATTACKS["cases"]]
-        self.assertEqual(len(ids), len(set(ids)))
+                self.assertIn(case["expect"]["outcome"], OUTCOMES)
+                if case["expect"]["outcome"] in ("flagged", "known_miss"):
+                    self.assertTrue(case.get("why"))
+                if case["surface"] in READ_SURFACES:
+                    self.assertIn("worst", case["expect"])
+
+    def test_the_corpus_covers_every_surface_and_outcome(self):
+        surfaces = {case["surface"] for case in ATTACKS}
+        self.assertLessEqual({"tool_description", "server_instructions", "result", "server_request", "call",
+                              "session"}, surfaces)
+        self.assertEqual({case["expect"]["outcome"] for case in ATTACKS}, set(OUTCOMES))
+
+    def test_the_files_are_exactly_what_the_generator_writes(self):
+        generator = load_generator()
+        expected = {f"{case['id']}.json": generator.file_text(case) for case in generator.all_cases()}
+        on_disk = {path.name: path.read_text(encoding="ascii") for path in PUBLISHED.glob("*.json")}
+        self.assertEqual(sorted(on_disk), sorted(expected))
+        for name, text in expected.items():
+            self.assertEqual(on_disk[name], text, f"{name} differs: run tests/attack_corpus/make_published.py")
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 Module map:
 
     detector.py   finds prompt injection in text            (no dependencies)
-    leaks.py      recognises secrets in outgoing text       (no dependencies)
+    leaks.py      recognises secrets in calls, results and logs  (uses textutil)
     policy.py     decides allow / ask / block for a call    (uses detector for severities)
     matchers.py   the ways a policy judges one argument's value (pattern, one_of, path, url, ...)
     policy_errors.py  error messages that help fix a policy file
@@ -16,13 +16,13 @@ Module map:
 """
 
 from .detector import Finding, scan
-from .firewall import BlockedError, Decision, Firewall
+from .firewall import BlockedError, CheckedResult, Decision, Firewall
 from .policy import Policy, PolicyError
 from .session import FileSessionStore, MemorySessionStore, SessionStateError
 from .textutil import printable
 
 __all__ = [
-    "BlockedError", "Decision", "FileSessionStore", "Finding", "Firewall", "MemorySessionStore", "Policy",
-    "PolicyError", "SessionStateError", "printable", "scan",
+    "BlockedError", "CheckedResult", "Decision", "FileSessionStore", "Finding", "Firewall", "MemorySessionStore",
+    "Policy", "PolicyError", "SessionStateError", "printable", "scan",
 ]
 __version__ = "0.4.1"

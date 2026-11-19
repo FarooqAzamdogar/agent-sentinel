@@ -2,12 +2,18 @@
 
 This is the core that everything else calls. It answers two questions:
 
-    check_call(tool, args)   may the agent make this call?        (secrets, policy, rate limits)
-    scan_result(tool, text)  may the agent read this text?        (detector)
+    check_call(tool, args)     may the agent make this call?      (secrets, policy, rate limits)
+    scan_result(tool, text)    may the agent read this text?      (detector; secrets in results)
 
 Both return a `Decision` and write one line to the audit log. What a server
 says about itself (tool descriptions, list entries, its instructions) is
 scanned with stricter rules than tool results: see METADATA_EVENTS.
+
+With the policy's `secrets.in_results` set to "redact", a result may be
+passed on with its secrets replaced. Only `check_result` can hand back that
+copy, so a caller that forwards results should use it: it returns the
+Decision together with the content to pass on. `scan_result` refuses a
+result that would need redacting, rather than let it through unchanged.
 
 A Decision carries two texts. `reason` is the full detail and goes to the audit
 log and the human approver. `public_reason` is what may be shown to the agent:
@@ -50,19 +56,32 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from secrets import token_hex
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from .detector import METADATA, RESULT, SEVERITY_ORDER, Finding, max_severity, scan_views
 from .filelock import lock_file as _lock_file, unlock_file as _unlock_file
-from .leaks import find_secrets, redact, redact_value
+from .leaks import (
+    CANARY,
+    CUSTOM,
+    KNOWN_VALUE,
+    CannotRedact,
+    CustomFormat,
+    Found,
+    SecretGuard,
+    known_values_from_environment,
+)
 from .policy import (
     PERMITTED,
     RULE_CALLER,
     RULE_INJECTION,
     RULE_MALFORMED,
     RULE_SECRETS,
+    RULE_SECRETS_CANARIES,
+    RULE_SECRETS_IN_RESULTS,
+    RULE_SECRETS_KNOWN_VALUES,
     RULE_SESSION,
     RULE_UNSCANNABLE,
+    SECRET_CHARSETS,
     Policy,
     Verdict,
     limit_rule,
@@ -103,6 +122,15 @@ MAX_CALL_ID_CHARS = 256
 # it gives at initialize. They are read with the detector's "metadata" rules,
 # which know how tool descriptions are poisoned (see detector.py, "Profiles").
 METADATA_EVENTS = frozenset({"tool_description", "list_item", "server_instructions"})
+# The scan_result events that secrets.in_results applies to: what a call
+# returned, or the error it raised (the proxy checks every reply to a request
+# as a "result"). Not what a server says about itself, and not a request the
+# server sends (the policy's server_requests section decides those).
+RESULT_EVENTS = frozenset({"result", "tool_error"})
+# The arguments of a call are also read joined end to end, so that a token
+# split over two arguments is seen whole. The joined text is cut at this
+# length: past it, a split token is not seen.
+MAX_JOINED_ARGUMENT_CHARS = 100_000
 
 # A long unbroken run of letters and digits in an excerpt. An excerpt is cut
 # out of the text around a match, and the cut can go through the middle of a
@@ -113,6 +141,7 @@ _INJECTION_REFUSAL = "possible prompt injection; the content was withheld"
 _SECRET_REFUSAL = "the call contains what looks like a secret, so it was not made"
 _RATE_REFUSAL = "too many calls in a short time; try again later"
 _UNSCANNABLE_REFUSAL = "the content has a type that cannot be checked"
+_SECRET_RESULT_REFUSAL = "the content holds what looks like a secret, so it was withheld"
 # Says nothing about flows or sessions: the agent must not learn that its history is tracked.
 _WITHHELD_REFUSAL = "the content could not be checked, so it was withheld"
 
@@ -146,7 +175,8 @@ class Decision:
     to scan_result for the call's result). `pending` is True only for the
     answer of `check_call(..., defer_ask=True)` to a call that needs a human:
     it is not allowed (so `bool(decision)` is False), and `finish_approval`
-    gives the final answer.
+    gives the final answer. `redacted` names the kinds of secret that
+    `check_result` replaced in a result (never the secrets themselves).
     """
 
     allowed: bool
@@ -158,6 +188,7 @@ class Decision:
     ref: str | None = None  # blocks only: the reference shared by the agent's text and the audit record
     call_id: str | None = None  # shared by the audit records of one call
     pending: bool = False  # waiting for a human: see Firewall.check_call(defer_ask=True) and finish_approval
+    redacted: tuple[str, ...] = ()  # kinds of secret replaced in a result, e.g. ("GitHub token",)
 
     def __post_init__(self) -> None:
         if self.pending and self.allowed:
@@ -172,6 +203,23 @@ class Decision:
     def __bool__(self) -> bool:
         # So that `if firewall.check_call(...):` means what it looks like.
         return self.allowed
+
+
+@dataclass(frozen=True)
+class CheckedResult:
+    """The answer of `Firewall.check_result`: the Decision, and the content that may be passed on.
+
+    content: when decision.allowed, exactly what was checked and may reach the
+             agent: the content that was given, or a copy with its secrets
+             replaced (decision.redacted names their kinds). None when the
+             content is refused: there is nothing to pass on then.
+    """
+
+    decision: Decision
+    content: Any = None
+
+    def __bool__(self) -> bool:
+        return self.decision.allowed
 
 
 class BlockedError(Exception):
@@ -260,6 +308,14 @@ class Firewall:
         self._annotations_overflowed = False
         # Calls waiting for finish_approval: call id -> (the pending decision, the tool, its reason).
         self._pending_approvals: dict[str, tuple[Decision, str, str]] = {}
+        # The secret guard for the policy's secret settings: (settings it was built
+        # for, the guard, warnings about secrets.known_values_from_env). Built now,
+        # so that the values of those variables are read when the firewall starts;
+        # rebuilt if the settings change. One tuple, so that a thread never sees a
+        # guard with another guard's warnings.
+        self._secret_environment: Mapping[str, str] | None = None  # None: os.environ
+        self._guard_state: tuple[tuple[Any, ...], SecretGuard, list[str]] | None = None
+        self._secret_guard()
 
     # ---- decisions ----------------------------------------------------------
 
@@ -381,39 +437,76 @@ class Firewall:
         detector (it is still scanned as text). A clean result does not set
         flow marks: call `mark_delivered` once it is certain the result
         reaches the agent.
-        """
-        if isinstance(content, str):
-            views = [content]
-        else:
-            try:
-                views = text_views(content, strict=True)
-            except UnscannableError as exc:
-                # Fail closed: content that cannot be read cannot be called clean.
-                return self.refuse(
-                    tool, str(exc), event=event, public_reason=_UNSCANNABLE_REFUSAL, rule=RULE_UNSCANNABLE,
-                    call_id=call_id,
-                )
 
-        metadata = event in METADATA_EVENTS
-        findings = scan_views(
-            views,
-            profile=METADATA if metadata else RESULT,
-            parameters=tool_parameters(content) if event == "tool_description" else None,
-            foreign_tools=foreign_tools if metadata else (),
-            skip_decoding=() if isinstance(content, str) else media_payloads(content),
-        )
-        worst = max_severity(findings)
-        threshold = self.policy.block_severity
-        rules = ", ".join(f.rule for f in findings)
-        if worst is None:
-            decision = Decision(True, "no injection patterns found", call_id=call_id)
-        elif threshold is not None and SEVERITY_ORDER[worst] >= SEVERITY_ORDER[threshold]:
-            reason = f"possible prompt injection ({rules})"
-            decision = Decision(False, reason, findings, _INJECTION_REFUSAL, rule=RULE_INJECTION, call_id=call_id)
-        else:
-            reason = f"suspicious content below blocking threshold ({rules})"
-            decision = Decision(True, reason, findings, call_id=call_id)
-        return self._finish(event, tool, decision, log=bool(findings) or log_clean)
+        Secrets (the policy's secrets.in_results, for the RESULT_EVENTS
+        "result" and "tool_error"): with "block", a result holding what looks
+        like a secret is refused. With "redact", scan_result cannot hand back
+        a redacted copy, so it refuses every result that `check_result` would
+        change (a JWT included); use `check_result` to pass results on with
+        their secrets replaced. With "block", a JWT is never a reason to
+        refuse, and canaries are not looked for in results.
+        """
+        checked = self._checked_content(tool, content, event, log_clean, call_id, foreign_tools, can_replace=False)
+        return checked.decision
+
+    def check_result(
+        self,
+        tool: str,
+        content: Any,
+        event: str = "result",
+        log_clean: bool = True,
+        *,
+        call_id: str | None = None,
+        foreign_tools: Iterable[str] = (),
+    ) -> CheckedResult:
+        """Like `scan_result`, and also return the content that may be passed on: for a caller that forwards it.
+
+        With the policy's secrets.in_results "redact", the secrets in a result
+        are replaced first (see leaks.SecretGuard.redact_result), and the copy
+        is what the detector scans and what `CheckedResult.content` holds.
+        Pass on exactly that, never the original. Without a secret, or with any
+        other setting, the content is the one given (the same object), and the
+        answer is the one scan_result would give.
+
+        Results that are not text are redacted where they are text, dict,
+        list or tuple (exactly those types; numbers, booleans and None are
+        kept). A result is refused (decision not allowed, content None) when
+        it holds a secret that cannot be replaced: one split over several
+        strings, or one inside a part of another type (bytes, a set, a
+        dataclass, a subclass of str or dict, ...), which cannot be rebuilt
+        without it. A part of another type with no secret in it is passed on
+        as it is. The audit record lists the kinds replaced under "redacted",
+        never the secrets; decision.redacted holds the same.
+        """
+        return self._checked_content(tool, content, event, log_clean, call_id, foreign_tools, can_replace=True)
+
+    def secret_warnings(self) -> list[str]:
+        """Why some secrets.known_values_from_env values are not guarded: for the operator, at startup.
+
+        A variable that is not set in the environment the values are read from
+        (see set_secret_environment), or whose value is shorter than
+        leaks.MIN_VALUE_CHARS (8) or longer than leaks.MAX_VALUE_CHARS. The
+        texts name variables, never values. Empty when all are guarded.
+        """
+        self._secret_guard()
+        assert self._guard_state is not None
+        return list(self._guard_state[2])
+
+    def set_secret_environment(self, environ: Mapping[str, str] | None) -> None:
+        """Read the values of secrets.known_values_from_env from `environ` instead of os.environ.
+
+        For a caller that starts the tool's server with an environment of its
+        own (the proxy with --clean-env or --env-file): the values to guard
+        are the ones the server holds. The mapping is copied now; None goes
+        back to os.environ. Entries that are not text are ignored.
+        """
+        if environ is not None and not isinstance(environ, Mapping):
+            raise TypeError("environ must be a mapping of variable names to values, or None")
+        self._secret_environment = None if environ is None else {
+            name: value for name, value in environ.items() if isinstance(name, str) and isinstance(value, str)
+        }
+        self._guard_state = None  # rebuilt now, from the new values
+        self._secret_guard()
 
     def block(
         self, tool: str, reason: str, event: str = "call", public_reason: str = "", rule: str = RULE_CALLER,
@@ -469,6 +562,11 @@ class Firewall:
         raised by the tool is blocked. A result (or an error) that is returned
         to the caller sets the session's flow marks first. For an `async def`
         tool use `run_async`.
+
+        With the policy's secrets.in_results "redact", what is returned is the
+        checked copy with its secrets replaced (see check_result), not the
+        tool's own object. An error whose text holds a secret is blocked under
+        "redact" as under "block": an exception cannot be rebuilt without it.
         """
         args = {} if args is None else args
         decision = self.check_call(tool, args)
@@ -613,11 +711,10 @@ class Firewall:
         # The secret guard runs first, so that its answer does not depend on the
         # policy. If it ran after, "looks like a secret" would tell a probing
         # agent that the policy would have let the call through.
-        if self.policy.secrets_in_arguments == "block":
-            secrets = find_secrets("\n".join([tool, *texts_in(args, keys=True)]))
-            if secrets:
-                reason = f"the call contains what looks like a secret ({', '.join(secrets)})"
-                return Decision(False, reason, public_reason=_SECRET_REFUSAL, rule=RULE_SECRETS, call_id=call_id)
+        secrets = self._secrets_in_call(tool, args)
+        if secrets:
+            reason = f"the call contains what looks like a secret ({_kinds(secrets)})"
+            return Decision(False, reason, public_reason=_SECRET_REFUSAL, rule=_secret_rule(secrets), call_id=call_id)
 
         verdict = self._verdict(tool, args)
         if verdict.action not in ("allow", "ask"):
@@ -644,6 +741,42 @@ class Firewall:
                 )
             return self._ask_human(tool, args, verdict, call_id)
         return Decision(True, verdict.reason, rule=verdict.rule, call_id=call_id)
+
+    def _secret_guard(self) -> SecretGuard:
+        """The secret guard for the policy's secret settings, rebuilt when they have changed.
+
+        Building it reads the values of secrets.known_values_from_env, from
+        this process's environment (which a server it starts inherits) unless
+        set_secret_environment gave another.
+        """
+        policy = self.policy
+        settings = (policy.secrets_patterns, policy.secrets_known_values_from_env, policy.secrets_canaries)
+        state = self._guard_state
+        if state is not None and state[0] == settings:
+            return state[1]
+        environ = os.environ if self._secret_environment is None else self._secret_environment
+        values, warnings = known_values_from_environment(policy.secrets_known_values_from_env, environ)
+        custom = [
+            CustomFormat(pattern.name, pattern.prefix, SECRET_CHARSETS[pattern.charset], pattern.min_len,
+                         pattern.max_len)
+            for pattern in policy.secrets_patterns
+        ]
+        guard = SecretGuard(custom, values, policy.secrets_canaries)
+        self._guard_state = (settings, guard, warnings)
+        return guard
+
+    def _secrets_in_call(self, tool: str, args: dict[str, Any]) -> list[Found]:
+        """The secrets in a call's tool name and arguments.
+
+        Formats (built-in and custom) are looked for only when the policy's
+        secrets.in_arguments is "block". Known values and canaries are always
+        looked for: the operator listed them by name, and they never belong in a call.
+        """
+        guard = self._secret_guard()
+        formats = self.policy.secrets_in_arguments == "block"
+        if not formats and not guard.has_values:
+            return []
+        return guard.find_in_texts(_call_spellings(tool, args), formats=formats)
 
     def _verdict(self, tool: str, args: dict[str, Any]) -> Verdict:
         """The policy's verdict, with the flow rules applied when the policy has any."""
@@ -706,12 +839,140 @@ class Firewall:
 
     # ---- internals: results -------------------------------------------------
 
+    def _checked_content(
+        self,
+        tool: str,
+        content: Any,
+        event: str,
+        log_clean: bool,
+        call_id: str | None,
+        foreign_tools: Iterable[str],
+        can_replace: bool,
+    ) -> CheckedResult:
+        """scan_result and check_result: the secret step (for results), then the detector, then one audit record.
+
+        can_replace: whether the caller passes on the content this returns. If
+        not, a result that would need redacting is refused instead.
+        """
+        if isinstance(content, str):
+            views = [content]
+        else:
+            try:
+                views = text_views(content, strict=True)
+            except UnscannableError as exc:
+                # Fail closed: content that cannot be read cannot be called clean.
+                refusal = self.refuse(
+                    tool, str(exc), event=event, public_reason=_UNSCANNABLE_REFUSAL, rule=RULE_UNSCANNABLE,
+                    call_id=call_id,
+                )
+                return CheckedResult(refusal)
+
+        redacted: tuple[str, ...] = ()
+        secret_problem = None
+        if event in RESULT_EVENTS and self.policy.secrets_in_results != "off":
+            content, views, redacted, secret_problem = self._secrets_in_result(content, views, can_replace)
+
+        # The detector reads what will be passed on: after redaction, the copy.
+        metadata = event in METADATA_EVENTS
+        findings = scan_views(
+            views,
+            profile=METADATA if metadata else RESULT,
+            parameters=tool_parameters(content) if event == "tool_description" else None,
+            foreign_tools=foreign_tools if metadata else (),
+            skip_decoding=() if isinstance(content, str) else media_payloads(content),
+        )
+        decision = self._result_decision(findings, redacted, secret_problem, call_id)
+        logged = bool(findings) or bool(redacted) or secret_problem is not None or log_clean
+        decision = self._finish(event, tool, decision, log=logged)
+        return CheckedResult(decision, content if decision.allowed else None)
+
+    def _secrets_in_result(
+        self, content: Any, views: list[str], can_replace: bool
+    ) -> tuple[Any, list[str], tuple[str, ...], str | None]:
+        """Apply secrets.in_results: (content, its views, kinds replaced, why it must be refused or None).
+
+        The content and views returned are what the detector reads next and
+        what is passed on if nothing refuses it: the redacted copy, or the
+        content as given. Canaries are not looked for: a canary must stay in
+        the private text it marks, so that it is caught if that text is sent
+        out in a call. A JWT is redacted but never a reason to refuse.
+        """
+        guard = self._secret_guard()
+        if self.policy.secrets_in_results == "block":
+            found = guard.find_in_texts(views, canaries=False)
+            if found:
+                return content, views, (), f"the result holds what looks like a secret ({_kinds(found)})"
+            return content, views, (), None
+
+        # "redact". Most results hold no secret: one pass over the views says so,
+        # before any string is copied.
+        if not guard.find_in_texts(views, canaries=False, redaction_only=True):
+            return content, views, (), None
+        try:
+            copy, kinds = guard.redact_result(content)
+            if not kinds:
+                copy_views = views
+            elif isinstance(copy, str):
+                copy_views = [copy]
+            else:
+                copy_views = text_views(copy, strict=True)
+        except (CannotRedact, UnscannableError) as exc:
+            return content, views, (), f"the result holds what looks like a secret that cannot be redacted: {exc}"
+        # Redaction works string by string. What it could not replace (a secret
+        # split over several strings, or one past the decoding limits of a
+        # single string) is still there, and the result is refused.
+        left = guard.find_in_texts(copy_views, canaries=False)
+        if not can_replace and (kinds or left):
+            # scan_result: its caller passes on the content it holds, which cannot be changed from here.
+            every_kind = ", ".join(dict.fromkeys([*kinds, *(item.kind for item in left)]))
+            reason = (
+                f"the result holds what looks like a secret ({every_kind}); secrets.in_results is 'redact', "
+                "but this caller cannot pass on a redacted copy (Firewall.check_result can)"
+            )
+            return content, views, (), reason
+        if left:
+            why = (
+                f"what looks like a secret ({_kinds(left)}) is still there after redaction: it is split over "
+                "several strings, or encoded where it cannot be replaced"
+            )
+            return copy, copy_views, kinds, why
+        return copy, copy_views, kinds, None
+
+    def _result_decision(
+        self, findings: list[Finding], redacted: tuple[str, ...], secret_problem: str | None, call_id: str | None
+    ) -> Decision:
+        """The Decision on a result, from the detector's findings and the secret step."""
+        worst = max_severity(findings)
+        threshold = self.policy.block_severity
+        rules = ", ".join(f.rule for f in findings)
+        if secret_problem is not None:
+            reason = secret_problem + (f"; the detector also found: {rules}" if findings else "")
+            return Decision(
+                False, reason, findings, _SECRET_RESULT_REFUSAL, rule=RULE_SECRETS_IN_RESULTS, call_id=call_id,
+                redacted=redacted,
+            )
+        if worst is not None and threshold is not None and SEVERITY_ORDER[worst] >= SEVERITY_ORDER[threshold]:
+            reason = f"possible prompt injection ({rules})"
+            return Decision(
+                False, reason, findings, _INJECTION_REFUSAL, rule=RULE_INJECTION, call_id=call_id, redacted=redacted
+            )
+        if worst is None:
+            reason = "no injection patterns found"
+        else:
+            reason = f"suspicious content below blocking threshold ({rules})"
+        if not redacted:
+            return Decision(True, reason, findings, call_id=call_id)
+        reason = f"replaced what looks like a secret ({', '.join(redacted)}); {reason}"
+        return Decision(True, reason, findings, rule=RULE_SECRETS_IN_RESULTS, call_id=call_id, redacted=redacted)
+
     def _checked_result(self, tool: str, result: Any, call_id: str | None) -> Any:
-        self._require_allowed(self.scan_result(tool, result, call_id=call_id))
+        """The result `run` returns: checked (and, with secrets.in_results "redact", redacted), and marked delivered."""
+        checked = self.check_result(tool, result, call_id=call_id)
+        self._require_allowed(checked.decision)
         refused = self._deliver(tool, call_id)
         if refused is not None:
             raise BlockedError(refused)
-        return result
+        return checked.content
 
     def _deliver(self, tool: str, call_id: str | None) -> Decision | None:
         """Set the marks of a result that is about to be returned; a refusal if they cannot be recorded."""
@@ -746,7 +1007,7 @@ class Firewall:
             reason = f"monitor mode, would block: {decision.reason}"
             return Decision(
                 True, reason, decision.findings, rule=decision.rule, matched_arg=decision.matched_arg,
-                call_id=decision.call_id,
+                call_id=decision.call_id, redacted=decision.redacted,
             )
         if log:
             self._audit(event, tool, "allow" if decision.allowed else "block", decision, args)
@@ -770,12 +1031,14 @@ class Firewall:
             if value is not None:
                 record[name] = value
         record["reason"] = decision.reason
+        if decision.redacted:
+            record["redacted"] = list(decision.redacted)
         if args is not None and self.log_args:
             record["args"] = args
         if decision.findings:
             record["findings"] = [dict(asdict(f), excerpt=_LONG_RUN.sub("[...]", f.excerpt)) for f in decision.findings]
         try:
-            _append_line(self.audit_path, _audit_line(record))
+            _append_line(self.audit_path, _audit_line(record, self._secret_guard()))
         except OSError as exc:
             # A broken log must not stop the firewall from enforcing decisions.
             if not self._audit_failed:
@@ -824,15 +1087,84 @@ def _error_texts(exc: BaseException) -> list[str]:
     return [text for text in dict.fromkeys(texts) if text.strip()]
 
 
-def _audit_line(record: dict[str, Any]) -> str:
-    """One audit record as a line of JSON: secrets redacted, oversized arguments left out, safe to display."""
-    record = redact_value(record)  # before json.dumps: see leaks.redact_value for why
+def _call_spellings(tool: str, args: dict[str, Any]) -> list[str]:
+    """The texts of a call that the secret guard reads.
+
+    1. The tool name, keys and strings, one per line.
+    2. The strings joined end to end with nothing between them, and the keys
+       and strings joined the same way: a token split over several arguments
+       (in order), or over a key and its value, is seen whole.
+    3. Each two neighbouring strings joined, one pair per line. In (2) the
+       start of a split token is glued to the end of the argument before it,
+       and the formats that must not continue a longer word (an AWS key,
+       "sk-...") would not be seen there; a pair starts on a line of its own.
+
+    Each joined text is cut at MAX_JOINED_ARGUMENT_CHARS: past that, a split
+    token is not seen. The one-per-line text is not cut (it is what the guard
+    has always read).
+    """
+    everything = texts_in(args, keys=True)
+    strings = texts_in(args, keys=False)
+    spellings = ["\n".join([tool, *everything])]
+    if len(strings) > 1:
+        spellings.append(_joined(strings, MAX_JOINED_ARGUMENT_CHARS))
+        pairs = (strings[index] + strings[index + 1] for index in range(len(strings) - 1))
+        spellings.append(_joined(pairs, MAX_JOINED_ARGUMENT_CHARS, separator="\n"))
+    if len(everything) > len(strings):
+        spellings.append(_joined(everything, MAX_JOINED_ARGUMENT_CHARS))
+    return list(dict.fromkeys(spellings))
+
+
+def _joined(texts: Iterable[str], limit: int, separator: str = "") -> str:
+    """The texts joined with `separator` between them, cut at `limit` characters (read no further)."""
+    pieces: list[str] = []
+    room = limit
+    for text in texts:
+        if pieces and separator:
+            pieces.append(separator)
+            room -= len(separator)
+        if room <= 0:
+            break
+        pieces.append(text[:room])
+        room -= len(pieces[-1])
+    return "".join(pieces)
+
+
+def _kinds(found: list[Found]) -> str:
+    """The kinds of secret found, for a reason in the audit log."""
+    return ", ".join(item.kind for item in found)
+
+
+def _secret_rule(found: list[Found]) -> str:
+    """The rule id of a call refused for secrets: the most specific part of the guard that found one.
+
+    A canary first (it can only be there if private text is leaving), then
+    a known value, then a custom format, then the built-in formats ("secrets").
+    """
+    sources = {item.source for item in found}
+    if CANARY in sources:
+        return RULE_SECRETS_CANARIES
+    if KNOWN_VALUE in sources:
+        return RULE_SECRETS_KNOWN_VALUES
+    for item in found:
+        if item.source == CUSTOM:
+            return f"secrets.patterns[{item.index}]"
+    return RULE_SECRETS
+
+
+def _audit_line(record: dict[str, Any], guard: SecretGuard) -> str:
+    """One audit record as a line of JSON: secrets redacted, oversized arguments left out, safe to display.
+
+    `guard` knows the policy's custom formats, known values and canaries, so
+    those are redacted as well as the built-in formats.
+    """
+    record = guard.redact_value(record)  # before json.dumps: see SecretGuard.redact_value for why
     args = record.get("args")
     if args is not None:
         size = len(json.dumps(args, ensure_ascii=False, default=str))
         if size > MAX_LOGGED_ARGS_CHARS:
             record["args"] = f"[{size} characters of arguments not logged]"
-    return _log_safe(json.dumps(record, ensure_ascii=False, default=lambda value: redact(str(value))))
+    return _log_safe(json.dumps(record, ensure_ascii=False, default=lambda value: guard.redact(str(value))))
 
 
 def _log_safe(json_line: str) -> str:

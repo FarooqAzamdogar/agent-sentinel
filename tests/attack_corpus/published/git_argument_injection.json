@@ -1,0 +1,30 @@
+{
+ "id": "git_argument_injection",
+ "source": "https://www.theregister.com/2026/01/20/anthropic_prompt_injection_flaws/",
+ "about": "An argument that the git server passes on to git as an option (--output=...), writing a file of the attacker's choice.",
+ "surface": "call",
+ "policy": {
+  "default": "block",
+  "tools": {
+   "git_diff": {
+    "action": "allow",
+    "allow_args": [
+     {
+      "arg": "target",
+      "no_options": true
+     }
+    ]
+   }
+  }
+ },
+ "call": {
+  "tool": "git_diff",
+  "arguments": {
+   "target": "--output=/home/me/.bashrc"
+  }
+ },
+ "expect": {
+  "outcome": "stopped",
+  "rule": "tools.git_diff.allow_args[0]"
+ }
+}
