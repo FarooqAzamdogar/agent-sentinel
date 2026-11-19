@@ -10,6 +10,12 @@ The output ends with a verdict: would the text be blocked, at the threshold
 of the policy (--policy), at a severity given on the command line
 (--fail-on), or at the default threshold ("high")?
 
+--as says what the text is: a tool's "result" (the default), a tool's
+"description", or a server's "instructions". The last two are read with the
+stricter rules for what a server says about itself (detector.METADATA), as
+the proxy reads a tools/list reply or an initialize reply: use them to look
+at a server's tools before it is installed.
+
 Exit codes. Without --policy or --fail-on they are as before 0.5: 1 when
 anything is found, at any severity. With either option, 1 only when a finding
 reaches the threshold, so the command can gate a CI job. 2 when a file cannot
@@ -24,7 +30,7 @@ import sys
 from dataclasses import dataclass, field
 
 from .cli_common import EXIT_ERROR, EXIT_FAIL, EXIT_OK, CommandError, load_policy, read_input, readings
-from .detector import SEVERITY_ORDER, Finding, scan_views
+from .detector import METADATA, RESULT, SEVERITY_ORDER, Finding, scan_views
 from .leaks import redact
 from .policy import Policy
 from .textutil import printable
@@ -43,9 +49,12 @@ exit codes:
 examples:
   agent-sentinel scan page.txt
   agent-sentinel scan --policy policy.json notes.md page.html
+  agent-sentinel scan --as description tool-description.txt
   cat page.txt | agent-sentinel scan --fail-on medium --format json
 """
 
+# --as: what the text is, and the detector's profile for it (as the firewall picks it for each scan_result event).
+PROFILES = {"result": RESULT, "description": METADATA, "instructions": METADATA}
 # More files than this in one command is almost certainly a mistake (a glob gone wrong).
 MAX_FILES = 1_000
 # The threshold the firewall uses when a policy does not set one.
@@ -74,6 +83,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                            help="judge the findings with this policy's injection.block_severity")
     threshold.add_argument("--fail-on", choices=tuple(SEVERITY_ORDER), metavar="SEVERITY",
                            help="exit with 1 only for a finding of this severity or higher (low, medium, high)")
+    parser.add_argument("--as", dest="read_as", choices=tuple(PROFILES), default="result",
+                        help="what the text is: a tool's result (the default), a tool's description, or a server's "
+                             "instructions (these two are read with the stricter rules for what a server says "
+                             "about itself)")
     parser.add_argument("--format", choices=("text", "json"), default="text", help="output format (default text)")
 
 
@@ -86,7 +99,7 @@ def run(args: argparse.Namespace) -> int:
     threshold = _threshold(args)
     if threshold is None:
         return EXIT_ERROR
-    scanned = [_scan_one(name) for name in names]
+    scanned = [_scan_one(name, PROFILES[args.read_as]) for name in names]
     blocked = [item for item in scanned if _reaches(item.findings, threshold.severity)]
     if args.format == "json":
         _print_json(scanned, blocked, threshold)
@@ -114,13 +127,13 @@ def _threshold(args: argparse.Namespace) -> _Threshold | None:
     return _Threshold(DEFAULT_THRESHOLD, "default", f"the default block_severity={DEFAULT_THRESHOLD}")
 
 
-def _scan_one(name: str) -> _Scanned:
+def _scan_one(name: str, profile: str = RESULT) -> _Scanned:
     shown = "stdin" if name == "-" else name
     try:
         data = read_input(name)
     except CommandError as exc:
         return _Scanned(shown, error=str(exc))
-    return _Scanned(shown, findings=scan_views(readings(data)))
+    return _Scanned(shown, findings=scan_views(readings(data), profile=profile))
 
 
 def _reaches(findings: list[Finding], severity: str | None) -> bool:

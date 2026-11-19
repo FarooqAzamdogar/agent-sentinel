@@ -22,6 +22,10 @@ one message, or one part of one, and either returns what the proxy may
 forward or raises ShapeError with a reason for the operator. mcp_proxy.py
 decides what to do about it. Every limit below bounds something that a
 hostile peer controls.
+
+COVERAGE, at the end, is the table of what the proxy does with each kind of
+message in both eras, written by hand for the documentation; a test checks
+that every method the proxy's code names has a row in it.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Collection
-from typing import Any
+from typing import Any, NamedTuple
 
 from .matchers import read_url
 from .textutil import printable
@@ -509,3 +513,135 @@ def name_skeleton(name: str) -> str:
     "read_file" all have the skeleton "read_flle". Only for comparing; never shown.
     """
     return fold_lookalikes(name).translate(_ASCII_LOOKALIKES)
+
+
+# ---- what the proxy does with each kind of message (the protocol coverage table) -----------
+
+# The revisions a row applies to.
+ALL_REVISIONS = "all"
+LEGACY_ONLY = f"{LEGACY_VERSIONS[0]} to {LEGACY_VERSIONS[-1]}"
+MODERN_ONLY = MODERN_VERSIONS[0]
+
+# What the proxy does, in the words the table uses.
+CHECKED = "checked"  # a rule decides before it goes on: the policy's rules, or the secret guard
+REFUSED = "refused"  # always refused, whatever the policy says
+SCANNED = "scanned"  # the scanner reads it before it goes on (and the copy passed on is cleaned of hidden characters)
+FORWARDED = "forwarded"  # passed on as it is (the policy's client_requests may refuse it); its reply is scanned
+REWRITTEN = "rewritten"  # the proxy changes the copy it passes on
+SENT = "sent"  # sent by the proxy itself
+HANDLINGS = (CHECKED, REFUSED, SCANNED, FORWARDED, REWRITTEN, SENT)
+
+
+class Coverage(NamedTuple):
+    """One row of the coverage table: a kind of message, and what the proxy does with it."""
+
+    message: str  # a method or notification as the proxy matches it ("tasks/*": every tasks method), or a kind
+    sender: str  # "client", "server" or "proxy"
+    revisions: str  # ALL_REVISIONS, LEGACY_ONLY, MODERN_ONLY, or another range in words
+    handling: tuple[str, ...]  # the HANDLINGS words that apply, the main one first
+    detail: str  # what exactly happens, for the documentation
+
+
+# Every method and notification the proxy treats in a way of its own, both eras, written by hand.
+# tests/test_protocol_coverage.py checks that every method the proxy's code names is a row here,
+# so the table cannot fall behind the code. The README and the website show it.
+COVERAGE = (
+    # ---- from the client ----
+    Coverage("initialize", "client", LEGACY_ONLY, (REWRITTEN, SCANNED),
+             "Needs params.protocolVersion (else refused, -32602); a version the proxy cannot pass on becomes "
+             f"{NEWEST_LEGACY_VERSION}. The server's copy of the client's capabilities loses sampling, elicitation "
+             "and roots when server_requests blocks their request, and always loses tasks. Reply: protocolVersion "
+             "must be a legacy version the proxy knows (else refused); tasks removed from the server's "
+             "capabilities; serverInfo icons cleaned; instructions scanned with the metadata rules, pinned, and "
+             "removed if either fails; the whole reply scanned."),
+    Coverage("server/discover", "client", MODERN_ONLY, (FORWARDED, SCANNED),
+             "Reply: supportedVersions cut down to the versions the proxy knows (none left: refused); tasks removed; "
+             "serverInfo icons cleaned; instructions checked as for initialize. The session becomes a 2026-07-28 one."),
+    Coverage("tools/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
+             "Each tool: unsafe icons dropped; its name checked (MCP naming rules with --tool-names, look-alikes, a "
+             "name listed twice, characters the proxy cannot forward); scanned with the metadata rules, with the "
+             "policy's other tool names for shadowing; pinned. A tool that fails is removed and quarantined. Tools "
+             "the policy blocks outright are hidden (hide_blocked_tools). Calls wait while a tools/list reply is "
+             "being checked."),
+    Coverage("tools/call", "client", ALL_REVISIONS, (CHECKED,),
+             "Secret guard, tool rules, flow rules, rate limits; an ask goes to --approve-with or is refused. "
+             "Refused: a reserved name (resources/read, resources/subscribe, prompts/get), a task-augmented call "
+             "(params.task), a quarantined tool. Reply: resultType checked; scanned; secrets.in_results; flow marks."),
+    Coverage("resources/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
+             "Each resource scanned and its icons cleaned; one whose URI has characters the proxy cannot forward is "
+             "removed. Not pinned."),
+    Coverage("resources/templates/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
+             "Each template scanned and pinned; a template that fails is removed and quarantined."),
+    Coverage("resources/read", "client", ALL_REVISIONS, (CHECKED,),
+             "Checked like a call of a tool named 'resources/read' with the argument uri. Reply scanned; "
+             "secrets.in_results; flow marks."),
+    Coverage("resources/subscribe", "client", ALL_REVISIONS, (CHECKED,),
+             "Checked as a resources/read of the same URI. Update notifications are scanned."),
+    Coverage("subscriptions/listen", "client", MODERN_ONLY, (CHECKED,),
+             "Shape checked (-32602). Each URI in resourceSubscriptions is checked as a resources/read; one refusal "
+             "refuses the request; never held for approval. The acknowledgement and notifications are scanned."),
+    Coverage("prompts/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
+             "Each prompt: icons cleaned, name checked, scanned, pinned; a prompt that fails is removed and "
+             "quarantined."),
+    Coverage("prompts/get", "client", ALL_REVISIONS, (CHECKED,),
+             "A quarantined prompt is refused. When the policy opts in (a client_requests section, or a tools rule "
+             "named 'prompts/get'), checked like a call of 'prompts/get' with {name, arguments}. Reply scanned."),
+    Coverage("completion/complete", "client", "2025-03-26 and later", (CHECKED,),
+             "Its params (what the user is typing) pass the secret guard, then client_requests."),
+    Coverage("tasks/*", "client", "2025-11-25 and 2026-07-28 (extension)", (REFUSED,),
+             "Answered 'method not found' (-32601): tasks are not supported."),
+    Coverage("notifications/cancelled", "client", ALL_REVISIONS, (FORWARDED,),
+             "One that cancels a call held for approval refuses that call and is not forwarded (the server never "
+             "saw the call); otherwise forwarded."),
+    Coverage("any other request or notification", "client", ALL_REVISIONS, (FORWARDED,),
+             "ping, logging/setLevel, resources/unsubscribe, notifications/initialized and the rest: the policy's "
+             "client_requests may refuse them ('method not found'; a notification is dropped). Replies are scanned."),
+    Coverage("reply to a server request", "client", LEGACY_ONLY, (CHECKED, REWRITTEN),
+             "Must answer a request the server made, else dropped. Rebuilt from its result or error; passes the "
+             "secret guard (refused: the server is told 'request refused'). The answer to one of the proxy's own "
+             "approval questions is taken by the proxy and never forwarded."),
+    Coverage("inputResponses and requestState of a retried request", "client", MODERN_ONLY, (CHECKED,),
+             "Shape checked (-32602). inputResponses pass the secret guard before the policy runs; requestState is "
+             "only size-checked."),
+    Coverage("a request naming an unknown protocol version", "client", MODERN_ONLY, (REFUSED,),
+             "Answered as a 2026-07-28 server would: -32022 UnsupportedProtocolVersion, listing the version the "
+             "proxy knows. A notification naming one is dropped."),
+    Coverage("JSON-RPC batch", "client", ALL_REVISIONS, (REFUSED,),
+             "Refused (-32600): MCP no longer uses batches."),
+    # ---- from the server ----
+    Coverage("sampling/createMessage", "server", LEGACY_ONLY, (CHECKED, SCANNED),
+             "server_requests decides (refused: the server is told 'request refused', the client nothing); then "
+             "scanned. The client's answer passes the secret guard."),
+    Coverage("elicitation/create", "server", "2025-06-18 to 2025-11-25", (CHECKED, SCANNED),
+             "server_requests, then what it asks: a URL must be a public https address (and on the "
+             "--elicitation-host list, if given); a form may not ask for a password, key or card number. Scanned."),
+    Coverage("roots/list", "server", LEGACY_ONLY, (CHECKED, SCANNED),
+             "server_requests decides; scanned. The client's answer passes the secret guard."),
+    Coverage("any other server request", "server", LEGACY_ONLY, (CHECKED, SCANNED),
+             "ping and the rest: server_requests decides; scanned. Always refused: tasks/*, an id the proxy keeps "
+             "for its own questions, and every request in a 2026-07-28 session (a modern server may not send any)."),
+    Coverage("notifications from the server", "server", ALL_REVISIONS, (CHECKED, SCANNED),
+             "Progress, log messages, list_changed, resources/updated, "
+             "notifications/subscriptions/acknowledged and the rest: server_requests may block them (dropped); "
+             "scanned. notifications/cancelled also forgets the server request it cancels."),
+    Coverage("input_required result", "server", MODERN_ONLY, (CHECKED, SCANNED),
+             "Only in reply to tools/call, prompts/get or resources/read of a request that named 2026-07-28. Each "
+             "inputRequests entry (elicitation/create, sampling/createMessage, roots/list) passes server_requests, "
+             "the elicitation checks and the scanner; one refused entry refuses the reply. Then the whole result "
+             "is scanned."),
+    Coverage("task result (resultType task, or a 2025-11-25 task handle)", "server",
+             "2025-11-25 and 2026-07-28 (extension)", (REFUSED,), "Refused: tasks are not supported."),
+    Coverage("result of an unknown resultType", "server", MODERN_ONLY, (REFUSED,),
+             "Refused: the proxy cannot check a kind of result it does not know."),
+    Coverage("error -32042 (URLElicitationRequiredError)", "server", "2025-11-25 and later", (CHECKED, SCANNED),
+             "Each URL it lists is checked as for elicitation/create; then the error is scanned."),
+    Coverage("any other reply", "server", ALL_REVISIONS, (SCANNED,),
+             "Must answer a request the proxy forwarded, else dropped. Rebuilt from its result or error; scanned; "
+             "secrets.in_results (block, or redact: a copy with the secrets replaced); cleaned of escape codes, "
+             "control, tag and bidi characters; the request's flow marks set."),
+    # ---- from the proxy itself ----
+    Coverage("elicitation/create (approval question)", "proxy", "2025-06-18 and 2025-11-25", (SENT,),
+             "With --approve-with elicitation, to a client that declared forms: one yes/no field. Its id is "
+             "random and never sent to the server; an unanswered question is withdrawn with "
+             "notifications/cancelled."),
+)

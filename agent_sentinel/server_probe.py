@@ -66,7 +66,7 @@ _HINT_WORDS = {
     "idempotentHint": "idempotent", "openWorldHint": "open world",
 }
 # The events and actions of the audit records that say why the proxy removed something.
-_REMOVAL_EVENTS = ("tool_description", "tool_changed")
+_REMOVAL_EVENTS = ("tool_description", "tool_changed", "tool_name", "tool_lookalike")
 _PROXY_PREFIX = "Blocked by agent-sentinel:"
 
 

@@ -278,7 +278,7 @@ class ProxyUnitTests(unittest.TestCase):
 
         self.h.from_client(call(2, "read_file", {"path": "a.txt"}))
         self.h.sent_to_server()
-        with mock.patch.object(Firewall, "scan_result", side_effect=RuntimeError("bug")):
+        with mock.patch.object(Firewall, "check_result", side_effect=RuntimeError("bug")):
             self.h.from_server(reply(2, text_result("hello")))
         self.assertIn("internal error", self.h.sent_to_client()[0]["error"]["message"])
 

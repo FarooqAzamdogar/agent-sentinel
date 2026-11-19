@@ -18,7 +18,8 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         # 3.10 is the oldest version supported. 3.11 is where exception notes
         # and task groups appear, which some code paths and tests depend on.
-        python-version: ["3.10", "3.11", "3.13"]
+        # Every version that pyproject.toml lists in its classifiers is tested.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       # Actions are pinned to exact commits so that a moved tag cannot change what runs here.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

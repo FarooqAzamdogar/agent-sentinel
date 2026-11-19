@@ -20,14 +20,17 @@ PreToolUse          firewall.check_call(tool_name, tool_input): the secret guard
                              permission prompt. Only in the permission modes that show that
                              prompt (PROMPTING_MODES); in any other mode, bypassPermissions
                              among them, nobody would be asked, so the call is refused.
-PostToolUse         firewall.scan_result(tool_name, tool_response). A clean result sets the
-                    session's flow marks. A blocked one is replaced (updatedToolOutput) by an
-                    output that says it was withheld. Claude Code passes an MCP tool's
-                    replacement on as it is. A built-in tool's replacement is checked
-                    against the tool's output schema and ignored if it does not fit, so
-                    for those the answer also stops the agent (continue: false).
-PostToolUseFailure  the error text is scanned the same way. Claude Code cannot replace it,
-                    so a block stops the agent.
+PostToolUse         firewall.check_result(tool_name, tool_response). A clean result sets the
+                    session's flow marks, and gets no answer. With the policy's
+                    secrets.in_results "redact", a result holding a secret is replaced
+                    (updatedToolOutput) by the copy with the secret replaced, which has
+                    the same shape. A blocked one is replaced by an output that says it
+                    was withheld. Claude Code passes an MCP tool's replacement on as it
+                    is. A built-in tool's replacement is checked against the tool's output
+                    schema and ignored if it does not fit, so for a withheld output the
+                    answer also stops the agent (continue: false).
+PostToolUseFailure  the error text is scanned (scan_result). Claude Code cannot replace it,
+                    so a block stops the agent, and so does a secret under "redact".
 SessionStart        a new session (source "startup" or "clear") gets an empty session file
                     (session.FileSessionStore.begin). Any other source (resume, compact,
                     fork) keeps what is there; a missing file means every flow mark is set.
@@ -359,9 +362,12 @@ def _pre_tool_use(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
 
 def _post_tool_use(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
     tool, call_id, output = event["tool_name"], event.get("tool_use_id"), event["tool_response"]
-    decision = _delivered(firewall, tool, firewall.scan_result(tool, output, call_id=call_id), call_id)
+    checked = firewall.check_result(tool, output, call_id=call_id)
+    decision = _delivered(firewall, tool, checked.decision, call_id)
     if decision.allowed:
-        return HookAnswer()
+        if not decision.redacted:
+            return HookAnswer()
+        return HookAnswer({"hookSpecificOutput": _redacted_output(tool, checked.content)})
     notice = blocked_text(decision.public_reason)
     if is_mcp_tool(tool):
         # Claude Code passes an MCP tool's replacement on without checking its shape: it takes effect.
@@ -384,6 +390,20 @@ def _post_tool_use(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
         "reason": notice,
         "hookSpecificOutput": {"hookEventName": POST_TOOL_USE, "updatedToolOutput": withheld_copy(output, notice)},
     })
+
+
+def _redacted_output(tool: str, content: Any) -> dict[str, Any]:
+    """The answer that replaces a tool's output with the copy whose secrets were replaced (secrets.in_results "redact").
+
+    The copy has the shape of the original (the same keys, lists and types;
+    only the text of some strings differs), so Claude Code's check of a
+    built-in tool's replacement against its output schema passes, and the
+    agent goes on. An MCP tool's replacement is passed on as it is.
+    """
+    output: dict[str, Any] = {"hookEventName": POST_TOOL_USE, "updatedToolOutput": content}
+    if is_mcp_tool(tool):
+        output["updatedMCPToolOutput"] = content
+    return output
 
 
 def _post_tool_use_failure(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:

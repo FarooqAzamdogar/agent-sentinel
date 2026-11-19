@@ -10,14 +10,31 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
-keywords = ["ai", "llm", "agents", "security", "mcp", "prompt-injection", "guardrails", "firewall"]
+keywords = [
+    "ai", "llm", "agents", "security", "mcp", "model-context-protocol", "prompt-injection", "guardrails",
+    "firewall", "tool-calls", "secrets", "audit-log", "claude-code", "hooks",
+]
+# The Python versions listed are the ones the tests run on (.github/workflows/tests.yml).
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: Console",
     "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Security",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://farooqazamdogar.github.io/agent-sentinel/"
+Source = "https://github.com/FarooqAzamdogar/agent-sentinel"
+Issues = "https://github.com/FarooqAzamdogar/agent-sentinel/issues"
+Security = "https://github.com/FarooqAzamdogar/agent-sentinel/blob/main/SECURITY.md"
 
 [project.scripts]
 agent-sentinel = "agent_sentinel.__main__:main"

@@ -706,7 +706,7 @@ class Policy:
         found.extend(_missing_root_warnings(self))
         found.extend(_flow_warnings(self))
         found.extend(_client_request_warnings(self))
-        found.extend(_secret_warnings(self))
+        found.extend(known_value_warnings(self))
         return found
 
     def describe_rule(self, rule_id: str) -> str | None:
@@ -1099,8 +1099,12 @@ def _client_request_warnings(policy: Policy) -> list[str]:
     return found
 
 
-def _secret_warnings(policy: Policy) -> list[str]:
-    """Warn about secrets.known_values_from_env names that are not set where `validate` runs."""
+def known_value_warnings(policy: Policy) -> list[str]:
+    """Warn about secrets.known_values_from_env names that are not set where `validate` runs.
+
+    Part of Policy.warnings. The proxy, which knows the environment its server
+    gets, prints the firewall's own warnings instead (Firewall.secret_warnings).
+    """
     return [
         f"secrets.known_values_from_env: '{name}' is not set in this environment "
         "(it is read where the firewall runs, so this may be expected)"

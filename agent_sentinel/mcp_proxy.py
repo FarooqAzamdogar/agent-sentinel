@@ -23,6 +23,19 @@ A message the proxy cannot parse, cannot match to a request, or fails to check
 is dropped or answered with an error. It is never forwarded unchecked. Messages
 are re-serialized, so each side receives exactly what the proxy inspected.
 
+What a reply forwards
+---------------------
+A reply's result or error passes Firewall.check_result: the scanner, and the
+policy's secrets.in_results, which with "redact" forwards a copy with the
+secrets replaced. A reply, a list entry and the server's instructions are
+forwarded cleaned of what can hide text from the person who reads it:
+terminal escape sequences, control characters, Unicode tag characters and
+bidi overrides (textutil.clean_value_for_forwarding). The text as the server
+sent it is scanned first (hidden tag text is read there), and a copy that
+cleaning changed is scanned again; pins are taken of what the server sent.
+Requests and notifications from the server are forwarded as they were sent,
+once checked: cleaning could change a method or a field the client answers by.
+
 Code layout
 -----------
 `Proxy.handle_client_line` and `Proxy.handle_server_line` are the two entry
@@ -99,8 +112,10 @@ elicitation, roots) is removed, so a well-behaved server does not ask. Only
 the copy sent to the server is changed.
 
 What the client sends back to the server (its answers to server requests,
-and the inputResponses of a retried request) passes the secret guard, and
-an answer is rebuilt from its `result` or `error` before it is forwarded.
+and the inputResponses of a retried request) passes the same secret guard as
+a call's arguments (Firewall.find_secrets: the formats, the policy's own
+formats, known values and canaries), and an answer is rebuilt from its
+`result` or `error` before it is forwarded.
 
 Lists, pins and names
 ---------------------
@@ -112,16 +127,21 @@ resources/templates/list reply are checked one by one (_clean_items):
 * tool and prompt names must follow the MCP naming rules (proxy --tool-names
   strict, warn or off) and must not look like another name of the same
   server ("read_fіle" beside "read_file"); a name listed twice with two
-  different definitions is refused;
-* each entry is scanned, and tools, prompts and resource templates are
-  compared with their pins (pins.py), as are the server's instructions.
+  different definitions is refused; an entry whose name (or URI) has
+  characters the proxy does not forward is refused in every mode;
+* each entry is scanned (a tool's description also with the tool names the
+  policy gives other servers, to catch shadowing), and tools, prompts and
+  resource templates are compared with their pins (pins.py), as are the
+  server's instructions.
 
 A tool, prompt or template that fails is removed from the list and
 quarantined for as long as the proxy runs: it is left out of later lists, a
 tool cannot be called, a prompt cannot be fetched. Changed instructions are
-removed from the reply. Then, if the policy says hide_blocked_tools, the
-tools it blocks outright are hidden from the list (never in monitor mode);
-a call to a hidden tool is still checked and refused.
+removed from the reply. With a pins file, a changed definition is kept
+beside it for `agent-sentinel pins diff` and `pins accept`. Then, if the
+policy says hide_blocked_tools, the tools it blocks outright are hidden from
+the list (never in monitor mode); a call to a hidden tool is still checked
+and refused.
 
 Requests other than tool calls
 ------------------------------
@@ -153,6 +173,7 @@ each listed tool's MCP annotations are passed to the firewall as well.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -163,7 +184,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from secrets import token_hex
-from typing import Any, BinaryIO, Callable, Iterable, Sequence
+from typing import Any, BinaryIO, Callable, Iterable, Mapping, Sequence
 
 from . import __version__, elicitation, proxy_report
 from . import mcp_protocol as protocol
@@ -180,14 +201,23 @@ from .approvers import (
     declares_form_elicitation,
     parse_backend,
 )
-from .firewall import SERVER_NAME, Decision, Firewall
-from .leaks import find_secrets
+from .cli_common import shell_line
+from .firewall import SERVER_NAME, CheckedResult, Decision, Firewall, secret_rule
+from .leaks import Found
 from .mcp_protocol import ShapeError
-from .pins import CHANGED, FULL, PINNED_LISTS, ToolPins, definition_of, fingerprint
-from .policy import PROMPTS_GET, RULE_MALFORMED, RULE_QUARANTINE, RULE_SECRETS, Policy, PolicyError
+from .pins import CHANGED, FULL, KIND_WORDS, PINNED_LISTS, ToolPins, definition_of, fingerprint
+from .policy import (
+    PROMPTS_GET,
+    RULE_MALFORMED,
+    RULE_QUARANTINE,
+    RULE_SECRETS_IN_RESULTS,
+    RULE_UNSCANNABLE,
+    Policy,
+    PolicyError,
+)
 from .policy_errors import file_error_message
 from .session import SessionStateError
-from .textutil import UnscannableError, printable, texts_in
+from .textutil import UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable
 
 # How long a tool call waits for an in-flight tools/list reply to be checked.
 TOOL_LIST_WAIT_SECONDS = 15
@@ -235,6 +265,11 @@ _ENTRY_NAME = {"tools": "tool", "prompts": "prompt", "resources": "resource", "r
 # The lists whose names are what the client calls or fetches by: they follow the
 # MCP naming rules and are checked for look-alikes.
 _NAMED_LISTS = ("tools", "prompts")
+# The members of a list entry that the client sends back to ask for it (a tool's name, a resource's
+# URI). What the proxy forwards is cleaned of hidden characters, so an entry whose member would change
+# is removed: the client could not ask for it as the server knows it.
+_ASKED_FOR_BY = {"tools": ("name",), "prompts": ("name",), "resources": ("uri",),
+                 "resourceTemplates": ("name", "uriTemplate")}
 
 # proxy --tool-names: what happens to a tool or prompt whose name breaks the MCP naming rules.
 TOOL_NAMES_STRICT = "strict"  # removed and quarantined
@@ -252,6 +287,7 @@ _MALFORMED_REPLY = "the server sent a malformed reply"
 _UNSUPPORTED_REQUEST = "this request is not supported"
 _UNSUPPORTED_REPLY = "the server sent a reply this proxy cannot check"
 _UNSUPPORTED_VERSION = "the server chose a protocol version this proxy does not support"
+_UNCHECKED_CONTENT = "the content could not be checked, so it was withheld"
 # What a refused server is told: nothing about why.
 _SERVER_REFUSAL = "request refused"
 # How the reason of a pending decision ends (Firewall.check_call with defer_ask).
@@ -361,6 +397,11 @@ def _is_name(value: Any) -> bool:
 def _label(text: str) -> str:
     """A bounded name for the audit log; the text may be chosen by the peer."""
     return text if len(text) <= MAX_LABEL_CHARS else text[:MAX_LABEL_CHARS] + "..."
+
+
+def _kinds(found: list[Found]) -> str:
+    """The kinds of secret the guard found, for a reason in the audit log: "GitHub token, value of DB_PASSWORD"."""
+    return ", ".join(item.kind for item in found)
 
 
 def _tool_error(msg_id: Any, reason: str, modern: bool = False) -> JsonObject:
@@ -520,6 +561,9 @@ class Proxy:
         self._server_write_lock = threading.Lock()
         # The names each named list has used, to catch look-alikes; pinned names come first.
         self._names = {kind: _NameRegistry(self._pins.names(kind)) for kind in _NAMED_LISTS}
+        # Every tool name this server has listed (at most MAX_KNOWN_NAMES), so that a description that
+        # names one of the server's own tools is not taken for shadowing (_foreign_tools). Guarded by `_state`.
+        self._listed_tools: set[str] = set()
 
         # `_state` guards the collections below. It is a Condition so that
         # tool calls can wait for tool lists to finish being checked.
@@ -751,8 +795,8 @@ class Proxy:
             self._report(f"{what}: {exc} {proxy_report.rule_and_ref(decision)}")
             return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL))
         if secrets:
-            reason = f"the client's answer contains what looks like a secret ({', '.join(secrets)})"
-            decision = self._firewall.block(label, reason, event="client_reply", rule=RULE_SECRETS)
+            reason = f"the client's answer contains what looks like a secret ({_kinds(secrets)})"
+            decision = self._firewall.block(label, reason, event="client_reply", rule=secret_rule(secrets))
             if not decision.allowed:
                 self._report_block(what, decision)
                 return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL))
@@ -799,9 +843,9 @@ class Proxy:
             return self._refuse_malformed_request(message, str(exc))
         if not secrets:
             return None
-        reason = f"the answers sent with the request contain what looks like a secret ({', '.join(secrets)})"
+        reason = f"the answers sent with the request contain what looks like a secret ({_kinds(secrets)})"
         decision = self._firewall.block(
-            _request_label(message), reason, public_reason=_SECRET_REFUSAL, rule=RULE_SECRETS
+            _request_label(message), reason, public_reason=_SECRET_REFUSAL, rule=secret_rule(secrets)
         )
         return None if decision.allowed else self._refused(message, decision)  # allowed: monitor mode
 
@@ -822,9 +866,10 @@ class Proxy:
             return self._refuse_malformed_request(message, str(exc))
         if not secrets:
             return None
-        reason = f"the completion request contains what looks like a secret ({', '.join(secrets)})"
+        reason = f"the completion request contains what looks like a secret ({_kinds(secrets)})"
         decision = self._firewall.block(
-            COMPLETION_COMPLETE, reason, event="client_request", public_reason=_SECRET_REFUSAL, rule=RULE_SECRETS
+            COMPLETION_COMPLETE, reason, event="client_request", public_reason=_SECRET_REFUSAL,
+            rule=secret_rule(secrets),
         )
         return None if decision.allowed else self._refused(message, decision)  # allowed: monitor mode
 
@@ -851,15 +896,15 @@ class Proxy:
             return _DROP
         return _Outcome(to_client=_rpc_error(message["id"], decision.public_reason, code=protocol.METHOD_NOT_FOUND))
 
-    def _secrets_in(self, value: Any) -> list[str]:
-        """The kinds of secret in what the client sends the server besides a call's arguments.
+    def _secrets_in(self, value: Any) -> list[Found]:
+        """The secrets in what the client sends the server besides a call's arguments.
 
-        The same guard check_call applies to arguments (keys included), under
-        the same setting: with secrets.in_arguments "allow", nothing is looked for.
+        The firewall's own guard, exactly as check_call applies it to a call's
+        arguments (Firewall.find_secrets): the built-in and custom formats,
+        unless secrets.in_arguments is "allow", and the known values and
+        canaries always. Raises UnscannableError for a value nested too deeply to read.
         """
-        if self._firewall.policy.secrets_in_arguments != "block":
-            return []
-        return find_secrets("\n".join(texts_in(value, keys=True)))
+        return self._firewall.find_secrets(value)
 
     # ---- client -> server: the protocol revision ------------------------------
 
@@ -1574,7 +1619,7 @@ class Proxy:
             refusal = self._url_elicitation_refusal(pending, msg_id, message["error"])
             if refusal is not None:
                 return refusal
-            return self._deliver_or_block(pending, msg_id, "error", message["error"], scan=message["error"])
+            return self._deliver_or_block(pending, msg_id, "error", message["error"])
 
         result = message["result"]
         try:
@@ -1609,7 +1654,7 @@ class Proxy:
             refusal = self._check_handshake_reply(pending, msg_id, result)
             if refusal is not None:
                 return refusal
-        return self._deliver_or_block(pending, msg_id, "result", result, scan=result, log_clean=items_key is None)
+        return self._deliver_or_block(pending, msg_id, "result", result, log_clean=items_key is None)
 
     def _checked_input_required(self, pending: _PendingRequest, msg_id: Any, result: Any) -> JsonObject:
         """Check an input_required result: a 2026-07-28 server asking the client for input inside its reply.
@@ -1633,7 +1678,7 @@ class Proxy:
             decision = self._check_input_request(entry, pending)
             if not decision.allowed:
                 return _refusal_reply(pending.method, msg_id, decision.public_reason, pending.modern)
-        return self._deliver_or_block(pending, msg_id, "result", result, scan=result)
+        return self._deliver_or_block(pending, msg_id, "result", result)
 
     def _check_input_request(self, entry: JsonObject, pending: _PendingRequest) -> Decision:
         """The policy's answer for one entry of an input_required result, then what an elicitation asks, then a scan."""
@@ -1778,16 +1823,68 @@ class Proxy:
         return _rpc_error(msg_id, decision.public_reason, code=code)
 
     def _deliver_or_block(
-        self, pending: _PendingRequest, msg_id: Any, member: str, value: Any, scan: Any, log_clean: bool = True
+        self, pending: _PendingRequest, msg_id: Any, member: str, value: Any, log_clean: bool = True
     ) -> JsonObject:
-        decision = self._firewall.scan_result(pending.label, scan, log_clean=log_clean, call_id=pending.call_id)
+        """The reply to deliver for the `result` or `error` the server sent: built from what was checked, or a refusal.
+
+        The value passes Firewall.check_result: the scanner, and the policy's
+        secrets.in_results, which with "redact" gives a copy with the secrets
+        replaced. It is then cleaned of hidden characters (_checked_for_forwarding).
+        The reply holds that checked copy, never `value` itself. The flow
+        marks of the request are set just before the reply is returned.
+        """
+        checked = self._checked_for_forwarding(pending.label, value, "result", log_clean, pending.call_id)
+        decision = checked.decision
         if not decision.allowed:
             self._report_block(f"blocked {_reply_description(pending)}", decision)
         else:
+            if decision.redacted:
+                self._report(f"replaced what looks like a secret ({', '.join(decision.redacted)}) in "
+                             f"{_reply_description(pending)} [rule {RULE_SECRETS_IN_RESULTS}]")
             decision = self._mark_delivered(pending)  # reports a reply it withholds
         if decision.allowed:
-            return {"jsonrpc": "2.0", "id": msg_id, member: value}
+            return {"jsonrpc": "2.0", "id": msg_id, member: checked.content}
         return _refusal_reply(pending.method, msg_id, decision.public_reason, pending.modern)
+
+    def _checked_for_forwarding(
+        self, label: str, value: Any, event: str, log_clean: bool, call_id: str | None = None,
+        foreign_tools: Iterable[str] = (),
+    ) -> CheckedResult:
+        """Check something the server sent (Firewall.check_result), and return the copy that may be forwarded.
+
+        The copy is cleaned of what can hide or disguise text from the person
+        who reads it: terminal escape sequences, control characters, Unicode
+        tag characters and bidi overrides (textutil.clean_value_for_forwarding).
+        The value is checked as the server sent it first, because hidden tag
+        text is read there, and an injection written in it is refused. If
+        cleaning changed anything, the cleaned copy is checked as well, since
+        removing a character joins the text on either side of it: what is
+        forwarded is always what was checked. (Pins are taken earlier, of
+        what the server sent.)
+        """
+        checked = self._firewall.check_result(
+            label, value, event=event, log_clean=log_clean, call_id=call_id, foreign_tools=foreign_tools
+        )
+        if not checked.decision.allowed:
+            return checked
+        try:
+            cleaned = clean_value_for_forwarding(checked.content)
+        except UnscannableError as exc:
+            refusal = self._firewall.refuse(
+                label, f"the content could not be cleaned for forwarding: {exc}", event=event,
+                public_reason=_UNCHECKED_CONTENT, rule=RULE_UNSCANNABLE, call_id=call_id,
+            )
+            return CheckedResult(refusal)
+        if cleaned == checked.content:
+            return checked
+        again = self._firewall.check_result(
+            label, cleaned, event=event, log_clean=False, call_id=call_id, foreign_tools=foreign_tools
+        )
+        if not again.decision.allowed or not checked.decision.redacted:
+            return again
+        # Both checks replaced secrets, or only the first: the reply should name every kind replaced.
+        kinds = tuple(dict.fromkeys([*checked.decision.redacted, *again.decision.redacted]))
+        return CheckedResult(dataclasses.replace(again.decision, redacted=kinds), again.content)
 
     def _mark_delivered(self, pending: _PendingRequest) -> Decision:
         """Set the flow marks of a reply that is about to be delivered; a refusal if they cannot be recorded.
@@ -1808,15 +1905,22 @@ class Proxy:
 
         Clients commonly place these instructions in the model's system
         prompt, which makes them the most direct injection route a server has.
-        Removing the field keeps the connection usable.
+        Removing the field keeps the connection usable. Instructions that stay
+        are forwarded cleaned of hidden characters (_checked_for_forwarding);
+        the pin is taken of the text as the server sent it.
         """
         instructions = result.get("instructions")
         if not isinstance(instructions, str):
             return
-        decision = self._firewall.scan_result(source, instructions, event="server_instructions")
+        # No foreign tool names: the server's own tools are not known yet, and its
+        # instructions name them ("call get_me first").
+        checked = self._checked_for_forwarding(source, instructions, "server_instructions", log_clean=True)
+        decision = checked.decision
         if decision.allowed:
             decision = self._check_instructions_pin(source, instructions)
-        if not decision.allowed:
+        if decision.allowed:
+            result["instructions"] = checked.content
+        else:
             del result["instructions"]
             self._report_block("removed the server's instructions", decision)
 
@@ -1824,12 +1928,27 @@ class Proxy:
         status = self._pins.check_instructions(instructions)
         self._save_pins()
         if status == CHANGED:
-            reason = (
-                "they changed after they were first seen. If the change is expected, restart the proxy; "
-                "with --pins, first delete \"instructions\" from the pins file"
-            )
+            reason = f"they changed after they were first seen. {self._how_to_accept('instructions')}"
             return self._firewall.block(source, reason, event="instructions_changed", rule=RULE_QUARANTINE)
         return Decision(True, "the instructions are unchanged or new")
+
+    def _how_to_accept(self, kind: str, name: str | None = None) -> str:
+        """What the operator can do about a pinned definition that changed: the end of a quarantine reason.
+
+        With a pins file, the proxy keeps the new definition beside it (see
+        pins.py, "Changes waiting"), so the change can be looked at and
+        accepted with the pins command. Either way the entry stays removed
+        until the proxy restarts.
+        """
+        if self._pins.path is None:
+            return "If the change is expected, restart the proxy"
+        command = ["agent-sentinel", "pins", "diff", "--pins", str(self._pins.path)]
+        if kind != "tools":
+            command += ["--kind", KIND_WORDS[kind]]
+        if name is not None:
+            command.append(name)
+        return (f"If the change is expected, review it with: {shell_line(command)}; "
+                "then pins accept, and restart the proxy")
 
     def _clean_items(self, items: list[Any], items_key: str) -> list[Any]:
         """Return the entries of a list (tools, prompts, resources, resourceTemplates) that are safe to show.
@@ -1845,6 +1964,7 @@ class Proxy:
                 name = item.get("name")
                 self._clean_icons_of(item, f"'{_label(name) if _is_name(name) else '?'}' in the {items_key} list")
         collisions, repeats = self._name_collisions(items, items_key)
+        foreign = self._foreign_tools(items) if items_key == "tools" else frozenset()
         kept = []
         for position, item in enumerate(items):
             if position in repeats:
@@ -1852,16 +1972,35 @@ class Proxy:
             name = item.get("name") if isinstance(item, dict) else None
             label = _label(name) if _is_name(name) else "?"
             collision = collisions.get(name) if label != "?" else None
-            problem = self._problem_with_item(item, label, items_key, collision)
+            problem, forwarded = self._problem_with_item(item, label, items_key, collision, foreign)
             if problem is None:
-                kept.append(item)
+                kept.append(forwarded)
             else:
-                self._report(f"removed '{label}' from the {items_key} list: {problem}")
+                self._report(f"removed '{label}' from the {items_key} list: {problem}", limit=1000)
         if items_key in PINNED_LISTS:
             self._save_pins()
         if items_key == "tools":
             kept = self._without_blocked_tools(kept)
         return kept
+
+    def _foreign_tools(self, tools: list[Any]) -> frozenset[str]:
+        """The names of other servers' tools, for the shadowing check of this list's descriptions.
+
+        A description that gives orders about another server's tool ("when
+        send_email is called, bcc ...") is tool shadowing. The proxy sees one
+        server, so it takes the tool names the policy writes out in full
+        (Firewall.foreign_tool_names), less every name this server has
+        listed in this process, lists now, or has pinned: its own tools refer
+        to each other all the time.
+        """
+        listed = {tool["name"] for tool in tools if isinstance(tool, dict) and _is_name(tool.get("name"))}
+        with self._state:
+            for name in listed - self._listed_tools:
+                if len(self._listed_tools) >= MAX_KNOWN_NAMES:
+                    break
+                self._listed_tools.add(name)
+            own = listed | self._listed_tools
+        return self._firewall.foreign_tool_names(own | set(self._pins.names("tools")))
 
     def _clean_icons_of(self, item: JsonObject, whose: str) -> None:
         """Drop the icons of an entry (or of the server) that are not safe to forward (mcp_protocol.clean_icons).
@@ -1915,48 +2054,65 @@ class Proxy:
         return collisions, repeats
 
     def _problem_with_item(
-        self, item: Any, label: str, kind: str, collision: tuple[str, str, bool] | None = None
-    ) -> str | None:
-        """Why a list entry must be removed, or None if it may stay.
+        self, item: Any, label: str, kind: str, collision: tuple[str, str, bool] | None = None,
+        foreign_tools: Iterable[str] = (),
+    ) -> tuple[str | None, Any]:
+        """Why a list entry must be removed (None if it may stay), and the entry to forward in its place.
 
         In order: its shape, an earlier quarantine, its name (collision from
-        _name_collisions, and the naming rules), the scanner, its pin. A
-        tool, prompt or template that is removed is quarantined.
+        _name_collisions, characters that cannot be forwarded, the naming
+        rules), the scanner (a tool's description with the names of other
+        servers' tools, `foreign_tools`, to catch shadowing), its pin. The
+        entry forwarded is the copy cleaned of hidden characters, checked too
+        (_checked_for_forwarding); the pin is taken of the entry as the server
+        sent it. A tool, prompt or template that is removed is quarantined.
         """
         pinned = kind in PINNED_LISTS
         if not isinstance(item, dict) or (pinned and label == "?"):
-            return "it is not a well-formed entry"
+            return "it is not a well-formed entry", None
         if pinned and self._was_quarantined(kind, item["name"]):
-            return "it was quarantined earlier"  # even if it looks clean now
+            return "it was quarantined earlier", None  # even if it looks clean now
 
         decision = self._check_name(item, label, kind, collision)
+        forwarded = None
         if decision.allowed:
             event = "tool_description" if kind == "tools" else "list_item"
-            decision = self._firewall.scan_result(label, item, event=event, log_clean=False)
+            checked = self._checked_for_forwarding(label, item, event, log_clean=False, foreign_tools=foreign_tools)
+            decision, forwarded = checked.decision, checked.content
         if decision.allowed and pinned:
             decision = self._check_pin(kind, item, label)
         if decision.allowed:
             if kind == "tools":
                 # Annotations are pinned with the rest of the tool, and they can only add flow labels.
                 self._firewall.learn_annotations(item["name"], item.get("annotations"))
-            return None
+            return None, forwarded
         if pinned:
             # Remember the name: the agent may already know it from an
             # earlier list, and the server may list it again looking clean.
             self._quarantine(kind, item["name"])
-        return decision.reason
+        return decision.reason, None
 
     def _check_name(self, item: JsonObject, label: str, kind: str, collision: tuple[str, str, bool] | None) -> Decision:
-        """The verdict on an entry's name: a collision, then the MCP naming rules (tools and prompts).
+        """The verdict on an entry's name: a collision, then hidden characters, then the MCP naming rules.
 
-        A name outside the rules is refused with --tool-names strict; with
-        warn it is kept and reported, once, on stderr and in the audit log.
+        An entry whose name (or URI) would change when it is cleaned for
+        forwarding is refused in every mode: the client would ask for it by a
+        name the server does not know, or by the name of another entry. A
+        name outside the MCP naming rules (tools and prompts) is refused with
+        --tool-names strict; with warn it is kept and reported, once, on
+        stderr and in the audit log.
         """
         if collision is not None:
             reason, event, may_lift = collision
             if may_lift:
                 return self._firewall.block(label, reason, event=event, rule=RULE_QUARANTINE)
             return self._firewall.refuse(label, reason, event=event, rule=RULE_QUARANTINE)
+        hiding = [member for member in _ASKED_FOR_BY[kind]
+                  if isinstance(item.get(member), str) and clean_for_forwarding(item[member]) != item[member]]
+        if hiding:
+            reason = (f"its {hiding[0]} has characters the proxy does not forward (controls, escapes, tag or bidi "
+                      "characters), so the client could not ask for it as the server knows it")
+            return self._firewall.refuse(label, reason, event=f"{_ENTRY_NAME[kind]}_name", rule=RULE_MALFORMED)
         if kind not in _NAMED_LISTS or self._tool_names == TOOL_NAMES_OFF:
             return Decision(True, "the name is not checked")
         problem = protocol.tool_name_problem(item["name"])
@@ -1977,8 +2133,8 @@ class Proxy:
         if status == CHANGED:
             what = _ENTRY_NAME[kind].replace("_", " ")
             reason = (
-                f"{what} quarantined: its definition changed after it was first seen. If the change is expected, "
-                f"restart the proxy; with --pins, first delete this {what}'s entry from the pins file"
+                f"{what} quarantined: its definition changed after it was first seen. "
+                f"{self._how_to_accept(kind, item['name'])}"
             )
             return self._firewall.block(label, reason, event=f"{_ENTRY_NAME[kind]}_changed", rule=RULE_QUARANTINE)
         if status == FULL:
@@ -2240,20 +2396,47 @@ def _argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _server_environment(args: argparse.Namespace, say: Callable[..., None]) -> dict[str, str] | None:
-    """The environment to start the server with, after reporting on it; None if the env file cannot be used.
+def _env_file_values(args: argparse.Namespace) -> dict[str, str] | None:
+    """The variables of --env-file (none without it); None, after saying why, if the file cannot be used."""
+    try:
+        return server_env.read_env_file(args.env_file) if args.env_file else {}
+    except (OSError, server_env.EnvFileError) as exc:
+        _warn(f"cannot use the env file: {exc}", limit=500)
+        return None
+
+
+def _guarded_values(
+    names: Sequence[str], environment: Mapping[str, str], windows: bool = sys.platform == "win32",
+) -> dict[str, str]:
+    """The values secrets.known_values_from_env guards, for Firewall.set_secret_environment.
+
+    A variable's value as the server is given it (its environment, the env
+    file included), or else the proxy's own: a value the agent could send
+    out through this server's tools is a secret whether the server holds it
+    or not. Names compare without regard to case on Windows, as the system does.
+    """
+    values: dict[str, str] = {}
+    for name in names:
+        value = environment.get(name)
+        if value is None and windows:
+            value = next((found for key, found in environment.items() if key.upper() == name.upper()), None)
+        if value is None:
+            value = os.environ.get(name)
+        if value is not None:
+            values[name] = value
+    return values
+
+
+def _report_server_environment(
+    args: argparse.Namespace, environment: Mapping[str, str], added: Mapping[str, str], say: Callable[..., None],
+) -> None:
+    """Report on the environment the server is started with.
 
     Names are reported, never values: the --pass-env names the proxy does not
     have, what --clean-env passes, and the variables that look like secrets
     and that no --pass-env or env file named. `say` prints those notices
-    (nothing under --quiet); an env file that cannot be used is an error, always printed.
+    (nothing under --quiet).
     """
-    try:
-        added = server_env.read_env_file(args.env_file) if args.env_file else {}
-    except (OSError, server_env.EnvFileError) as exc:
-        _warn(f"cannot use the env file: {exc}", limit=500)
-        return None
-    environment = server_env.server_environment(os.environ, args.clean_env, args.pass_env, added)
     if args.clean_env:
         for name in server_env.missing_names(os.environ, args.pass_env):
             say(f"--pass-env {name}: the proxy has no such variable, so the server does not get it")
@@ -2265,7 +2448,6 @@ def _server_environment(args: argparse.Namespace, say: Callable[..., None]) -> d
         say(f"the server gets {len(secret_looking)} environment variable(s) whose names look like secrets: "
             f"{', '.join(secret_looking)}. If it does not need them, start the proxy with --clean-env; "
             "name each one it needs with --pass-env NAME", limit=2000)
-    return environment
 
 
 def _report_policy_error(path: str, error: Exception) -> None:
@@ -2327,19 +2509,27 @@ def main(argv: list[str] | None = None) -> int:
         _warn(f"cannot pass {unsafe[0]!r} to the batch file {executable}: cmd.exe would change it. "
               "Start the program behind the batch file directly, for example with node or python")
         return 2
+    added = _env_file_values(args)
+    if added is None:
+        return 2
+    environment = server_env.server_environment(os.environ, args.clean_env, args.pass_env, added)
+    firewall = Firewall(
+        policy, audit_path=args.audit, log_args=not args.no_log_args, monitor=args.monitor, server_name=args.name
+    )
+    # secrets.known_values_from_env guards the values the server is given (--clean-env, --pass-env, --env-file).
+    firewall.set_secret_environment(_guarded_values(policy.secrets_known_values_from_env, environment))
+
     approval_timeout = args.approval_timeout or DEFAULT_APPROVAL_TIMEOUT
     start = proxy_report.Startup(
         version=__version__, name=args.name, policy_path=args.policy, policy=policy, audit_path=args.audit,
         pins_path=args.pins, pins_enabled=not args.no_pins, server_command=[executable, *command[1:]],
         approvers=[(approver.describe(), approver.unavailable()) for approver in args.approve_with],
         approval_timeout=approval_timeout, approval_timeout_given=args.approval_timeout is not None,
-        monitor=args.monitor,
+        monitor=args.monitor, secret_warnings=firewall.secret_warnings(),
     )
     for line in proxy_report.startup_lines(start):
         say(line, limit=1500)
-    environment = _server_environment(args, say)
-    if environment is None:
-        return 2
+    _report_server_environment(args, environment, added, say)
     try:
         server = subprocess.Popen(
             [executable, *command[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -2353,9 +2543,6 @@ def main(argv: list[str] | None = None) -> int:
         # Printed even under --quiet: the proxy is protecting nothing.
         _warn("monitor mode: nothing is being blocked by the policy or the scanner")
 
-    firewall = Firewall(
-        policy, audit_path=args.audit, log_args=not args.no_log_args, monitor=args.monitor, server_name=args.name
-    )
     proxy = Proxy(
         firewall, sys.stdout.buffer, server.stdin, pins=pins, max_message_bytes=args.max_message_bytes,
         tool_names=args.tool_names, elicitation_hosts=args.elicitation_host, approvers=args.approve_with,

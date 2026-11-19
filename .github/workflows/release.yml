@@ -1,0 +1,81 @@
+name: release
+
+# Builds the package and publishes it to PyPI, only when a version tag such as
+# "v0.5.0" is pushed. Nothing else starts it: not a push to a branch, not a pull
+# request, not a schedule, not a button.
+#
+# PyPI trusts this workflow through Trusted Publishing (OpenID Connect), so no
+# PyPI token is stored anywhere. Before the first release the maintainer:
+#   1. checks by hand that the name "agent-sentinel" is free on PyPI;
+#   2. adds a trusted publisher on PyPI: this repository, workflow release.yml,
+#      environment "pypi";
+#   3. creates the "pypi" environment in the repository settings, with required
+#      reviewers, so that a pushed tag still waits for a person.
+# The publish step also uploads signed attestations of the files (on by default).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Nothing here writes to the repository.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and check the package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # Actions are pinned to exact commits so that a moved tag cannot change what runs here.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: the tag must be the version in agent_sentinel/__init__.py
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(python -c 'import agent_sentinel; print(agent_sentinel.__version__)')"
+          if [ "$TAG" != "v$version" ]; then
+            echo "The tag $TAG does not match the package version $version; nothing is published." >&2
+            exit 1
+          fi
+      - name: run the tests
+        run: python -m unittest discover tests
+      - name: build the source archive and the wheel
+        run: |
+          python -m pip install build
+          python -m build
+      - name: install the wheel in an empty environment and start it
+        run: |
+          python -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/python" -m pip install --no-index --no-deps dist/*.whl
+          "$RUNNER_TEMP/smoke/bin/agent-sentinel" --version
+          "$RUNNER_TEMP/smoke/bin/agent-sentinel" validate policy.example.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/agent-sentinel/
+    # Only this job may ask for an identity token, and only to prove to PyPI which workflow publishes.
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: distributions
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

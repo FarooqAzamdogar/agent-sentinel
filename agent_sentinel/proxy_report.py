@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
 from .leaks import redact
-from .policy import ACTIONS, Policy
+from .policy import ACTIONS, Policy, known_value_warnings
 from .textutil import printable
 
 QUIET = "quiet"
@@ -103,6 +103,10 @@ class Startup:
     approval_timeout: int = 120
     approval_timeout_given: bool = False
     monitor: bool = False
+    # Firewall.secret_warnings, for the values of secrets.known_values_from_env as the server's
+    # environment holds them. When given, they replace the policy's own guess (known_value_warnings),
+    # which can only look at the proxy's environment.
+    secret_warnings: Sequence[str] | None = None
 
 
 def startup_lines(start: Startup) -> list[str]:
@@ -160,6 +164,10 @@ def startup_warnings(start: Startup) -> list[str]:
     if policy.secrets_in_arguments == "allow":
         found.append("secrets.in_arguments is \"allow\": calls that carry keys or tokens are not refused")
     policy_warnings = policy.warnings()
+    if start.secret_warnings is not None:
+        guessed = set(known_value_warnings(policy))
+        policy_warnings = [text for text in policy_warnings if text not in guessed]
+        found.extend(f"secrets.known_values_from_env: {printable(text, limit=300)}" for text in start.secret_warnings)
     found.extend(printable(text, limit=500) for text in policy_warnings[:MAX_POLICY_WARNINGS_SHOWN])
     if len(policy_warnings) > MAX_POLICY_WARNINGS_SHOWN:
         found.append(f"{len(policy_warnings) - MAX_POLICY_WARNINGS_SHOWN} more warning(s) about the policy; "

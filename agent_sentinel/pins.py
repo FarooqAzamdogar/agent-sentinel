@@ -65,6 +65,21 @@ The loader is strict: an unknown version, section or member, a repeated key,
 a malformed fingerprint or a definition that does not match its fingerprint
 is an error. Keep a pins file where the agent's tools cannot write: anything
 that can edit it can make a changed definition look pinned.
+
+Changes waiting
+---------------
+When a pinned entry changes, the proxy keeps the definition it was sent in a
+second file beside the pins file, "<pins file>.pending" (pending_path), in
+the same format and under the same limits. (A new definition the scanner
+removes never gets as far as its pin, so it is not kept: accepting it would
+not let it through.) Nothing reads the file automatically: it is for the
+operator, who looks at the change with `agent-sentinel pins diff` and, on a
+terminal, accepts it with `agent-sentinel pins accept` (cli_pins.py), which
+scans it again. The changed entry stays removed until the proxy restarts.
+
+A running proxy writes the pins file whole when it pins something new. It
+writes the file as it is on disk plus what it pinned itself, so a pin that
+`pins accept` or `pins forget` changed meanwhile is not put back.
 """
 
 from __future__ import annotations
@@ -93,6 +108,8 @@ PINNED_FIELDS = {
 }
 PINNED_LISTS = tuple(PINNED_FIELDS)
 INSTRUCTIONS = "instructions"
+# How the pins command names each section (agent-sentinel pins ... --kind WORD).
+KIND_WORDS = {"tools": "tool", "prompts": "prompt", "resourceTemplates": "template", INSTRUCTIONS: INSTRUCTIONS}
 
 # Limits. Pinned text comes from the server, so everything kept is bounded.
 MAX_PINS_PER_LIST = 10_000
@@ -326,8 +343,34 @@ def _expect_keys(value: dict[str, Any], allowed: tuple[str, ...], where: str) ->
         )
 
 
-def _now() -> str:
+def pending_path(path: str | Path) -> Path:
+    """Where the changed definitions of a pins file wait for the operator: "<pins file>.pending"."""
+    path = Path(path)
+    return path.with_name(path.name + ".pending")
+
+
+def now() -> str:
+    """The time now, as a pin's first_seen: "2026-11-19T12:00:00Z" (UTC)."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def new_pin(definition: dict[str, Any], stored_chars: int = 0) -> Pin:
+    """A pin of a definition seen now; the definition is kept only within the limits.
+
+    stored_chars: how much the file already stores in definitions
+    (MAX_STORED_DEFINITION_CHARS bounds the total). The stored definition is
+    a copy read back from the canonical text, so it is exactly what was fingerprinted.
+    """
+    text = canonical_json(definition)
+    keep = len(text) <= MAX_DEFINITION_CHARS and stored_chars + len(text) <= MAX_STORED_DEFINITION_CHARS
+    return Pin(sha256=fingerprint(definition), first_seen=now(), definition=json.loads(text) if keep else None)
+
+
+def stored_chars(pins: PinsFile) -> int:
+    """How many characters of definitions a PinsFile stores (for MAX_STORED_DEFINITION_CHARS)."""
+    every = [pin for section in pins.lists.values() for pin in section.values()]
+    every += [pins.instructions] if pins.instructions is not None else []
+    return sum(len(canonical_json(pin.definition)) for pin in every if pin.definition is not None)
 
 
 # ---- the pins of one running proxy ----------------------------------------------------------
@@ -336,9 +379,10 @@ class ToolPins:
     """The pins of one server: in memory, and in a pins file when there is one. Thread-safe.
 
     Despite the name (kept from 0.4), it pins prompts, resource templates and
-    the server's instructions as well as tools. Use one file per server. To
-    accept a legitimate change, delete that entry from the file (or the file)
-    and restart the proxy: a changed entry stays removed while the proxy runs.
+    the server's instructions as well as tools. Use one file per server. A
+    changed entry stays removed while the proxy runs; its new definition
+    waits in the pending file (see "Changes waiting") for `agent-sentinel
+    pins accept`, after which the proxy is restarted.
     """
 
     def __init__(self, path: str | Path | None = None, enabled: bool = True) -> None:
@@ -351,10 +395,20 @@ class ToolPins:
         self._pins = PinsFile()
         if self._path is not None and self._path.exists():
             self._pins = read_pins_file(self._path)
-        self._stored_chars = sum(
-            len(canonical_json(pin.definition)) for pin in self._all_pins() if pin.definition is not None
-        )
+        self._stored_chars = stored_chars(self._pins)
         self._unsaved = False
+        # What this process pinned itself (section, name; INSTRUCTIONS, None for the instructions): only
+        # these are written over what is on disk (see save).
+        self._added: set[tuple[str, str | None]] = set()
+        # The changed definitions seen by this process, for the pending file (see "Changes waiting").
+        self._pending = PinsFile()
+        self._pending_chars = 0
+        self._pending_unsaved = False
+
+    @property
+    def path(self) -> Path | None:
+        """The pins file, or None when pins are kept in memory only."""
+        return self._path
 
     @staticmethod
     def fingerprint(tool: dict[str, Any]) -> str:
@@ -381,14 +435,19 @@ class ToolPins:
             if pin is None:
                 if len(pins) >= MAX_PINS_PER_LIST:
                     return FULL
-                pins[name] = self._new_pin(definition, sha)
+                pins[name] = self._new_pin(definition, kind, name)
                 return NEW
             if pin.sha256_v1 is not None:
                 if pin.sha256_v1 != v1_fingerprint(item):
+                    self._note_pending(kind, name, definition, sha)
                     return CHANGED
-                pins[name] = self._new_pin(definition, sha)  # the members version 1 did not pin are trusted now
+                # The members version 1 did not pin are trusted now.
+                pins[name] = self._new_pin(definition, kind, name)
                 return SAME
-            return SAME if pin.sha256 == sha else CHANGED
+            if pin.sha256 == sha:
+                return SAME
+            self._note_pending(kind, name, definition, sha)
+            return CHANGED
 
     def check_instructions(self, text: str) -> str:
         """Compare the server's instructions with their pin: SAME, CHANGED or NEW (now pinned)."""
@@ -398,9 +457,12 @@ class ToolPins:
         sha = fingerprint(definition)
         with self._lock:
             if self._pins.instructions is None:
-                self._pins.instructions = self._new_pin(definition, sha)
+                self._pins.instructions = self._new_pin(definition, INSTRUCTIONS, None)
                 return NEW
-            return SAME if self._pins.instructions.sha256 == sha else CHANGED
+            if self._pins.instructions.sha256 == sha:
+                return SAME
+            self._note_pending(INSTRUCTIONS, None, definition, sha)
+            return CHANGED
 
     def names(self, kind: str) -> list[str]:
         """The pinned names of one list, in the order they were pinned."""
@@ -408,25 +470,85 @@ class ToolPins:
             return list(self._pins.lists[kind])
 
     def save(self) -> None:
-        """Write the pins file, if there is one and anything was pinned since it was read. Raises OSError."""
+        """Write the pins file and the pending file, if there is a file and anything changed. Raises OSError.
+
+        The pins file is written as it is on disk now, plus the pins this
+        process made itself: a pin the operator accepted or forgot meanwhile
+        (agent-sentinel pins accept / forget) is kept as they left it. A
+        pins file that has become unreadable is written from memory.
+        """
         if self._path is None:
             return
         with self._lock:
-            if not self._unsaved:
-                return
-            write_pins_file(self._path, self._pins)
-            self._unsaved = False
+            if self._unsaved:
+                write_pins_file(self._path, self._merged_with_disk())
+                self._unsaved = False
+            if self._pending_unsaved:
+                write_pins_file(pending_path(self._path), self._pending_merged_with_disk())
+                self._pending_unsaved = False
 
-    def _new_pin(self, definition: dict[str, Any], sha: str) -> Pin:
-        """A pin for a definition seen now. Called with the lock held."""
-        text = canonical_json(definition)
-        keep = len(text) <= MAX_DEFINITION_CHARS and self._stored_chars + len(text) <= MAX_STORED_DEFINITION_CHARS
-        if keep:
-            self._stored_chars += len(text)
+    def _new_pin(self, definition: dict[str, Any], kind: str, name: str | None) -> Pin:
+        """A pin for a definition seen now, which this process made. Called with the lock held."""
+        pin = new_pin(definition, self._stored_chars)
+        if pin.definition is not None:
+            self._stored_chars += len(canonical_json(pin.definition))
         self._unsaved = True
-        # A copy read back from the canonical text: the stored definition is exactly what was fingerprinted.
-        return Pin(sha256=sha, first_seen=_now(), definition=json.loads(text) if keep else None)
+        self._added.add((kind, name))
+        return pin
 
-    def _all_pins(self) -> list[Pin]:
-        pins = [pin for section in self._pins.lists.values() for pin in section.values()]
-        return pins + ([self._pins.instructions] if self._pins.instructions is not None else [])
+    def _note_pending(self, kind: str, name: str | None, definition: dict[str, Any], sha: str) -> None:
+        """Keep a changed definition for the pending file (only with a pins file). Called with the lock held."""
+        if self._path is None:
+            return
+        waiting = self._pending.instructions if kind == INSTRUCTIONS else self._pending.lists[kind].get(name or "")
+        if waiting is not None and waiting.sha256 == sha:
+            return  # the same change, seen again
+        if kind != INSTRUCTIONS and waiting is None and len(self._pending.lists[kind]) >= MAX_PINS_PER_LIST:
+            return
+        pin = new_pin(definition, self._pending_chars)
+        if pin.definition is not None:
+            self._pending_chars += len(canonical_json(pin.definition))
+        if kind == INSTRUCTIONS:
+            self._pending.instructions = pin
+        else:
+            self._pending.lists[kind][name or ""] = pin
+        self._pending_unsaved = True
+
+    def _merged_with_disk(self) -> PinsFile:
+        """The pins file as it is on disk, with the pins this process made put in. Called with the lock held.
+
+        A pin this process made replaces the one on disk only where the disk
+        has none, or has one carried over from version 1 that this process
+        upgraded. Without a readable file on disk, the pins in memory.
+        """
+        try:
+            merged = read_pins_file(self._path) if self._path is not None and self._path.exists() else None
+        except (OSError, ValueError):
+            merged = None
+        if merged is None:
+            return self._pins
+        for kind, name in sorted(self._added, key=lambda key: (key[0], key[1] or "")):
+            ours = self._pins.instructions if kind == INSTRUCTIONS else self._pins.lists[kind].get(name or "")
+            theirs = merged.instructions if kind == INSTRUCTIONS else merged.lists[kind].get(name or "")
+            if ours is None or (theirs is not None and theirs.sha256_v1 is None):
+                continue
+            if kind == INSTRUCTIONS:
+                merged.instructions = ours
+            elif len(merged.lists[kind]) < MAX_PINS_PER_LIST or theirs is not None:
+                merged.lists[kind][name or ""] = ours
+        return merged
+
+    def _pending_merged_with_disk(self) -> PinsFile:
+        """The pending file on disk with this process's changes put in; it starts afresh if it cannot be read."""
+        assert self._path is not None
+        try:
+            merged = read_pins_file(pending_path(self._path))
+        except (OSError, ValueError):
+            merged = PinsFile()
+        for kind in PINNED_LISTS:
+            for name, pin in self._pending.lists[kind].items():
+                if name in merged.lists[kind] or len(merged.lists[kind]) < MAX_PINS_PER_LIST:
+                    merged.lists[kind][name] = pin
+        if self._pending.instructions is not None:
+            merged.instructions = self._pending.instructions
+        return merged

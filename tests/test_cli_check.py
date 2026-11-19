@@ -204,6 +204,19 @@ class Results(TempFolderTest):
         self.assertEqual(check(EXAMPLE, "fetch_page", "--result", self.write("r.txt", b"\xff\xfe\x00"))[0], 2)
         self.assertEqual(check(EXAMPLE, "fetch_page", "--result", self.folder / "none.txt")[0], 2)
 
+    def test_a_secret_in_a_result_is_reported_as_the_proxy_treats_it(self):
+        token = "ghp_" + "a1B2c3D4e5" * 4
+        page = self.write("env.txt", f"GITHUB_TOKEN={token}")
+        for mode, code, verdict in (("redact", 0, "PASS, with what looks like a secret replaced (GitHub token)"),
+                                    ("block", 1, "BLOCK (withheld from the agent)"),
+                                    ("off", 0, "verdict:     PASS")):
+            with self.subTest(mode=mode):
+                policy = self.write(f"{mode}.json", {"default": "allow", "secrets": {"in_results": mode}})
+                result = check(policy, "read_file", "path=.env", "--result", page)
+                self.assertEqual(result[0], code, result[1])
+                self.assertIn(verdict, result[1])
+                self.assertNotIn(token, result[1])
+
     def test_a_result_can_come_from_stdin(self):
         code, out, _ = check(EXAMPLE, "fetch_page", "--result", "-", stdin=INJECTION.encode())
         self.assertEqual(code, 1, out)

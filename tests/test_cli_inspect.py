@@ -259,7 +259,9 @@ class TheInspectCommand(IsolatedHomeTest):
         for extra in ((), ("--format", "json")):
             with self.subTest(format=extra):
                 code, out, _ = run_cli("inspect", *extra, "--", *command)
-                self.assertEqual(code, 0)
+                # The proxy removes a tool whose name it could not forward unchanged (escape codes in it).
+                self.assertEqual(code, 1)
+                self.assertIn("does not forward", out)
                 self.assertNotIn("\x1b", out)
                 self.assertNotIn("\x07", out)
                 self.assertIn("\\x1b", out)

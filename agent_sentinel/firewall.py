@@ -8,6 +8,8 @@ This is the core that everything else calls. It answers two questions:
 Both return a `Decision` and write one line to the audit log. What a server
 says about itself (tool descriptions, list entries, its instructions) is
 scanned with stricter rules than tool results: see METADATA_EVENTS.
+`find_secrets` applies check_call's secret guard to anything else the
+agent's side sends out (the proxy: the client's answers to a server).
 
 With the policy's `secrets.in_results` set to "redact", a result may be
 passed on with its secrets replaced. Only `check_result` can hand back that
@@ -487,6 +489,23 @@ class Firewall:
         """
         return self._checked_content(tool, content, event, log_clean, call_id, foreign_tools, can_replace=True)
 
+    def find_secrets(self, value: Any) -> list[Found]:
+        """The secrets in something the agent's side sends out other than a call: what check_call's guard would find.
+
+        For a caller that passes on more than calls (the proxy: the client's
+        answers to the server's requests, the answers a retried request
+        carries, a completion request). It is the guard check_call applies to
+        a call's arguments, under the same settings: the built-in and custom
+        formats unless secrets.in_arguments is "allow", the known values and
+        canaries always. Keys and strings are read one per line and joined,
+        as a call's arguments are, so a token split over two strings is seen.
+
+        Each Found names a kind of secret, never the secret; `secret_rule`
+        gives the rule id of a refusal. Raises UnscannableError for a value
+        with more nested parts than textutil.MAX_CONTAINERS.
+        """
+        return self._secrets_in_call(None, value)
+
     def secret_warnings(self) -> list[str]:
         """Why some secrets.known_values_from_env values are not guarded: for the operator, at startup.
 
@@ -729,7 +748,7 @@ class Firewall:
         secrets = self._secrets_in_call(tool, args)
         if secrets:
             reason = f"the call contains what looks like a secret ({_kinds(secrets)})"
-            return Decision(False, reason, public_reason=_SECRET_REFUSAL, rule=_secret_rule(secrets), call_id=call_id)
+            return Decision(False, reason, public_reason=_SECRET_REFUSAL, rule=secret_rule(secrets), call_id=call_id)
 
         verdict = self._verdict(tool, args)
         if verdict.action not in ("allow", "ask"):
@@ -780,8 +799,8 @@ class Firewall:
         self._guard_state = (settings, guard, warnings)
         return guard
 
-    def _secrets_in_call(self, tool: str, args: dict[str, Any]) -> list[Found]:
-        """The secrets in a call's tool name and arguments.
+    def _secrets_in_call(self, tool: str | None, args: Any) -> list[Found]:
+        """The secrets in a call's tool name and arguments (or, with no tool, in any value: find_secrets).
 
         Formats (built-in and custom) are looked for only when the policy's
         secrets.in_arguments is "block". Known values and canaries are always
@@ -1102,10 +1121,10 @@ def _error_texts(exc: BaseException) -> list[str]:
     return [text for text in dict.fromkeys(texts) if text.strip()]
 
 
-def _call_spellings(tool: str, args: dict[str, Any]) -> list[str]:
-    """The texts of a call that the secret guard reads.
+def _call_spellings(tool: str | None, args: Any) -> list[str]:
+    """The texts of a call that the secret guard reads (with tool None: of any value, for find_secrets).
 
-    1. The tool name, keys and strings, one per line.
+    1. The tool name (when there is one), keys and strings, one per line.
     2. The strings joined end to end with nothing between them, and the keys
        and strings joined the same way: a token split over several arguments
        (in order), or over a key and its value, is seen whole.
@@ -1120,7 +1139,7 @@ def _call_spellings(tool: str, args: dict[str, Any]) -> list[str]:
     """
     everything = texts_in(args, keys=True)
     strings = texts_in(args, keys=False)
-    spellings = ["\n".join([tool, *everything])]
+    spellings = ["\n".join(everything if tool is None else [tool, *everything])]
     if len(strings) > 1:
         spellings.append(_joined(strings, MAX_JOINED_ARGUMENT_CHARS))
         pairs = (strings[index] + strings[index + 1] for index in range(len(strings) - 1))
@@ -1150,8 +1169,8 @@ def _kinds(found: list[Found]) -> str:
     return ", ".join(item.kind for item in found)
 
 
-def _secret_rule(found: list[Found]) -> str:
-    """The rule id of a call refused for secrets: the most specific part of the guard that found one.
+def secret_rule(found: list[Found]) -> str:
+    """The rule id of a call (or message) refused for secrets: the most specific part of the guard that found one.
 
     A canary first (it can only be there if private text is leaving), then
     a known value, then a custom format, then the built-in formats ("secrets").

@@ -14,7 +14,10 @@ The answer names the rule that decided, what the agent would be told, and,
 for a refusal, what the operator could change.
 
 Exit codes: 0 allow, 1 block, 3 ask, 2 an error in the input. With --result,
-a result that would be withheld counts as a block.
+a result that would be withheld counts as a block. The result is checked as
+the proxy checks a reply (Firewall.check_result): with the policy's
+secrets.in_results "redact", a result holding a secret passes with the
+secret replaced, and the answer says which kinds were replaced.
 
 Arguments: `name=value` passes the value as text, exactly as typed.
 `name:=JSON` passes a JSON value: a number (`count:=5`), true or false, a
@@ -128,7 +131,7 @@ def run(args: argparse.Namespace) -> int:
     result_blocked = False
     if result is not None:
         content, how = result
-        scanned = firewall.scan_result(args.tool, content, call_id=decision.call_id)
+        scanned = firewall.check_result(args.tool, content, call_id=decision.call_id).decision
         result_blocked = not scanned.allowed
         _print_result(policy, args.tool, scanned, f"{shown_path(args.result)}, read as {how}", outcome)
 
@@ -263,7 +266,12 @@ def _print_session_note(policy: Policy, marks: list[str]) -> None:
 
 def _print_result(policy: Policy, tool: str, scanned: Decision, source: str, call_outcome: str) -> None:
     print(f"\nResult ({source}):")
-    print_field("verdict", "PASS" if scanned.allowed else "BLOCK (withheld from the agent)")
+    if not scanned.allowed:
+        print_field("verdict", "BLOCK (withheld from the agent)")
+    elif scanned.redacted:
+        print_field("verdict", f"PASS, with what looks like a secret replaced ({', '.join(scanned.redacted)})")
+    else:
+        print_field("verdict", "PASS")
     if scanned.rule:
         print_field("rule", printable(scanned.rule, limit=200))
     print_field("reason", printable(scanned.reason, limit=1000))

@@ -8,6 +8,7 @@
     agent-sentinel unwrap --client NAME                 take it out again
     agent-sentinel doctor                               check that every server is protected
     agent-sentinel hook install claude-code --policy P  enforce the policy inside Claude Code (its hooks)
+    agent-sentinel pins diff --pins FILE                see what changed in a definition the proxy removed
     agent-sentinel check POLICY TOOL [name=value ...]   try one call against a policy
     agent-sentinel test POLICY CASES.json               run a policy's test cases (for CI)
     agent-sentinel validate POLICY                      check that a policy file is well formed
@@ -42,6 +43,7 @@ from . import (
     cli_hook,
     cli_init,
     cli_inspect,
+    cli_pins,
     cli_report,
     cli_scan,
     cli_suggest,
@@ -63,6 +65,7 @@ _COMMANDS = (
     ("unwrap", cli_unwrap),
     ("doctor", cli_doctor),
     ("hook", cli_hook),
+    ("pins", cli_pins),
     ("check", cli_check),
     ("test", cli_test),
     ("validate", cli_validate),

@@ -150,7 +150,7 @@ class OneLinePerBlock(unittest.TestCase):
                 h.from_client(call(1, "read_file", {"path": "a"}))
             h.from_client(call(2, "read_file", {"path": "a"}))
             h.sent_to_server()
-            with mock.patch.object(Firewall, "scan_result", side_effect=RuntimeError("bug")):
+            with mock.patch.object(Firewall, "check_result", side_effect=RuntimeError("bug")):
                 h.from_server(reply(2, text_result("hello")))
             first, second = (m["error"]["message"] for m in h.sent_to_client())
             refs = {json.loads(line).get("ref") for line in audit.read_text(encoding="utf-8").splitlines()}
