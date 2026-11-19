@@ -300,6 +300,37 @@ class StartingTheProxy(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("cannot load the pins file", stderr)
 
+    def test_file_options_may_start_with_the_home_folder(self):
+        # MCP clients start the proxy without a shell, so the proxy reads a leading "~" itself.
+        home, elsewhere = self.folder / "home", self.folder / "client"
+        (home / "logs").mkdir(parents=True)
+        elsewhere.mkdir()
+        (home / "policy.json").write_text(EXAMPLE_POLICY_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+        (home / "server.env").write_text("FROM_FILE=from-the-env-file\n", encoding="utf-8")
+        environment = dict(os.environ, HOME=str(home), USERPROFILE=str(home), PYTHONPATH=str(ROOT))
+
+        messages = (request(1, "ping"), call(2, "delete_file", {"path": "x"}))
+
+        def run(*options):
+            return subprocess.run(
+                [sys.executable, "-m", "agent_sentinel", "proxy", "--policy", "~/policy.json", *options,
+                 "--", sys.executable, str(self.server)],
+                input="".join(json.dumps(m) + "\n" for m in messages), capture_output=True, encoding="utf-8",
+                errors="replace", cwd=elsewhere, timeout=60, env=environment,
+            )
+
+        proc = run("--audit", "~/logs/audit.jsonl", "--pins", "~/pins.json", "--env-file", "~/server.env")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        replies = {m["id"]: m for m in map(json.loads, proc.stdout.splitlines())}
+        self.assertEqual(replies[1]["result"]["from_file"], "from-the-env-file")
+        self.assertIn("delete_file", (home / "logs" / "audit.jsonl").read_text(encoding="utf-8"))
+        self.assertNotIn("is relative", proc.stderr)
+        self.assertEqual(list(elsewhere.iterdir()), [])  # no folder named "~" where the client started it
+        (home / "pins.json").write_text("not a pins file", encoding="utf-8")
+        proc = run("--pins", "~/pins.json")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("cannot load the pins file", proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

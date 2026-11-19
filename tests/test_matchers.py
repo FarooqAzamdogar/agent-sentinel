@@ -255,6 +255,38 @@ class PathsOnWindows(unittest.TestCase):
         self.assertFalse(deny.found_in(r"C:\Documents and Settings\me\notes.txt"))
         self.assertFalse(deny.found_in(r"C:\Users\me\Application Data\Other\x"))
 
+    def test_deny_sees_through_the_other_junctions_of_a_profile_programdata_and_documents(self):
+        # `dir /AL` of C:\Users\Default (copied for every new user), C:\ProgramData and Documents lists these.
+        roots = ["~/AppData", "~/Pictures", "~/Music", "C:/Users/Public", "C:/ProgramData/Microsoft"]
+        deny = PathMatcher.for_roots(roots, **WINDOWS)
+        history = PathMatcher.for_roots([r"C:\Users\me\AppData\Local\Microsoft\Windows\History",
+                                         r"C:\Users\me\AppData\Local\Microsoft\Windows\INetCache"], **WINDOWS)
+        for value in (r"C:\Users\me\Start Menu\Programs\Startup\evil.cmd", "~/Start Menu/Programs/Startup/evil.cmd",
+                      r"C:\Users\me\SendTo\evil.lnk", r"C:\Users\me\Recent\report.lnk",
+                      r"C:\Users\me\Templates\Normal.dotm", r"C:\Users\me\NetHood\x", r"C:\Users\me\PrintHood\x",
+                      r"C:\Users\me\Cookies\x", r"C:\Documents and Settings\me\Start Menu\Programs\Startup\evil.cmd",
+                      r"C:\ProgramData\Start Menu\Programs\StartUp\evil.cmd", r"C:\ProgramData\Templates\x",
+                      r"C:\ProgramData\Desktop\evil.lnk", r"C:\ProgramData\Documents\x.txt",
+                      r"C:\Users\All Users\Documents\x.txt", r"C:\Users\me\Documents\My Pictures\passport.jpg",
+                      r"C:\Users\me\My Documents\My Music\song.mp3"):
+            with self.subTest(value=value):
+                self.assertTrue(deny.found_in(value))
+        for value in (r"C:\Users\me\Local Settings\History\x", r"C:\Users\me\AppData\Local\Temporary Internet Files\x",
+                      r"C:\Users\me\AppData\Local\Microsoft\Windows\Temporary Internet Files\x"):
+            with self.subTest(value=value):
+                self.assertTrue(history.found_in(value))
+        # A folder of the same name elsewhere is no junction, and the real folders are not aliases of themselves.
+        for value in (r"C:\work\app\templates\index.html", r"C:\work\Microsoft\Windows\Start Menu\Programs\x",
+                      r"C:\Users\me\Documents\notes.txt", r"C:\Users\me\Desktop\x"):
+            with self.subTest(value=value):
+                self.assertFalse(deny.found_in(value))
+
+    def test_deny_denies_a_value_with_more_alias_readings_than_it_follows(self):
+        deny = PathMatcher.for_roots(["~/AppData"], **WINDOWS)
+        names = ["templates", "recent", "sendto", "cookies", "nethood", "printhood", "start menu"]
+        self.assertFalse(deny.found_in("C:\\work\\" + "\\".join(names[:4]) + "\\x"))
+        self.assertTrue(deny.found_in("C:\\work\\" + "\\".join(names) + "\\x"))  # denied rather than read in part
+
     def test_an_unknown_current_folder_refuses_relative_paths(self):
         def gone():
             raise FileNotFoundError("deleted")

@@ -245,21 +245,50 @@ _WINDOWS_DRIVE_URI_PATH = re.compile(r"/[A-Za-z]:")
 
 # Folders that every system has under a second name, with no link the agent
 # made: through them a value reaches a root without naming it. Windows keeps
-# junctions for programs written for XP (in lowercase, as deny_args compares;
-# each is (the alias, what it leads to)). "Application Data" leads to
-# AppData\Roaming in a profile, but to the folder that holds it inside
-# AppData\Local and ProgramData, so both readings are made.
+# junctions for programs written for XP, in every profile (C:\Users\Default
+# is copied for each new user), in ProgramData and in Documents. Each is (the
+# alias, what it leads to), in lowercase as deny_args compares. A name used
+# for more than one junction ("Application Data", "Start Menu", "Templates")
+# is read each way; a reading that names no real folder can only add blocks.
 _WINDOWS_ALIASES = (
+    # The drive and C:\Users.
     ("\\documents and settings\\", "\\users\\"),
     ("\\users\\all users\\", "\\programdata\\"),
     ("\\users\\default user\\", "\\users\\default\\"),
-    ("\\local settings\\", "\\appdata\\local\\"),
+    # A profile.
     ("\\application data\\", "\\appdata\\roaming\\"),
-    ("\\application data\\", "\\"),
+    ("\\cookies\\", "\\appdata\\local\\microsoft\\windows\\inetcookies\\"),
+    ("\\local settings\\", "\\appdata\\local\\"),
     ("\\my documents\\", "\\documents\\"),
+    ("\\nethood\\", "\\appdata\\roaming\\microsoft\\windows\\network shortcuts\\"),
+    ("\\printhood\\", "\\appdata\\roaming\\microsoft\\windows\\printer shortcuts\\"),
+    ("\\recent\\", "\\appdata\\roaming\\microsoft\\windows\\recent\\"),
+    ("\\sendto\\", "\\appdata\\roaming\\microsoft\\windows\\sendto\\"),
+    ("\\start menu\\", "\\appdata\\roaming\\microsoft\\windows\\start menu\\"),
+    ("\\templates\\", "\\appdata\\roaming\\microsoft\\windows\\templates\\"),
+    # Documents, a profile's or Public's.
+    ("\\documents\\my music\\", "\\music\\"),
+    ("\\documents\\my pictures\\", "\\pictures\\"),
+    ("\\documents\\my videos\\", "\\videos\\"),
+    # AppData\Local and ProgramData, where "Application Data" leads to the folder that holds it.
+    ("\\application data\\", "\\"),
+    ("\\appdata\\local\\history\\", "\\appdata\\local\\microsoft\\windows\\history\\"),
+    ("\\appdata\\local\\temporary internet files\\", "\\appdata\\local\\microsoft\\windows\\inetcache\\"),
+    ("\\microsoft\\windows\\temporary internet files\\", "\\microsoft\\windows\\inetcache\\"),
+    ("\\programdata\\desktop\\", "\\users\\public\\desktop\\"),
+    ("\\programdata\\documents\\", "\\users\\public\\documents\\"),
+    ("\\programdata\\start menu\\", "\\programdata\\microsoft\\windows\\start menu\\"),
+    ("\\programdata\\templates\\", "\\programdata\\microsoft\\windows\\templates\\"),
 )
-# How many alias readings one value may have: a few aliases in one path, never more.
-_MAX_ALIAS_READINGS = 32
+# The real Start Menu, Recent, SendTo and Templates folders are in a
+# Microsoft\Windows folder: a name there is the folder itself, not an alias
+# (and reading it as one would never end, as the target holds the name again).
+_WINDOWS_ALIAS_PATTERNS = tuple(
+    (re.compile(r"(?<!\\microsoft\\windows)" + re.escape(alias)), target) for alias, target in _WINDOWS_ALIASES
+)
+# How many alias readings one value may have. A real path goes through a few
+# aliases at most; a value that needs more is denied rather than read in part.
+_MAX_ALIAS_READINGS = 64
 # On Linux, /proc/<process>/root, cwd, fd ... lead into another process's view of
 # the files (/dev/fd is /proc/self/fd), where a root can be reached by any name.
 # A path through them cannot be read with certainty.
@@ -286,7 +315,8 @@ class PathMatcher(Matcher):
     links and junctions are not followed, so a link inside a root can still
     lead out of it, and a link elsewhere into it. deny_args does know the
     second names the system itself gives some folders (_WINDOWS_ALIASES, such
-    as "C:\\Documents and Settings" for "C:\\Users"; "/private/etc" on macOS).
+    as "C:\\Documents and Settings" for "C:\\Users" and "~\\Start Menu" for
+    the Start Menu in AppData; "/private/etc" on macOS).
 
     A value is refused (allow_args) or denied (deny_args) when it cannot be
     read with certainty: a Windows short name ("SSH~1"), an alternate data
@@ -294,6 +324,7 @@ class PathMatcher(Matcher):
     device name (CON, NUL, COM1...), a name ending in a dot or a space,
     wildcards, control characters, "~user", a path through /proc/<process>/root,
     cwd or fd or through /dev/fd, or more than MAX_PATH_CHARS characters.
+    deny_args also denies a value with more alias readings than _MAX_ALIAS_READINGS.
 
     Readings. A value starting with "~/" is read as the home folder, as most
     tools read it; deny_args also checks it as a folder named "~". A "file:"
@@ -364,10 +395,10 @@ class PathMatcher(Matcher):
             readings = [self._absolute(reading, expand_home=expand)
                         for reading in self._paths_in(text)
                         for expand in ((True, False) if self._starts_with_home(reading) else (False,))]
+            names = [name for path in readings for name in self._other_names(path.casefold())]
         except _Unreadable:
             return True
         roots = [root.casefold() for root in self.roots]
-        names = [name for path in readings for name in self._other_names(path.casefold())]
         return any(self._inside(name, root) for name in names for root in roots)
 
     def describe(self) -> str:
@@ -488,11 +519,12 @@ class PathMatcher(Matcher):
             return [path]
         names = [path]
         for name in names:  # grows as it goes: an alias reached through another is read too
-            for alias, target in _WINDOWS_ALIASES:
-                if alias in name + "\\" and len(names) < _MAX_ALIAS_READINGS:
-                    other = ntpath.normpath((name + "\\").replace(alias, target))
-                    if other not in names:
-                        names.append(other)
+            for alias, target in _WINDOWS_ALIAS_PATTERNS:
+                other = ntpath.normpath(alias.sub(lambda _: target, name + "\\"))
+                if other not in names:
+                    if len(names) >= _MAX_ALIAS_READINGS:
+                        raise _Unreadable("it goes through more of the system's folder aliases than are followed")
+                    names.append(other)
         return names
 
     def _allow_key(self, path: str) -> str:

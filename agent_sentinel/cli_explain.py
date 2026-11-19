@@ -72,6 +72,13 @@ _HEADINGS = {
     "would_block": "WOULD BE BLOCKED (monitor mode let it through)",
     "ask": "WAITING FOR APPROVAL",
 }
+# The answer to an "ask" that did not let the call through, by the record's "approval". Without one,
+# a person approved the call and a flow rule blocked it as the session had changed while it waited.
+_REFUSED_HEADINGS = {
+    "refused": "REFUSED when a person was asked",
+    "unavailable": "REFUSED: nobody could be asked",
+}
+_BLOCKED_AFTER_APPROVAL = "BLOCKED after it was approved"
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -146,9 +153,10 @@ def find_records(path: str, ref: str | None, last: int) -> tuple[list[dict[str, 
 def explain_record(record: dict[str, Any], policy: Policy | None) -> None:
     """Print what one audit record says, the rule behind it, and how to allow the call."""
     action = text_of(record, "action") or "?"
+    approval = text_of(record, "approval")
     heading = _HEADINGS.get(action, printable(action, limit=20).upper())
     if record.get("event") == "approval":
-        heading = "APPROVED" if action == "allow" else "REFUSED when a person was asked"
+        heading = "APPROVED" if action == "allow" else _REFUSED_HEADINGS.get(approval or "", _BLOCKED_AFTER_APPROVAL)
     ref = f"ref {field_text(record, 'ref', 20)}  " if "ref" in record else ""
     print(f"{ref}{field_text(record, 'time', 40)}  {heading}  {field_text(record, 'event', 40)} "
           f"{field_text(record, 'tool', 120)}")
@@ -177,7 +185,6 @@ def explain_record(record: dict[str, Any], policy: Policy | None) -> None:
         _print_policy_now(record, policy)
     # Not for an "ask" record: the call was still waiting; the answer has a record of its own.
     if action in ("block", "would_block"):
-        approval = text_of(record, "approval") or ("refused" if record.get("event") == "approval" else None)
         hint = fix_hints.fix_hint(
             rule, tool=text_of(record, "tool"), matched_arg=text_of(record, "matched_arg"),
             args=record.get("args"), policy=policy, approval=approval,

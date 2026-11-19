@@ -163,6 +163,10 @@ class TheWindowsDialog(unittest.TestCase):
                 self.assertFalse(answer.approved)
                 self.assertIn(detail, answer.detail)
 
+    def test_a_box_that_could_not_be_shown_asked_nobody(self):
+        # The audit log then says nobody could be asked, not that a person said no.
+        self.assertEqual([self.ask(code)[0].asked for code in (2, 32000, 0, 6)], [True, True, False, False])
+
     def test_the_box_shows_the_call_and_closes_itself_at_the_timeout(self):
         _, (text, title, timeout_ms) = self.ask(2)
         self.assertIn('"to": "bob@example.com"', text)
@@ -231,6 +235,16 @@ class TheMacDialog(unittest.TestCase):
         runner = FakeRunner(0, b"button returned:Allow, gave up:false\n")
         self.assertFalse(DialogApprover(platform="darwin", run=runner, clock=hurried(0.5)).ask(request(), 45).approved)
 
+    def test_only_refuse_and_the_timeout_count_as_asking(self):
+        # "Refuse" is the cancel button: osascript ends with error -128. Any other error: no dialog was shown.
+        for code, out, err, asked in ((1, b"", b"execution error: User canceled. (-128)\n", True),
+                                      (0, b"button returned:, gave up:true", b"", True), (None, b"", b"", True),
+                                      (1, b"", b"execution error: No user interaction allowed. (-1713)\n", False)):
+            with self.subTest(code=code, err=err):
+                dialog = DialogApprover(platform="darwin", run=FakeRunner(code, out, err), clock=unhurried())
+                answer = dialog.ask(request(), 5)
+                self.assertEqual((answer.approved, answer.asked), (False, asked))
+
 
 class TheLinuxDialog(unittest.TestCase):
     DISPLAY = {"DISPLAY": ":0", "PATH": "/usr/bin"}
@@ -260,6 +274,13 @@ class TheLinuxDialog(unittest.TestCase):
         for code in (1, 5, -1, None):
             with self.subTest(code=code):
                 self.assertFalse(self.dialog(FakeRunner(code)).ask(request(), 5).approved)
+
+    def test_only_refuse_and_the_timeout_count_as_asking(self):
+        # zenity exits with 1 for Refuse or a closed window and 5 at its timeout; other codes are its errors.
+        for code, asked in ((1, True), (5, True), (None, True), (-1, False), (255, False)):
+            with self.subTest(code=code):
+                self.assertEqual(self.dialog(FakeRunner(code)).ask(request(), 5).asked, asked)
+        self.assertFalse(self.dialog(zenity=None).ask(request(), 5).asked)
 
     def test_an_allow_that_comes_too_soon_is_refused(self):
         # zenity (GTK) moves the focus with Tab too.
@@ -402,6 +423,15 @@ class TheElicitation(unittest.TestCase):
             with self.subTest(hostile=hostile):
                 self.assertFalse(ElicitationApprover.answer(hostile).approved)
 
+    def test_an_error_or_an_unreadable_answer_means_nobody_was_asked(self):
+        error = {"jsonrpc": "2.0", "id": "x", "error": {"code": -1, "message": "no form"}}
+        unknown = {"jsonrpc": "2.0", "id": "x", "result": {"action": "later"}}
+        self.assertEqual([ElicitationApprover.answer(reply).asked for reply in (error, unknown)], [False, False])
+        for result in ({"action": "decline"}, {"action": "cancel"},
+                       {"action": "accept", "content": {"approve": False}}):
+            with self.subTest(result=result):
+                self.assertTrue(ElicitationApprover.answer({"jsonrpc": "2.0", "id": "x", "result": result}).asked)
+
     def test_which_clients_can_show_a_form(self):
         for capabilities, expected in (
             ({"elicitation": {}}, True), ({"elicitation": {"form": {}}}, True),
@@ -426,6 +456,14 @@ class ReadingApproveWith(unittest.TestCase):
             self.assertEqual(parse_backend(f"command:{program}", lambda name: name).program, program)
             found = parse_backend("command:approve-it", lambda name: program if name == "approve-it" else None)
             self.assertEqual(found.program, program)
+
+    def test_a_command_may_start_with_the_home_folder(self):
+        # MCP clients start the proxy without a shell, so "~" is read here.
+        with tempfile.TemporaryDirectory() as tmp:
+            program = write_program(tmp, "print('approve')\n")
+            with mock.patch.dict(os.environ, {"HOME": tmp, "USERPROFILE": tmp}):
+                found = parse_backend(f"command:~/{os.path.basename(program)}", lambda name: name)
+        self.assertEqual(os.path.normcase(found.program), os.path.normcase(os.path.abspath(program)))
 
     def test_a_command_that_cannot_be_used_is_refused_clearly(self):
         for text, message in (

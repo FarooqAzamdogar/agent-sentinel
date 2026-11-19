@@ -146,8 +146,10 @@ def fix_hint(
         )
     if approval == "unavailable":
         return (
-            "The policy sends this call to a person, and nobody could be asked: the proxy needs an approver "
-            "(--approve-with), and an approver that fails refuses. Set one up rather than allowing the call."
+            "The policy sends this call to a person, and nobody could be asked; the reason says why. The proxy "
+            "needs an approver that can ask (--approve-with), and refuses when it fails or too many calls wait; "
+            "the Claude Code hook refuses in a permission mode that shows no prompt, such as bypassPermissions. "
+            "Make sure someone can be asked rather than allowing the call."
         )
     argument = f" in argument {_name(matched_arg)}" if isinstance(matched_arg, str) else ""
     kind = rule_id.kind

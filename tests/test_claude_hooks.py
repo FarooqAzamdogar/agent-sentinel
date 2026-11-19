@@ -157,6 +157,7 @@ class BeforeACall(HookTest):
                 self.assertEqual((asked["action"], answered["event"], answered["action"]), ("ask", "approval", "block"))
                 self.assertEqual(asked["ref"], answered["ref"])
                 self.assertIn("would not show the prompt", answered["reason"])
+                self.assertEqual(answered["approval"], "unavailable")  # nobody was asked, so nobody said no
 
     def test_rate_limits_hold_from_one_hook_process_to_the_next(self):
         self.assertIsNone(self.pre()[1])
@@ -252,6 +253,15 @@ class FlowRulesAcrossProcesses(HookTest):
         self.assertEqual(decision, "deny")
         self.assertRegex(reason, "the call could not be checked, so it was not made " + REF)
         self.assertEqual(self.records()[-1]["rule"], "session")
+
+    def test_an_ask_whose_marks_cannot_be_recorded_is_refused_before_anyone_is_asked(self):
+        self.use_private_reads({"action": "ask"})
+        with mock.patch("agent_sentinel.session.FileSessionStore.add", side_effect=SessionStateError("disk full")):
+            _, answer, _ = self.pre("pre_tool_use_read.json", tool_input={"file_path": "notes.txt"})
+        self.assertEqual(self.decision(answer)[0], "deny")
+        record = self.records()[-1]
+        self.assertEqual((record["event"], record["action"], record["approval"]), ("approval", "block", "unavailable"))
+        self.assertIn("flow marks could not be recorded", record["reason"])
 
     def test_a_clean_error_text_counts_as_read(self):
         self.start_session()
