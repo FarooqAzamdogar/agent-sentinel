@@ -239,7 +239,9 @@ class ProxyLists(unittest.TestCase):
             for number, (first, second) in enumerate(halves):
                 with self.subTest(method=method, phrase=first):
                     h = Harness()
-                    entries = [{"name": f"a{number}", "description": first}, {"name": f"b{number}", "description": second}]
+                    # search_*: names the example policy allows, so that no tool is hidden from the list.
+                    entries = [{"name": f"search_a{number}", "description": first},
+                               {"name": f"search_b{number}", "description": second}]
                     delivered = h.round_trip(request(1, method), {key: entries})
                     self.assertNotIn("result", delivered)
 

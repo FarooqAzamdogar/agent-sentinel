@@ -77,6 +77,44 @@ What the client sends back to the server (its answers to server requests,
 and the inputResponses of a retried request) passes the secret guard, and
 an answer is rebuilt from its `result` or `error` before it is forwarded.
 
+Lists, pins and names
+---------------------
+The entries of a tools/list, prompts/list, resources/list or
+resources/templates/list reply are checked one by one (_clean_items):
+
+* icons that are not safe for the client to fetch are dropped (the entry
+  stays; mcp_protocol.clean_icons), here and in the server's own serverInfo;
+* tool and prompt names must follow the MCP naming rules (proxy --tool-names
+  strict, warn or off) and must not look like another name of the same
+  server ("read_fіle" beside "read_file"); a name listed twice with two
+  different definitions is refused;
+* each entry is scanned, and tools, prompts and resource templates are
+  compared with their pins (pins.py), as are the server's instructions.
+
+A tool, prompt or template that fails is removed from the list and
+quarantined for as long as the proxy runs: it is left out of later lists, a
+tool cannot be called, a prompt cannot be fetched. Changed instructions are
+removed from the reply. Then, if the policy says hide_blocked_tools, the
+tools it blocks outright are hidden from the list (never in monitor mode);
+a call to a hidden tool is still checked and refused.
+
+Requests other than tool calls
+------------------------------
+The policy's client_requests section may refuse any other method the client
+sends (Policy.client_request_action), with "method not found". Once the
+policy opts in (Policy.checks_prompts), prompts/get is checked like a call of
+a tool named "prompts/get", with arguments {"name", "arguments"}.
+completion/complete passes the secret guard, since it carries what the user
+is typing.
+
+Elicitation
+-----------
+An elicitation is checked for what it asks the user (elicitation.py): a URL
+it sends the user to must be a public https address, and on the operator's
+list if there is one (--elicitation-host); a form may not ask for a password,
+key or card number. This applies to elicitation/create requests, to the
+entries of input_required results and to URLElicitationRequiredError replies.
+
 Flow rules
 ----------
 One proxy process is one session. When a tools/call or resources/read result
@@ -90,7 +128,6 @@ each listed tool's MCP annotations are passed to the firewall as well.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -100,14 +137,16 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, BinaryIO, Callable
+from typing import Any, BinaryIO, Callable, Iterable, Sequence
 
+from . import elicitation
 from . import mcp_protocol as protocol
-from .firewall import Decision, Firewall
+from . import server_env
+from .firewall import SERVER_NAME, Decision, Firewall
 from .leaks import find_secrets
 from .mcp_protocol import ShapeError
-from .policy import RULE_MALFORMED, RULE_QUARANTINE, RULE_SECRETS, Policy, PolicyError
+from .pins import CHANGED, FULL, PINNED_LISTS, ToolPins, definition_of, fingerprint
+from .policy import PROMPTS_GET, RULE_MALFORMED, RULE_QUARANTINE, RULE_SECRETS, Policy, PolicyError
 from .policy_errors import file_error_message
 from .session import SessionStateError
 from .textutil import UnscannableError, printable, texts_in
@@ -124,8 +163,9 @@ SHUTDOWN_GRACE_SECONDS = 1.5
 DEFAULT_MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 MAX_PENDING_REQUESTS = 10_000  # client requests waiting for a reply
 MAX_SERVER_REQUESTS = 1_000  # server requests waiting for the client's reply
-MAX_QUARANTINED_TOOLS = 10_000
-MAX_PINNED_TOOLS = 10_000
+MAX_QUARANTINED = 10_000  # tools, prompts and resource templates together
+MAX_KNOWN_NAMES = 10_000  # names of one kind remembered to catch look-alikes
+MAX_REPORTED = 10_000  # things reported once on stderr (see _first_report)
 MAX_LABEL_CHARS = 200
 MAX_NAME_CHARS = 256  # tool names and request ids the proxy has to remember
 
@@ -133,9 +173,11 @@ MAX_NAME_CHARS = 256  # tool names and request ids the proxy has to remember
 # argument, "uri". A policy rule for it looks like a rule for a tool.
 RESOURCE_READ = "resources/read"
 _RESOURCE_METHODS = (RESOURCE_READ, "resources/subscribe")
-
-# The members of a tool definition that reach the model, and so are pinned.
-_PINNED_FIELDS = ("name", "title", "description", "inputSchema", "outputSchema", "annotations")
+# Names a tool may not have: the policy checks these requests under them, and a tool must not borrow their rules.
+_RESERVED_TOOL_NAMES = (*_RESOURCE_METHODS, PROMPTS_GET)
+COMPLETION_COMPLETE = "completion/complete"
+# Where 2026-07-28 puts the server's serverInfo (in the _meta of a server/discover result).
+_SERVER_INFO_KEY = "io.modelcontextprotocol/serverInfo"
 
 # List methods and the result field that holds their items. Items are scanned
 # one by one, so a single poisoned entry does not take the whole list down.
@@ -145,6 +187,17 @@ _LIST_ITEMS_KEY = {
     "resources/list": "resources",
     "resources/templates/list": "resourceTemplates",
 }
+# One entry of each list, as audit events name it ("tool_changed", "prompt_lookalike", ...).
+_ENTRY_NAME = {"tools": "tool", "prompts": "prompt", "resources": "resource", "resourceTemplates": "resource_template"}
+# The lists whose names are what the client calls or fetches by: they follow the
+# MCP naming rules and are checked for look-alikes.
+_NAMED_LISTS = ("tools", "prompts")
+
+# proxy --tool-names: what happens to a tool or prompt whose name breaks the MCP naming rules.
+TOOL_NAMES_STRICT = "strict"  # removed and quarantined
+TOOL_NAMES_WARN = "warn"  # kept, and reported on stderr and in the audit log (the default)
+TOOL_NAMES_OFF = "off"  # neither the naming rules nor look-alikes are checked
+TOOL_NAME_MODES = (TOOL_NAMES_STRICT, TOOL_NAMES_WARN, TOOL_NAMES_OFF)
 
 JsonObject = dict[str, Any]
 
@@ -190,9 +243,21 @@ _DROP = _Outcome()
 
 # ---- small helpers ----------------------------------------------------------
 
+# How each line the proxy writes to stderr begins: "agent-sentinel", or, with
+# --name, "agent-sentinel[NAME]", so that the log of a client that runs
+# several proxies says which one wrote each line.
+_stderr_label = "agent-sentinel"
+
+
 def _warn(message: str, limit: int = 300) -> None:
     # Warnings can include names chosen by the server, so make them terminal-safe.
-    print(f"agent-sentinel: {printable(message, limit=limit)}", file=sys.stderr, flush=True)
+    print(f"{_stderr_label}: {printable(message, limit=limit)}", file=sys.stderr, flush=True)
+
+
+def _name_stderr(name: str) -> None:
+    """Put the server's name (proxy --name, already checked against SERVER_NAME) in every stderr line."""
+    global _stderr_label
+    _stderr_label = f"agent-sentinel[{name}]"
 
 
 def _reject_constant(name: str) -> Any:
@@ -278,74 +343,47 @@ def _request_label(message: JsonObject) -> str:
     return _label(message["method"])
 
 
-# ---- tool pinning -----------------------------------------------------------
+# ---- names that look alike ----------------------------------------------------
 
-class ToolPins:
-    """Remembers what each tool looked like when it was first seen.
+class _NameRegistry:
+    """The names one server has given its tools (or its prompts), to catch a new name that looks like a known one.
 
-    A server can show a harmless tool until the user trusts it and then change
-    its description or schema (a "rug pull"). Each tool definition is reduced
-    to a fingerprint the first time it is listed; a later listing with a
-    different fingerprint is reported as "changed".
-
-    With a file, the fingerprints survive restarts (trust on first use). Use
-    one file per server. To accept a legitimate update, delete the tool's
-    entry, or the file.
+    Two names look alike when they have the same mcp_protocol.name_skeleton:
+    "read_fіle" (with a Cyrillic і) or "read_fiIe" beside "read_file". A
+    wildcard rule such as "read_*" matches both, and a person reading the list
+    cannot tell them apart. The name seen first keeps its skeleton: a pinned
+    name, then one listed earlier, then, within one list, the first that
+    follows the naming rules (so a server cannot push the real name out by
+    listing the fake one first). Names are only ever added.
     """
 
-    def __init__(self, path: str | Path | None = None, enabled: bool = True) -> None:
-        self._enabled = enabled
-        self._path = Path(path) if path else None
-        self._fingerprints: dict[str, str] = {}
-        self._unsaved = False
-        if self._path is not None and self._path.exists():
-            self._load()
+    def __init__(self, known: Iterable[str]) -> None:
+        self._lock = threading.Lock()
+        self._first: dict[str, str] = {}  # skeleton -> the name that has it
+        for name in known:
+            if len(self._first) < MAX_KNOWN_NAMES:
+                self._first.setdefault(protocol.name_skeleton(name), name)
 
-    def _load(self) -> None:
-        assert self._path is not None
-        data = json.loads(self._path.read_text(encoding="utf-8"))
-        tools = data.get("tools") if isinstance(data, dict) else None
-        if not isinstance(tools, dict) or not all(isinstance(v, str) for v in tools.values()):
-            raise ValueError(f"{self._path}: not a tool pins file")
-        self._fingerprints = dict(tools)
-
-    @staticmethod
-    def fingerprint(tool: JsonObject) -> str:
-        """A digest of the parts of a tool definition that a model reads.
-
-        Other members, such as "_meta", are left out: servers put counters and
-        timestamps there, and a tool that "changed" on every listing would be
-        quarantined for nothing.
-        """
-        pinned = {name: tool[name] for name in _PINNED_FIELDS if name in tool}
-        canonical = json.dumps(pinned, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-        return hashlib.sha256(canonical.encode("ascii")).hexdigest()
-
-    def check(self, name: str, tool: JsonObject) -> str:
-        """Return "same", "changed", "new" (and remember it) or "full"."""
-        if not self._enabled:
-            return "same"
-        fingerprint = self.fingerprint(tool)
-        known = self._fingerprints.get(name)
-        if known is not None:
-            return "same" if known == fingerprint else "changed"
-        if len(self._fingerprints) >= MAX_PINNED_TOOLS:
-            return "full"
-        self._fingerprints[name] = fingerprint
-        self._unsaved = True
-        return "new"
-
-    def save(self) -> None:
-        """Write new fingerprints to the file, if there is one. Never raises."""
-        if self._path is None or not self._unsaved:
-            return
-        temporary = self._path.with_name(self._path.name + ".tmp")
-        try:
-            temporary.write_text(json.dumps({"version": 1, "tools": self._fingerprints}, indent=1), encoding="utf-8")
-            os.replace(temporary, self._path)  # atomic: a crash cannot leave half a file
-            self._unsaved = False
-        except OSError as exc:
-            _warn(f"cannot save tool pins to {self._path}: {exc}")
+    def lookalikes(self, names: Iterable[str], follows_rules: Callable[[str], bool]) -> dict[str, str]:
+        """Register the names of one list; return {name: why it is refused} for those that cannot keep their name."""
+        groups: dict[str, list[str]] = {}
+        for name in dict.fromkeys(names):
+            groups.setdefault(protocol.name_skeleton(name), []).append(name)
+        refused: dict[str, str] = {}
+        with self._lock:
+            for skeleton, group in groups.items():
+                first = self._first.get(skeleton)
+                if first is None:
+                    if len(self._first) >= MAX_KNOWN_NAMES:
+                        # It cannot be remembered, so a later look-alike could not be caught.
+                        refused.update(dict.fromkeys(group, "too many names to keep track of"))
+                        continue
+                    first = next((name for name in group if follows_rules(name)), group[0])
+                    self._first[skeleton] = first
+                for name in group:
+                    if name != first:
+                        refused[name] = f"its name looks like that of '{printable(first, limit=80)}'"
+        return refused
 
 
 # ---- the proxy --------------------------------------------------------------
@@ -358,14 +396,30 @@ class Proxy:
         server_in: BinaryIO,
         pins: ToolPins | None = None,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+        tool_names: str = TOOL_NAMES_WARN,
+        elicitation_hosts: Sequence[str] = (),
     ) -> None:
+        """
+        pins:              the pins of this server (pins.ToolPins); default: kept in memory only.
+        tool_names:        what to do with a tool or prompt whose name breaks the MCP naming
+                           rules: TOOL_NAMES_STRICT, TOOL_NAMES_WARN (the default) or TOOL_NAMES_OFF.
+        elicitation_hosts: the hosts a URL-mode elicitation may send the user to (proxy
+                           --elicitation-host); empty: any public https address. PolicyError
+                           for an entry that cannot be used.
+        """
+        if tool_names not in TOOL_NAME_MODES:
+            raise ValueError(f"tool_names must be one of {', '.join(TOOL_NAME_MODES)}")
         self._firewall = firewall
         self._client_out = client_out
         self._server_in = server_in
         self._pins = pins if pins is not None else ToolPins()
         self._max_message_bytes = max_message_bytes
+        self._tool_names = tool_names
+        self._elicitation_hosts = elicitation.allowed_hosts(elicitation_hosts)
         self._client_write_lock = threading.Lock()
         self._server_write_lock = threading.Lock()
+        # The names each named list has used, to catch look-alikes; pinned names come first.
+        self._names = {kind: _NameRegistry(self._pins.names(kind)) for kind in _NAMED_LISTS}
 
         # `_state` guards the collections below. It is a Condition so that
         # tool calls can wait for tool lists to finish being checked.
@@ -378,10 +432,13 @@ class Proxy:
         # client request names a 2026-07-28 version or a server/discover result arrives.
         # In a modern session the server may not send requests (see _check_server_request).
         self._era: str | None = None
-        self._quarantined_tools: set[str] = set()
+        # Entries removed from their list for good, by list: such a tool cannot be called, nor such a prompt fetched.
+        self._quarantined: dict[str, set[str]] = {kind: set() for kind in PINNED_LISTS}
         self._quarantine_overflowed = False
         self._tools_unverified = False  # set while the latest tools/list reply was malformed
         self._tool_lists_in_flight: set[str | int] = set()
+        # What was already reported on stderr: a client that lists its tools often gets each line once.
+        self._reported: set[tuple[str, ...]] = set()
 
     # ---- entry points -------------------------------------------------------
 
@@ -470,15 +527,25 @@ class Proxy:
         if not isinstance(method, str) or not method:
             return self._dropped("a client message with an invalid method")
 
-        # What every request must pass first: the protocol revision's rules, then
-        # the secret guard on the answers it carries back to the server (if any).
-        refused = self._check_protocol(message) or self._check_input_responses(message)
+        # What every request must pass first: the protocol revision's rules, then the
+        # secret guard on what it carries to the server besides a call's arguments
+        # (answers to the server, what the user is typing), then the policy's
+        # client_requests. The secret guard comes before the policy, so that its
+        # answer does not tell a probing agent what the policy would have said.
+        refused = (
+            self._check_protocol(message)
+            or self._check_input_responses(message)
+            or self._check_completion(message)
+            or self._check_client_request(message)
+        )
         if refused is not None:
             return refused
         if method == "tools/call":
             return self._check_tool_call(message)
         if method in _RESOURCE_METHODS:
             return self._check_resource_request(message)
+        if method == PROMPTS_GET:
+            return self._check_prompt_request(message)
         if method == protocol.SUBSCRIPTIONS_LISTEN:
             return self._check_subscriptions(message)
         if method.startswith(protocol.TASKS_METHOD_PREFIX):
@@ -563,6 +630,51 @@ class Proxy:
             _request_label(message), reason, public_reason=_SECRET_REFUSAL, rule=RULE_SECRETS
         )
         return None if decision.allowed else self._refused(message, decision)  # allowed: monitor mode
+
+    def _check_completion(self, message: JsonObject) -> _Outcome | None:
+        """Pass a completion/complete request through the secret guard; None when it may go on.
+
+        A client asks for completions while the user types an argument of a
+        prompt or a resource template: `argument.value` is that half-typed
+        text and `context.arguments` what was typed before. A key pasted there
+        would reach the server as it is typed, so the request is checked like
+        a call's arguments.
+        """
+        if message["method"] != COMPLETION_COMPLETE:
+            return None
+        try:
+            secrets = self._secrets_in(message.get("params"))
+        except UnscannableError as exc:
+            return self._refuse_malformed_request(message, str(exc))
+        if not secrets:
+            return None
+        reason = f"the completion request contains what looks like a secret ({', '.join(secrets)})"
+        decision = self._firewall.block(
+            COMPLETION_COMPLETE, reason, event="client_request", public_reason=_SECRET_REFUSAL, rule=RULE_SECRETS
+        )
+        return None if decision.allowed else self._refused(message, decision)  # allowed: monitor mode
+
+    def _check_client_request(self, message: JsonObject) -> _Outcome | None:
+        """Apply the policy's client_requests section to the request's method; None when it may go on.
+
+        A refused request is answered "method not found", as a server that
+        does not offer the method would answer, so the client carries on
+        without it; a notification is dropped. tools/call and the resource
+        requests are always allowed here: the tools rules decide them, call by call.
+        """
+        method = message["method"]
+        verdict = self._firewall.policy.client_request_action(method)
+        if verdict.action != "block":
+            return None
+        decision = self._firewall.block(
+            _label(method), verdict.reason, event="client_request", public_reason=verdict.public,
+            rule=verdict.rule or RULE_MALFORMED,
+        )
+        if decision.allowed:  # monitor mode
+            return None
+        if "id" not in message:
+            return _DROP
+        return _Outcome(to_client=_rpc_error(message["id"], decision.public_reason, code=protocol.METHOD_NOT_FOUND))
 
     def _secrets_in(self, value: Any) -> list[str]:
         """The kinds of secret in what the client sends the server besides a call's arguments.
@@ -708,8 +820,8 @@ class Proxy:
             decision = self._refusal("?", "malformed tools/call request: missing tool name")
         elif arguments is not None and not isinstance(arguments, dict):
             decision = self._refusal(_label(name), "malformed tools/call request: arguments must be an object")
-        elif name in _RESOURCE_METHODS:
-            # Resource reads share the policy's namespace; a tool must not borrow their rule.
+        elif name in _RESERVED_TOOL_NAMES:
+            # Resource reads and prompts share the policy's namespace; a tool must not borrow their rules.
             decision = self._refusal(_label(name), "this tool name is reserved")
         elif "task" in params:
             # A 2025-11-25 task-augmented call: its result would arrive through tasks/*, which is refused.
@@ -736,6 +848,33 @@ class Proxy:
         reads = decision.allowed and message["method"] == RESOURCE_READ
         marks = self._firewall.marks_for(RESOURCE_READ) if reads else frozenset()
         return self._forward_or_refuse(message, decision, label=_label(str(uri)), marks=marks)
+
+    def _check_prompt_request(self, message: JsonObject) -> _Outcome:
+        """prompts/get: fetch a prompt by name, with arguments that fill it in.
+
+        A prompt removed from the prompt list (flagged, changed, or with a
+        name that is not allowed) cannot be fetched. Once the policy opts in
+        (Policy.checks_prompts), the request is checked like a call of a tool
+        named "prompts/get" with the arguments {"name", "arguments"}: deny
+        rules, the secret guard, the tools rules, rate limits and flow rules.
+        Otherwise it is forwarded as before 0.5, and its reply is scanned.
+        """
+        params = message.get("params")
+        name = params.get("name") if isinstance(params, dict) else None
+        arguments = params.get("arguments") if isinstance(params, dict) else None
+        if not _is_name(name) or (arguments is not None and not isinstance(arguments, dict)):
+            return self._refuse_malformed_request(message, "it needs a prompt name, and arguments as an object")
+        if self._was_quarantined("prompts", name):
+            decision = self._firewall.refuse(
+                PROMPTS_GET, f"the prompt '{printable(name, limit=80)}' was removed from the prompt list",
+                public_reason="this prompt was removed from the prompt list and cannot be used", rule=RULE_QUARANTINE,
+            )
+        elif self._firewall.policy.checks_prompts:
+            decision = self._firewall.check_call(PROMPTS_GET, {"name": name, "arguments": arguments or {}})
+        else:
+            return self._forward_request(message, label=PROMPTS_GET)
+        marks = self._firewall.marks_for(PROMPTS_GET) if decision.allowed else frozenset()
+        return self._forward_or_refuse(message, decision, label=PROMPTS_GET, marks=marks)
 
     def _check_subscriptions(self, message: JsonObject) -> _Outcome:
         """subscriptions/listen (2026-07-28) replaces resources/subscribe, so it needs the same permission.
@@ -807,15 +946,16 @@ class Proxy:
             return False
 
     def _is_quarantined(self, tool: str) -> bool:
+        """Whether a call to this tool must be refused because the tool cannot be vouched for."""
         with self._state:
             # No tool can be vouched for if more were quarantined than can be
             # remembered, or if the last tool list could not be checked at all.
-            return self._quarantine_overflowed or self._tools_unverified or tool in self._quarantined_tools
+            return self._quarantine_overflowed or self._tools_unverified or tool in self._quarantined["tools"]
 
-    def _was_quarantined(self, tool: str) -> bool:
-        """Whether this tool itself was quarantined (for filtering a list; calls use _is_quarantined)."""
+    def _was_quarantined(self, kind: str, name: str) -> bool:
+        """Whether this entry of a list (tools, prompts, resourceTemplates) was itself quarantined."""
         with self._state:
-            return self._quarantine_overflowed or tool in self._quarantined_tools
+            return self._quarantine_overflowed or name in self._quarantined[kind]
 
     def _set_tools_unverified(self, unverified: bool) -> None:
         with self._state:
@@ -823,13 +963,25 @@ class Proxy:
                 _warn("the tool list could not be checked; tool calls are refused until a valid list arrives")
             self._tools_unverified = unverified
 
-    def _quarantine(self, tool: str) -> None:
+    def _quarantine(self, kind: str, name: str) -> None:
         with self._state:
-            if len(self._quarantined_tools) < MAX_QUARANTINED_TOOLS:
-                self._quarantined_tools.add(tool)
+            if sum(len(names) for names in self._quarantined.values()) < MAX_QUARANTINED:
+                self._quarantined[kind].add(name)
             elif not self._quarantine_overflowed:
                 self._quarantine_overflowed = True
-                _warn("too many quarantined tools to track; all tool calls are now refused")
+                _warn("too many quarantined entries to track; all tool calls and prompts are now refused")
+
+    def _first_report(self, *key: str) -> bool:
+        """True the first time `key` comes up, so that a line about it is printed once, not at every listing.
+
+        Past MAX_REPORTED keys every line is printed again: noisy, but nothing is hidden.
+        """
+        with self._state:
+            if key in self._reported:
+                return False
+            if len(self._reported) < MAX_REPORTED:
+                self._reported.add(key)
+            return True
 
     def _internal_error_outcome(self, message: Any) -> _Outcome:
         """Tell the client its request failed, so it is not left waiting."""
@@ -873,10 +1025,13 @@ class Proxy:
             return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL, code=protocol.METHOD_NOT_FOUND))
 
         verdict = self._firewall.policy.server_request_verdict(method)
+        decision = None
         if verdict.action == "block":
             rule = verdict.rule or RULE_MALFORMED
             decision = self._firewall.block(label, verdict.reason, "server_request", rule=rule)
-        else:
+        elif method == elicitation.ELICITATION_CREATE:
+            decision = self._elicitation_refusal(label, message.get("params"))
+        if decision is None:
             decision = self._firewall.scan_result(label, message, event="server_request", log_clean=False)
         if decision.allowed:
             if is_request:
@@ -949,6 +1104,9 @@ class Proxy:
         if ("result" in message) == ("error" in message):
             return self._malformed_reply(pending, msg_id, "a reply must have exactly one of result and error")
         if "error" in message:
+            refusal = self._url_elicitation_refusal(pending, msg_id, message["error"])
+            if refusal is not None:
+                return refusal
             return self._deliver_or_block(pending, msg_id, "error", message["error"], scan=message["error"])
 
         result = message["result"]
@@ -1011,22 +1169,73 @@ class Proxy:
         return self._deliver_or_block(pending, msg_id, "result", result, scan=result)
 
     def _check_input_request(self, entry: JsonObject, pending: _PendingRequest) -> Decision:
-        """The policy's answer for one entry of an input_required result, then the scan of it."""
+        """The policy's answer for one entry of an input_required result, then what an elicitation asks, then a scan."""
         method = entry["method"]
         label = _label(f"server:{method}")
         verdict = self._firewall.policy.server_request_verdict(method)
+        decision = None
         if verdict.action == "block":
             decision = self._firewall.block(
                 label, verdict.reason, event="server_request", public_reason=_INPUT_REFUSAL,
                 rule=verdict.rule or RULE_MALFORMED, call_id=pending.call_id,
             )
-        else:
+        elif method == elicitation.ELICITATION_CREATE:
+            decision = self._elicitation_refusal(label, entry.get("params"), pending.call_id)
+        if decision is None:
             decision = self._firewall.scan_result(
                 label, entry, event="server_request", log_clean=False, call_id=pending.call_id
             )
         if not decision.allowed:
             _warn(f"refused a reply to {pending.method} that asks the client for '{method}': {decision.reason}")
         return decision
+
+    def _elicitation_refusal(self, label: str, params: Any, call_id: str | None = None) -> Decision | None:
+        """Check what an elicitation asks the user (elicitation.review_request); the refusal, or None to go on.
+
+        A refusal for what is asked (an address that may not be opened, a form
+        that asks for a password) is a block that monitor mode lifts; one for a
+        shape that cannot be checked always holds. Fields that only sometimes
+        mean a secret are reported to the operator and let through.
+        """
+        try:
+            review = elicitation.review_request(params, self._elicitation_hosts)
+        except ShapeError as exc:
+            return self._firewall.refuse(
+                label, f"malformed elicitation: {exc}", event="server_request", public_reason=_INPUT_REFUSAL,
+                rule=RULE_MALFORMED, call_id=call_id,
+            )
+        for field in review.unclear:
+            reason = f"the elicitation asks for {field}, which may be a secret"
+            self._firewall.note(label, reason, event="server_request", call_id=call_id)
+            _warn(reason)
+        if review.refusal is None:
+            return None
+        decision = self._firewall.block(
+            label, review.refusal, event="server_request", public_reason=_INPUT_REFUSAL, rule=review.rule,
+            call_id=call_id,
+        )
+        return None if decision.allowed else decision
+
+    def _url_elicitation_refusal(self, pending: _PendingRequest, msg_id: Any, error: Any) -> JsonObject | None:
+        """The refusal of an error reply that sends the user to an address that may not be opened, or None.
+
+        Only a URLElicitationRequiredError (-32042) does: its data lists URL-mode
+        elicitations the client is to show before it retries the request.
+        """
+        try:
+            review = elicitation.review_url_required_error(error, self._elicitation_hosts)
+        except ShapeError as exc:
+            return self._malformed_reply(pending, msg_id, str(exc))
+        if review.refusal is None:
+            return None
+        decision = self._firewall.block(
+            pending.label, review.refusal, event="result", public_reason=_INPUT_REFUSAL, rule=review.rule,
+            call_id=pending.call_id,
+        )
+        if decision.allowed:  # monitor mode
+            return None
+        _warn(f"refused a reply to {pending.method}: {review.refusal}")
+        return _refusal_reply(pending.method, msg_id, decision.public_reason, pending.modern)
 
     def _check_handshake_reply(self, pending: _PendingRequest, msg_id: Any, result: Any) -> JsonObject | None:
         """Check what a server says about itself in reply to initialize or server/discover; a refusal, or None.
@@ -1037,7 +1246,9 @@ class Proxy:
           must keep at least one.
         * Tasks are removed from the server's capabilities, so that the client
           does not start one.
-        * Instructions that look like an injection are removed.
+        * Unsafe icons are removed from the serverInfo.
+        * Instructions that look like an injection, or that changed since they
+          were pinned, are removed.
         A server/discover result also makes the session a 2026-07-28 one,
         unless the client has chosen initialize.
         """
@@ -1063,7 +1274,11 @@ class Proxy:
             return self._malformed_reply(pending, msg_id, str(exc))
         if problem is not None:
             return self._unsupported_reply(pending, msg_id, problem, _UNSUPPORTED_VERSION, code=protocol.INVALID_PARAMS)
-        self._strip_poisoned_instructions(result, source=pending.method)
+        meta = result.get("_meta")
+        for server_info in (result.get("serverInfo"), meta.get(_SERVER_INFO_KEY) if isinstance(meta, dict) else None):
+            if isinstance(server_info, dict) and "icons" in server_info:
+                self._clean_icons_of(server_info, f"the server, in its reply to {pending.method}")
+        self._check_instructions(result, source=pending.method)
         if pending.method == protocol.SERVER_DISCOVER:
             with self._state:
                 if self._era is None:
@@ -1112,8 +1327,9 @@ class Proxy:
             return self._firewall.withhold(pending.label, exc, call_id=pending.call_id)
         return Decision(True, "delivered", call_id=pending.call_id)
 
-    def _strip_poisoned_instructions(self, result: JsonObject, source: str) -> None:
-        """Remove the server's `instructions` (from initialize or server/discover) if they look like an injection.
+    def _check_instructions(self, result: JsonObject, source: str) -> None:
+        """Remove the server's `instructions` (from initialize or server/discover) if they look like an injection,
+        or if they changed since they were pinned.
 
         Clients commonly place these instructions in the model's system
         prompt, which makes them the most direct injection route a server has.
@@ -1123,59 +1339,209 @@ class Proxy:
         if not isinstance(instructions, str):
             return
         decision = self._firewall.scan_result(source, instructions, event="server_instructions")
+        if decision.allowed:
+            decision = self._check_instructions_pin(source, instructions)
         if not decision.allowed:
             del result["instructions"]
             _warn(f"removed the server's instructions: {decision.reason}")
 
+    def _check_instructions_pin(self, source: str, instructions: str) -> Decision:
+        status = self._pins.check_instructions(instructions)
+        self._save_pins()
+        if status == CHANGED:
+            reason = (
+                "they changed after they were first seen. If the change is expected, restart the proxy; "
+                "with --pins, first delete \"instructions\" from the pins file"
+            )
+            return self._firewall.block(source, reason, event="instructions_changed", rule=RULE_QUARANTINE)
+        return Decision(True, "the instructions are unchanged or new")
+
     def _clean_items(self, items: list[Any], items_key: str) -> list[Any]:
-        """Return the list entries (tools, prompts, resources) that are safe to show."""
-        kept = []
+        """Return the entries of a list (tools, prompts, resources, resourceTemplates) that are safe to show.
+
+        1. Unsafe icons are dropped from every entry; the entry stays.
+        2. Names that collide are found for the list as a whole (_name_collisions).
+        3. Each entry is checked on its own (_problem_with_item).
+        4. Tools the policy blocks outright are hidden, now that every tool
+           has been scanned and pinned (_without_blocked_tools).
+        """
         for item in items:
+            if isinstance(item, dict) and "icons" in item:
+                name = item.get("name")
+                self._clean_icons_of(item, f"'{_label(name) if _is_name(name) else '?'}' in the {items_key} list")
+        collisions, repeats = self._name_collisions(items, items_key)
+        kept = []
+        for position, item in enumerate(items):
+            if position in repeats:
+                continue  # the very same entry listed again: forwarded once
             name = item.get("name") if isinstance(item, dict) else None
             label = _label(name) if _is_name(name) else "?"
-            problem = self._problem_with_item(item, label, is_tool=items_key == "tools")
+            collision = collisions.get(name) if label != "?" else None
+            problem = self._problem_with_item(item, label, items_key, collision)
             if problem is None:
                 kept.append(item)
             else:
                 _warn(f"removed '{label}' from the {items_key} list: {problem}")
+        if items_key in PINNED_LISTS:
+            self._save_pins()
         if items_key == "tools":
-            self._pins.save()
+            kept = self._without_blocked_tools(kept)
         return kept
 
-    def _problem_with_item(self, item: Any, label: str, is_tool: bool) -> str | None:
-        """Why a list entry must be removed, or None if it may stay."""
-        if not isinstance(item, dict) or (is_tool and label == "?"):
+    def _clean_icons_of(self, item: JsonObject, whose: str) -> None:
+        """Drop the icons of an entry (or of the server) that are not safe to forward (mcp_protocol.clean_icons).
+
+        whose: the entry, for the stderr line ("'search_web' in the tools list"); each is reported once.
+        """
+        kept, dropped = protocol.clean_icons(item["icons"])
+        if kept:
+            item["icons"] = kept
+        else:
+            del item["icons"]
+        if dropped and self._first_report("icons", whose):
+            _warn(f"dropped {len(dropped)} icon(s) of {whose}: {dropped[0]}")
+
+    def _name_collisions(self, items: list[Any], kind: str) -> tuple[dict[str, tuple[str, str, bool]], set[int]]:
+        """Find the names of a list that collide: {name: (reason, audit event, whether monitor mode may lift it)},
+        and the positions of entries that repeat an earlier one exactly, to be dropped.
+
+        * A name listed twice with two different definitions (tools, prompts,
+          templates): the client could use either, so both are refused, and
+          monitor mode does not lift that.
+        * A name that looks like another name of the server (tools and
+          prompts, unless --tool-names off): see _NameRegistry.
+        """
+        if kind not in PINNED_LISTS:
+            return {}, set()
+        definitions: dict[str, str] = {}
+        collisions: dict[str, tuple[str, str, bool]] = {}
+        repeats: set[int] = set()
+        entry = _ENTRY_NAME[kind]
+        for position, item in enumerate(items):
+            name = item.get("name") if isinstance(item, dict) else None
+            if not _is_name(name):
+                continue
+            definition = fingerprint(definition_of(kind, item))
+            if name not in definitions:
+                definitions[name] = definition
+            elif definitions[name] == definition:
+                repeats.add(position)
+            else:
+                collisions[name] = ("the list has two different entries with this name", f"{entry}_name", False)
+        if kind in _NAMED_LISTS and self._tool_names != TOOL_NAMES_OFF:
+            def follows_rules(name: str) -> bool:
+                return protocol.tool_name_problem(name) is None
+
+            # With strict, a name that breaks the rules is removed anyway, so it must not claim a skeleton.
+            names = [name for name in definitions if name not in collisions
+                     and (self._tool_names != TOOL_NAMES_STRICT or follows_rules(name))]
+            for name, reason in self._names[kind].lookalikes(names, follows_rules).items():
+                collisions[name] = (reason, f"{entry}_lookalike", True)
+        return collisions, repeats
+
+    def _problem_with_item(
+        self, item: Any, label: str, kind: str, collision: tuple[str, str, bool] | None = None
+    ) -> str | None:
+        """Why a list entry must be removed, or None if it may stay.
+
+        In order: its shape, an earlier quarantine, its name (collision from
+        _name_collisions, and the naming rules), the scanner, its pin. A
+        tool, prompt or template that is removed is quarantined.
+        """
+        pinned = kind in PINNED_LISTS
+        if not isinstance(item, dict) or (pinned and label == "?"):
             return "it is not a well-formed entry"
-        if is_tool and self._was_quarantined(item["name"]):
+        if pinned and self._was_quarantined(kind, item["name"]):
             return "it was quarantined earlier"  # even if it looks clean now
 
-        event = "tool_description" if is_tool else "list_item"
-        decision = self._firewall.scan_result(label, item, event=event, log_clean=False)
-        if decision.allowed and is_tool:
-            decision = self._check_pin(item, label)
+        decision = self._check_name(item, label, kind, collision)
         if decision.allowed:
-            if is_tool:
+            event = "tool_description" if kind == "tools" else "list_item"
+            decision = self._firewall.scan_result(label, item, event=event, log_clean=False)
+        if decision.allowed and pinned:
+            decision = self._check_pin(kind, item, label)
+        if decision.allowed:
+            if kind == "tools":
                 # Annotations are pinned with the rest of the tool, and they can only add flow labels.
                 self._firewall.learn_annotations(item["name"], item.get("annotations"))
             return None
-        if is_tool:
+        if pinned:
             # Remember the name: the agent may already know it from an
             # earlier list, and the server may list it again looking clean.
-            self._quarantine(item["name"])
+            self._quarantine(kind, item["name"])
         return decision.reason
 
-    def _check_pin(self, tool: JsonObject, label: str) -> Decision:
-        status = self._pins.check(tool["name"], tool)
-        if status == "changed":
+    def _check_name(self, item: JsonObject, label: str, kind: str, collision: tuple[str, str, bool] | None) -> Decision:
+        """The verdict on an entry's name: a collision, then the MCP naming rules (tools and prompts).
+
+        A name outside the rules is refused with --tool-names strict; with
+        warn it is kept and reported, once, on stderr and in the audit log.
+        """
+        if collision is not None:
+            reason, event, may_lift = collision
+            if may_lift:
+                return self._firewall.block(label, reason, event=event, rule=RULE_QUARANTINE)
+            return self._firewall.refuse(label, reason, event=event, rule=RULE_QUARANTINE)
+        if kind not in _NAMED_LISTS or self._tool_names == TOOL_NAMES_OFF:
+            return Decision(True, "the name is not checked")
+        problem = protocol.tool_name_problem(item["name"])
+        if problem is None:
+            return Decision(True, "the name follows the MCP naming rules")
+        reason = f"its name breaks the MCP naming rules: {problem}"
+        event = f"{_ENTRY_NAME[kind]}_name"
+        if self._tool_names == TOOL_NAMES_STRICT:
+            return self._firewall.block(label, reason, event=event, rule=RULE_QUARANTINE)
+        if self._first_report("name", kind, item["name"]):
+            self._firewall.note(label, f"{reason} (kept: --tool-names warn)", event=event)
+            _warn(f"the name of '{label}' in the {kind} list breaks the MCP naming rules: {problem}; "
+                  "it is kept (--tool-names strict would remove it)")
+        return Decision(True, reason)
+
+    def _check_pin(self, kind: str, item: JsonObject, label: str) -> Decision:
+        status = self._pins.check_item(kind, item["name"], item)
+        if status == CHANGED:
+            what = _ENTRY_NAME[kind].replace("_", " ")
             reason = (
-                "its definition changed after it was first seen. If the change is expected, restart the proxy; "
-                "with --pins, first delete this tool's entry from the pins file"
+                f"{what} quarantined: its definition changed after it was first seen. If the change is expected, "
+                f"restart the proxy; with --pins, first delete this {what}'s entry from the pins file"
             )
-            reason = f"tool quarantined: {reason}"
-            return self._firewall.block(label, reason, event="tool_changed", rule=RULE_QUARANTINE)
-        if status == "full":
-            return Decision(False, "too many tools to keep track of", rule=RULE_QUARANTINE)
-        return Decision(True, "tool definition is unchanged or new")
+            return self._firewall.block(label, reason, event=f"{_ENTRY_NAME[kind]}_changed", rule=RULE_QUARANTINE)
+        if status == FULL:
+            return Decision(False, f"too many {kind} to keep track of", rule=RULE_QUARANTINE)
+        return Decision(True, "the definition is unchanged or new")
+
+    def _save_pins(self) -> None:
+        try:
+            self._pins.save()
+        except OSError as exc:
+            _warn(f"cannot save the pins file: {exc}")
+
+    def _without_blocked_tools(self, tools: list[JsonObject]) -> list[JsonObject]:
+        """Hide the tools the policy blocks outright (the policy's hide_blocked_tools).
+
+        Done after every tool was scanned and pinned, so hiding changes
+        nothing about those checks. It keeps a blocked tool's description out
+        of the model's context and saves the agent calls that would be
+        refused; it is not enforcement: a call to a hidden tool is still
+        checked, and refused. A tool that needs approval ("ask") stays
+        visible, and nothing is hidden in monitor mode, which must show what
+        happens without changing it. Each hidden name is reported once.
+        """
+        policy = self._firewall.policy
+        if not policy.hide_blocked_tools or self._firewall.monitor:
+            return tools
+        shown, newly_hidden = [], []
+        for tool in tools:
+            if policy.tool_level_action(tool["name"]) != "block":
+                shown.append(tool)
+            elif self._first_report("hidden", tool["name"]):
+                newly_hidden.append(_label(tool["name"]))
+        for name in newly_hidden:
+            self._firewall.note(name, "hidden from the tool list: the policy blocks every call to it", "tool_hidden")
+        if newly_hidden:
+            hidden = ", ".join(newly_hidden)
+            _warn(f"hid {len(newly_hidden)} tool(s) that the policy blocks from the tool list: {hidden}", limit=2000)
+        return shown
 
     # ---- sending ------------------------------------------------------------
 
@@ -1316,23 +1682,88 @@ def _positive_int(text: str) -> int:
     return value
 
 
-def main(argv: list[str] | None = None) -> int:
+def _server_name(text: str) -> str:
+    if not SERVER_NAME.fullmatch(text):
+        raise argparse.ArgumentTypeError("must be 1 to 64 letters, digits, '_', '-' or '.'")
+    return text
+
+
+def _pass_env_name(text: str) -> str:
+    try:
+        return server_env.check_pass_name(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-sentinel proxy", description="Run an MCP server behind the firewall.")
     parser.add_argument("--policy", required=True, help="path to the policy JSON file")
     parser.add_argument("--audit", default=None, help="path of the audit log (JSON lines)")
     parser.add_argument("--no-log-args", action="store_true", help="leave tool arguments out of the audit log")
+    parser.add_argument("--name", type=_server_name, default=None, metavar="NAME",
+                        help="a short name for the server (letters, digits, '_', '-', '.'; at most 64), written into "
+                             "every audit record and at the start of every line the proxy prints")
     parser.add_argument("--pins", default=None, metavar="FILE",
-                        help="remember tool definitions in FILE and quarantine a tool that changes later")
+                        help="remember tool, prompt and template definitions in FILE, and quarantine one that "
+                             "changes later")
     parser.add_argument("--no-pins", action="store_true",
                         help="do not quarantine a tool whose definition changes (for servers that change them often)")
     parser.add_argument("--monitor", action="store_true",
                         help="log what the policy and the scanner would block, but block nothing (for tuning a policy)")
     parser.add_argument("--max-message-bytes", type=_positive_int, default=DEFAULT_MAX_MESSAGE_BYTES,
                         help=f"drop any message larger than this (default {DEFAULT_MAX_MESSAGE_BYTES})")
+    parser.add_argument("--tool-names", choices=TOOL_NAME_MODES, default=TOOL_NAMES_WARN,
+                        help="a tool or prompt whose name breaks the MCP naming rules is removed (strict), "
+                             "reported (warn, the default) or let be (off)")
+    parser.add_argument("--elicitation-host", action="append", default=[], metavar="HOST",
+                        help="a host a URL-mode elicitation may send the user to; repeat it for more, "
+                             "'*.example.com' for subdomains (default: any public https address)")
+    parser.add_argument("--clean-env", action="store_true",
+                        help="start the server with a minimal environment (PATH, system and temporary folders, "
+                             "home folder, ...) instead of every variable the proxy has")
+    parser.add_argument("--pass-env", type=_pass_env_name, action="append", default=[], metavar="NAME",
+                        help="also give the server this variable with --clean-env; repeat it for more, "
+                             "NAME* for every variable starting with NAME")
+    parser.add_argument("--env-file", default=None, metavar="FILE",
+                        help="add the NAME=VALUE lines of FILE to the server's environment (values are never printed)")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- followed by the MCP server command")
+    return parser
+
+
+def _server_environment(args: argparse.Namespace) -> dict[str, str] | None:
+    """The environment to start the server with, after reporting on it; None if the env file cannot be used.
+
+    Names are reported, never values: the --pass-env names the proxy does not
+    have, what --clean-env passes, and the variables that look like secrets
+    and that no --pass-env or env file named.
+    """
+    try:
+        added = server_env.read_env_file(args.env_file) if args.env_file else {}
+    except (OSError, server_env.EnvFileError) as exc:
+        _warn(f"cannot use the env file: {exc}", limit=500)
+        return None
+    environment = server_env.server_environment(os.environ, args.clean_env, args.pass_env, added)
+    if args.clean_env:
+        for name in server_env.missing_names(os.environ, args.pass_env):
+            _warn(f"--pass-env {name}: the proxy has no such variable, so the server does not get it")
+        named = server_env.named_variables(environment, args.pass_env, added)
+        _warn(f"--clean-env: the server gets a minimal environment, plus {', '.join(named) or 'nothing else'}",
+              limit=2000)
+    secret_looking = server_env.unnamed_secrets(environment, args.pass_env, added)
+    if secret_looking:
+        _warn(f"the server gets {len(secret_looking)} environment variable(s) whose names look like secrets: "
+              f"{', '.join(secret_looking)}. If it does not need them, start the proxy with --clean-env; "
+              "name each one it needs with --pass-env NAME", limit=2000)
+    return environment
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _argument_parser()
     args = parser.parse_args(argv)
     if hasattr(sys.stderr, "reconfigure"):  # warnings must never crash on an odd character
         sys.stderr.reconfigure(errors="backslashreplace")
+    if args.name is not None:
+        _name_stderr(args.name)
 
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
@@ -1348,7 +1779,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         pins = ToolPins(args.pins, enabled=not args.no_pins)
     except (OSError, ValueError) as exc:  # unreadable, not JSON, or not a pins file
-        _warn(f"cannot load tool pins: {exc}")
+        _warn(f"cannot load the pins file: {exc}", limit=500)
+        return 2
+    try:
+        elicitation.allowed_hosts(args.elicitation_host)
+    except PolicyError as exc:
+        _warn(f"cannot use {exc}", limit=500)
         return 2
 
     executable = _resolve_executable(command[0])
@@ -1361,12 +1797,13 @@ def main(argv: list[str] | None = None) -> int:
         _warn(f"cannot pass {unsafe[0]!r} to the batch file {executable}: cmd.exe would change it. "
               "Start the program behind the batch file directly, for example with node or python")
         return 2
-    # Keeps cmd.exe, and whatever the server starts, from running a file in the
-    # current folder in place of a command of the same name on PATH.
-    os.environ["NoDefaultCurrentDirectoryInExePath"] = "1"
+    environment = _server_environment(args)
+    if environment is None:
+        return 2
     try:
         server = subprocess.Popen(
-            [executable, *command[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            [executable, *command[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=environment,
         )
     except OSError as exc:
         _warn(f"cannot start server: {exc}")
@@ -1375,8 +1812,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.monitor:
         _warn("monitor mode: nothing is being blocked by the policy or the scanner")
 
-    firewall = Firewall(policy, audit_path=args.audit, log_args=not args.no_log_args, monitor=args.monitor)
-    proxy = Proxy(firewall, sys.stdout.buffer, server.stdin, pins=pins, max_message_bytes=args.max_message_bytes)
+    firewall = Firewall(
+        policy, audit_path=args.audit, log_args=not args.no_log_args, monitor=args.monitor, server_name=args.name
+    )
+    proxy = Proxy(
+        firewall, sys.stdout.buffer, server.stdin, pins=pins, max_message_bytes=args.max_message_bytes,
+        tool_names=args.tool_names, elicitation_hosts=args.elicitation_host,
+    )
 
     # Run one relay per direction. When either side closes, shut down.
     one_side_closed = threading.Event()

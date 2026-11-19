@@ -318,8 +318,10 @@ class ProxyEndToEndTests(unittest.TestCase):
         ])
         self.assertEqual(set(replies), set(range(1, 10)))
         self.assertEqual(replies[1]["result"]["serverInfo"]["name"], "fake")
-        self.assertEqual([t["name"] for t in replies[2]["result"]["tools"]], ["read_file", "fetch_page", "delete_file"])
+        # delete_file is hidden: the example policy blocks delete_* and says hide_blocked_tools.
+        self.assertEqual([t["name"] for t in replies[2]["result"]["tools"]], ["read_file", "fetch_page"])
         self.assertIn("removed 'search_notes'", stderr)
+        self.assertIn("hid 1 tool(s) that the policy blocks from the tool list: delete_file", stderr)
         self.assertEqual(replies[3]["result"]["content"][0]["text"], "contents of notes.txt")
         self.assertTrue(replies[4]["result"]["isError"])   # blocked by the policy
         self.assertTrue(replies[5]["result"]["isError"])   # the result contained an injection
