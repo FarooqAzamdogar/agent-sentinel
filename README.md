@@ -86,7 +86,7 @@ This writes `policy.json` into the agent-sentinel home folder and prints its ful
 | macOS, Linux | `~/.agent-sentinel` |
 | Any | the folder in the `AGENT_SENTINEL_HOME` environment variable, if you set it (a full path) |
 
-In the examples below, `~` means your home folder. The shells of macOS and Linux understand it. On Windows (cmd or PowerShell), write the full path instead, for example `C:\Users\me\.agent-sentinel\policy.json`: the path `init` printed.
+In the examples below, `~` means your home folder. The shells of macOS and Linux expand it. On Windows (cmd or PowerShell), `wrap`, `unwrap`, `hook install`, `init --out`, `inspect --policy` and `doctor --config` expand a leading `~` themselves, and so does the proxy for its file options. For the other commands, write the full path, for example `C:\Users\me\.agent-sentinel\policy.json`: the path `init` printed.
 
 There are four templates. Pick one with `--template NAME`:
 
@@ -157,7 +157,7 @@ What `wrap` does and does not do:
 - It changes only the entries it wraps. Unknown keys, order, spacing and line endings stay as they are.
 - Each wrapped server gets the full paths of the policy, the audit log (`audit.jsonl` in the home folder) and its own pins file (in `pins/` in the home folder), and `--name` with the server's name.
 - Remote servers (`url`, http, sse) and Claude Desktop Extensions cannot be wrapped. They are listed as **NOT protected**.
-- The backup goes beside the file, or into `backups/` in the home folder when the file is inside a git (or hg, svn, jj) project, so it never ends up in your repository.
+- The backup goes beside the file, or into `backups/` in the home folder when the file is inside a git (or hg, svn, jj) project. That folder gets a `.gitignore` that ignores everything in it, so git and jj never commit a backup, even when your home folder is itself a repository. If the home folder is inside a Mercurial or Subversion working copy, which reads no `.gitignore`, `wrap` stops without changing anything: set `AGENT_SENTINEL_HOME` to a folder outside it.
 - To undo: `agent-sentinel unwrap --client claude-desktop --apply`, or copy the backup back.
 
 Tip: to watch first and block nothing, add `--monitor` to `wrap`. Use your agent for a while. Then `agent-sentinel suggest ~/.agent-sentinel/audit.jsonl --policy ~/.agent-sentinel/policy.json` drafts rules from what it saw. Wrap again without `--monitor` when you are done: monitor mode protects nothing.
@@ -192,7 +192,7 @@ agent-sentinel explain ~/.agent-sentinel/audit.jsonl --ref 7f3a9c21
 
 You can write the entry yourself instead of using `wrap`. Two things matter:
 
-1. **Use full paths everywhere.** Clients start servers in a folder they choose, so a relative path like `policy.json` is looked up in the wrong place.
+1. **Use full paths everywhere.** Clients start servers in a folder they choose, so a relative path like `policy.json` is looked up in the wrong place. The proxy reads a leading `~` in its file options (`--policy`, `--audit`, `--pins`, `--env-file`, `--approve-with command:`) as your home folder, because clients start it without a shell; the server command itself is passed as written.
 2. **In JSON, write every backslash twice.** `C:\Users\me` is written `"C:\\Users\\me"`.
 
 Find the full path of your Python:
@@ -619,7 +619,7 @@ Write options in full: the proxy refuses shortened ones such as `--mon`.
 
 | Option | Meaning |
 |---|---|
-| `--policy FILE` | The policy. Required. Use a full path. |
+| `--policy FILE` | The policy. Required. Use a full path; a leading `~` is your home folder (also for `--audit`, `--pins` and `--env-file`). |
 | `--audit FILE` | Where to write the audit log. Without it, blocks are reported on stderr but recorded nowhere. |
 | `--no-log-args` | Leave tool arguments out of the audit log. |
 | `--name NAME` | A short name for the server (letters, digits, `_`, `-`, `.`; at most 64). It starts every line the proxy prints (`agent-sentinel[github]:`) and goes into every audit record. |
@@ -751,7 +751,7 @@ One JSON object per line. For example, a blocked call:
 | `rule` | Which rule decided, for example `default`, `tools.send_email`, `tools.send_email.allow_args[0]`, `deny_args[0]`, `flows[0]`, `secrets`, `secrets.canaries`, `injection`, `quarantine`, `malformed`. |
 | `matched_arg` | The argument a rule matched. |
 | `ref` | The reference the agent was shown. 8 random hex characters, so two records can share one in a long log. |
-| `approval` | On a refused ask: `refused` (a person said no) or `unavailable` (nobody could be asked). |
+| `approval` | On a refused ask: `refused` (the person or program asked said no, or did not answer in time) or `unavailable` (nobody could be asked: no approver could ask, the approver failed, the call could not be shown or could not wait, or the Claude Code hook ran in a mode that shows no prompt). |
 | `redacted` | The kinds of secret replaced in a result, never the values. |
 
 - **What is not logged:** list entries and server notifications that pass their check. Tool calls, replies to them, and everything that is blocked or dropped are always logged.
@@ -812,7 +812,7 @@ The rules are tested against 650 real tool descriptions from public MCP servers 
 
 ### "cannot load policy: there is no policy file at ..."
 
-The client started the proxy in another folder, and the policy path was relative. The message shows the full path it tried and the current folder. Use full paths for `--policy`, `--audit` and `--pins`. `wrap` always writes full paths. At startup the proxy warns about relative paths.
+The client started the proxy in another folder, and the policy path was relative. The message shows the full path it tried and the current folder. Use full paths for `--policy`, `--audit` and `--pins` (a path starting with `~` counts: the proxy reads it as your home folder). `wrap` always writes full paths. At startup the proxy warns about relative paths.
 
 ### "the policy says "ask" for ..., and no --approve-with is given"
 

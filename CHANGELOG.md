@@ -84,7 +84,7 @@ The biggest release so far: commands that set up real MCP clients, Claude Code h
 - **Names the client could not ask for are removed**: a tool, prompt, template or resource whose name or URI holds control, escape, tag or bidi characters.
 - **`--max-message-bytes`** must be a whole number of at most 1 GiB.
 - **stderr is rate-limited**: the proxy prints at most 20 lines in 10 seconds, and relays at most 60 lines a minute of the server's stderr.
-- **Library:** `Decision` has new fields (`rule`, `matched_arg`, `ref`, `call_id`, `pending`, `redacted`, `approval`, `would_block`), added at the end. The public text of an allowed decision is `"allowed"`. A `Policy` built in code is validated like a file. `Policy.from_file` refuses NaN, Infinity and huge numbers. `ToolPins.save()` raises `OSError` instead of hiding it.
+- **Library:** `Decision` has new fields (`rule`, `matched_arg`, `ref`, `call_id`, `pending`, `redacted`, `approval`, `would_block`), added at the end. The public text of an allowed decision is `"allowed"`. A `Policy` built in code is validated like a file. `Policy.from_file` refuses NaN, Infinity and huge numbers. `ToolPins.save()` raises `OSError` instead of hiding it. `Firewall.finish_approval` takes `asked=False` for a call nobody could be asked about; `approvers.Answer` has a new `asked` field (default `True`).
 - **`examples/demo.py`** writes its audit log to a temporary folder.
 
 ### Fixes
@@ -100,6 +100,19 @@ The biggest release so far: commands that set up real MCP clients, Claude Code h
 - Every refusal the proxy makes is audited and carries a reference, including "too many requests are waiting" and internal errors.
 - Server instructions that are not text are removed.
 - The "cannot write audit log" line names the server and is safe to print.
+- Path rules (`"type": "path"` in `deny_args`) know every junction Windows creates: `Start Menu`, `SendTo`, `Recent`, `Templates`, `NetHood`, `PrintHood` and `Cookies` in a profile; `History` and `Temporary Internet Files` in `AppData\Local`; `My Music`, `My Pictures` and `My Videos` in Documents; `Start Menu`, `Templates`, `Desktop` and `Documents` in ProgramData. A value with more alias readings than are followed is denied.
+- An "ask" that nobody could be asked about is recorded with `approval` `unavailable`, not `refused`. This covers no approver that could ask, a failed approver or dialog, a form the client answered with an error, a call that could not be shown or could not wait, an internal error, and the Claude Code hook in a mode that shows no prompt. `explain` then says nobody could be asked. An approved call that a flow rule then blocked is explained by its flow rule.
+- A token in brackets at the start of a finding's excerpt is masked like any other long run; only the detector's own `[tags]`, `[base64]` and `[hex]` markers are kept as written.
+- The proxy reads a leading `~` in `--policy`, `--audit`, `--pins`, `--env-file` and `--approve-with command:` as the home folder, since MCP clients start it without a shell.
+- `doctor`, `clients` and `wrap` count a package runner as protected only when it runs agent-sentinel at a version (`agent-sentinel@0.5.0`, `==0.5.0`, `@latest`). One that installs it from a URL or a path, or with extras or markers, is broken.
+- `doctor` runs the proxy's own checks on option values (`--max-message-bytes`, `--approval-timeout`, `--approve-with`, `--pass-env`, `--tool-names`, `--elicitation-host`, `--name`, `--quiet` with `--verbose`), so an entry the proxy would refuse to start is broken, not protected.
+- `doctor` and the proxy again see a secret name with a digit attached to the word (`GITHUB_TOKEN2`, `apiKey2`).
+- `wrap` run by PyPy, GraalPy or a debug build of Python writes entries that `doctor`, `unwrap` and a second `wrap` read back as wrapped, and `wrap` never writes an entry it would not read back.
+- A JSON mistake in a client configuration or settings file is shown by line and column only: the text after a stray backslash, which could be part of a password, is no longer printed.
+- Backups in the home folder's `backups/` get a `.gitignore` that ignores them; a home folder inside a Mercurial or Subversion working copy is refused.
+- An integer of more than 4300 digits is refused the same way on every Python, with or without a minus sign.
+- `wrap` and `hook install` point to the install from GitHub, not to `pip install agent-sentinel` (not on PyPI yet).
+- `wrap`, `unwrap`, `hook install`, `init --out`, `inspect --policy` and `doctor --config` expand a leading `~`, which Windows PowerShell 5.1 and cmd pass on as it is.
 
 ## 0.4.1 (2026-11-18)
 
