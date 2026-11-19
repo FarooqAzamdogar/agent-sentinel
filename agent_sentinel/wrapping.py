@@ -47,6 +47,8 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 
+from .textutil import printable
+
 # The proxy options that take a value, and those that do not (the command-line
 # contract between the proxy and the commands that write or read wrapped entries).
 VALUE_OPTIONS = frozenset({
@@ -57,10 +59,16 @@ FLAG_OPTIONS = frozenset({"--no-log-args", "--no-pins", "--monitor", "--clean-en
 # The shapes of command that start the proxy (read_proxy_command), each followed by "proxy":
 #   agent-sentinel                        the script (agent-sentinel.exe, .cmd, .bat)
 #   PYTHON [-I] -m agent_sentinel         a Python, with only harmless options of its own before -m
-#   uvx / uv tool run / pipx run PACKAGE  a package runner, PACKAGE being agent-sentinel[@==VERSION]
-_SCRIPT = re.compile(r"agent[-_]sentinel(\.exe|\.cmd|\.bat)?", re.IGNORECASE)
-PACKAGE = re.compile(r"agent[-_]sentinel(\.exe|\.cmd|\.bat)?([=@].*)?", re.IGNORECASE)
-_PYTHON = re.compile(r"(python[0-9.]*t?w?|pyw?)(\.exe)?", re.IGNORECASE)  # python3.13t, pythonw.exe, py
+#   uvx / uv tool run / pipx run PACKAGE  a package runner, PACKAGE being agent-sentinel[@VERSION|==VERSION|@latest]
+SCRIPT = re.compile(r"agent[-_]sentinel(\.exe|\.cmd|\.bat)?", re.IGNORECASE)
+# Only a version may follow the package's name. Anything else is a requirement that installs other code under
+# that name: "agent-sentinel@git+https://...", "agent-sentinel @ file:///...", extras, markers.
+PACKAGE = re.compile(r"agent[-_]sentinel((@|==)[0-9][0-9A-Za-z.+!-]*|@latest)?", re.IGNORECASE)
+# Any word that names agent-sentinel, whatever follows the name (mentions_proxy).
+_NAMED = re.compile(r"agent[-_]sentinel([^A-Za-z0-9_-].*)?", re.IGNORECASE | re.DOTALL)
+# The file name of a Python, with .exe or not: python3.13, python3.13t (free-threaded), pythonw, python_d and
+# python3.12d or python3.12-dbg (debug builds), python3.12-intel64 (macOS), pypy3.10, graalpy, and the py launcher.
+_PYTHON = re.compile(r"((python|pypy|graalpy)[0-9.]*t?w?(d|_d|-dbg)?(-intel64)?|pyw?)(\.exe)?", re.IGNORECASE)
 # Options a Python may get before "-m agent_sentinel" that cannot make it run anything else
 # (not -c, not another -m, not a script): -I, -E, -s, -S, -B, -u, -O, -q, -b; -X and -W
 # with their value; the Windows py launcher's version, such as -3.12.
@@ -160,7 +168,7 @@ def _launcher_length(words: list[str]) -> int | None:
         return None
     at = None
     program = _program(words[0])
-    if _SCRIPT.fullmatch(program):
+    if SCRIPT.fullmatch(program):
         at = 1
     elif _PYTHON.fullmatch(program):
         at = _after_python_options(words)
@@ -201,12 +209,15 @@ def _after_runner_options(words: list[str], index: int) -> int | None:
 def mentions_proxy(words: list[str]) -> bool:
     """Whether "agent-sentinel proxy" appears near the start of a command that read_proxy_command does not accept.
 
-    Such a command may run something else first, so it is not protected; doctor
-    says why instead of calling it a plain unprotected server.
+    Such a command may run something else first, or install something else
+    under the name agent-sentinel ("uvx agent-sentinel@git+https://...
+    proxy"), so it is not protected; doctor says why instead of calling it a
+    plain unprotected server.
     """
     if read_proxy_command(words) is not None:
         return False
-    return any(words[index + 1] == "proxy" and PACKAGE.fullmatch(_program(words[index]))
+    return any(words[index + 1] == "proxy"
+               and (_NAMED.fullmatch(words[index]) or _NAMED.fullmatch(_program(words[index])))
                for index in range(min(len(words) - 1, _LAUNCHER_REACH)))
 
 
@@ -341,7 +352,9 @@ def wrap_entry(entry: dict[str, Any], settings: ProxySettings, label: str, pins:
     """A copy of a stdio entry that starts the proxy in front of the same command.
 
     The other keys keep their place; "args" is added after "command" when the
-    entry had none. WrapError if the entry cannot be wrapped.
+    entry had none. WrapError if the entry cannot be wrapped, or if the new
+    entry would not read back as wrapped (doctor would call it broken, and
+    wrap and unwrap would not know it).
     """
     words = command_line(entry)
     if words is None:
@@ -356,7 +369,13 @@ def wrap_entry(entry: dict[str, Any], settings: ProxySettings, label: str, pins:
     if settings.monitor:
         proxy_args.append("--monitor")
     proxy_args += ["--", *words]
-    return _with_command(entry, settings.python, proxy_args)
+    new = _with_command(entry, settings.python, proxy_args)
+    found = proxy_command_of(new)
+    if found is None or found.server != words or found.python_module() != (settings.python, settings.isolated):
+        raise WrapError(f"the Python {printable(_program(settings.python), limit=60)!r} does not have a name "
+                        "agent-sentinel reads back as a Python (python, pypy or graalpy, with or without a version), "
+                        "so the wrapped entry would not be known as wrapped. Run wrap with a Python of such a name")
+    return new
 
 
 def unwrap_entry(entry: dict[str, Any]) -> dict[str, Any]:

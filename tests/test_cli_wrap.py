@@ -180,6 +180,36 @@ class ShowingAndApplying(WrapTest):
         _, out, _ = self.wrap()
         self.assertIn("has agent-sentinel 0.0.1 installed", out)
 
+    def test_the_install_advice_names_an_install_that_works(self):
+        # agent-sentinel is not on PyPI yet: "pip install agent-sentinel" would fail, or install someone else's
+        # package of that name into the Python the client starts.
+        self.place()
+        self.check_python.return_value = PythonCheck(True, None)
+        for args in (("--client", "claude-desktop"), ("--client", "codex", "--name", "files", "--", "npx", "x")):
+            with self.subTest(args=args):
+                code, out, err = run_cli("wrap", "--policy", self.policy, *args)
+                self.assertEqual(code, 0, err)
+                self.assertIn("python -m pip install git+https://github.com/FarooqAzamdogar/agent-sentinel.git", out)
+                self.assertIn("see Install in the README", out)
+                self.assertNotIn("pip install agent-sentinel", out)
+
+    def test_a_leading_tilde_is_the_home_folder(self):
+        # Windows PowerShell 5.1 and cmd pass "~" on as it is; it must not become a folder named "~".
+        config = self.place(path=self.user / "configs" / "claude.json")
+        self.write("user/my-policy.json", templates.template("starter"))
+        code, out, err = run_cli("wrap", "--client", "claude-desktop", "--config", "~/configs/claude.json",
+                                 "--policy", "~/my-policy.json", "--audit", "~/logs/audit.jsonl",
+                                 "--pins-dir", "~/my-pins", "--apply")
+        self.assertEqual(code, 0, err)
+        args = json.loads(config.read_text(encoding="utf-8"))["mcpServers"]["files"]["args"]
+        self.assertEqual(args[args.index("--policy") + 1], str(self.user / "my-policy.json"))
+        self.assertEqual(args[args.index("--audit") + 1], str(self.user / "logs" / "audit.jsonl"))
+        self.assertTrue(args[args.index("--pins") + 1].startswith(str(self.user / "my-pins") + os.sep))
+        self.assertFalse((self.project / "~").exists())
+        code, out, err = run_cli("unwrap", "--client", "claude-desktop", "--config", "~/configs/claude.json", "--apply")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(config.read_text(encoding="utf-8")), ORIGINAL)
+
     def test_a_user_install_is_started_without_isolation_and_the_risk_is_named(self):
         self.place()
         self.check_python.return_value = PythonCheck(False, __version__)
@@ -222,6 +252,22 @@ class Refusals(WrapTest):
         self.assertIn("not valid JSON", err)
         self.assertNotIn(TOKEN, err)
         self.assertNotIn(TOKEN[:12], err)
+
+    def test_a_backslash_mistake_in_a_secret_is_located_without_quoting_it(self):
+        # "\Z" is not a JSON escape. The hint written for policies would quote what follows the backslash.
+        secret = "Zx9QpLm77Kw2Rt5Y"
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text('{"mcpServers": {"db": {"command": "npx", "args": ["db-server@1.0.0"],\n'
+                               '  "env": {"DB_PASSWORD": "hunter2\\' + secret + '"}}}}', encoding="utf-8")
+        for command in (("wrap", "--client", "claude-desktop", "--policy", self.policy),
+                        ("unwrap", "--client", "claude-desktop")):
+            with self.subTest(command=command[0]):
+                code, out, err = run_cli(*command)
+                self.assertEqual(code, 2)
+                self.assertIn(":2:", err)
+                self.assertIn("a backslash inside text must be doubled", err)
+                self.assertNotIn(secret[:6], out + err)
+                self.assertNotIn("hunter2", out + err)
 
     def test_claude_codes_state_file_is_never_edited(self):
         state = self.write("project/.claude.json", {"mcpServers": {"a": {"command": "npx"}}})

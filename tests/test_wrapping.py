@@ -108,6 +108,33 @@ class Wrapping(unittest.TestCase):
             with self.subTest(command=command), self.assertRaises(WrapError):
                 wrapped({"command": command, "args": args})
 
+    def test_whatever_python_wrap_runs_under_its_entry_reads_back_as_wrapped(self):
+        entry = {"command": "npx", "args": ["-y", "srv@1.0.0"]}
+        for python in ("/opt/pypy3.10/bin/pypy3.10", r"C:\pypy3.10\pypy3.10.exe", "/opt/pypy/bin/pypy3",
+                       "/opt/graalpy/bin/graalpy", r"C:\graalpy\bin\graalpy.exe", "/usr/bin/python3.13d",
+                       "/usr/bin/python3.12-dbg", "/Library/Frameworks/Python.framework/Versions/3.12/bin/"
+                       "python3.12-intel64", r"C:\Python313\python_d.exe", r"C:\Python313\pythonw_d.exe",
+                       "/usr/bin/python3.13td", "/usr/bin/python3.13t", "/usr/bin/python3", r"C:\Python313\python.exe"):
+            for isolated in (True, False):
+                settings = ProxySettings(python, SETTINGS.policy, SETTINGS.audit, SETTINGS.pins_folder,
+                                         isolated=isolated)
+                with self.subTest(python=python, isolated=isolated):
+                    once = wrapped(entry, settings)
+                    self.assertEqual(wrapping.status_of(once), "protected")
+                    self.assertEqual(wrapping.proxy_command_of(once).python_module(), (python, isolated))
+                    with self.assertRaisesRegex(WrapError, "already wrapped"):
+                        wrapped(once, settings)
+                    self.assertEqual(unwrap_entry(once), entry)
+
+    def test_wrap_refuses_to_write_an_entry_it_would_not_read_back(self):
+        # A Python of a name the reader does not know: the entry would look like a command that runs
+        # something else before the proxy, and a second wrap would put a proxy in front of the proxy.
+        for python in ("/opt/bin/my-interpreter", r"C:\tools\node.exe", "/usr/bin/agent-sentinel", "/usr/bin/uvx"):
+            settings = ProxySettings(python, SETTINGS.policy, SETTINGS.audit, SETTINGS.pins_folder)
+            with self.subTest(python=python), self.assertRaises(WrapError) as caught:
+                wrapped({"command": "npx", "args": ["x"]}, settings)
+            self.assertIn("does not have a name agent-sentinel reads back as a Python", str(caught.exception))
+
     def test_env_must_hold_plain_variable_names(self):
         for env, expected in (({"A B": "1"}, "not a plain variable name"), (["A"], "is not an object"),
                               ({"--policy": "x"}, "not a plain variable name")):
@@ -207,6 +234,30 @@ class ReadingTheProxyCommand(unittest.TestCase):
                       ["python", "-m", "agent_sentinel.__main__", "proxy", "--", "s"]):
             with self.subTest(words=words):
                 self.assertIsNone(read_proxy_command(words))
+
+    def test_a_package_runner_must_run_agent_sentinel_at_a_version_and_nothing_else(self):
+        # pip, uv and pipx read "agent-sentinel@<URL>" as "install whatever is at that URL under this name".
+        for package in ("agent-sentinel@0.5.0", "agent-sentinel==0.5.0", "agent_sentinel@latest",
+                        "Agent-Sentinel==1!2.0.0rc1+local"):
+            for launcher in (["uvx", package], ["uvx", "--from", package, "agent-sentinel"],
+                             ["pipx", "run", "--spec", package, "agent-sentinel"]):
+                with self.subTest(launcher=launcher):
+                    words = [*launcher, "proxy", "--policy", "p.json", "--", "server"]
+                    self.assertEqual(read_proxy_command(words).launcher, [*launcher, "proxy"])
+                    self.assertEqual(wrapping.status_of({"command": words[0], "args": words[1:]}), "protected")
+        for package in ("agent-sentinel@git+https://evil.example/x", "agent-sentinel@file:///C:/Users/Public/evil",
+                        "agent-sentinel@https://evil.example/x.whl", "agent-sentinel @ git+https://evil.example/x",
+                        "agent-sentinel@ git+https://evil.example/x", "agent-sentinel[extra]==0.5.0",
+                        "agent-sentinel==0.5.0; python_version>'3'", "agent-sentinel@../evil", "agent-sentinel>=0.5",
+                        "agent-sentinel.exe", "agent-sentinel@", "agent-sentinel=="):
+            for launcher in (["uvx", package], ["uv", "tool", "run", package], ["pipx", "run", package],
+                             ["uvx", "--from", package, "agent-sentinel"],
+                             ["pipx", "run", "--spec", package, "agent-sentinel"]):
+                words = [*launcher, "proxy", "--policy", "p.json", "--", "server"]
+                with self.subTest(words=words):
+                    self.assertIsNone(read_proxy_command(words))
+                    self.assertTrue(wrapping.mentions_proxy(words))
+                    self.assertEqual(wrapping.status_of({"command": words[0], "args": words[1:]}), "broken")
 
     def test_a_shortened_proxy_option_is_recognised(self):
         self.assertEqual(wrapping.shortened_option("--mon"), ["--monitor"])

@@ -95,6 +95,31 @@ class PrintingTheSnippet(InstallTest):
         self.assertNotIn('"-I"', out)
         self.assertIn("Warning:", out)
 
+    def test_the_install_advice_names_an_install_that_works(self):
+        self.python_check.return_value = PythonCheck(True, None)
+        self.settings.parent.mkdir(parents=True)
+        for args in ((), ("--settings", self.settings)):
+            with self.subTest(args=args):
+                code, out, _ = self.install(*args)
+                self.assertEqual(code, 0)
+                self.assertIn("python -m pip install git+https://github.com/FarooqAzamdogar/agent-sentinel.git", out)
+                self.assertNotIn("pip install agent-sentinel", out)
+
+    def test_a_leading_tilde_is_the_home_folder(self):
+        # Windows PowerShell 5.1 and cmd pass "~" on as it is.
+        self.write("user/hook-policy.json", POLICY)
+        self.settings.parent.mkdir(parents=True)
+        code, out, err = run_cli("hook", "install", "claude-code", "--policy", "~/hook-policy.json",
+                                 "--audit", "~/logs/audit.jsonl", "--state-dir", "~/state",
+                                 "--settings", "~/.claude/settings.json", "--apply")
+        self.assertEqual(code, 0, err)
+        (handler, *_) = self.our_handlers(json.loads(self.settings.read_text(encoding="utf-8")))
+        options = dict(zip(handler["args"][5::2], handler["args"][6::2]))
+        self.assertEqual(options, {"--policy": str(self.user / "hook-policy.json"),
+                                   "--audit": str(self.user / "logs" / "audit.jsonl"),
+                                   "--state-dir": str(self.user / "state")})
+        self.assertFalse((self.project / "~").exists())
+
     def test_it_warns_when_the_policy_blocks_claude_codes_own_tools(self):
         _, out, _ = self.install()
         self.assertIn("the policy blocks Claude Code's own tools Glob, Grep, Edit, Write", out)
@@ -194,6 +219,14 @@ class ChangingASettingsFile(InstallTest):
                 self.assertEqual(code, 2)
                 self.assertIn(expected, err)
                 self.assertEqual(self.settings.read_bytes(), before)
+
+    def test_a_backslash_mistake_in_a_secret_is_located_without_quoting_it(self):
+        before = self.place(text='{"env": {"ANTHROPIC_API_KEY": "abc\\Qsecretpart12345"}}')
+        code, out, err = self.install("--settings", self.settings, "--apply")
+        self.assertEqual(code, 2)
+        self.assertIn("not valid JSON: Invalid \\escape", err)
+        self.assertNotIn("secretpart", out + err)
+        self.assertEqual(self.settings.read_bytes(), before)
 
     def test_claude_codes_own_state_file_is_never_edited(self):
         state = self.write("user/.claude.json", {"projects": {}})

@@ -22,7 +22,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import server_probe
-from .cli_common import EXIT_ERROR, EXIT_FAIL, EXIT_OK, CommandError, load_policy, shown_command, shown_path
+from .cli_common import (
+    EXIT_ERROR,
+    EXIT_FAIL,
+    EXIT_OK,
+    CommandError,
+    full_path,
+    load_policy,
+    shown_command,
+    shown_path,
+)
 from .policy import Policy
 from .server_probe import ListedTool, ProbeResult
 from .session import labels_from_annotations
@@ -90,6 +99,7 @@ def run(args: argparse.Namespace) -> int:
         )
     policy = None
     if args.policy is not None:
+        args.policy = full_path(args.policy)
         policy = load_policy(args.policy)
         if policy is None:
             return EXIT_ERROR

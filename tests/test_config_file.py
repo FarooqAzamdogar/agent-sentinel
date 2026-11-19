@@ -2,6 +2,8 @@
 
 import json
 import os
+import shutil
+import subprocess
 import unittest
 from datetime import datetime
 from unittest import mock
@@ -45,6 +47,27 @@ class ReadingStrictly(TempFolderTest):
             with self.subTest(name), self.assertRaises(ConfigError) as caught:
                 read_config(self.write("bad.json", text))
             self.assertIn(expected, str(caught.exception))
+
+    def test_a_mistake_inside_text_is_located_but_the_text_is_never_quoted(self):
+        # A password with a backslash in it is an invalid escape; the hint for a policy would quote what follows.
+        secret = "Zx9QpLm77Kw2Rt5Y"
+        for text, expected in (
+            ('{\n  "mcpServers": {},\n  "env": {"DB_PASSWORD": "hunter2\\' + secret + '"}\n}', ":3:"),
+            ('{"env": {"API_KEY": "abc\\Qsecretpart' + secret + '"}}', ":1:"),
+            ('{"env": {"API_KEY": "abc\\u12' + secret + '"}}', ":1:"),
+            ('{"env": {"API_KEY": "abc\t' + secret + '"}}', ":1:"),
+            ('{"env": {"API_KEY": "abc' + secret, ":1:"),
+        ):
+            with self.subTest(text=text), self.assertRaises(ConfigError) as caught:
+                read_config(self.write("bad.json", text))
+            message = str(caught.exception)
+            self.assertIn(expected, message)
+            self.assertIn("not valid JSON", message)
+            for quoted in (secret, secret[:6], "hunter2", "Qsecret", "regular expression"):
+                self.assertNotIn(quoted, message)
+        with self.assertRaises(ConfigError) as caught:
+            read_config(self.write("bad.json", '{"env": {"P": "a\\Zb"}}'))
+        self.assertIn("Invalid \\escape\nIn JSON a backslash inside text must be doubled", str(caught.exception))
 
     def test_jsonc_gets_the_plain_json_explanation(self):
         with self.assertRaises(ConfigError) as caught:
@@ -220,6 +243,48 @@ class Writing(TempFolderTest):
                 self.assertEqual(backup.read_bytes(), ORIGINAL.encode("utf-8"))
                 self.assertEqual(sorted(entry.name for entry in path.parent.iterdir()), [".mcp.json"])
         self.assertFalse(config_file.in_work_tree(self.folder / "c.json"))
+
+    def test_backups_in_a_home_folder_kept_in_git_are_ignored_by_git(self):
+        # Dotfiles kept as a git repository in the home folder: ~/.cursor/mcp.json is in it, and so is
+        # the agent-sentinel home folder with its backups.
+        user = self.folder.resolve() / "user"
+        path = user / ".cursor" / "mcp.json"
+        path.parent.mkdir(parents=True)
+        git = shutil.which("git")
+        if git:
+            subprocess.run([git, "init", "-q", str(user)], check=True, capture_output=True, timeout=60)
+        else:
+            (user / ".git").mkdir()
+        (user / ".gitignore").write_text(".cursor/mcp.json\n", encoding="utf-8")  # the file itself is ignored
+        path.write_bytes(ORIGINAL.encode("utf-8"))
+        home = user / ".agent-sentinel"
+        with mock.patch.dict(os.environ, {"AGENT_SENTINEL_HOME": str(home)}):
+            backup = write_config(read_config(path), ORIGINAL.replace("Ctrl", "Alt"))
+            write_config(read_config(path), ORIGINAL)  # a second backup keeps the same .gitignore
+        self.assertEqual(backup.parent, home / "backups")
+        self.assertEqual((home / "backups" / ".gitignore").read_text(encoding="utf-8").splitlines()[-1], "*")
+        if git:
+            added = subprocess.run([git, "add", "-A", "--dry-run"], cwd=user, capture_output=True, text=True,
+                                   timeout=60, check=True).stdout
+            self.assertNotIn(".bak", added)
+            self.assertNotIn("backups", added)
+
+    def test_a_home_folder_kept_in_mercurial_or_subversion_gets_no_backup(self):
+        # Neither reads a .gitignore, so a backup with tokens there could be committed: refused, nothing changed.
+        for marker in (".hg", ".svn"):
+            user = self.folder / f"user{marker}"
+            (user / marker).mkdir(parents=True)
+            path = user / "project" / ".mcp.json"
+            (user / "project" / ".git").mkdir(parents=True)
+            path.write_bytes(ORIGINAL.encode("utf-8"))
+            with self.subTest(marker=marker), \
+                    mock.patch.dict(os.environ, {"AGENT_SENTINEL_HOME": str(user / ".agent-sentinel")}), \
+                    self.assertRaises(ConfigError) as caught:
+                write_config(read_config(path), "{}")
+            self.assertIn("Mercurial or Subversion work tree", str(caught.exception))
+            self.assertIn("AGENT_SENTINEL_HOME", str(caught.exception))
+            self.assertEqual(path.read_bytes(), ORIGINAL.encode("utf-8"))
+            self.assertFalse((user / ".agent-sentinel").exists())
 
     def test_a_file_that_changed_since_it_was_read_is_not_written(self):
         path = self.write("c.json", ORIGINAL.encode("utf-8"))

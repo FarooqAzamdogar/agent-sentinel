@@ -39,8 +39,13 @@ class RepeatedKeyError(ValueError):
 
 
 def bounded_int(text: str) -> int:
-    """json's parse_int: an integer, unless it has more digits than MAX_INT_DIGITS (then ValueError)."""
-    if len(text) > MAX_INT_DIGITS + 1:  # +1 for a minus sign
+    """json's parse_int: an integer, unless it has more digits than MAX_INT_DIGITS (then ValueError).
+
+    The digits are counted here, before int() sees them, so that the answer
+    does not depend on the interpreter's own limit (none before 3.10.7, or
+    when it is turned off).
+    """
+    if len(text) - text.startswith("-") > MAX_INT_DIGITS:
         raise ValueError(f"a number with more than {MAX_INT_DIGITS} digits")
     return int(text)
 

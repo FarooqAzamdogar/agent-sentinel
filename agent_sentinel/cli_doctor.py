@@ -12,7 +12,8 @@ For each configuration file (those `clients` finds, or the ones given with
     broken        wrapped, but the proxy would not start or would not find what it needs:
                   no policy, a relative or missing policy, a policy that does not load,
                   an unreadable pins file, a command that is not found, an argument a
-                  .cmd launcher cannot take
+                  .cmd launcher cannot take, an option value the proxy refuses (checked
+                  by the proxy's own functions, such as --max-message-bytes over 1 GiB)
 
 and these are checked too: every policy loads, with its warnings; the audit
 and pins folders can be written; no two servers share a pins file; npx and
@@ -44,10 +45,10 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from . import __version__, clients, home, mcp_proxy
-from .cli_common import EXIT_FAIL, EXIT_OK, CommandError, shown_command, shown_path
+from . import __version__, clients, elicitation, home, mcp_proxy
+from .cli_common import EXIT_FAIL, EXIT_OK, CommandError, full_path, shown_command, shown_path
 from .clients import CLIENTS
 from .config_file import ConfigError, read_config
 from .firewall import SERVER_NAME
@@ -170,7 +171,7 @@ def _configs(given: list[str]) -> list[tuple[Path, str | None, str, str]]:
     if given:
         found = []
         for path_text in given:
-            path = Path(os.path.abspath(path_text))
+            path = Path(full_path(path_text))
             if not path.exists():
                 raise CommandError(f"there is no file at {path}")
             found.append((path, clients.client_for_file(path), clients.scope_of(path), ""))
@@ -221,8 +222,9 @@ def check_server(name: str, entry: Any, client: str | None, project: Path | None
     proxy = read_proxy_command(words)
     if proxy is None and mentions_proxy(words):
         report = ServerReport(shown_name, "broken", [Line(
-            "fail", f"NOT protected: {_shown(words)} starts the proxy only after other words, which may run something "
-                    "else first, unchecked. Make the entry start the server directly, then run wrap")])
+            "fail", f"NOT protected: {_shown(words)} starts the proxy only after other words, or from a package that "
+                    "is not agent-sentinel at a version (a URL or a path); either may run something else, unchecked. "
+                    "Make the entry start the server directly, then run wrap")])
         report.lines += _secret_lines(entry)
         return report
     if proxy is None:
@@ -267,10 +269,11 @@ def _check_wrapped(report: ServerReport, proxy: ProxyCommand, entry: dict[str, A
     if len(proxy.values("--policy")) > 1:
         lines.append(Line("fail", "--policy is given more than once: the proxy uses the last one, which is easy to "
                                   "miss when reading the entry. Keep one"))
+    _check_values(lines, proxy)
     report.policy = _policy_path(lines, proxy.value("--policy"))
     report.pins = _pins_path(lines, proxy)
     report.audit = _audit_path(lines, proxy.value("--audit"))
-    _check_name(lines, proxy.value("--name"))
+    _check_name(lines, proxy.values("--name"))
     _check_server_command(lines, proxy.server)
     _check_passed_env(lines, proxy, entry)
     if project is not None:
@@ -420,12 +423,60 @@ def _check_writable(lines: list[Line], path: str, what: str, consequence: str) -
         lines.append(Line("warn", f"the {what} {printable(path, limit=200)} cannot be written, so {consequence}"))
 
 
-def _check_name(lines: list[Line], name: str | None) -> None:
-    if name is None:
+def _check_name(lines: list[Line], names: list[str]) -> None:
+    if not names:
         lines.append(Line("warn", "no --name: the audit log cannot tell this server's records from others'"))
-    elif not SERVER_NAME.fullmatch(name):
-        lines.append(Line("fail", f"the proxy refuses the --name {printable(name, limit=80)!r} (letters, digits, "
-                                  "'-', '_' and '.' only, at most 64)"))
+    for name in names:
+        if not SERVER_NAME.fullmatch(name):
+            lines.append(Line("fail", f"the proxy refuses the --name {printable(name, limit=80)!r} (letters, digits, "
+                                      "'-', '_' and '.' only, at most 64)"))
+
+
+def _check_values(lines: list[Line], proxy: ProxyCommand) -> None:
+    """The option values the proxy refuses to start with, found by the proxy's own checks (--name: _check_name)."""
+    approvers = []
+    for option, value in proxy.options:
+        if value is None or option not in _VALUE_CHECKS:
+            continue
+        if option == "--approve-with" and _on_another_machine(value.partition(":")[2]):
+            lines.append(Line("fail", f"the approver {printable(value, limit=120)!r} is on another machine; doctor "
+                                      "does not open network paths, so it cannot tell whether the proxy will start"))
+            continue
+        try:
+            checked = _VALUE_CHECKS[option](value)
+        except argparse.ArgumentTypeError as exc:
+            lines.append(Line("fail", f"the proxy refuses {option} {printable(value, limit=80)!r} "
+                                      f"({printable(exc, limit=200)}), so it will not start"))
+            continue
+        if option == "--approve-with":
+            approvers.append(checked.describe())
+    for repeated in sorted({described for described in approvers if approvers.count(described) > 1}):
+        lines.append(Line("fail", f"--approve-with {printable(repeated, limit=120)} is given twice, so the proxy "
+                                  "will not start"))
+    try:
+        elicitation.allowed_hosts(proxy.values("--elicitation-host"))
+    except PolicyError as exc:
+        lines.append(Line("fail", f"the proxy will not start: it cannot use {printable(exc, limit=200)}"))
+    if proxy.has("--quiet") and proxy.has("--verbose"):
+        lines.append(Line("fail", "--quiet and --verbose are both given, and the proxy takes only one of them, so it "
+                                  "will not start"))
+
+
+def _tool_names(value: str) -> str:
+    if value not in mcp_proxy.TOOL_NAME_MODES:
+        raise argparse.ArgumentTypeError(f"choose from {', '.join(mcp_proxy.TOOL_NAME_MODES)}")
+    return value
+
+
+# The proxy's own check of an option's value: the types and choices of its argument parser. A value for which
+# one raises ArgumentTypeError is one the proxy refuses to start with.
+_VALUE_CHECKS: dict[str, Callable[[str], Any]] = {
+    "--max-message-bytes": mcp_proxy._message_bytes,
+    "--approval-timeout": mcp_proxy._approval_timeout,
+    "--approve-with": mcp_proxy._approver,
+    "--pass-env": mcp_proxy._pass_env_name,
+    "--tool-names": _tool_names,
+}
 
 
 def _check_server_command(lines: list[Line], server: list[str]) -> None:

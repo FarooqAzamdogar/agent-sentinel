@@ -183,6 +183,15 @@ class InitFromATemplate(IsolatedHomeTest):
         self.assertIn(shown_path(written), out)
         self.assertIn("suggest", out)  # the monitor template's next steps
 
+    def test_out_with_a_leading_tilde_is_in_the_home_folder(self):
+        # Windows PowerShell 5.1 and cmd pass "~" on as it is; it must not become a folder named "~".
+        code, out, err = run_cli("init", "--template", "readonly", "--out", "~/readonly.json")
+        self.assertEqual(code, 0, err)
+        written = self.user / "readonly.json"
+        self.assertTrue(written.is_file())
+        self.assertIn(shown_path(written), out)
+        self.assertFalse((self.project / "~").exists())
+
     def test_out_in_a_folder_that_does_not_exist_is_refused(self):
         code, _, err = run_cli("init", "--template", "starter", "--out", self.folder / "nope" / "p.json")
         self.assertEqual(code, 2)
