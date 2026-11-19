@@ -311,16 +311,19 @@ def _log_part(policy: Policy, audit_path: Path, refused_ref: str | None) -> None
 def _next_steps(policy_path: Path | None, audit_path: Path | None) -> None:
     _heading("Next steps")
     if policy_path is not None:
-        start = f"Start from the demo's policy, kept at {shown_path(policy_path)}."
+        start = f"or start from the demo's policy, kept at {shown_path(policy_path)}."
     else:
-        start = "To start from the demo's policy, keep it: agent-sentinel demo --keep DIR"
+        start = "or start from the demo's policy: agent-sentinel demo --keep DIR"
     log = shown_path(audit_path) if audit_path is not None else "audit.jsonl"
-    print(f"""  1. Write a policy for your own tools. {start}
+    print(f"""  1. Write a policy for your own tools: agent-sentinel init --template starter
+     or draft one from a server's real tool list: agent-sentinel init -- <server command>
+     {start}
   2. Check it:            agent-sentinel validate policy.json
   3. Try calls on it:     agent-sentinel check policy.json read_file path=notes/todo.txt
-  4. In your MCP client's configuration, start each server through the proxy, with full paths:
-       agent-sentinel proxy --policy /full/path/policy.json --audit /full/path/audit.jsonl -- <server command>
-     (add --monitor while you tune the policy: it logs what would be blocked and blocks nothing)
+  4. Put the proxy in front of your MCP client's servers (shows the change; --apply writes it):
+       agent-sentinel wrap --client claude-desktop --policy /full/path/policy.json
+     then check that every server is protected: agent-sentinel doctor
+     (wrap --monitor while you tune the policy: it logs what would be blocked and blocks nothing)
   5. Read what happened:  agent-sentinel report {log}
      and for a refusal:   agent-sentinel explain {log} --ref <ref>""")
 

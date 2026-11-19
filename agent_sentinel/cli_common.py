@@ -5,6 +5,8 @@ same parts, which __main__.py puts together:
 
     HELP                   one line for the list of commands
     DESCRIPTION, EPILOG    optional: the text above and below the command's --help
+    USAGE                  optional: the usage line, when argparse's own would leave something out
+    TAKES_SERVER_COMMAND   optional: True for a command that takes "-- <server command>"
     add_arguments(parser)  the command's options, on an argparse parser
     run(args) -> int       does the work and returns the exit code
 
@@ -24,6 +26,8 @@ import codecs
 import json
 import os
 import re
+import shlex
+import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -194,6 +198,18 @@ def shown_path(path: str | Path) -> str:
     """A path as a person would type it on a command line: printable, and in double quotes if it has a space."""
     text = printable(str(path), limit=500)
     return f'"{text}"' if " " in text else text
+
+
+def shell_line(words: list[str], platform: str | None = None) -> str:
+    """Words as one command line for this system's shell, quoted where a word needs it."""
+    if (platform or sys.platform) == "win32":
+        return subprocess.list2cmdline(words)
+    return shlex.join(words)
+
+
+def shown_command(words: list[str], limit: int = 2000) -> str:
+    """A command (a server's, from the command line or a configuration) to print: quoted, then made printable."""
+    return printable(shell_line(words), limit=limit)
 
 
 def shown_value(value: Any, limit: int = 80) -> str:

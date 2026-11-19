@@ -1,6 +1,12 @@
 """Command line for agent-sentinel.
 
     agent-sentinel proxy --policy policy.json -- <mcp server command...>
+    agent-sentinel init --template starter              write a first policy (or: init -- <server command>)
+    agent-sentinel inspect -- <server command>          list a server's tools and what the proxy would do
+    agent-sentinel clients                              list the MCP client configurations on this machine
+    agent-sentinel wrap --client NAME --policy POLICY   put the proxy in front of a client's servers
+    agent-sentinel unwrap --client NAME                 take it out again
+    agent-sentinel doctor                               check that every server is protected
     agent-sentinel check POLICY TOOL [name=value ...]   try one call against a policy
     agent-sentinel test POLICY CASES.json               run a policy's test cases (for CI)
     agent-sentinel validate POLICY                      check that a policy file is well formed
@@ -13,7 +19,8 @@
 This module only builds the argument parser and hands each command to the
 module that does its work, agent_sentinel/cli_<command>.py (see cli_common.py
 for what such a module provides). The proxy parses its own arguments, in
-mcp_proxy.py.
+mcp_proxy.py. A command module that sets TAKES_SERVER_COMMAND gets what
+follows the first "--" as `args.server_command`, word for word.
 
 Everything printed may contain untrusted text (file contents, tool names
 from an audit log), so the command modules pass it through `printable` first.
@@ -27,13 +34,19 @@ import sys
 from . import (
     __version__,
     cli_check,
+    cli_clients,
     cli_demo,
+    cli_doctor,
     cli_explain,
+    cli_init,
+    cli_inspect,
     cli_report,
     cli_scan,
     cli_suggest,
     cli_test,
+    cli_unwrap,
     cli_validate,
+    cli_wrap,
     mcp_proxy,
 )
 from .cli_common import EXIT_ERROR, CommandError, print_error
@@ -41,6 +54,12 @@ from .textutil import printable
 
 # The commands, in the order --help lists them: name and the module that runs it.
 _COMMANDS = (
+    ("init", cli_init),
+    ("inspect", cli_inspect),
+    ("clients", cli_clients),
+    ("wrap", cli_wrap),
+    ("unwrap", cli_unwrap),
+    ("doctor", cli_doctor),
     ("check", cli_check),
     ("test", cli_test),
     ("validate", cli_validate),
@@ -73,6 +92,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
         command = commands.add_parser(
             name,
             help=module.HELP,
+            usage=getattr(module, "USAGE", None),
             description=getattr(module, "DESCRIPTION", None) or module.HELP,
             epilog=getattr(module, "EPILOG", None),
             formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -83,6 +103,20 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     return parser, command_parsers
 
 
+def _split_server_command(argv: list[str]) -> tuple[list[str], list[str] | None]:
+    """Split "COMMAND [options] -- server words..." at the first "--", for the commands that start a server.
+
+    argparse treats "--" differently from one Python version to the next, and
+    the server's own words (its options, a second "--") must reach it exactly
+    as written. None when there is no "--" or the command takes no server command.
+    """
+    takes = {name for name, module in _COMMANDS if getattr(module, "TAKES_SERVER_COMMAND", False)}
+    if argv[:1] and argv[0] in takes and "--" in argv:
+        at = argv.index("--")
+        return argv[:at], argv[at + 1:]
+    return argv, None
+
+
 def main(argv: list[str] | None = None) -> int:
     _make_output_safe()
     argv = sys.argv[1:] if argv is None else argv
@@ -90,11 +124,14 @@ def main(argv: list[str] | None = None) -> int:
         mcp_proxy.exit_process(mcp_proxy.main(argv[1:]))  # does not return: see exit_process for why
 
     parser, command_parsers = _build_parser()
+    argv, server_command = _split_server_command(argv)
     # parse_known_args, so that `check` can take name=value arguments after its options as
     # well as before them (argparse alone would refuse "check p.json tool --proxy a=1").
     args, extras = parser.parse_known_args(argv)
     if not hasattr(args, "func"):  # "proxy" reached here because something came before it, such as "--"
         parser.error("write 'proxy' first: agent-sentinel proxy --policy FILE -- COMMAND")
+    if getattr(args.module, "TAKES_SERVER_COMMAND", False):
+        args.server_command = server_command
     take_extras = getattr(args.module, "take_extra_arguments", None)
     if extras and (take_extras is None or not take_extras(args, extras)):
         command_parsers[args.command].error(f"unrecognized arguments: {printable(' '.join(extras), limit=200)}")
