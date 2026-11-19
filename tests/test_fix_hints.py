@@ -3,6 +3,7 @@
 import unittest
 
 from support import POLICY
+from agent_sentinel import Policy
 from agent_sentinel.fix_hints import PROTECTIVE_KINDS, classify, fix_hint
 from agent_sentinel.textutil import printable
 
@@ -85,6 +86,21 @@ class Hints(unittest.TestCase):
         for rule in (None, 5, ["x"], "tools.\x1b.other_args", "client_requests.\x1b"):
             with self.subTest(rule=rule):
                 self.assertNotIn("\x1b", fix_hint(rule, tool=["odd"], matched_arg={"odd": 1}, args="odd"))
+
+
+
+class HookHints(unittest.TestCase):
+    def test_a_refusal_by_the_claude_code_hook_itself_is_explained(self):
+        self.assertEqual(classify("hook_failed").kind, "hook_failed")
+        self.assertIn("hook_failed", PROTECTIVE_KINDS)
+        hint = fix_hint("hook_failed")
+        self.assertIn("Claude Code hook could not finish its checks", hint)
+        self.assertIn("no policy rule changes this", hint)
+
+    def test_rate_limit_and_ask_hints_mention_hook_mode(self):
+        self.assertIn("per Claude Code session", fix_hint("tools.Bash.max_calls_per_minute"))
+        policy = Policy.from_dict({"tools": {"Bash": "ask"}})
+        self.assertIn("bypassPermissions", fix_hint("tools.Bash", tool="Bash", policy=policy))
 
 
 if __name__ == "__main__":

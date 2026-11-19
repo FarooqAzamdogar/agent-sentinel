@@ -115,7 +115,7 @@ def run(args: argparse.Namespace) -> int:
     loaded = _policy(args.policy)
     if loaded is None:
         return EXIT_ERROR
-    python = _python()
+    python = this_python()
     settings = _settings(args, loaded[0], python)
     plan = plan_wrap(config, args.client, servers, names, settings)
     _print_header(config, args.client, settings, *loaded)
@@ -210,7 +210,7 @@ def _policy(path: str) -> tuple[str, Policy] | None:
     return None if policy is None else (policy_path, policy)
 
 
-def _python() -> PythonCheck:
+def this_python() -> PythonCheck:
     """How the wrapped entries can start the Python that runs this command (it is started to find out)."""
     if not sys.executable:
         raise CommandError("cannot tell which Python runs agent-sentinel, so the wrapped entries could not start it")
@@ -386,7 +386,7 @@ def _print_snippet(args: argparse.Namespace) -> int:
     loaded = _policy(args.policy)
     if loaded is None:
         return EXIT_ERROR
-    python = _python()
+    python = this_python()
     settings = _settings(args, loaded[0], python)
     label = server_label(args.name, set())
     entry: dict[str, Any] = {"command": command[0], "args": command[1:]}

@@ -7,6 +7,7 @@
     <home>/policy.json      written by `init`
     <home>/audit.jsonl      the audit log that `wrap` gives every wrapped server
     <home>/pins/            one tool pins file per wrapped server
+    <home>/hook-state/      the Claude Code hook's session state: flow marks and rate-limit counts
 
 Why not %APPDATA% on Windows: Claude Desktop installed from the Microsoft
 Store (an MSIX package) sees a private copy of AppData. Files that a proxy
@@ -34,6 +35,7 @@ FOLDER_NAME = ".agent-sentinel"
 POLICY_FILE = "policy.json"
 AUDIT_FILE = "audit.jsonl"
 PINS_FOLDER = "pins"
+HOOK_STATE_FOLDER = "hook-state"
 
 
 class HomeError(CommandError):
@@ -108,6 +110,10 @@ def audit_file(home: Path) -> Path:
 
 def pins_folder(home: Path) -> Path:
     return home / PINS_FOLDER
+
+
+def hook_state_folder(home: Path) -> Path:
+    return home / HOOK_STATE_FOLDER
 
 
 def make_folders(home: Path) -> list[Path]:

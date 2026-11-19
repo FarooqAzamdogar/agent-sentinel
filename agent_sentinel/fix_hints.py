@@ -42,6 +42,7 @@ _FIXED_KINDS = {
     "quarantine": "quarantine",
     "session": "session",
     "caller": "caller",
+    "hook_failed": "hook_failed",
 }
 _INDEXED_KINDS = (
     (re.compile(rf"deny_args{_INDEX}"), "deny_global"),
@@ -54,7 +55,7 @@ _PART_KINDS = {"other_args": "other_args", "max_calls_per_minute": "limit_tool"}
 # policy. `suggest` never proposes to loosen them; `report` says so next to them.
 PROTECTIVE_KINDS = frozenset({
     "deny_global", "deny_tool", "secrets", "secrets_results", "canary", "known_value", "secret_pattern",
-    "injection", "unscannable", "malformed", "quarantine", "session", "flow",
+    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "hook_failed",
 })
 
 
@@ -152,7 +153,7 @@ def fix_hint(
         )
         return (
             f"The call reached {which}. Raise it if this pace is normal for the agent. Each proxy, and each "
-            "Firewall, counts its calls on its own."
+            "Firewall, counts its calls on its own; the Claude Code hook counts them per Claude Code session."
         )
     if kind in ("server_request", "client_request"):
         section = "server_requests" if kind == "server_request" else "client_requests"
@@ -199,8 +200,9 @@ def _tool_rule_hint(rule_name: str, tool: Any, policy: Policy | None) -> str:
     if action == "ask":
         return (
             f"The tool rule {_name(rule_name)} says ask, and no person approved the call. The proxy needs an "
-            'approver to ask (--approve-with); without one an ask is refused. Change the action to "allow" only '
-            "if these calls need no review."
+            "approver to ask (--approve-with); without one an ask is refused. The Claude Code hook asks in Claude "
+            'Code\'s own prompt, but refuses in bypassPermissions mode. Change the action to "allow" only if these '
+            "calls need no review."
         )
     if action == "block":
         if is_wildcard:
@@ -287,6 +289,11 @@ _FIXED_HINTS = {
         "state folder is writable."
     ),
     "caller": "The program that uses the firewall blocked this itself (Firewall.block). Look at that program.",
+    "hook_failed": (
+        "The Claude Code hook could not finish its checks, so it refused (the reason says why: often a policy "
+        "that does not load, or a state folder that cannot be written). Fix that cause; no policy rule changes "
+        "this."
+    ),
     "none": (
         "This record names no rule: it was written by agent-sentinel before 0.5, or edited. Its reason says what "
         "happened."

@@ -7,6 +7,7 @@
     agent-sentinel wrap --client NAME --policy POLICY   put the proxy in front of a client's servers
     agent-sentinel unwrap --client NAME                 take it out again
     agent-sentinel doctor                               check that every server is protected
+    agent-sentinel hook install claude-code --policy P  enforce the policy inside Claude Code (its hooks)
     agent-sentinel check POLICY TOOL [name=value ...]   try one call against a policy
     agent-sentinel test POLICY CASES.json               run a policy's test cases (for CI)
     agent-sentinel validate POLICY                      check that a policy file is well formed
@@ -38,6 +39,7 @@ from . import (
     cli_demo,
     cli_doctor,
     cli_explain,
+    cli_hook,
     cli_init,
     cli_inspect,
     cli_report,
@@ -60,6 +62,7 @@ _COMMANDS = (
     ("wrap", cli_wrap),
     ("unwrap", cli_unwrap),
     ("doctor", cli_doctor),
+    ("hook", cli_hook),
     ("check", cli_check),
     ("test", cli_test),
     ("validate", cli_validate),

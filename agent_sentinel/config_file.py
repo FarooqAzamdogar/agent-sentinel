@@ -172,12 +172,21 @@ def _entry_text(value: Any, config: ConfigFile, member: _Member) -> str:
     unwrapping gives back the same text); otherwise it is indented like the
     file, one item per line.
     """
-    line_start = config.text.rfind("\n", 0, member.key_start) + 1
-    lead = config.text[line_start:member.key_start]
+    lead = _lead(config.text, member.key_start)
     compact = (
         bool(lead.strip())  # the key is not at the start of its line: the file is written compactly
         or "\n" not in config.text[member.value_start:member.value_end]
     )
+    return _json_text(value, config, lead, compact)
+
+
+def _lead(text: str, key_start: int) -> str:
+    """What comes before a key on its line: its indentation, or other text when the file is written compactly."""
+    return text[text.rfind("\n", 0, key_start) + 1:key_start]
+
+
+def _json_text(value: Any, config: ConfigFile, lead: str, compact: bool) -> str:
+    """A value written as JSON: on one line, or indented like the file below a key that has `lead` before it."""
 
     def written(ascii_only: bool) -> str:
         if compact:
@@ -222,6 +231,63 @@ def edited_text(config: ConfigFile, servers_key: str, entries: dict[str, Any]) -
             f"{config.path}: the edited file would not read back as intended; nothing was written"
         ) from exc
     return text
+
+
+def with_top_level_value(config: ConfigFile, key: str, value: Any) -> str:
+    """The file's text with the top-level `key` set to `value`: its value replaced, or the key added at the end.
+
+    For a settings file that gets a whole section (Claude Code's "hooks").
+    The new value is indented like the file (on one line in a file written
+    on one line). Everything else is kept byte for byte, and the result must
+    read back as exactly the intended document, or ConfigError.
+    """
+    text = config.text
+    try:
+        start = _skip_whitespace(text, 0)
+        members = _members(text, start)
+    except (ValueError, IndexError, RecursionError) as exc:
+        raise ConfigError(f"{config.path}: could not find where to write {key!r} ({exc}); nothing was written") from exc
+    existing = next((member for member in members if member.key == key), None)
+    if existing is not None:
+        lead = _lead(text, existing.key_start)
+        written = _json_text(value, config, lead, compact=bool(lead.strip()))
+        edited = text[:existing.value_start] + written + text[existing.value_end:]
+    elif members:
+        last = members[-1]
+        lead = _lead(text, last.key_start)
+        compact = bool(lead.strip())
+        separator = ", " if compact else "," + config.newline + lead
+        added = separator + json.dumps(key) + ": " + _json_text(value, config, lead, compact)
+        edited = text[:last.value_end] + added + text[last.value_end:]
+    else:  # an empty object: "{}"
+        unit = _indent_unit(text)
+        close = text.index("}", start)
+        added = config.newline + unit + json.dumps(key) + ": " + _json_text(value, config, unit, False) + config.newline
+        edited = text[:start + 1] + added + text[close:]
+
+    expected = {**config.document, key: value}
+    try:
+        if strict_json(edited, str(config.path)) != expected:
+            raise ValueError("it differs")
+    except (CommandError, ValueError) as exc:
+        raise ConfigError(
+            f"{config.path}: the edited file would not read back as intended; nothing was written"
+        ) from exc
+    return edited
+
+
+def create_config(path: Path, text: str) -> None:
+    """Write a new configuration file. Refuses if one appeared meanwhile: it is never overwritten."""
+    try:
+        with open(path, "x", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError as exc:
+        raise ConfigError(f"{path} appeared while agent-sentinel was working; nothing was written. "
+                          "Run the command again") from exc
+    except OSError as exc:
+        raise ConfigError(f"cannot write {path}: {exc.strerror or exc}") from exc
 
 
 # ---- writing ----------------------------------------------------------------------------------------

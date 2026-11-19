@@ -196,5 +196,48 @@ class Writing(TempFolderTest):
         self.assertEqual(len(attempts), 2)
 
 
+class SettingATopLevelSection(TempFolderTest):
+    """with_top_level_value and create_config: what `hook install` uses for a settings file's "hooks"."""
+
+    HOOKS = {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "x", "args": ["a"]}]}]}
+
+    def edited(self, text):
+        config = read_config(self.write("settings.json", text.encode("utf-8")))
+        result = config_file.with_top_level_value(config, "hooks", self.HOOKS)
+        self.assertEqual(json.loads(result), {**config.document, "hooks": self.HOOKS})
+        return result
+
+    def test_an_existing_section_is_replaced_and_the_rest_kept_byte_for_byte(self):
+        text = '{\n  "model": "opus",\n  "hooks": {"Stop": []},\n  "zzz": [1,   2]\n}\n'
+        result = self.edited(text)
+        self.assertTrue(result.startswith('{\n  "model": "opus",\n  "hooks": {\n    "PreToolUse": [\n'))
+        self.assertTrue(result.endswith('\n  },\n  "zzz": [1,   2]\n}\n'))
+
+    def test_a_missing_section_is_added_at_the_end_in_the_files_style(self):
+        result = self.edited('{\r\n\t"model": "opus"\r\n}\r\n')
+        self.assertTrue(result.startswith('{\r\n\t"model": "opus",\r\n\t"hooks": {\r\n\t\t"PreToolUse"'))
+        self.assertNotIn("\n", result.replace("\r\n", ""))
+        self.assertTrue(self.edited('{"a": 1}').startswith('{"a": 1, "hooks": {"PreToolUse": '))
+
+    def test_an_empty_object_gets_the_section(self):
+        for text in ("{}", "{ }\n", "﻿{}"):
+            with self.subTest(text=text):
+                self.assertIn('"hooks": {', self.edited(text))
+
+    def test_a_result_that_would_not_read_back_is_not_returned(self):
+        config = read_config(self.write("settings.json", b'{"a": 1}'))
+        with mock.patch.object(config_file, "_json_text", return_value="[broken"):
+            with self.assertRaisesRegex(ConfigError, "would not read back"):
+                config_file.with_top_level_value(config, "hooks", self.HOOKS)
+
+    def test_a_new_file_is_never_written_over_an_existing_one(self):
+        path = self.folder / "new.json"
+        config_file.create_config(path, "{}\n")
+        self.assertEqual(path.read_text(encoding="utf-8"), "{}\n")
+        with self.assertRaisesRegex(ConfigError, "appeared"):
+            config_file.create_config(path, '{"other": 1}')
+        self.assertEqual(path.read_text(encoding="utf-8"), "{}\n")
+
+
 if __name__ == "__main__":
     unittest.main()
