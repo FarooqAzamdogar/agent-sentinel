@@ -43,6 +43,10 @@ MAX_FORM_FIELDS = 64
 # refused rather than read in part, so a phrase cannot hide past what is read.
 MAX_FIELD_NAME_CHARS = 256
 MAX_FIELD_TEXT_CHARS = 4096
+# How much longer a label may become once normalised (NFKC). Ordinary text barely
+# grows; one character such as U+FDFA becomes 18, which would let a form of short
+# labels cost seconds to read. A label that grows more is refused as malformed.
+MAX_NORMALISED_GROWTH = 2
 MAX_URL_ELICITATIONS = 32  # addresses in one URLElicitationRequiredError
 FORM_MODES = ("form", "url")
 # What a form field may be (2025-11-25): text, a number, a yes/no, or a choice of several texts.
@@ -218,7 +222,12 @@ def _as_words(text: str) -> str:
 
     Full-width letters and look-alike letters of other alphabets are folded
     first, so that "pаssword" with a Cyrillic а still reads "password".
+    Raises ShapeError for text that normalisation makes much longer
+    (MAX_NORMALISED_GROWTH): reading it would cost far more than its length suggests.
     """
-    text = unicodedata.normalize("NFKC", text)
+    normalised = unicodedata.normalize("NFKC", text)
+    if len(normalised) > MAX_NORMALISED_GROWTH * max(len(text), 64):
+        raise ShapeError("a form field's label grows too much when its characters are normalised")
+    text = normalised
     text = _CAMEL_CASE.sub(" ", text)
     return " ".join(_NOT_A_WORD.sub(" ", fold_lookalikes(text)).split())

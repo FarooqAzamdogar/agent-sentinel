@@ -30,8 +30,33 @@ points. Each parses a line, asks an `_inspect_*` method what to do, and sends
 the resulting `_Outcome`. The `_inspect_*` methods decide and never write to a
 stream, which keeps them easy to test.
 
-Rules with action "ask" are blocked here, because a stdio proxy has no
-terminal to ask a human on.
+Approvals
+---------
+A call the policy says "ask" for is refused, unless the proxy was given a
+way to ask a person (proxy --approve-with: a dialog on this machine, the
+operator's own program, or a form the MCP client shows; see approvers.py).
+Then the call is held: the firewall has already passed it through the secret
+guard, the policy and the rate limits (check_call with defer_ask), and a
+worker thread asks, so the client's other messages keep flowing meanwhile.
+Only an explicit yes lets it through; no answer before --approval-timeout,
+an error or anything else refuses it. Before a held call is sent on, the
+proxy checks again that the tool was not quarantined while it waited, and
+the firewall checks the flow rules again (finish_approval). One question is
+asked at a time, and at most MAX_WAITING_APPROVALS calls wait.
+
+The agent cannot answer for the person: a dialog and a program answer on
+this machine, and the client's answer to the proxy's own elicitation is
+matched by a random id that is never sent to the server, and never
+forwarded to it.
+
+What the operator sees
+----------------------
+On stderr, which MCP clients keep in their log of the server (see
+proxy_report.py): a summary at startup, one line for each block with the
+rule that decided and the reference the agent was shown, and, with
+--verbose, one line for each call let through. Lines about traffic are
+limited (20 in 10 seconds, proxy_report.LineBudget), so a peer cannot flood
+the log. --quiet leaves only errors.
 
 Protocol revisions
 ------------------
@@ -136,12 +161,25 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from secrets import token_hex
 from typing import Any, BinaryIO, Callable, Iterable, Sequence
 
-from . import elicitation
+from . import __version__, elicitation, proxy_report
 from . import mcp_protocol as protocol
 from . import server_env
+from .approvers import (
+    APPROVAL_ID_PREFIX,
+    ELICITATION_VERSIONS,
+    Answer,
+    ApprovalRequest,
+    Approver,
+    ElicitationApprover,
+    NotShowable,
+    check_showable,
+    declares_form_elicitation,
+    parse_backend,
+)
 from .firewall import SERVER_NAME, Decision, Firewall
 from .leaks import find_secrets
 from .mcp_protocol import ShapeError
@@ -168,6 +206,11 @@ MAX_KNOWN_NAMES = 10_000  # names of one kind remembered to catch look-alikes
 MAX_REPORTED = 10_000  # things reported once on stderr (see _first_report)
 MAX_LABEL_CHARS = 200
 MAX_NAME_CHARS = 256  # tool names and request ids the proxy has to remember
+MAX_WAITING_APPROVALS = 16  # calls held for a person's answer; more are refused at once
+
+# proxy --approval-timeout: how long a held call waits for an answer, in seconds.
+DEFAULT_APPROVAL_TIMEOUT = 120
+MAX_APPROVAL_TIMEOUT = 3600
 
 # Resource reads are checked by the policy under this name, with one
 # argument, "uri". A policy rule for it looks like a rule for a tool.
@@ -211,6 +254,8 @@ _UNSUPPORTED_REPLY = "the server sent a reply this proxy cannot check"
 _UNSUPPORTED_VERSION = "the server chose a protocol version this proxy does not support"
 # What a refused server is told: nothing about why.
 _SERVER_REFUSAL = "request refused"
+# How the reason of a pending decision ends (Firewall.check_call with defer_ask).
+_WAITING_SUFFIX = "; waiting for approval"
 
 # The protocol era of the session (see mcp_protocol.py), once the client has shown it.
 _LEGACY = "legacy"
@@ -239,6 +284,27 @@ class _Outcome:
 
 
 _DROP = _Outcome()
+
+
+@dataclass
+class _WaitingCall:
+    """A client request held until a person approves it, or the time for an answer runs out.
+
+    The worker thread that asks (Proxy._approval_worker) is the only one that
+    sends anything for it. `answered` is set when an answer arrives or the
+    client cancels the request; `answer` and `cancelled` say which. Both are
+    changed under Proxy._state.
+    """
+
+    message: JsonObject
+    pending: Decision  # from check_call(..., defer_ask=True)
+    request: ApprovalRequest
+    label: str  # the audit label, as for a forwarded request
+    description: str  # "tools/call 'send_email'", for stderr
+    deadline: float  # on time.monotonic(): no answer by then refuses the call
+    answered: threading.Event = field(default_factory=threading.Event)
+    answer: Answer | None = None
+    cancelled: bool = False
 
 
 # ---- small helpers ----------------------------------------------------------
@@ -343,6 +409,28 @@ def _request_label(message: JsonObject) -> str:
     return _label(message["method"])
 
 
+# The parameter that says what a request is about, for the lines the operator reads.
+_SUBJECT_PARAM = {"tools/call": "name", "resources/read": "uri", "resources/subscribe": "uri", PROMPTS_GET: "name"}
+
+
+def _request_description(message: JsonObject) -> str:
+    """A client request as the operator reads it on stderr: "tools/call 'delete_file'", or just the method."""
+    method = message["method"]
+    params = message.get("params")
+    key = _SUBJECT_PARAM.get(method)
+    subject = params.get(key) if key and isinstance(params, dict) else None
+    if isinstance(subject, str) and subject:
+        return f"{method} '{printable(subject, limit=MAX_LABEL_CHARS)}'"
+    return printable(method, limit=MAX_LABEL_CHARS)
+
+
+def _reply_description(pending: _PendingRequest) -> str:
+    """The reply to a request, as the operator reads it: "the reply to tools/call 'fetch_page'"."""
+    if pending.label != pending.method:
+        return f"the reply to {pending.method} '{printable(pending.label, limit=MAX_LABEL_CHARS)}'"
+    return f"the reply to {pending.method}"
+
+
 # ---- names that look alike ----------------------------------------------------
 
 class _NameRegistry:
@@ -398,6 +486,9 @@ class Proxy:
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
         tool_names: str = TOOL_NAMES_WARN,
         elicitation_hosts: Sequence[str] = (),
+        approvers: Sequence[Approver] = (),
+        approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT,
+        report: str = proxy_report.NORMAL,
     ) -> None:
         """
         pins:              the pins of this server (pins.ToolPins); default: kept in memory only.
@@ -406,9 +497,18 @@ class Proxy:
         elicitation_hosts: the hosts a URL-mode elicitation may send the user to (proxy
                            --elicitation-host); empty: any public https address. PolicyError
                            for an entry that cannot be used.
+        approvers:         who is asked about a call the policy says "ask" for (proxy
+                           --approve-with; approvers.py), in order: the first that can ask at
+                           the time of the call is used. Empty: such calls are refused.
+        approval_timeout:  seconds a held call waits for an answer before it is refused.
+        report:            how much the proxy writes to stderr: proxy_report.QUIET, NORMAL or VERBOSE.
         """
         if tool_names not in TOOL_NAME_MODES:
             raise ValueError(f"tool_names must be one of {', '.join(TOOL_NAME_MODES)}")
+        if report not in (proxy_report.QUIET, proxy_report.NORMAL, proxy_report.VERBOSE):
+            raise ValueError("report must be proxy_report.QUIET, NORMAL or VERBOSE")
+        if not 0 < approval_timeout <= MAX_APPROVAL_TIMEOUT:
+            raise ValueError(f"approval_timeout must be more than 0 and at most {MAX_APPROVAL_TIMEOUT} seconds")
         self._firewall = firewall
         self._client_out = client_out
         self._server_in = server_in
@@ -439,6 +539,27 @@ class Proxy:
         self._tool_lists_in_flight: set[str | int] = set()
         # What was already reported on stderr: a client that lists its tools often gets each line once.
         self._reported: set[tuple[str, ...]] = set()
+
+        # Approvals (see "Approvals" above). The approvers themselves never change.
+        self._approvers = tuple(approvers)
+        self._approval_timeout = approval_timeout
+        # Calls held for an answer, by the firewall's call id; the proxy's own questions to
+        # the client (elicitation), by their request id. Both guarded by `_state`.
+        self._waiting: dict[str, _WaitingCall] = {}
+        self._questions: dict[str, _WaitingCall] = {}
+        # One question at a time: a person facing several at once could answer the wrong one.
+        self._approval_turn = threading.Lock()
+        # What the client said in initialize, and the version the server chose: whether
+        # the client can be asked through an elicitation form. Guarded by `_state`.
+        self._client_shows_forms = False
+        self._negotiated_version: str | None = None
+
+        # What the operator reads on stderr (proxy_report.py). `_warn` is looked up when a
+        # line is written, so that output redirected or silenced around a call is respected.
+        self._report_level = report
+        self._lines = proxy_report.LineBudget(
+            lambda text, limit: _warn(text, limit=limit), has_audit=firewall.audit_path is not None
+        )
 
     # ---- entry points -------------------------------------------------------
 
@@ -503,13 +624,37 @@ class Proxy:
 
     def _dropped(self, what: str) -> _Outcome:
         """Record and report a message that is being dropped for its shape."""
-        self._firewall.refuse("?", f"dropped {what}", event="dropped", rule=RULE_MALFORMED)
-        _warn(f"dropped {what}")
+        decision = self._firewall.refuse("?", f"dropped {what}", event="dropped", rule=RULE_MALFORMED)
+        self._report(f"dropped {what} {proxy_report.rule_and_ref(decision)}")
         return _DROP
 
-    def _refusal(self, label: str, reason: str, rule: str = RULE_MALFORMED) -> Decision:
+    def _refusal(
+        self, label: str, reason: str, rule: str = RULE_MALFORMED, public_reason: str = "", call_id: str | None = None,
+    ) -> Decision:
         """A block for a structural reason. Unlike a policy block, monitor mode does not lift it."""
-        return self._firewall.refuse(label, reason, rule=rule)
+        return self._firewall.refuse(label, reason, public_reason=public_reason, rule=rule, call_id=call_id)
+
+    # ---- what the operator reads on stderr ----------------------------------------
+
+    def _report(self, text: str, limit: int = 300) -> None:
+        """A line about traffic, for the operator: not with --quiet, and within the line budget."""
+        if self._report_level != proxy_report.QUIET:
+            self._lines.line(text, limit)
+
+    def _report_block(self, what: str, decision: Decision) -> None:
+        """One line for a block: what, why, the rule and the reference the agent was shown."""
+        self._report(proxy_report.block_line(what, decision), limit=1000)
+
+    def _report_allowed(self, what: str, decision: Decision) -> None:
+        """A line for a call that was let through: with --verbose, or when monitor mode lifted a block."""
+        lifted = self._firewall.monitor and decision.reason.startswith(proxy_report.WOULD_BLOCK_PREFIX)
+        if lifted or self._report_level == proxy_report.VERBOSE:
+            self._report(proxy_report.allowed_line(what, decision), limit=1000)
+
+    def close_report(self) -> None:
+        """Say how many lines the line budget left out, if any. The proxy calls this when it stops."""
+        if self._report_level != proxy_report.QUIET:
+            self._lines.flush()
 
     # ---- client -> server ---------------------------------------------------
 
@@ -550,8 +695,8 @@ class Proxy:
             return self._check_subscriptions(message)
         if method.startswith(protocol.TASKS_METHOD_PREFIX):
             return self._refuse_task_request(message)
-        if method == "notifications/cancelled":
-            self._forget_cancelled_request(message)
+        if method == "notifications/cancelled" and self._forget_cancelled_request(message):
+            return _DROP  # it cancelled a call held for approval, which the server never saw
         return self._forward_request(message, label=_label(method))
 
     def _refuse_batch(self, batch: list[Any]) -> _Outcome:
@@ -561,6 +706,7 @@ class Proxy:
             "?", "dropped a batched client message", event="dropped",
             public_reason="batched requests are not supported", rule=RULE_MALFORMED,
         )
+        self._report(f"refused a batch of {len(batch)} client messages {proxy_report.rule_and_ref(decision)}")
         replies = [
             _rpc_error(item["id"], decision.public_reason, code=-32600)
             for item in batch
@@ -579,8 +725,13 @@ class Proxy:
         is rebuilt from its `result` or `error`, so nothing else in the message
         reaches the server. A refused answer is replaced by an error that tells
         the server nothing.
+
+        An answer to one of the proxy's own approval questions is taken first,
+        by its id, and never reaches the server (_approval_answer).
         """
         msg_id = message.get("id")
+        if isinstance(msg_id, str) and msg_id.startswith(APPROVAL_ID_PREFIX):
+            return self._approval_answer(message)
         is_reply = ("result" in message) != ("error" in message)
         with self._state:
             method = self._server_requests.pop(msg_id, None) if is_reply and _valid_id(msg_id) else None
@@ -589,20 +740,43 @@ class Proxy:
 
         label = _label(f"server:{method}")  # the label the server's request was logged under
         member = "result" if "result" in message else "error"
+        what = f"refused the client's answer to a '{printable(method, limit=100)}' request"
         try:
             value = protocol.client_reply_value(member, message[member])
             secrets = self._secrets_in(value)
         except (ShapeError, UnscannableError) as exc:
-            self._firewall.refuse(label, f"malformed client reply: {exc}", event="client_reply", rule=RULE_MALFORMED)
-            _warn(f"refused the client's answer to a '{method}' request: {exc}")
+            decision = self._firewall.refuse(
+                label, f"malformed client reply: {exc}", event="client_reply", rule=RULE_MALFORMED
+            )
+            self._report(f"{what}: {exc} {proxy_report.rule_and_ref(decision)}")
             return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL))
         if secrets:
             reason = f"the client's answer contains what looks like a secret ({', '.join(secrets)})"
             decision = self._firewall.block(label, reason, event="client_reply", rule=RULE_SECRETS)
             if not decision.allowed:
-                _warn(f"refused the client's answer to a '{method}' request: {reason}")
+                self._report_block(what, decision)
                 return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL))
         return _Outcome(to_server={"jsonrpc": "2.0", "id": msg_id, member: value})
+
+    def _approval_answer(self, message: JsonObject) -> _Outcome:
+        """The client's answer to one of the proxy's own approval questions (an elicitation form).
+
+        It is matched by the question's random id, which only the client was
+        ever sent; a server request may not use an id that begins the same way
+        (_server_request_problem). The answer goes to the call that waits for
+        it and nowhere else: nothing is sent to the server.
+        """
+        with self._state:
+            waiting = self._questions.pop(message["id"], None)
+        if waiting is None:
+            self._report("ignored an answer to an approval question that is no longer waiting")
+            return _DROP
+        if ("result" in message) != ("error" in message):
+            answer = ElicitationApprover.answer(message)
+        else:
+            answer = Answer(False, "an answer that is neither a result nor an error")
+        self._take_answer(waiting, answer)
+        return _DROP
 
     def _check_input_responses(self, message: JsonObject) -> _Outcome | None:
         """Pass the answers a retried request carries through the secret guard; None when it may go on.
@@ -672,6 +846,7 @@ class Proxy:
         )
         if decision.allowed:  # monitor mode
             return None
+        self._report_block(f"blocked {_request_description(message)}", decision)
         if "id" not in message:
             return _DROP
         return _Outcome(to_client=_rpc_error(message["id"], decision.public_reason, code=protocol.METHOD_NOT_FOUND))
@@ -732,6 +907,11 @@ class Proxy:
         only a legacy version it knows (see _check_handshake_reply). Passing on
         an unknown version would invite the server to answer with it, and the
         session would then have to be refused.
+
+        Whether the client can show an elicitation form is noted from its own
+        capabilities, before they are minimised for the server: the proxy may
+        ask the client's user to approve a call even when the server may not
+        send elicitations (C31 changes only the server's copy).
         """
         params = message.get("params")
         if not isinstance(params, dict):
@@ -740,11 +920,16 @@ class Proxy:
         if not isinstance(version, str):
             raise ShapeError("protocolVersion must be text")
         if version not in protocol.LEGACY_VERSIONS:
-            _warn(f"the client asked for MCP protocol version '{printable(version, limit=40)}' in initialize, "
-                  f"which this proxy cannot pass on; asking the server for {protocol.NEWEST_LEGACY_VERSION} instead")
+            self._report(
+                f"the client asked for MCP protocol version '{printable(version, limit=40)}' in initialize, "
+                f"which this proxy cannot pass on; asking the server for {protocol.NEWEST_LEGACY_VERSION} instead"
+            )
             params["protocolVersion"] = protocol.NEWEST_LEGACY_VERSION
+        shows_forms = declares_form_elicitation(params.get("capabilities"))
         if "capabilities" in params:
             params["capabilities"] = protocol.minimised_capabilities(params["capabilities"], self._blocked_requests())
+        with self._state:
+            self._client_shows_forms = shows_forms
 
     def _minimise_request_capabilities(self, message: JsonObject) -> None:
         """Minimise the capabilities a 2026-07-28 request declares in params._meta (requested_version checked _meta)."""
@@ -772,8 +957,8 @@ class Proxy:
         """Answer a request naming a protocol version the proxy does not know, as a 2026-07-28 server would."""
         method = message["method"]
         reason = f"the request names MCP protocol version '{printable(version, limit=40)}', unknown to this proxy"
-        self._firewall.refuse(_label(method), reason, event="client_request", rule=RULE_MALFORMED)
-        _warn(f"refused a '{method}' request: {reason}")
+        decision = self._firewall.refuse(_label(method), reason, event="client_request", rule=RULE_MALFORMED)
+        self._report_block(f"refused a '{printable(method, limit=100)}' request", decision)
         if "id" not in message:
             return _DROP
         return _Outcome(to_client=protocol.unsupported_version_error(message["id"], version))
@@ -785,7 +970,7 @@ class Proxy:
             _label(method), f"malformed {method} request: {problem}", event="client_request",
             public_reason=_MALFORMED_REQUEST, rule=RULE_MALFORMED,
         )
-        _warn(f"refused a malformed '{method}' request: {problem}")
+        self._report(f"refused a malformed '{method}' request: {problem} {proxy_report.rule_and_ref(decision)}")
         if "id" not in message:
             return _DROP
         return _Outcome(to_client=_rpc_error(message["id"], decision.public_reason, code=protocol.INVALID_PARAMS))
@@ -797,13 +982,17 @@ class Proxy:
         decision = self._firewall.refuse(
             _label(method), reason, event="client_request", public_reason=_UNSUPPORTED_REQUEST, rule=RULE_MALFORMED,
         )
-        _warn(f"refused a '{method}' request: {reason}")
+        self._report_block(f"refused a '{printable(method, limit=100)}' request", decision)
         if "id" not in message:
             return _DROP
         return _Outcome(to_client=_rpc_error(message["id"], decision.public_reason, code=protocol.METHOD_NOT_FOUND))
 
     def _refused(self, message: JsonObject, decision: Decision) -> _Outcome:
-        """Answer a refused client request with the decision's public reason (a notification gets no answer)."""
+        """Report a refused client request, and answer it with the decision's public reason.
+
+        A notification gets no answer.
+        """
+        self._report_block(f"blocked {_request_description(message)}", decision)
         if "id" not in message:
             return _DROP
         reply = _refusal_reply(message["method"], message["id"], decision.public_reason, _is_modern_request(message))
@@ -832,9 +1021,8 @@ class Proxy:
             reason = "this tool was removed from the tool list and cannot be called"
             decision = self._refusal(_label(name), reason, RULE_QUARANTINE)
         else:
-            decision = self._firewall.check_call(name, arguments or {})
-        marks = self._firewall.marks_for(name) if decision.allowed else frozenset()
-        return self._forward_or_refuse(message, decision, label=_label(str(name)), marks=marks)
+            return self._check_policy(message, name, arguments or {}, label=_label(name))
+        return self._forward_or_refuse(message, decision, label=_label(str(name)))
 
     def _check_resource_request(self, message: JsonObject) -> _Outcome:
         """resources/read and resources/subscribe both ask the server to open a URI."""
@@ -842,12 +1030,8 @@ class Proxy:
         uri = params.get("uri") if isinstance(params, dict) else None
         if not isinstance(uri, str) or not uri:
             decision = self._refusal(RESOURCE_READ, f"malformed {message['method']} request: missing uri")
-        else:
-            decision = self._firewall.check_call(RESOURCE_READ, {"uri": uri})
-        # Only a read returns content; a subscription's updates arrive as reads of their own.
-        reads = decision.allowed and message["method"] == RESOURCE_READ
-        marks = self._firewall.marks_for(RESOURCE_READ) if reads else frozenset()
-        return self._forward_or_refuse(message, decision, label=_label(str(uri)), marks=marks)
+            return self._forward_or_refuse(message, decision, label=RESOURCE_READ)
+        return self._check_policy(message, RESOURCE_READ, {"uri": uri}, label=_label(uri))
 
     def _check_prompt_request(self, message: JsonObject) -> _Outcome:
         """prompts/get: fetch a prompt by name, with arguments that fill it in.
@@ -865,16 +1049,20 @@ class Proxy:
         if not _is_name(name) or (arguments is not None and not isinstance(arguments, dict)):
             return self._refuse_malformed_request(message, "it needs a prompt name, and arguments as an object")
         if self._was_quarantined("prompts", name):
-            decision = self._firewall.refuse(
-                PROMPTS_GET, f"the prompt '{printable(name, limit=80)}' was removed from the prompt list",
-                public_reason="this prompt was removed from the prompt list and cannot be used", rule=RULE_QUARANTINE,
-            )
+            decision = self._refused_prompt(name)
         elif self._firewall.policy.checks_prompts:
-            decision = self._firewall.check_call(PROMPTS_GET, {"name": name, "arguments": arguments or {}})
+            return self._check_policy(message, PROMPTS_GET, {"name": name, "arguments": arguments or {}}, PROMPTS_GET)
         else:
             return self._forward_request(message, label=PROMPTS_GET)
-        marks = self._firewall.marks_for(PROMPTS_GET) if decision.allowed else frozenset()
-        return self._forward_or_refuse(message, decision, label=PROMPTS_GET, marks=marks)
+        return self._forward_or_refuse(message, decision, label=PROMPTS_GET)
+
+    def _refused_prompt(self, name: str, call_id: str | None = None) -> Decision:
+        """The refusal of a prompts/get for a prompt that was removed from the prompt list."""
+        return self._firewall.refuse(
+            PROMPTS_GET, f"the prompt '{printable(name, limit=80)}' was removed from the prompt list",
+            public_reason="this prompt was removed from the prompt list and cannot be used", rule=RULE_QUARANTINE,
+            call_id=call_id,
+        )
 
     def _check_subscriptions(self, message: JsonObject) -> _Outcome:
         """subscriptions/listen (2026-07-28) replaces resources/subscribe, so it needs the same permission.
@@ -893,12 +1081,253 @@ class Proxy:
                 return self._refused(message, decision)
         return self._forward_request(message, label=protocol.SUBSCRIPTIONS_LISTEN)
 
-    def _forward_or_refuse(
-        self, message: JsonObject, decision: Decision, label: str, marks: frozenset[str] = frozenset(),
+    def _check_policy(self, message: JsonObject, tool: str, arguments: JsonObject, label: str) -> _Outcome:
+        """Ask the firewall about a request the policy decides, then forward it, refuse it, or hold it for approval.
+
+        `tool` and `arguments` are what the policy sees: the tool's name and
+        arguments, or "resources/read" with {"uri"}, or "prompts/get" with
+        {"name", "arguments"}. With approvers, an "ask" comes back pending and
+        the request is held (_hold_for_approval); without, the firewall refuses it.
+        """
+        decision = self._firewall.check_call(tool, arguments, defer_ask=bool(self._approvers))
+        if decision.pending:
+            return self._hold_for_approval(message, decision, tool, arguments, label)
+        return self._forward_or_refuse(message, decision, label)
+
+    def _forward_or_refuse(self, message: JsonObject, decision: Decision, label: str) -> _Outcome:
+        """Forward a request the checks allowed (setting what it needs for its reply), or refuse it."""
+        if not decision.allowed:
+            return self._refused(message, decision)
+        self._report_allowed(_request_description(message), decision)
+        return self._forward_request(message, label, marks=self._marks_of(message), call_id=decision.call_id)
+
+    def _marks_of(self, message: JsonObject) -> frozenset[str]:
+        """The flow marks the reply to an allowed request gives the session once it is delivered.
+
+        A tool's result, a resource read and a prompt bring content into the
+        conversation. A subscription brings nothing itself: its updates arrive
+        as reads of their own.
+        """
+        method = message["method"]
+        if method == "tools/call":
+            return self._firewall.marks_for(message["params"]["name"])
+        if method in (RESOURCE_READ, PROMPTS_GET):
+            return self._firewall.marks_for(method)
+        return frozenset()
+
+    # ---- client -> server: calls held for a person's approval --------------------------
+
+    def _hold_for_approval(
+        self, message: JsonObject, pending: Decision, tool: str, arguments: JsonObject, label: str,
     ) -> _Outcome:
-        if decision.allowed:
-            return self._forward_request(message, label, marks=marks, call_id=decision.call_id)
-        return self._refused(message, decision)
+        """Hold a request the policy says "ask" for; a worker thread asks, and sends the outcome later.
+
+        Nothing is sent now. The client is not kept waiting on its other
+        messages: they are handled while the person decides.
+        """
+        # The person is told why the policy asks; that the call is waiting, they can see.
+        reason = pending.reason
+        if reason.endswith(_WAITING_SUFFIX):
+            reason = reason[: -len(_WAITING_SUFFIX)]
+        request = ApprovalRequest(tool, arguments, reason, pending.ref or "", self._firewall.server_name)
+        waiting = _WaitingCall(
+            message, pending, request, label, _request_description(message),
+            deadline=time.monotonic() + self._approval_timeout,
+        )
+        with self._state:
+            room = len(self._waiting) < MAX_WAITING_APPROVALS
+            if room:
+                self._waiting[pending.call_id or ""] = waiting
+        if not room:
+            who = f"the proxy ({MAX_WAITING_APPROVALS} calls were already waiting)"
+            return self._refused(message, self._firewall.finish_approval(pending, False, who))
+        self._report(f"waiting for approval: {waiting.description} {proxy_report.rule_and_ref(pending)}", limit=1000)
+        threading.Thread(target=self._approval_worker, args=(waiting,), name="agent-sentinel approval",
+                         daemon=True).start()
+        return _DROP
+
+    def _approval_worker(self, waiting: _WaitingCall) -> None:
+        """Ask about one held call, then send the outcome: the request to the server, or a refusal to the client.
+
+        Fails closed: an error anywhere refuses the call. A call the client
+        cancelled meanwhile gets no answer at all. The call counts as waiting
+        until its outcome has been sent.
+        """
+        try:
+            try:
+                answer, who = self._ask_someone(waiting)
+                approved = answer.approved is True
+                final = self._firewall.finish_approval(waiting.pending, approved, f"{who} ({answer.detail})")
+                outcome = self._released(waiting, final)
+            except Exception as exc:  # a bug must not let the call through
+                _warn(f"refused a call that waited for approval, after an internal error: {exc!r}")
+                final = self._firewall.finish_approval(waiting.pending, False, "the proxy, after an internal error")
+                outcome = self._refused(waiting.message, final)
+            if not waiting.cancelled:
+                self._send(outcome)
+        except (OSError, ValueError):  # the client or the server has gone; the proxy is stopping
+            pass
+        finally:
+            with self._state:
+                self._waiting.pop(waiting.pending.call_id or "", None)
+
+    def waiting_for_approval(self) -> int:
+        """How many calls are held for a person's answer now (until each one's outcome has been sent)."""
+        with self._state:
+            return len(self._waiting)
+
+    def _ask_someone(self, waiting: _WaitingCall) -> tuple[Answer, str]:
+        """Ask the first approver that can ask now; return the answer and who gave it, for the audit log.
+
+        One question at a time: a person facing several questions at once
+        could answer the wrong one. A call whose turn does not come before its
+        deadline is refused like one nobody answered.
+        """
+        try:
+            check_showable(waiting.request.arguments)
+        except NotShowable as exc:
+            return Answer(False, str(exc)), "the proxy"
+        approver, why_nobody = self._choose_approver()
+        if approver is None:
+            if self._first_report("nobody to ask", why_nobody):
+                self._report(f"a call needs approval, but nobody can be asked: {why_nobody}", limit=1000)
+            return Answer(False, why_nobody), "nobody"
+        if not self._approval_turn.acquire(timeout=max(0.0, waiting.deadline - time.monotonic())):
+            return Answer(False, "no answer in time: other calls were being asked about"), approver.name
+        try:
+            if waiting.cancelled:
+                answer = self._await_answer(waiting)
+            elif isinstance(approver, ElicitationApprover):
+                answer = self._ask_client(waiting)
+            else:
+                answer = self._ask_on_this_machine(approver, waiting)
+        finally:
+            self._approval_turn.release()
+        return answer, approver.name
+
+    def _choose_approver(self) -> tuple[Approver | None, str]:
+        """The first approver that can ask now, or None and why none can."""
+        reasons = []
+        for approver in self._approvers:
+            why = self._why_cannot_ask(approver)
+            if why is None:
+                return approver, ""
+            reasons.append(f"{approver.name}: {why}")
+        return None, "; ".join(reasons)
+
+    def _why_cannot_ask(self, approver: Approver) -> str | None:
+        """Why this approver cannot ask about a call now, or None.
+
+        An elicitation needs a session opened with initialize (a 2026-07-28
+        server, which the proxy stands in for, may not send requests on stdio),
+        a protocol version that has elicitation, and a client that declared it
+        can show a form.
+        """
+        if not isinstance(approver, ElicitationApprover):
+            return approver.unavailable()
+        with self._state:
+            era, shows_forms, version = self._era, self._client_shows_forms, self._negotiated_version
+        if era != _LEGACY or version is None:
+            return "the session was not opened with initialize"
+        if version not in ELICITATION_VERSIONS:
+            return f"MCP protocol version {version} has no elicitation"
+        if not shows_forms:
+            return "the client did not declare that it can show an elicitation form"
+        return None
+
+    def _ask_on_this_machine(self, approver: Approver, waiting: _WaitingCall) -> Answer:
+        """Ask through a dialog or the operator's program, in a thread of its own.
+
+        The answer is awaited only until the deadline, so a dialog or program
+        that ignores its timeout cannot hold the call past it.
+        """
+        timeout = waiting.deadline - time.monotonic()
+        if timeout <= 0 or waiting.cancelled:
+            return self._await_answer(waiting)
+
+        def ask() -> None:
+            try:
+                answer = approver.ask(waiting.request, timeout)
+            except Exception as exc:  # a broken approver refuses
+                answer = Answer(False, f"it failed: {printable(exc, limit=100)}")
+            self._take_answer(waiting, answer)
+
+        threading.Thread(target=ask, name="agent-sentinel approver", daemon=True).start()
+        return self._await_answer(waiting)
+
+    def _ask_client(self, waiting: _WaitingCall) -> Answer:
+        """Ask the client's user with an elicitation form; the answer arrives through _approval_answer.
+
+        If no answer comes in time, the question is withdrawn with
+        notifications/cancelled, so the form does not stay open.
+        """
+        request_id = APPROVAL_ID_PREFIX + token_hex(16)
+        with self._state:
+            version = self._negotiated_version or ""
+            self._questions[request_id] = waiting
+        timeout = max(1.0, waiting.deadline - time.monotonic())
+        self._send(_Outcome(to_client=ElicitationApprover.question(request_id, waiting.request, timeout, version)))
+        answer = self._await_answer(waiting)
+        with self._state:
+            unanswered = self._questions.pop(request_id, None) is not None
+        if unanswered:
+            withdrawn = {"requestId": request_id, "reason": "the call was refused before an answer came"}
+            self._send(_Outcome(to_client={"jsonrpc": "2.0", "method": "notifications/cancelled", "params": withdrawn}))
+        return answer
+
+    def _take_answer(self, waiting: _WaitingCall, answer: Answer) -> None:
+        """Record the first answer for a held call; a later one (after the timeout) is ignored."""
+        with self._state:
+            if waiting.answer is None:
+                waiting.answer = answer
+        waiting.answered.set()
+
+    def _await_answer(self, waiting: _WaitingCall) -> Answer:
+        """Wait until the call is answered or cancelled, or its deadline passes, and return the answer."""
+        waiting.answered.wait(max(0.0, waiting.deadline - time.monotonic()))
+        with self._state:
+            if waiting.cancelled:
+                return Answer(False, "the client cancelled the request")
+            if waiting.answer is None:  # from now on a late answer changes nothing
+                waiting.answer = Answer(False, f"no answer within {self._approval_timeout:g} seconds")
+            return waiting.answer
+
+    def _released(self, waiting: _WaitingCall, final: Decision) -> _Outcome:
+        """What to send once a held call has its final decision.
+
+        An approved call is checked once more for what may have changed while
+        it waited: a tool list that removed the tool, or the prompt (the
+        firewall already checked the flow rules again). Then it is forwarded
+        like any allowed request.
+        """
+        message = waiting.message
+        if waiting.cancelled:
+            return _DROP
+        if not final.allowed:
+            return self._refused(message, final)
+        refusal = self._removed_while_waiting(message, waiting.label, final.call_id)
+        if refusal is not None:
+            return self._refused(message, refusal)
+        self._report(f"approved {waiting.description} {proxy_report.rule_and_ref(waiting.pending)}: {final.reason}",
+                     limit=1000)
+        return self._forward_request(message, waiting.label, marks=self._marks_of(message), call_id=final.call_id)
+
+    def _removed_while_waiting(self, message: JsonObject, label: str, call_id: str | None) -> Decision | None:
+        """The refusal of an approved call whose tool or prompt was quarantined while it waited, or None."""
+        method, params = message["method"], message["params"]
+        if method == "tools/call":
+            if not self._wait_for_tool_lists():
+                reason = "timed out waiting for the tool list to be checked"
+                return self._refusal(label, reason, RULE_QUARANTINE, call_id=call_id)
+            if self._is_quarantined(params["name"]):
+                return self._refusal(
+                    label, "the tool was removed from the tool list while the call waited for approval",
+                    RULE_QUARANTINE, public_reason="this tool was removed from the tool list and cannot be called",
+                    call_id=call_id,
+                )
+        elif method == PROMPTS_GET and self._was_quarantined("prompts", params["name"]):
+            return self._refused_prompt(params["name"], call_id)
+        return None
 
     def _forward_request(
         self, message: JsonObject, label: str, marks: frozenset[str] = frozenset(), call_id: str | None = None,
@@ -910,24 +1339,38 @@ class Proxy:
         with self._state:
             # If the client reuses an id that is still in flight, the newer
             # request wins. The reply is scanned either way; honest clients do not reuse ids.
-            is_new = message["id"] not in self._pending
-            if is_new and len(self._pending) >= MAX_PENDING_REQUESTS:
-                reason = "too many requests are waiting for a reply"
-                return _Outcome(to_client=_refusal_reply(message["method"], message["id"], reason, modern))
-            self._pending[message["id"]] = _PendingRequest(message["method"], label, marks, call_id, modern)
-            if message["method"] == "tools/list":
-                self._tool_lists_in_flight.add(message["id"])
+            full = message["id"] not in self._pending and len(self._pending) >= MAX_PENDING_REQUESTS
+            if not full:
+                self._pending[message["id"]] = _PendingRequest(message["method"], label, marks, call_id, modern)
+                if message["method"] == "tools/list":
+                    self._tool_lists_in_flight.add(message["id"])
+        if full:
+            event = "call" if message["method"] == "tools/call" else "client_request"
+            refusal = self._firewall.refuse(
+                label, "too many requests are waiting for a reply", event=event, rule=RULE_MALFORMED, call_id=call_id
+            )
+            return self._refused(message, refusal)
         return _Outcome(to_server=message)
 
-    def _forget_cancelled_request(self, message: JsonObject) -> None:
+    def _forget_cancelled_request(self, message: JsonObject) -> bool:
+        """Forget a request the client cancelled. True when it was only held for approval, never forwarded.
+
+        A held call that is cancelled is refused (its question, if one is
+        showing, is left to time out) and no answer is sent for it.
+        """
         params = message.get("params")
         request_id = params.get("requestId") if isinstance(params, dict) else None
         if not _valid_id(request_id):
-            return
+            return False
         with self._state:
-            self._pending.pop(request_id, None)
+            forwarded = self._pending.pop(request_id, None) is not None
             self._tool_lists_in_flight.discard(request_id)
             self._state.notify_all()
+            held = [waiting for waiting in self._waiting.values() if waiting.message["id"] == request_id]
+            for waiting in held:
+                waiting.cancelled = True
+                waiting.answered.set()
+        return bool(held) and not forwarded
 
     def _wait_for_tool_lists(self) -> bool:
         """Wait until no tools/list reply is being checked.
@@ -960,7 +1403,7 @@ class Proxy:
     def _set_tools_unverified(self, unverified: bool) -> None:
         with self._state:
             if unverified and not self._tools_unverified:
-                _warn("the tool list could not be checked; tool calls are refused until a valid list arrives")
+                self._report("the tool list could not be checked; tool calls are refused until a valid list arrives")
             self._tools_unverified = unverified
 
     def _quarantine(self, kind: str, name: str) -> None:
@@ -969,7 +1412,7 @@ class Proxy:
                 self._quarantined[kind].add(name)
             elif not self._quarantine_overflowed:
                 self._quarantine_overflowed = True
-                _warn("too many quarantined entries to track; all tool calls and prompts are now refused")
+                self._report("too many quarantined entries to track; all tool calls and prompts are now refused")
 
     def _first_report(self, *key: str) -> bool:
         """True the first time `key` comes up, so that a line about it is printed once, not at every listing.
@@ -986,8 +1429,24 @@ class Proxy:
     def _internal_error_outcome(self, message: Any) -> _Outcome:
         """Tell the client its request failed, so it is not left waiting."""
         if isinstance(message, dict) and isinstance(message.get("method"), str) and _valid_id(message.get("id")):
-            return _Outcome(to_client=_rpc_error(message["id"], "internal error while checking the request"))
+            text = self._internal_error_text(_label(message["method"]), "client_request", "the request")
+            return _Outcome(to_client=_rpc_error(message["id"], text))
         return _DROP
+
+    def _internal_error_text(self, label: str, event: str, what: str) -> str:
+        """Record a refusal after an internal error; return what the agent is told, with the record's ref.
+
+        The error itself is already on stderr. If even the record cannot be
+        written, the agent is told the same without a ref.
+        """
+        public = f"internal error while checking {what}"
+        try:
+            return self._firewall.refuse(
+                label, f"refused after an internal error while checking {what}", event=event, public_reason=public,
+                rule=RULE_MALFORMED,
+            ).public_reason
+        except Exception:  # the record is a courtesy; the refusal stands without it
+            return public
 
     # ---- server -> client ---------------------------------------------------
 
@@ -1017,11 +1476,11 @@ class Proxy:
             return self._dropped("a server message that is neither a valid request nor a reply")
 
         label = _label(f"server:{method}")  # prefixed so it cannot pass for a tool name in the log
-        problem = self._server_request_problem(method) if is_request else None
+        problem = self._server_request_problem(method, msg_id) if is_request else None
         if problem is not None:
             # Not a policy decision, so monitor mode does not lift it.
-            self._firewall.refuse(label, problem, event="server_request", rule=RULE_MALFORMED)
-            _warn(f"refused a '{method}' request from the server: {problem}")
+            refusal = self._firewall.refuse(label, problem, event="server_request", rule=RULE_MALFORMED)
+            self._report_block(f"refused a '{printable(method, limit=100)}' request from the server", refusal)
             return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL, code=protocol.METHOD_NOT_FOUND))
 
         verdict = self._firewall.policy.server_request_verdict(method)
@@ -1039,14 +1498,21 @@ class Proxy:
             elif method == "notifications/cancelled":
                 self._forget_cancelled_server_request(message)
             return _Outcome(to_client=message)
-        _warn(f"refused a '{method}' message from the server: {decision.reason}")
+        self._report_block(f"refused a '{printable(method, limit=100)}' message from the server", decision)
         if is_request:
             # Answer so the server is not left waiting, without saying which check it failed.
             return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL))
         return _DROP
 
-    def _server_request_problem(self, method: str) -> str | None:
-        """Why the protocol does not let the server send this request, or None (then the policy decides)."""
+    def _server_request_problem(self, method: str, msg_id: str | int) -> str | None:
+        """Why the protocol does not let the server send this request, or None (then the policy decides).
+
+        An id that begins like the ids of the proxy's own approval questions is
+        refused, so that the client's answer to a server request can never be
+        taken for an answer to an approval question.
+        """
+        if isinstance(msg_id, str) and msg_id.startswith(APPROVAL_ID_PREFIX):
+            return "the request uses an id reserved for the proxy's own requests"
         with self._state:
             modern = self._era == _MODERN
         if modern:
@@ -1084,7 +1550,8 @@ class Proxy:
             return _Outcome(to_client=self._checked_reply(message, pending))
         except Exception as exc:
             _warn(f"blocked a server reply after an internal error: {exc!r}")
-            return _Outcome(to_client=_rpc_error(msg_id, "internal error while checking the reply"))
+            text = self._internal_error_text(pending.label, "result", "the reply")
+            return _Outcome(to_client=_rpc_error(msg_id, text))
         finally:
             # Quarantine decisions were recorded inside _checked_reply, so
             # calls waiting on this tool list may now proceed.
@@ -1186,7 +1653,10 @@ class Proxy:
                 label, entry, event="server_request", log_clean=False, call_id=pending.call_id
             )
         if not decision.allowed:
-            _warn(f"refused a reply to {pending.method} that asks the client for '{method}': {decision.reason}")
+            self._report_block(
+                f"refused a reply to {pending.method} that asks the client for '{printable(method, limit=100)}'",
+                decision,
+            )
         return decision
 
     def _elicitation_refusal(self, label: str, params: Any, call_id: str | None = None) -> Decision | None:
@@ -1207,7 +1677,7 @@ class Proxy:
         for field in review.unclear:
             reason = f"the elicitation asks for {field}, which may be a secret"
             self._firewall.note(label, reason, event="server_request", call_id=call_id)
-            _warn(reason)
+            self._report(reason)
         if review.refusal is None:
             return None
         decision = self._firewall.block(
@@ -1234,7 +1704,7 @@ class Proxy:
         )
         if decision.allowed:  # monitor mode
             return None
-        _warn(f"refused a reply to {pending.method}: {review.refusal}")
+        self._report_block(f"refused a reply to {pending.method}", decision)
         return _refusal_reply(pending.method, msg_id, decision.public_reason, pending.modern)
 
     def _check_handshake_reply(self, pending: _PendingRequest, msg_id: Any, result: Any) -> JsonObject | None:
@@ -1279,10 +1749,12 @@ class Proxy:
             if isinstance(server_info, dict) and "icons" in server_info:
                 self._clean_icons_of(server_info, f"the server, in its reply to {pending.method}")
         self._check_instructions(result, source=pending.method)
-        if pending.method == protocol.SERVER_DISCOVER:
-            with self._state:
-                if self._era is None:
-                    self._era = _MODERN
+        with self._state:
+            if pending.method == protocol.INITIALIZE:
+                # The version both sides now speak: it decides whether the client can be asked in a form.
+                self._negotiated_version = result["protocolVersion"]
+            elif pending.method == protocol.SERVER_DISCOVER and self._era is None:
+                self._era = _MODERN
         return None
 
     def _malformed_reply(self, pending: _PendingRequest, msg_id: Any, reason: str) -> JsonObject:
@@ -1290,7 +1762,7 @@ class Proxy:
             pending.label, f"malformed reply: {reason}", event="result",
             public_reason=_MALFORMED_REPLY, rule=RULE_MALFORMED, call_id=pending.call_id,
         )
-        _warn(f"blocked a malformed reply to {pending.method}: {reason}")
+        self._report(f"blocked a malformed reply to {pending.method}: {reason} {proxy_report.rule_and_ref(decision)}")
         return _rpc_error(msg_id, decision.public_reason)
 
     def _unsupported_reply(
@@ -1302,15 +1774,17 @@ class Proxy:
             pending.label, f"unsupported reply: {reason}", event="result",
             public_reason=public_reason, rule=RULE_MALFORMED, call_id=pending.call_id,
         )
-        _warn(f"blocked a reply to {pending.method}: {reason}")
+        self._report(f"blocked a reply to {pending.method}: {reason} {proxy_report.rule_and_ref(decision)}")
         return _rpc_error(msg_id, decision.public_reason, code=code)
 
     def _deliver_or_block(
         self, pending: _PendingRequest, msg_id: Any, member: str, value: Any, scan: Any, log_clean: bool = True
     ) -> JsonObject:
         decision = self._firewall.scan_result(pending.label, scan, log_clean=log_clean, call_id=pending.call_id)
-        if decision.allowed:
-            decision = self._mark_delivered(pending)
+        if not decision.allowed:
+            self._report_block(f"blocked {_reply_description(pending)}", decision)
+        else:
+            decision = self._mark_delivered(pending)  # reports a reply it withholds
         if decision.allowed:
             return {"jsonrpc": "2.0", "id": msg_id, member: value}
         return _refusal_reply(pending.method, msg_id, decision.public_reason, pending.modern)
@@ -1323,8 +1797,9 @@ class Proxy:
         try:
             self._firewall.mark_delivered(pending.label, pending.marks)
         except SessionStateError as exc:
-            _warn(f"withheld a reply to {pending.method}: {exc}")
-            return self._firewall.withhold(pending.label, exc, call_id=pending.call_id)
+            decision = self._firewall.withhold(pending.label, exc, call_id=pending.call_id)
+            self._report_block(f"withheld a reply to {pending.method}", decision)
+            return decision
         return Decision(True, "delivered", call_id=pending.call_id)
 
     def _check_instructions(self, result: JsonObject, source: str) -> None:
@@ -1343,7 +1818,7 @@ class Proxy:
             decision = self._check_instructions_pin(source, instructions)
         if not decision.allowed:
             del result["instructions"]
-            _warn(f"removed the server's instructions: {decision.reason}")
+            self._report_block("removed the server's instructions", decision)
 
     def _check_instructions_pin(self, source: str, instructions: str) -> Decision:
         status = self._pins.check_instructions(instructions)
@@ -1381,7 +1856,7 @@ class Proxy:
             if problem is None:
                 kept.append(item)
             else:
-                _warn(f"removed '{label}' from the {items_key} list: {problem}")
+                self._report(f"removed '{label}' from the {items_key} list: {problem}")
         if items_key in PINNED_LISTS:
             self._save_pins()
         if items_key == "tools":
@@ -1399,7 +1874,7 @@ class Proxy:
         else:
             del item["icons"]
         if dropped and self._first_report("icons", whose):
-            _warn(f"dropped {len(dropped)} icon(s) of {whose}: {dropped[0]}")
+            self._report(f"dropped {len(dropped)} icon(s) of {whose}: {dropped[0]}")
 
     def _name_collisions(self, items: list[Any], kind: str) -> tuple[dict[str, tuple[str, str, bool]], set[int]]:
         """Find the names of a list that collide: {name: (reason, audit event, whether monitor mode may lift it)},
@@ -1493,8 +1968,8 @@ class Proxy:
             return self._firewall.block(label, reason, event=event, rule=RULE_QUARANTINE)
         if self._first_report("name", kind, item["name"]):
             self._firewall.note(label, f"{reason} (kept: --tool-names warn)", event=event)
-            _warn(f"the name of '{label}' in the {kind} list breaks the MCP naming rules: {problem}; "
-                  "it is kept (--tool-names strict would remove it)")
+            self._report(f"the name of '{label}' in the {kind} list breaks the MCP naming rules: {problem}; "
+                         "it is kept (--tool-names strict would remove it)")
         return Decision(True, reason)
 
     def _check_pin(self, kind: str, item: JsonObject, label: str) -> Decision:
@@ -1540,7 +2015,8 @@ class Proxy:
             self._firewall.note(name, "hidden from the tool list: the policy blocks every call to it", "tool_hidden")
         if newly_hidden:
             hidden = ", ".join(newly_hidden)
-            _warn(f"hid {len(newly_hidden)} tool(s) that the policy blocks from the tool list: {hidden}", limit=2000)
+            self._report(f"hid {len(newly_hidden)} tool(s) that the policy blocks from the tool list: {hidden}",
+                         limit=2000)
         return shown
 
     # ---- sending ------------------------------------------------------------
@@ -1695,6 +2171,28 @@ def _pass_env_name(text: str) -> str:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
+def _approver(text: str) -> Approver:
+    """One --approve-with value (approvers.parse_backend). A program is looked up as the server command is."""
+    try:
+        return parse_backend(text, _resolve_executable)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _approval_timeout(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a whole number of seconds") from None
+    if not 1 <= value <= MAX_APPROVAL_TIMEOUT:
+        raise argparse.ArgumentTypeError(f"must be 1 to {MAX_APPROVAL_TIMEOUT} seconds")
+    return value
+
+
+def _say_nothing(message: str, limit: int = 300) -> None:
+    """What `_warn` becomes for notices under --quiet."""
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-sentinel proxy", description="Run an MCP server behind the firewall.")
     parser.add_argument("--policy", required=True, help="path to the policy JSON file")
@@ -1726,16 +2224,29 @@ def _argument_parser() -> argparse.ArgumentParser:
                              "NAME* for every variable starting with NAME")
     parser.add_argument("--env-file", default=None, metavar="FILE",
                         help="add the NAME=VALUE lines of FILE to the server's environment (values are never printed)")
+    parser.add_argument("--approve-with", type=_approver, action="append", default=[], metavar="BACKEND",
+                        help="ask a person about calls the policy says \"ask\" for: dialog (a window on this machine), "
+                             "elicitation (a form in the MCP client, if it declares it can show one) or "
+                             "command:PROGRAM (it reads the request as JSON and approves by printing 'approve'); "
+                             "repeat it to give a fallback. Without it, such calls are refused")
+    parser.add_argument("--approval-timeout", type=_approval_timeout, default=None, metavar="SECONDS",
+                        help=f"refuse a call nobody answered within this time (default {DEFAULT_APPROVAL_TIMEOUT}, "
+                             f"at most {MAX_APPROVAL_TIMEOUT})")
+    loudness = parser.add_mutually_exclusive_group()
+    loudness.add_argument("--quiet", action="store_true",
+                          help="print only errors (the server's own stderr is still passed on)")
+    loudness.add_argument("--verbose", action="store_true", help="also print a line for every call let through")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- followed by the MCP server command")
     return parser
 
 
-def _server_environment(args: argparse.Namespace) -> dict[str, str] | None:
+def _server_environment(args: argparse.Namespace, say: Callable[..., None]) -> dict[str, str] | None:
     """The environment to start the server with, after reporting on it; None if the env file cannot be used.
 
     Names are reported, never values: the --pass-env names the proxy does not
     have, what --clean-env passes, and the variables that look like secrets
-    and that no --pass-env or env file named.
+    and that no --pass-env or env file named. `say` prints those notices
+    (nothing under --quiet); an env file that cannot be used is an error, always printed.
     """
     try:
         added = server_env.read_env_file(args.env_file) if args.env_file else {}
@@ -1745,16 +2256,32 @@ def _server_environment(args: argparse.Namespace) -> dict[str, str] | None:
     environment = server_env.server_environment(os.environ, args.clean_env, args.pass_env, added)
     if args.clean_env:
         for name in server_env.missing_names(os.environ, args.pass_env):
-            _warn(f"--pass-env {name}: the proxy has no such variable, so the server does not get it")
+            say(f"--pass-env {name}: the proxy has no such variable, so the server does not get it")
         named = server_env.named_variables(environment, args.pass_env, added)
-        _warn(f"--clean-env: the server gets a minimal environment, plus {', '.join(named) or 'nothing else'}",
-              limit=2000)
+        say(f"--clean-env: the server gets a minimal environment, plus {', '.join(named) or 'nothing else'}",
+            limit=2000)
     secret_looking = server_env.unnamed_secrets(environment, args.pass_env, added)
     if secret_looking:
-        _warn(f"the server gets {len(secret_looking)} environment variable(s) whose names look like secrets: "
-              f"{', '.join(secret_looking)}. If it does not need them, start the proxy with --clean-env; "
-              "name each one it needs with --pass-env NAME", limit=2000)
+        say(f"the server gets {len(secret_looking)} environment variable(s) whose names look like secrets: "
+            f"{', '.join(secret_looking)}. If it does not need them, start the proxy with --clean-env; "
+            "name each one it needs with --pass-env NAME", limit=2000)
     return environment
+
+
+def _report_policy_error(path: str, error: Exception) -> None:
+    """Say why the policy cannot be loaded, line by line, with advice for a relative path that was not found.
+
+    A JSON error shows the line of the file with a caret under the mistake.
+    The most common first failure is a relative --policy path: MCP clients
+    start servers in a folder of their own choosing, so the file is not where
+    the operator expected.
+    """
+    message = file_error_message(path, error) if isinstance(error, OSError) else str(error)
+    for number, line in enumerate(message.splitlines()):
+        _warn(f"cannot load policy: {line}" if number == 0 else line, limit=500)
+    hint = proxy_report.missing_policy_hint(path) if isinstance(error, FileNotFoundError) else None
+    if hint:
+        _warn(hint, limit=500)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1768,13 +2295,16 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("give the MCP server command after '--'")
+    backends = [approver.describe() for approver in args.approve_with]
+    for backend in backends:
+        if backends.count(backend) > 1:
+            parser.error(f"--approve-with {backend} is given twice")
+    report = proxy_report.QUIET if args.quiet else proxy_report.VERBOSE if args.verbose else proxy_report.NORMAL
+    say = _say_nothing if args.quiet else _warn  # notices; errors always go through _warn
     try:
         policy = Policy.from_file(args.policy)
     except (OSError, PolicyError) as exc:
-        message = file_error_message(args.policy, exc) if isinstance(exc, OSError) else str(exc)
-        # One line at a time: a JSON error shows the line of the file with a caret under it.
-        for number, line in enumerate(message.splitlines()):
-            _warn(f"cannot load policy: {line}" if number == 0 else line, limit=500)
+        _report_policy_error(args.policy, exc)
         return 2
     try:
         pins = ToolPins(args.pins, enabled=not args.no_pins)
@@ -1797,7 +2327,17 @@ def main(argv: list[str] | None = None) -> int:
         _warn(f"cannot pass {unsafe[0]!r} to the batch file {executable}: cmd.exe would change it. "
               "Start the program behind the batch file directly, for example with node or python")
         return 2
-    environment = _server_environment(args)
+    approval_timeout = args.approval_timeout or DEFAULT_APPROVAL_TIMEOUT
+    start = proxy_report.Startup(
+        version=__version__, name=args.name, policy_path=args.policy, policy=policy, audit_path=args.audit,
+        pins_path=args.pins, pins_enabled=not args.no_pins, server_command=[executable, *command[1:]],
+        approvers=[(approver.describe(), approver.unavailable()) for approver in args.approve_with],
+        approval_timeout=approval_timeout, approval_timeout_given=args.approval_timeout is not None,
+        monitor=args.monitor,
+    )
+    for line in proxy_report.startup_lines(start):
+        say(line, limit=1500)
+    environment = _server_environment(args, say)
     if environment is None:
         return 2
     try:
@@ -1810,6 +2350,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     assert server.stdin is not None and server.stdout is not None and server.stderr is not None
     if args.monitor:
+        # Printed even under --quiet: the proxy is protecting nothing.
         _warn("monitor mode: nothing is being blocked by the policy or the scanner")
 
     firewall = Firewall(
@@ -1817,7 +2358,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     proxy = Proxy(
         firewall, sys.stdout.buffer, server.stdin, pins=pins, max_message_bytes=args.max_message_bytes,
-        tool_names=args.tool_names, elicitation_hosts=args.elicitation_host,
+        tool_names=args.tool_names, elicitation_hosts=args.elicitation_host, approvers=args.approve_with,
+        approval_timeout=approval_timeout, report=report,
     )
 
     # Run one relay per direction. When either side closes, shut down.
@@ -1853,6 +2395,7 @@ def main(argv: list[str] | None = None) -> int:
     except OSError:
         pass
     server_relay.join(timeout=SHUTDOWN_GRACE_SECONDS)  # let it finish answering
+    proxy.close_report()  # how many lines about traffic were left out, if any
     return _stop(server, deadline)
 
 

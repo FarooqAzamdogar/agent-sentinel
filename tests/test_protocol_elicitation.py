@@ -123,12 +123,23 @@ class Forms(unittest.TestCase):
         limit = elicitation.MAX_FIELD_TEXT_CHARS
         fields = {
             f"f{n}": text_field(title=text[:limit], description=text[:limit])
-            for n, text in enumerate(("a" + "̖́" * limit, "ﷺ" * limit, "api " * limit, "aA" * limit))
+            for n, text in enumerate(("a" + "̖́" * limit, "api " * limit, "aA" * limit, "ﬁ" * limit))
         }
         started = time.perf_counter()
         for _ in range(16):  # as many such fields as a form may have
             review_request(form(**fields), None)
         self.assertLess(time.perf_counter() - started, 3)
+
+    def test_a_label_that_grows_too_much_when_normalised_is_refused_quickly(self):
+        # U+FDFA becomes 18 characters under NFKC: a form full of it used to take seconds to read.
+        label = "ﷺ" * elicitation.MAX_FIELD_TEXT_CHARS
+        started = time.perf_counter()
+        for _ in range(elicitation.MAX_FORM_FIELDS):
+            with self.assertRaises(ShapeError):
+                review_request(form(f=text_field(title=label, description=label)), None)
+        self.assertLess(time.perf_counter() - started, 3)
+        # A little growth is ordinary: a ligature, a circled digit, a squared word.
+        self.assertIsNone(review_request(form(f=text_field(title="㍿ ﬁle ①")), None).refusal)
 
 
 # ---- addresses --------------------------------------------------------------------------------
