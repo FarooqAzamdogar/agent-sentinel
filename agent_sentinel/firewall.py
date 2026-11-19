@@ -5,7 +5,9 @@ This is the core that everything else calls. It answers two questions:
     check_call(tool, args)   may the agent make this call?        (secrets, policy, rate limits)
     scan_result(tool, text)  may the agent read this text?        (detector)
 
-Both return a `Decision` and write one line to the audit log.
+Both return a `Decision` and write one line to the audit log. What a server
+says about itself (tool descriptions, list entries, its instructions) is
+scanned with stricter rules than tool results: see METADATA_EVENTS.
 
 A Decision carries two texts. `reason` is the full detail and goes to the audit
 log and the human approver. `public_reason` is what may be shown to the agent:
@@ -50,7 +52,7 @@ from pathlib import Path
 from secrets import token_hex
 from typing import Any, Awaitable, Callable, Iterable
 
-from .detector import SEVERITY_ORDER, Finding, max_severity, scan_views
+from .detector import METADATA, RESULT, SEVERITY_ORDER, Finding, max_severity, scan_views
 from .filelock import lock_file as _lock_file, unlock_file as _unlock_file
 from .leaks import find_secrets, redact, redact_value
 from .policy import (
@@ -74,7 +76,7 @@ from .session import (
     SessionStore,
     labels_from_annotations,
 )
-from .textutil import UnscannableError, printable, text_views, texts_in
+from .textutil import UnscannableError, media_payloads, printable, text_views, texts_in, tool_parameters
 
 # Called for "ask" rules: (tool, args, reason) -> True to approve. It must
 # return exactly True to approve; anything else is a refusal. `tool` and `args`
@@ -96,6 +98,11 @@ MAX_ANNOTATED_TOOLS = 10_000
 # A server name, as `proxy --name` accepts it: it is written into every audit record.
 SERVER_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 MAX_CALL_ID_CHARS = 256
+# The scan_result events whose content is a server describing itself: a tool
+# definition, an entry of another list (prompts, resources), the instructions
+# it gives at initialize. They are read with the detector's "metadata" rules,
+# which know how tool descriptions are poisoned (see detector.py, "Profiles").
+METADATA_EVENTS = frozenset({"tool_description", "list_item", "server_instructions"})
 
 # A long unbroken run of letters and digits in an excerpt. An excerpt is cut
 # out of the text around a match, and the cut can go through the middle of a
@@ -340,7 +347,14 @@ class Firewall:
         return final
 
     def scan_result(
-        self, tool: str, content: Any, event: str = "result", log_clean: bool = True, *, call_id: str | None = None
+        self,
+        tool: str,
+        content: Any,
+        event: str = "result",
+        log_clean: bool = True,
+        *,
+        call_id: str | None = None,
+        foreign_tools: Iterable[str] = (),
     ) -> Decision:
         """Scan what a tool returned before the agent reads it.
 
@@ -349,13 +363,24 @@ class Firewall:
                    `textutil.text_views`, so a phrase split over two items of
                    a list, or over two fields, is still seen as one.
         event:     labels the audit record, e.g. "result" or "tool_description".
+                   The events in METADATA_EVENTS ("tool_description",
+                   "list_item", "server_instructions") are what a server says
+                   about itself, and are read with the detector's stricter
+                   "metadata" rules; for "tool_description" each parameter of
+                   the tool is also read on its own.
         log_clean: set False to log only when something was found (useful for
                    high-volume traffic such as progress notifications).
         call_id:   the call this is the result of (decision.call_id from
                    check_call), so that both records share it.
+        foreign_tools: for the metadata events only: names of tools that belong
+                   to OTHER servers (see `foreign_tool_names`). A description
+                   that gives orders about one of them is reported as tool
+                   shadowing. Never pass the scanned server's own tool names.
 
-        A clean result does not set flow marks: call `mark_delivered` once it
-        is certain the result reaches the agent.
+        The base64 "data" of image and audio content is not decoded by the
+        detector (it is still scanned as text). A clean result does not set
+        flow marks: call `mark_delivered` once it is certain the result
+        reaches the agent.
         """
         if isinstance(content, str):
             views = [content]
@@ -369,7 +394,14 @@ class Firewall:
                     call_id=call_id,
                 )
 
-        findings = scan_views(views)
+        metadata = event in METADATA_EVENTS
+        findings = scan_views(
+            views,
+            profile=METADATA if metadata else RESULT,
+            parameters=tool_parameters(content) if event == "tool_description" else None,
+            foreign_tools=foreign_tools if metadata else (),
+            skip_decoding=() if isinstance(content, str) else media_payloads(content),
+        )
         worst = max_severity(findings)
         threshold = self.policy.block_severity
         rules = ", ".join(f.rule for f in findings)
@@ -483,6 +515,23 @@ class Firewall:
         if blocked is not None:
             raise BlockedError(blocked)
         return self._checked_result(tool, result, call_id)
+
+    def foreign_tool_names(self, own_tools: Iterable[str] = ()) -> frozenset[str]:
+        """The tool names the policy writes out in full, minus `own_tools`: for scan_result's `foreign_tools`.
+
+        A policy that covers several servers names their sensitive tools
+        ("send_email"); a description from this server that gives orders about
+        one of them is tool shadowing. Pass the names in the server's own tool
+        list as `own_tools`: its tools refer to each other all the time.
+        Wildcard rules ("delete_*") and method names ("resources/read",
+        "prompts/get") are left out. Add the names of other servers' tools
+        (from their pins) when the caller knows them.
+        """
+        if isinstance(own_tools, (str, bytes)):
+            raise TypeError("own_tools must be a collection of tool names, not one text")
+        own = {name for name in own_tools if isinstance(name, str)}
+        named = (rule.name for rule in self.policy.tools if not rule.is_glob and "/" not in rule.name)
+        return frozenset(name for name in named if name not in own)
 
     # ---- flow labels and session marks ----------------------------------------
 

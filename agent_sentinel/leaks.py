@@ -16,6 +16,12 @@ Two uses, with different needs:
   * `redact` and `redact_value` clean what goes into the audit log. There a
     false alarm costs nothing, so they remove more.
 
+Both read through simple disguises: percent-encoding (up to three rounds),
+and base64 or hex, one level deep and within fixed limits (see
+`_MAX_ENCODED_RUNS`): a hijacked agent can wrap a key in either to get it past
+a pattern. A key encoded twice, split up, or placed after enough other encoded
+runs to use up the limits still passes.
+
 Adding a pattern: anchor it on a literal prefix and give it explicit length
 bounds. Do not use "\\b": an underscore, or the "n" of a written-out "\\n",
 counts as a word character and would hide a token that follows it. A prefix
@@ -28,6 +34,8 @@ from __future__ import annotations
 import re
 from typing import Any, Callable
 from urllib.parse import unquote
+
+from .textutil import EncodedRuns
 
 _NOT_AFTER = r"(?<![A-Za-z0-9])"  # the token does not continue a longer word
 _NOT_BEFORE = r"(?![A-Za-z0-9])"
@@ -66,12 +74,22 @@ _KEY_MATERIAL_REACH = 300
 _DECODE_ROUNDS = 3
 _PERCENT_ESCAPE = re.compile("%[0-9A-Fa-f]{2}")
 
+# Base64 and hex runs decoded per call of find_secrets or redact: at most this
+# many runs, and this many decoded bytes in all (see textutil.EncodedRuns).
+_MAX_ENCODED_RUNS = 64
+_MAX_DECODED_BYTES = 64 * 1024
+# Shorter than the detector's minimum lengths, because one key is short: an
+# AWS access key is 28 characters of base64 and 40 of hex.
+_MIN_BASE64_CHARS = 24
+_MIN_HEX_CHARS = 40
+
 
 def find_secrets(text: str) -> list[str]:
     """Return the kinds of secret found in `text`, each kind once.
 
     Percent-decoded spellings are read too: in a URL the character before a
     token is often "%20" or "%3D", which would otherwise glue it to a word.
+    So are base64 and hex runs, decoded once (see the module docstring).
     """
     kinds: list[str] = []
     for spelling in _spellings(text):
@@ -87,7 +105,18 @@ def _spellings(text: str) -> list[str]:
         if not _PERCENT_ESCAPE.search(spellings[-1]):
             break
         spellings.append(unquote(spellings[-1], errors="replace"))
+    decoder = _decoder()
+    for spelling in list(spellings):
+        spellings.extend(run.text for run in decoder.decoded(spelling))
     return spellings
+
+
+def _decoder() -> EncodedRuns:
+    """A decoder of base64 and hex runs with the limits of one call."""
+    return EncodedRuns(
+        max_attempts=_MAX_ENCODED_RUNS, max_kept=_MAX_ENCODED_RUNS, max_bytes=_MAX_DECODED_BYTES,
+        min_base64_chars=_MIN_BASE64_CHARS, min_hex_chars=_MIN_HEX_CHARS,
+    )
 
 
 def _kinds_in(text: str) -> list[str]:
@@ -110,7 +139,16 @@ def _holds_a_private_key(text: str) -> bool:
 
 
 def redact(text: str) -> str:
-    """Replace every secret in `text` with a marker such as ``[redacted GitHub token]``."""
+    """Replace every secret in `text` with a marker such as ``[redacted GitHub token]``.
+
+    A base64 or hex run that decodes to a secret is replaced whole, with a
+    marker such as ``[redacted GitHub token (base64)]``.
+    """
+    return _redact_encoded(_redact_plain(text))
+
+
+def _redact_plain(text: str) -> str:
+    """Replace the secrets written out in `text`."""
     text = _redact_private_keys(text)
     for kind, pattern, accept in _TOKEN_PATTERNS:
         marker = f"[redacted {kind}]"
@@ -118,6 +156,17 @@ def redact(text: str) -> str:
             text = pattern.sub(marker, text)
         else:
             text = pattern.sub(lambda match: marker if accept(match.group()) else match.group(), text)
+    return text
+
+
+def _redact_encoded(text: str) -> str:
+    """Replace each base64 or hex run in `text` whose decoded text holds a secret. One level only."""
+    if len(text) < _MIN_BASE64_CHARS:
+        return text
+    for run in _decoder().decoded(text):
+        if _redact_plain(run.text) != run.text:
+            kinds = _kinds_in(run.text)
+            text = text.replace(run.run, f"[redacted {kinds[0] if kinds else 'secret'} ({run.kind})]")
     return text
 
 

