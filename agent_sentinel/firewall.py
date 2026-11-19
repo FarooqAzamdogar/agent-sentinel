@@ -268,6 +268,7 @@ class Firewall:
         server_name: str | None = None,
         session_id: str | None = None,
         session_store: SessionStore | None = None,
+        rate_limiter: Any = None,
     ) -> None:
         """
         monitor:       record what the policy and the detector WOULD block (audit
@@ -283,6 +284,12 @@ class Firewall:
         session_store: where the marks of flow rules are kept (see session.py).
                        Default: a new MemorySessionStore, so the session lasts as
                        long as this Firewall. Hook mode passes a FileSessionStore.
+        rate_limiter:  where calls are counted for the rate limits. Default: in
+                       memory, for this Firewall alone. Hook mode, where every
+                       call is checked by a new process, passes one that keeps
+                       the counts in a file (hook_state.FileRateLimiter). It needs
+                       one method, over_limit(limits, now) -> the name of a full
+                       bucket, or None after counting the call in every bucket.
         """
         if server_name is not None and (not isinstance(server_name, str) or not SERVER_NAME.fullmatch(server_name)):
             raise ValueError("server_name must be 1 to 64 letters, digits, '_', '-' or '.'")
@@ -298,7 +305,7 @@ class Firewall:
         self.server_name = server_name
         self.session_id = session_id if session_id is not None else token_hex(8)
         self.session_store: SessionStore = session_store if session_store is not None else MemorySessionStore()
-        self._limiter = _RateLimiter()
+        self._limiter = rate_limiter if rate_limiter is not None else _RateLimiter()
         self._audit_lock = threading.Lock()
         self._audit_failed = False
         # Guards the two collections below; each check takes it only briefly.

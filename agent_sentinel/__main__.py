@@ -1,202 +1,80 @@
 """Command line for agent-sentinel.
 
     agent-sentinel proxy --policy policy.json -- <mcp server command...>
-    agent-sentinel scan [FILE]          scan text (or stdin) for prompt injection
-    agent-sentinel validate POLICY      check that a policy file is well formed
-    agent-sentinel report AUDIT_LOG     summarize an audit log
+    agent-sentinel init --template starter              write a first policy (or: init -- <server command>)
+    agent-sentinel inspect -- <server command>          list a server's tools and what the proxy would do
+    agent-sentinel clients                              list the MCP client configurations on this machine
+    agent-sentinel wrap --client NAME --policy POLICY   put the proxy in front of a client's servers
+    agent-sentinel unwrap --client NAME                 take it out again
+    agent-sentinel doctor                               check that every server is protected
+    agent-sentinel hook install claude-code --policy P  enforce the policy inside Claude Code (its hooks)
+    agent-sentinel check POLICY TOOL [name=value ...]   try one call against a policy
+    agent-sentinel test POLICY CASES.json               run a policy's test cases (for CI)
+    agent-sentinel validate POLICY                      check that a policy file is well formed
+    agent-sentinel scan [FILE ...]                      scan text (or stdin) for prompt injection
+    agent-sentinel report AUDIT_LOG                     summarize an audit log
+    agent-sentinel explain AUDIT_LOG [--ref REF]        say why calls were blocked, and how to allow them
+    agent-sentinel suggest AUDIT_LOG --policy POLICY    draft rules from a monitor-mode log
+    agent-sentinel demo                                 see the firewall and the proxy at work
 
-Everything printed here may contain untrusted text (file contents, tool names
-from an audit log), so it goes through `printable` first.
+This module only builds the argument parser and hands each command to the
+module that does its work, agent_sentinel/cli_<command>.py (see cli_common.py
+for what such a module provides). The proxy parses its own arguments, in
+mcp_proxy.py. A command module that sets TAKES_SERVER_COMMAND gets what
+follows the first "--" as `args.server_command`, word for word.
+
+Everything printed may contain untrusted text (file contents, tool names
+from an audit log), so the command modules pass it through `printable` first.
 """
 
 from __future__ import annotations
 
 import argparse
-import codecs
-import json
 import sys
-from collections import Counter
-from pathlib import Path
 
-from . import __version__, mcp_proxy
-from .detector import scan_views
-from .policy import Policy, PolicyError
-from .policy_errors import file_error_message
+from . import (
+    __version__,
+    cli_check,
+    cli_clients,
+    cli_demo,
+    cli_doctor,
+    cli_explain,
+    cli_hook,
+    cli_init,
+    cli_inspect,
+    cli_report,
+    cli_scan,
+    cli_suggest,
+    cli_test,
+    cli_unwrap,
+    cli_validate,
+    cli_wrap,
+    mcp_proxy,
+)
+from .cli_common import EXIT_ERROR, CommandError, print_error
 from .textutil import printable
 
-# Byte order marks, longest first: the UTF-32-LE mark begins with the UTF-16-LE one.
-_BYTE_ORDER_MARKS = (
-    (codecs.BOM_UTF32_LE, "utf-32"),
-    (codecs.BOM_UTF32_BE, "utf-32"),
-    (codecs.BOM_UTF8, "utf-8-sig"),
-    (codecs.BOM_UTF16_LE, "utf-16"),
-    (codecs.BOM_UTF16_BE, "utf-16"),
+# The commands, in the order --help lists them: name and the module that runs it.
+_COMMANDS = (
+    ("init", cli_init),
+    ("inspect", cli_inspect),
+    ("clients", cli_clients),
+    ("wrap", cli_wrap),
+    ("unwrap", cli_unwrap),
+    ("doctor", cli_doctor),
+    ("hook", cli_hook),
+    ("check", cli_check),
+    ("test", cli_test),
+    ("validate", cli_validate),
+    ("scan", cli_scan),
+    ("report", cli_report),
+    ("explain", cli_explain),
+    ("suggest", cli_suggest),
+    ("demo", cli_demo),
 )
 
-
-def _readings(data: bytes) -> list[str]:
-    """The ways a file's bytes may be read as text. All of them are scanned.
-
-    Always as UTF-8, which is what most programs assume. Also as the encoding
-    a byte order mark announces, and as UTF-16 when the NUL bytes suggest it:
-    a UTF-16 file has a NUL beside every letter. Guessing ONE encoding would
-    be a way to hide text: two bytes that look like a UTF-16 mark in front of
-    ordinary UTF-8 would make the scanner read noise where another program
-    reads the words.
-    """
-    readings = [data.decode("utf-8", errors="replace")]
-    for mark, encoding in _BYTE_ORDER_MARKS:
-        if data.startswith(mark):
-            readings.append(data.decode(encoding, errors="replace"))
-    sample = data[:2000]
-    if len(sample) >= 4 and sample.count(0) >= len(sample) // 4:
-        readings.append(data.decode("utf-16-le", errors="replace"))
-        readings.append(data.decode("utf-16-be", errors="replace"))
-    return list(dict.fromkeys(readings))
-
-
-def _scan(args: argparse.Namespace) -> int:
-    data = sys.stdin.buffer.read() if args.file in (None, "-") else Path(args.file).read_bytes()
-    findings = scan_views(_readings(data))
-    if not findings:
-        print("No injection patterns found. (Pattern rules only: this is not proof the text is safe.)")
-        return 0
-    for finding in findings:
-        print(f"[{finding.severity.upper():6}] {finding.rule}: {printable(finding.excerpt)}")
-    return 1
-
-
-def _validate(args: argparse.Namespace) -> int:
-    try:
-        policy = Policy.from_file(args.policy)
-    except (OSError, PolicyError) as exc:
-        message = file_error_message(args.policy, exc) if isinstance(exc, OSError) else str(exc)
-        # Line by line: a JSON error shows the line of the file with a caret under the mistake.
-        lines = message.splitlines() or [""]
-        print(f"Invalid policy: {printable(lines[0], limit=1000)}", file=sys.stderr)
-        for line in lines[1:]:
-            print(printable(line, limit=1000), file=sys.stderr)
-        return 2
-    print(f"Policy is valid. Default action: {policy.default}. Blocks injection findings at: {policy.block_severity}.")
-    print(f"Secrets in tool arguments: {policy.secrets_in_arguments}.", end=" ")
-    print(f"Policy-wide deny rules: {len(policy.deny_args)}.", end=" ")
-    limit = policy.max_calls_per_minute
-    print(f"Limit for all tools: {f'{limit} call(s) per minute' if limit else 'none'}.")
-    for rule in policy.tools:
-        notes = []
-        if rule.deny_args:
-            notes.append(f"{len(rule.deny_args)} deny rule(s)")
-        if rule.allow_args:
-            notes.append(f"{len(rule.allow_args)} allow rule(s)")
-        if rule.other_args == "block":
-            notes.append("other arguments blocked")
-        if rule.max_calls_per_minute:
-            notes.append(f"{rule.max_calls_per_minute} call(s) per minute")
-        if rule.labels:
-            notes.append(f"labels {', '.join(rule.labels)}")
-        print(f"  {printable(rule.name):24} {rule.action:6} {', '.join(notes)}")
-    _print_new_settings(policy)
-    for warning in policy.warnings():
-        print(f"Warning: {printable(warning)}")
-    return 0
-
-
-def _print_new_settings(policy: Policy) -> None:
-    """The settings added in 0.5, each only when the policy uses it, so older policies print as before.
-
-    Canary strings and the values of known secrets are never printed: an agent
-    that reads this output (in a log, a chat) could strip them from what it sends.
-    """
-    extra = []
-    if policy.secrets_in_results != "off":
-        extra.append(f"Secrets in tool results: {policy.secrets_in_results}.")
-    if policy.secrets_patterns:
-        extra.append(f"Custom secret formats: {', '.join(printable(p.name) for p in policy.secrets_patterns)}.")
-    if policy.secrets_known_values_from_env:
-        extra.append(f"Values never sent, from the environment: {', '.join(policy.secrets_known_values_from_env)}.")
-    if policy.secrets_canaries:
-        extra.append(f"Canaries: {len(policy.secrets_canaries)}.")
-    if extra:
-        print(" ".join(extra))
-    if policy.flows:
-        print("Flow rules:")
-        for index, flow in enumerate(policy.flows):
-            print(f"  flows[{index}]  {flow.describe()}")
-        if policy.classify_by_annotations:
-            print("  MCP tool annotations add labels: openWorldHint -> untrusted, sink; destructiveHint -> sink.")
-    if policy.client_requests is not None:
-        rules = ", ".join(f"{printable(rule.name)} {rule.action}" for rule in policy.client_requests) or "none"
-        print(f"Client requests: {rules}.")
-    if policy.checks_prompts:
-        print("prompts/get is checked like a tool call named 'prompts/get'.")
-    if policy.hide_blocked_tools:
-        hidden = [printable(rule.name) for rule in policy.tools if policy.tool_level_action(rule.name) == "block"]
-        if policy.default == "block":
-            hidden.append("every tool without a rule")
-        print(f"Hidden from the tool list (blocked outright): {', '.join(hidden) or 'none'}.")
-
-
-_ACTIONS = ("allow", "block", "would_block")
-
-
-def _read_audit(path: str) -> tuple[list[dict], int]:
-    records, unreadable = [], 0
-    with Path(path).open(encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except (ValueError, RecursionError):  # not JSON, or nested absurdly deep
-                record = None
-            if isinstance(record, dict):
-                records.append(record)
-            else:
-                unreadable += 1
-    return records, unreadable
-
-
-def _report(args: argparse.Namespace) -> int:
-    records, unreadable = _read_audit(args.audit)
-    # Said first and plainly: a line that cannot be read may be a record someone wanted hidden.
-    if unreadable:
-        print(f"WARNING: {unreadable} line(s) of the log could not be read and are not counted below.")
-    if not records:
-        print("The audit log has no readable records.")
-        return 0
-
-    def field(record: dict, name: str, limit: int = 200) -> str:
-        return printable(record.get(name, "?"), limit=limit)
-
-    def action(record: dict) -> str:
-        value = record.get("action")
-        return value if value in _ACTIONS else "other"  # anything unexpected still gets counted
-
-    def table(title: str, records: list[dict], key: str, first_column: str) -> None:
-        counts = Counter((field(r, key, 40), action(r)) for r in records)
-        print(f"\n{title:40} {first_column:>8} {'blocked':>8} {'would block':>12} {'other':>6}")
-        for name in sorted({name for name, _ in counts}):
-            row = [counts[(name, a)] for a in (*_ACTIONS, "other")]
-            print(f"{name:40} {row[0]:>8} {row[1]:>8} {row[2]:>12} {row[3]:>6}")
-
-    print(f"{len(records)} records from {field(records[0], 'time')} to {field(records[-1], 'time')}")
-
-    # Only "call" records are tool calls. Scan records are labelled by text the
-    # server chose, so mixing them in would let a server invent "allowed" rows.
-    calls = [r for r in records if r.get("event") == "call"]
-    if calls:
-        table("Tool calls", calls, "tool", "allowed")
-    checks = [r for r in records if r.get("event") != "call"]
-    if checks:
-        table("Content checks, by kind", checks, "event", "passed")
-
-    blocked = [r for r in records if action(r) in ("block", "would_block")]
-    shown = blocked[-args.last :] if args.last > 0 else []
-    if shown:
-        print(f"\nLast {len(shown)} blocked:")
-        for record in shown:
-            print(f"  {field(record, 'time')}  {field(record, 'event')}  {field(record, 'tool')}: {field(record, 'reason')}")
-    return 0
+# Exit code for a command stopped with Ctrl+C, as shells report it.
+_EXIT_INTERRUPTED = 130
 
 
 def _make_output_safe() -> None:
@@ -206,38 +84,70 @@ def _make_output_safe() -> None:
             stream.reconfigure(errors="backslashreplace")
 
 
+def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
+    """The parser, and the parser of each command (for error messages that show the command's usage)."""
+    parser = argparse.ArgumentParser(prog="agent-sentinel", description="A firewall for AI agent tool calls.")
+    parser.add_argument("--version", action="version", version=f"agent-sentinel {__version__}")
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    commands.add_parser("proxy", help="run an MCP server behind the firewall (see: proxy --help)")
+    command_parsers = {}
+    for name, module in _COMMANDS:
+        command = commands.add_parser(
+            name,
+            help=module.HELP,
+            usage=getattr(module, "USAGE", None),
+            description=getattr(module, "DESCRIPTION", None) or module.HELP,
+            epilog=getattr(module, "EPILOG", None),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        module.add_arguments(command)
+        command.set_defaults(func=module.run, module=module)
+        command_parsers[name] = command
+    return parser, command_parsers
+
+
+def _split_server_command(argv: list[str]) -> tuple[list[str], list[str] | None]:
+    """Split "COMMAND [options] -- server words..." at the first "--", for the commands that start a server.
+
+    argparse treats "--" differently from one Python version to the next, and
+    the server's own words (its options, a second "--") must reach it exactly
+    as written. None when there is no "--" or the command takes no server command.
+    """
+    takes = {name for name, module in _COMMANDS if getattr(module, "TAKES_SERVER_COMMAND", False)}
+    if argv[:1] and argv[0] in takes and "--" in argv:
+        at = argv.index("--")
+        return argv[:at], argv[at + 1:]
+    return argv, None
+
+
 def main(argv: list[str] | None = None) -> int:
     _make_output_safe()
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["proxy"]:  # the proxy parses its own arguments, including the '--' part
         mcp_proxy.exit_process(mcp_proxy.main(argv[1:]))  # does not return: see exit_process for why
 
-    parser = argparse.ArgumentParser(prog="agent-sentinel", description="A firewall for AI agent tool calls.")
-    parser.add_argument("--version", action="version", version=f"agent-sentinel {__version__}")
-    commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("proxy", help="run an MCP server behind the firewall (see: proxy --help)")
-
-    scan_cmd = commands.add_parser("scan", help="scan a text file (or stdin) for prompt injection")
-    scan_cmd.add_argument("file", nargs="?", help="file to scan; omit or use '-' for stdin")
-    scan_cmd.set_defaults(func=_scan)
-
-    validate_cmd = commands.add_parser("validate", help="check a policy file")
-    validate_cmd.add_argument("policy")
-    validate_cmd.set_defaults(func=_validate)
-
-    report_cmd = commands.add_parser("report", help="summarize an audit log")
-    report_cmd.add_argument("audit")
-    report_cmd.add_argument("--last", type=int, default=10, help="how many recent blocks to list (default 10)")
-    report_cmd.set_defaults(func=_report)
-
-    args = parser.parse_args(argv)
+    parser, command_parsers = _build_parser()
+    argv, server_command = _split_server_command(argv)
+    # parse_known_args, so that `check` can take name=value arguments after its options as
+    # well as before them (argparse alone would refuse "check p.json tool --proxy a=1").
+    args, extras = parser.parse_known_args(argv)
     if not hasattr(args, "func"):  # "proxy" reached here because something came before it, such as "--"
         parser.error("write 'proxy' first: agent-sentinel proxy --policy FILE -- COMMAND")
+    if getattr(args.module, "TAKES_SERVER_COMMAND", False):
+        args.server_command = server_command
+    take_extras = getattr(args.module, "take_extra_arguments", None)
+    if extras and (take_extras is None or not take_extras(args, extras)):
+        command_parsers[args.command].error(f"unrecognized arguments: {printable(' '.join(extras), limit=200)}")
     try:
         return args.func(args)
+    except CommandError as exc:
+        print_error(str(exc))
+        return EXIT_ERROR
     except OSError as exc:
-        print(f"agent-sentinel: {printable(exc)}", file=sys.stderr)
-        return 2
+        print_error(f"{exc.strerror or type(exc).__name__}: {exc.filename}" if exc.filename else str(exc))
+        return EXIT_ERROR
+    except KeyboardInterrupt:
+        return _EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":
