@@ -145,7 +145,8 @@ class Marks(TempFolderTest):
                 self.assertNotIn("\x1b", err)
 
     def test_marks_with_a_policy_that_has_no_flows_say_so(self):
-        _, out, _ = check(EXAMPLE, "read_file", "path=a", "--marks", "untrusted")
+        policy = self.write("no-flows.json", {"tools": {"read_file": "allow"}})
+        _, out, _ = check(policy, "read_file", "path=a", "--marks", "untrusted")
         self.assertIn("no flow rules, so --marks changes nothing", out)
 
 

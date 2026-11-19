@@ -5,15 +5,16 @@
     { "arg": "*", "pattern": "(^|[\\\\/:])\\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\\b|id_(rsa|dsa|ecdsa|ed25519)|(^|[\\\\/:])(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]|(^|[\\\\/:])(\\.config|config~[0-9]+)[\\\\/](gh|gcloud|github-copilot)\\b|(^|[\\\\/])proc[\\\\/][^\\\\/]+[\\\\/]environ\\b|claude_desktop_config\\.json|(^|[\\\\/:])\\.claude\\.json\\b|(^|[\\\\/:])\\.(cursor|vscode)[\\\\/]mcp\\.json\\b|[\\\\/]code[\\\\/]user[\\\\/]mcp\\.json\\b" }
   ],
   "tools": {
-    "read_file": "allow",
-    "fetch_page": "allow",
+    "read_file": { "action": "allow", "labels": ["private"] },
+    "fetch_page": { "action": "allow", "labels": ["untrusted"] },
     "search_*": "allow",
     "send_email": {
       "action": "ask",
+      "labels": ["sink"],
       "allow_args": [
-        { "arg": "to", "pattern": "[^@\\s,;]+@example\\.com" },
-        { "arg": "cc", "pattern": "[^@\\s,;]+@example\\.com", "optional": true },
-        { "arg": "bcc", "pattern": "[^@\\s,;]+@example\\.com", "optional": true },
+        { "arg": "to", "type": "email", "domains": ["example.com"] },
+        { "arg": "cc", "type": "email", "domains": ["example.com"], "optional": true },
+        { "arg": "bcc", "type": "email", "domains": ["example.com"], "optional": true },
         { "arg": "subject", "pattern": "(?s).*", "optional": true },
         { "arg": "body", "pattern": "(?s).*", "optional": true }
       ],
@@ -24,6 +25,9 @@
     "run_shell": "block",
     "resources/read": "allow"
   },
+  "flows": [
+    { "after": ["untrusted", "private"], "then": "sink", "action": "block" }
+  ],
   "server_requests": {
     "sampling/createMessage": "block",
     "*": "allow"
@@ -32,7 +36,12 @@
     "block_severity": "high"
   },
   "secrets": {
-    "in_arguments": "block"
+    "in_arguments": "block",
+    "in_results": "redact",
+    "canaries": ["sentinel-canary-5d81e2"],
+    "patterns": [
+      { "name": "Example Corp token", "prefix": "exc_", "charset": "alnum", "min_len": 32, "max_len": 40 }
+    ]
   },
   "limits": {
     "max_calls_per_minute": 120

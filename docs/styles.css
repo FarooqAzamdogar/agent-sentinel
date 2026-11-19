@@ -2549,6 +2549,16 @@ h3 {
   --shadow: var(--pink);
 }
 
+/* The third row: no card shares its color with the one above it. */
+.usecases .card:nth-child(5) {
+  --tile: var(--cyan);
+  --shadow: var(--cyan);
+}
+
+.usecases .card:nth-child(6) {
+  --tile: var(--mint);
+}
+
 .usecases .card p {
   line-height: 1.75;
 }

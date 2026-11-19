@@ -229,7 +229,8 @@ class TheStartupSummary(unittest.TestCase):
         self.assertIn("  name      files", text)
         self.assertIn(f"  policy    {EXAMPLE_POLICY_PATH}: default block, 7 tool rule(s) (4 allow, 1 ask, 2 block)",
                       text)
-        self.assertIn("1 policy-wide deny rule(s), at most 120 calls a minute, injections blocked from high", text)
+        self.assertIn("1 policy-wide deny rule(s), 1 flow rule(s), at most 120 calls a minute, injections blocked from "
+                      "high", text)
         self.assertIn(f"  audit     {ROOT / 'audit.jsonl'}", text)
         self.assertIn("  pins      in memory", text)
         self.assertIn("  server    /usr/bin/node server.js", text)

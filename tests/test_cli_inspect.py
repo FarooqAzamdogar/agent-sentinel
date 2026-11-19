@@ -246,7 +246,8 @@ class TheInspectCommand(IsolatedHomeTest):
         report = json.loads(out)
         tools = {tool["name"]: tool for tool in report["tools"]}
         self.assertEqual(tools["read_file"]["policy"], {
-            "action": "allow", "rules": ["tools.read_file"], "hidden": False, "argument_rules": False, "labels": [],
+            "action": "allow", "rules": ["tools.read_file"], "hidden": False, "argument_rules": False,
+            "labels": ["private"],
         })
         self.assertFalse(tools["search_notes"]["reaches_agent"])
         self.assertNotIn("policy", tools["search_notes"])
