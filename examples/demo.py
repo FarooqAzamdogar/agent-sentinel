@@ -1,9 +1,14 @@
 """Demo: a pretend agent makes six tool calls through the firewall.
 
 Run from the project folder:   python examples/demo.py
+
+The audit log goes to a new temporary folder, not the project folder. For a
+fuller demo that also runs the MCP proxy, and works without a copy of the
+project: agent-sentinel demo
 """
 
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,7 +49,7 @@ def approve(tool, args, reason):
 
 
 def main():
-    audit = ROOT / "audit.jsonl"
+    audit = Path(tempfile.mkdtemp(prefix="agent-sentinel-example-")) / "audit.jsonl"
     firewall = Firewall(Policy.from_file(ROOT / "policy.example.json"), audit_path=audit, approver=approve)
 
     calls = [
