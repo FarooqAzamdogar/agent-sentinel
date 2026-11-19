@@ -27,6 +27,12 @@ def call(msg_id, name, arguments):
     return request(msg_id, "tools/call", {"name": name, "arguments": arguments})
 
 
+def initialize(msg_id, version="2025-06-18", capabilities=None):
+    """The request that opens a session in the legacy protocol (2024-11-05 to 2025-11-25)."""
+    params = {"protocolVersion": version, "capabilities": capabilities or {}}
+    return request(msg_id, "initialize", dict(params, clientInfo={"name": "test", "version": "0"}))
+
+
 def reply(msg_id, result):
     return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
@@ -194,13 +200,13 @@ class ProxyUnitTests(unittest.TestCase):
     # ---- everything else the server sends -----------------------------------
 
     def test_poisoned_server_instructions_are_removed(self):
-        result = {"serverInfo": {"name": "files"}, "instructions": INJECTION}
-        delivered = self.h.round_trip(request(1, "initialize"), result)
-        self.assertEqual(delivered["result"], {"serverInfo": {"name": "files"}})
+        result = {"protocolVersion": "2025-06-18", "serverInfo": {"name": "files"}, "instructions": INJECTION}
+        delivered = self.h.round_trip(initialize(1), result)
+        self.assertEqual(delivered["result"], {"protocolVersion": "2025-06-18", "serverInfo": {"name": "files"}})
 
     def test_clean_server_instructions_are_kept(self):
-        result = {"serverInfo": {"name": "files"}, "instructions": "Use read_file for text files."}
-        self.assertEqual(self.h.round_trip(request(1, "initialize"), result)["result"], result)
+        result = {"protocolVersion": "2025-06-18", "serverInfo": {"name": "files"}, "instructions": "Use read_file."}
+        self.assertEqual(self.h.round_trip(initialize(1), result)["result"], result)
 
     def test_any_other_reply_is_scanned_too(self):
         delivered = self.h.round_trip(request(1, "completion/complete"), {"completion": {"values": [INJECTION]}})
@@ -300,7 +306,7 @@ class ProxyEndToEndTests(unittest.TestCase):
 
     def test_a_whole_session(self):
         replies, stderr = self.run_proxy([
-            request(1, "initialize"),
+            initialize(1),
             request(2, "tools/list"),
             call(3, "read_file", {"path": "notes.txt"}),
             call(4, "delete_file", {"path": "notes.txt"}),
