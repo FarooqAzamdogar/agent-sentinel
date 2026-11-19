@@ -1,0 +1,26 @@
+{
+ "id": "env_file_in_result_blocked",
+ "source": "https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/",
+ "about": "The same with secrets.in_results 'block': the whole result is withheld.",
+ "surface": "result",
+ "policy": {
+  "default": "allow",
+  "secrets": {
+   "in_results": "block"
+  }
+ },
+ "content": {
+  "content": [
+   {
+    "type": "text",
+    "text": "OPENAI_API_KEY=sk-proj-Xy7Kq2Lm9Np4Rs6Tv8Wz1Ab3Cd5Ef7Gh9Jk2Mn4Pq6Rt8Uv0Wx2Yz4\nGITHUB_TOKEN=ghp_a1B2c3D4e5a1B2c3D4e5a1B2c3D4e5a1B2c3D4e5\nDEBUG=false\n"
+   }
+  ]
+ },
+ "expect": {
+  "outcome": "stopped",
+  "rule": "secrets.in_results",
+  "worst": null,
+  "rules": []
+ }
+}

@@ -20,18 +20,55 @@ not match the text as it arrived. `_normalize` builds a *matching view*:
 None of that removes anything a reader can see. Undoing an encoding does:
 it takes characters away, and taking the wrong ones away would hide a phrase
 instead of revealing it ("\\never tell the user" must not lose its "n"). So
-those steps go into a second, *decoded* view, and a rule may match in either:
+those steps go into further, *decoded* views, and a rule may match in any:
 
   * percent-encoding and HTML character references are decoded, HTML tags
     and terminal escape sequences are removed (`_decode`);
   * "_" and the written-out escapes \\n, \\t and \\r become a space
     (`_unglue`), because snake_case, _markdown emphasis_ and JSON kept inside
-    a string otherwise glue a trigger word to its neighbour.
+    a string otherwise glue a trigger word to its neighbour;
+  * Unicode tag characters are read as the ASCII they copy (`textutil.decode_tags`):
+    a model reads a sentence written in them although a person sees nothing;
+  * runs of base64 and hex are decoded, one level deep and within fixed
+    limits (`textutil.EncodedRuns`): at most 64 runs tried, 16 kept and
+    64 KiB decoded per scan. Runs placed in front of a payload can use those
+    limits up, so a payload can still pass this way.
 
-The chain rules are matched against both views in lowercase; the decoded view
-is skipped when it is the same as the plain one. `scan_views` merges the
-findings for several texts that describe one value, such as the views
+The chain rules are matched against every view in lowercase; a view that is
+the same as one already matched is skipped. A finding made in the tag view or
+in a decoded run has an excerpt that starts with "[tags]", "[base64]" or
+"[hex]", so the audit log says where the text came from. `scan_views` merges
+the findings for several texts that describe one value, such as the views
 `textutil.text_views` makes of a tool result.
+
+Profiles
+--------
+Text a tool returns can say anything: a web page may well tell its reader to
+"always use the search box" or to "read the .env file". A tool's description
+should only describe the tool. So the rules come in two profiles:
+
+  * "result" (the default): the rules in `_RULES`, for tool results and
+    anything else;
+  * "metadata": those rules plus `_METADATA_RULES`, for what a server says
+    about itself: tool descriptions, list entries, server instructions. They
+    know the published ways of poisoning a tool description.
+
+In metadata only COMBINATIONS are high: a concealment phrase ("do not mention
+this ... to the user"), and an order to put the content of a credential file
+or the conversation into an argument the tool has, or a parameter that asks
+for them. Preference wording ("always use this tool instead of other tools"),
+call ordering ("call this tool first"), authority tags ("<IMPORTANT>") and the
+like are low or medium, which by default is only logged: harmless descriptions
+use them too.
+
+Two checks need more than the text, and run only when the caller supplies it:
+the parameters of a tool (`scan_views(parameters=...)`), whose names and
+descriptions are read on their own; and the names of tools that belong to
+OTHER servers (`foreign_tools=...`). A description that gives orders about
+such a tool ("whenever send_email is used, always bcc ...") is "tool
+shadowing". References between a server's own tools are normal and are never
+flagged: the caller passes only names from elsewhere (the policy, other
+servers' pins).
 
 How a rule works
 ----------------
@@ -51,30 +88,49 @@ longer. Each rule runs its patterns over a view once; after that the chain match
 looks matches up in an index (see `_Occurrences`) and rarely has to search
 again. It counts its work and gives up at `_SCAN_BUDGET`: the text is then
 reported as a high `unscannable_content` finding, never passed as clean.
+Decoding has its own fixed limits (see above).
 
 Adding a rule
 -------------
-Add a `_rule(...)` entry to `_RULES` and a test to tests/test_detector.py,
-including a harmless sentence that must NOT match and a repetitive input in
-HostileInputIsScannedQuickly. Keep "high" rules narrow: by default high
-findings block content. Write patterns for the views they are matched in:
-lowercase, single spaces, plain apostrophes. A rule's first pattern is
-written without a leading "\\b" (see `_first_matches`).
+Add a `_rule(...)` entry to `_RULES` (or `_METADATA_RULES`) and a test to
+tests/test_detector.py, including a harmless sentence that must NOT match and
+a repetitive input in HostileInputIsScannedQuickly. Keep "high" rules narrow:
+by default high findings block content, and in metadata they remove a tool
+for the life of the proxy; a metadata rule must also keep every description in
+tests/attack_corpus/benign_tool_metadata.json below high. Write patterns for
+the views they are matched in: lowercase, single spaces, plain apostrophes. A
+rule's first pattern is written without a leading "\\b" (see `_first_matches`).
+Rules that share a name must share a severity.
 """
 
 from __future__ import annotations
 
 import bisect
 import html
+import itertools
 import re
 import unicodedata
 import urllib.parse
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 
-from .textutil import FIELD_BREAK
+from .textutil import (
+    FIELD_BREAK,
+    MAX_PARAMETERS,
+    TAG_CHARACTERS,
+    EncodedRuns,
+    decode_tags,
+    smuggled_text,
+    without_flags,
+)
+from .textutil import TERMINAL_ESCAPE as _ANSI_RE
 
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+# The rule sets: see "Profiles" above.
+RESULT = "result"
+METADATA = "metadata"
+PROFILES = (RESULT, METADATA)
 
 
 @dataclass(frozen=True)
@@ -107,7 +163,8 @@ _INVISIBLE_ELSEWHERE = frozenset([
 # Invisible characters with everyday uses: the soft hyphen, the joiners and
 # direction marks of emoji, Arabic, Urdu and Persian, the byte order mark and
 # the emoji variation selectors. Control characters count too: mojibake and
-# terminal output are full of them. On their own these are a low finding.
+# terminal output are full of them. On their own these are a low finding. So
+# are the tag characters of a subdivision flag, such as England's.
 _EVERYDAY_INVISIBLE = frozenset([0x00AD, 0x061C, 0x200C, 0x200D, 0x200E, 0x200F, 0xFEFF, *range(0xFE00, 0xFE10)])
 
 # Letters of other alphabets that are drawn like a Latin letter, by Unicode
@@ -244,13 +301,12 @@ def _normalize(text: str, table: "_Table | None" = None) -> str:
 
 
 # --------------------------------------------------------------------------
-# The decoded view
+# The decoded views
 # --------------------------------------------------------------------------
 
-# Terminal escape sequences: CSI (colors, cursor moves) and OSC (window title,
-# hyperlinks). They are removed whole, because removing only the ESC character
-# leaves "[31m" glued to the next word.
-_ANSI_RE = re.compile(r"\x1b\[[0-?]{0,64}[ -/]{0,8}[@-~]|\x1b\][^\x07\x1b]{0,512}(?:\x07|\x1b\\)")
+# Terminal escape sequences (`_ANSI_RE`, from textutil): CSI (colors, cursor
+# moves) and OSC (window title, hyperlinks). They are removed whole, because
+# removing only the ESC character leaves "[31m" glued to the next word.
 # html.unescape() reads the digits of "&#...;" with int(), which is slow, or
 # raises, once there are thousands of them. No real reference has more than seven.
 _ENDLESS_REFERENCE_RE = re.compile(r"&#[0-9]{8}")
@@ -268,10 +324,10 @@ def _decode(text: str) -> str:
     """Undo, once, the encodings a terminal, a web page or a URL puts on text, which a model reads through.
 
     Terminal escape sequences, percent-encoding, HTML character references
-    and JSON-escaped slashes only: base64, hex and the like are not decoded.
-    Each step is a single pass in this order and none is repeated, so text
-    that needs the same step twice is not fully decoded. HTML tags are removed
-    by the caller, as a separate view.
+    and JSON-escaped slashes only. Each step is a single pass in this order
+    and none is repeated, so text that needs the same step twice is not fully
+    decoded. HTML tags are removed by the caller, as a separate view, and so
+    are tag characters, base64 and hex.
     """
     if "\x1b" in text:
         text = _ANSI_RE.sub("", text)
@@ -297,22 +353,33 @@ def _unglue(view: str) -> str:
     return view if unglued == view else " ".join(unglued.split())
 
 
-def _matching_views(text: str) -> Iterator[str]:
-    """The views of `text` the chain rules are matched in: plain, then decoded if that is different."""
+def _matching_views(text: str, context: "_Context") -> Iterator[tuple[str, str]]:
+    """The views of `text` the chain rules are matched in, each with the marker its excerpts get.
+
+    The plain view first, then each decoded view that differs from those before it.
+    """
     plain = _normalize(text)
-    yield plain
+    yield plain, ""
     seen = {plain}
     decoded = _decode(text)
-    candidates = [_unglue(plain if decoded == text else _normalize(decoded))]
+    candidates = [(_unglue(plain if decoded == text else _normalize(decoded)), "")]
     if "<" in decoded:
-        candidates.append(_unglue(_normalize(_TAG_RE.sub("", decoded))))
+        candidates.append((_unglue(_normalize(_TAG_RE.sub("", decoded))), ""))
     if len(text.translate(_WITHOUT_INVISIBLE)) != len(text):
-        candidates.append(_normalize(text, _FOLD_SPACED))
-        candidates.append(_unglue(_normalize(decoded, _FOLD_SPACED)))
-    for view in candidates:
+        candidates.append((_normalize(text, _FOLD_SPACED), ""))
+        candidates.append((_unglue(_normalize(decoded, _FOLD_SPACED)), ""))
+        if TAG_CHARACTERS.search(text):
+            candidates.append((_unglue(_normalize(decode_tags(text))), "[tags]"))
+    for view, marker in candidates:
         if view not in seen:
             seen.add(view)
-            yield view
+            yield view, marker
+    # Last, and one level only: a decoded run is not decoded again.
+    for run in context.encoded.decoded(text):
+        view = _unglue(_normalize(run.text))
+        if view not in seen:
+            seen.add(view)
+            yield view, f"[{run.kind}]"
 
 
 # --------------------------------------------------------------------------
@@ -334,10 +401,18 @@ class _Rule:
     steps: tuple[_Step, ...]
     one_sentence: bool  # every step must start in the sentence that holds the first one
     unless_after: re.Pattern[str] | None  # the rule does not apply when this matches right before the first step
+    # A last check on where the chain ends: (lowercased view, end, context) -> may the chain end there?
+    accept_end: Callable[[str, int, "_Context"], bool] | None = None
 
 
 def _rule(
-    name: str, severity: str, first: str, *then: tuple[int, str], one_sentence: bool = False, unless_after: str = ""
+    name: str,
+    severity: str,
+    first: str,
+    *then: tuple[int, str],
+    one_sentence: bool = False,
+    unless_after: str = "",
+    accept_end: Callable[[str, int, "_Context"], bool] | None = None,
 ) -> _Rule:
     """Build a rule: a first pattern, then (max_gap, pattern) pairs.
 
@@ -346,7 +421,8 @@ def _rule(
     """
     steps = [_Step(re.compile(first), 0)]
     steps += [_Step(re.compile(pattern), gap) for gap, pattern in then]
-    return _Rule(name, severity, tuple(steps), one_sentence, re.compile(unless_after) if unless_after else None)
+    unless = re.compile(unless_after) if unless_after else None
+    return _Rule(name, severity, tuple(steps), one_sentence, unless, accept_end)
 
 
 _OVERRIDE = r"(ignore|disregard|forget|override)\b"
@@ -363,6 +439,8 @@ _SECRET = (
 # name before the "@" as well ("[\w.+-]+@") is slow on long runs of letters.
 # 63 characters is the longest label the DNS allows.
 _DESTINATION = r"(https?://|\bwww\.|(?<=[\w.+-])@[\w-]{1,63}\.\w)"
+# Who must not be told, in the concealment rules.
+_THE_USER = r"\b(users?|humans?|operators?)\b"
 
 _RULES: tuple[_Rule, ...] = (
     _rule(
@@ -407,10 +485,214 @@ _RULES: tuple[_Rule, ...] = (
     ),
 )
 
+# ---- the metadata profile ----------------------------------------------------
+
+# Files a tool description has no reason to name: those that hold keys,
+# tokens and the client's own configuration. One list for every rule that
+# needs it. Written for every view: "_" may have become a space ("id rsa").
+# Every alternative starts with a literal character, which lets the regex
+# engine skip ahead (see `_first_matches`); where a name must not continue a
+# longer word ("valid rsa", "process.env"), a look-behind AFTER it says so.
+_KEY_FILES = "|".join(rf"id[_ ]{key}\b(?<![a-z0-9]id.{key})" for key in ("rsa", "dsa", "ecdsa", "ed25519"))
+_CREDENTIAL_FILE = (
+    rf"(~/\.ssh\b|\.ssh[/\\]|{_KEY_FILES}|\.env\b(?<![\w.]\.env)"
+    r"|\.aws[/\\]credentials\b|mcp\.json\b|claude[_ ]desktop[_ ]config\b"
+    r"|\.cursor[/\\]|\.npmrc\b|\.pypirc\b|\.netrc\b|\.git-credentials\b|/proc/(self|\d{1,7})/environ\b"
+    r"|/etc/(passwd|shadow)\b|\.kube[/\\]config\b|\.docker[/\\]config\.json\b|\.gnupg\b|\.config[/\\]gh\b)"
+)
+# Reading or handing on a file.
+_READ = (
+    r"(read(s|ing)?|open(s|ing)?|cat|load(s|ing)?|includ(e|es|ing)|attach(es|ing)?|upload(s|ing)?|send(s|ing)?"
+    r"|pass(es|ing)?|cop(y|ies|ying)|get(s|ting)?|fetch(es|ing)?|access(es|ing)?|print(s|ing)?|show(s|ing)?"
+    r"|dump(s|ing)?|grep|retriev(e|es|ing)|extract(s|ing)?)\b"
+)
+# Putting a value somewhere: into an argument, in these rules.
+_PUT = (
+    r"(pass(es|ed|ing)?|includ(e|es|ed|ing)|put(s|ting)?|send(s|ing)?|sent|add(s|ed|ing)?|attach(es|ed|ing)?"
+    r"|insert(s|ed|ing)?|append(s|ed|ing)?|cop(y|ies|ied|ying)|past(e|es|ed|ing)|embed(s|ded|ding)?"
+    r"|provid(e|es|ed|ing)|suppl(y|ies|ied|ying)|fill(s|ed|ing)?)\b"
+)
+# The verbs of _PUT that are an order to copy something in. "Provide the chat
+# history" is an ordinary parameter description; "paste the whole
+# conversation" is not.
+_COPY_IN = (
+    r"(includ(e|es|ing)|pass(es|ing)?|put(s|ting)?|past(e|es|ing)|insert(s|ing)?|cop(y|ies|ying)|dump(s|ing)?"
+    r"|append(s|ing)?|attach(es|ing)?|send(s|ing)?)\b"
+)
+_INTO = r"\b(as|in|into|inside|within)\b"
+# The argument a value is put into: a generic word, a quoted name, or any
+# word. `_names_a_parameter` then accepts only a real parameter (see there).
+_ARGUMENT = (
+    r"(\b(arguments?|parameters?|params?|fields?|propert(y|ies))\b|['\"`][a-z][a-z0-9_.-]{0,63}['\"`]"
+    r"|\b[a-z][a-z0-9_]{0,63}\b)"
+)
+# Text of the conversation, or of the model's own instructions: what a
+# poisoned tool asks to be handed. "All messages" alone is not here: listing a
+# channel's messages is what a chat tool does.
+_CONVERSATION_WORDS = (
+    r"(entire|full|complete|whole) (conversation|chat|dialog(ue)?|message history|context( window)?)\b"
+    r"|(conversation|chat|message|dialog(ue)?) (history|so far|transcript|log)\b"
+    r"|(previous|prior|earlier) (user |chat )?messages\b"
+    r"|everything the user (has )?(said|wrote|typed|asked)\b"
+    r"|your (system prompt|system instructions|instructions)\b"
+)
+_CONVERSATION = rf"\b({_CONVERSATION_WORDS})"
+
+
+def _names_a_parameter(view: str, end: int, context: "_Context") -> bool:
+    """Whether the word that ends at `end` is a tool argument, so that a chain about passing a value may end there.
+
+    Yes for a generic word ("argument", "parameter", "field"), for one of the
+    tool's own parameter names (when the caller gave them), and for a quoted
+    name followed by such a word ("the 'transcript' argument"). Not for any
+    other word: "puts the values in `process.env`" names no argument. Not for
+    an argument that holds a path either: "pass the path of the .env file as
+    the 'path' argument" is what a file tool asks for.
+    """
+    match = _LAST_NAME.search(view, max(0, end - 66), end)
+    if match is None:
+        return False
+    name = match.group("name")
+    if _GENERIC_ARGUMENT.fullmatch(name):
+        # "the 'path' argument": the name before the generic word decides.
+        named = _NAMED_ARGUMENT.search(view, max(0, end - 140), end)
+        return named is None or not _holds_a_path(named.group("quoted") or named.group("word"))
+    if _holds_a_path(name):
+        return False
+    if name in context.parameter_names:
+        return True
+    quoted = match.group().startswith(_QUOTES)
+    return quoted and _ARGUMENT_WORD_AFTER.match(view, end) is not None
+
+
+def _holds_a_path(name: str) -> bool:
+    """Whether an argument's name says it holds a path ("path", "file_name", "folder")."""
+    return _PATH_PARAMETER.search(name.replace("_", " ")) is not None
+
+
+_QUOTES = ("`", "'", '"')
+_LAST_NAME = re.compile(r"['\"`]?(?P<name>[a-z][a-z0-9_.-]{0,63})['\"`]?\Z")
+_GENERIC_ARGUMENT = re.compile(r"arguments?|parameters?|params?|fields?|propert(y|ies)")
+# A name, quoted (where "_" may have become a space) or not, then a generic word.
+_NAMED_ARGUMENT = re.compile(
+    r"(?:(['\"`])(?P<quoted>[^'\"`]{1,64})\1|(?P<word>[a-z][a-z0-9_.-]{0,63}))"
+    r" (arguments?|parameters?|params?|fields?|propert(y|ies))\Z"
+)
+_ARGUMENT_WORD_AFTER = re.compile(r" {0,2}(argument|parameter|param|field|property)\b")
+
+_METADATA_RULES: tuple[_Rule, ...] = (
+    # Concealment from the person, with the wider reach that the published
+    # poisoned descriptions need ("Do not mention that you first need to read
+    # the file (this could even upset the user ..."). What is not to be
+    # mentioned must be the instruction itself ("this", "that", "it", "the
+    # file"): "never reveal secret values; show only their names to the user"
+    # is advice. Kept to one sentence.
+    _rule(
+        "hide_from_user", "high",
+        r"(do not|don'?t|never|no need to|without)\s+(ever\s+)?"
+        r"(tell(ing)?|inform(ing)?|mention(ing)?|reveal(ing)?|alert(ing)?|notify(ing)?)\b",
+        (12, r"\b(this|that|it|these|those|them|anything|any of (this|it|these)"
+             r"|the (above|following|instructions?|steps?|files?|requests?|notes?|fact))\b"),
+        (80, _THE_USER),
+        one_sentence=True,
+    ),
+    _rule(
+        "hide_from_user", "high",
+        r"(the|your) (users?|humans?|operators?) (must not|mustn't|should not|shouldn't|shall not) "
+        r"(know|notice|find out|be told|be informed|be aware|learn)\b",
+    ),
+    _rule(
+        "hide_from_user", "high",
+        r"keep (this|it|that|these|them) (a )?(secret|hidden|quiet) from (the |your )?" + _THE_USER,
+    ),
+    # Smuggling through an argument: a credential file's content, the
+    # conversation, put into an argument of the tool. High, because it takes
+    # all of: the thing, the putting, and an argument the tool really has.
+    _rule(
+        "parameter_smuggling", "high",
+        _CREDENTIAL_FILE, (100, r"\b" + _PUT), (60, _INTO), (40, _ARGUMENT),
+        one_sentence=True, accept_end=_names_a_parameter,
+    ),
+    _rule(
+        "parameter_smuggling", "high",
+        _PUT, (100, _CREDENTIAL_FILE), (60, _INTO), (40, _ARGUMENT),
+        one_sentence=True, accept_end=_names_a_parameter,
+    ),
+    _rule(
+        "parameter_smuggling", "high",
+        _PUT, (60, _CONVERSATION), (60, _INTO), (40, _ARGUMENT),
+        one_sentence=True, accept_end=_names_a_parameter,
+    ),
+    _rule("sensitive_file_read", "medium", _READ, (60, _CREDENTIAL_FILE), one_sentence=True),
+    _rule(
+        "authority_tag", "medium",
+        r"< ?/? ?(important|instructions?|system[ _-]?(note|message|prompt|instructions?)|admin|critical|hidden"
+        r"|secret|assistant)\b[^<>]{0,40}>|\[(important|admin|instructions?|hidden)\]",
+    ),
+    _rule("hidden_comment", "medium", r"<!--"),
+    _rule(
+        "preference_manipulation", "medium",
+        r"(always|only|exclusively) (use|call|choose|prefer|pick|select|invoke) (this|our) "
+        r"(tool|function|server|api)\b",
+    ),
+    _rule(
+        "preference_manipulation", "medium",
+        r"instead of (any|all|every|the) other\b", (30, r"\b(tools?|functions?|servers?|apis?|services?)\b"),
+    ),
+    _rule(
+        "preference_manipulation", "medium",
+        r"(do not|don'?t|never) (use|call|choose|trust|prefer) (any )?other (tools?|functions?|servers?)\b",
+    ),
+    _rule(
+        "preference_manipulation", "medium",
+        r"other (tools?|functions?|servers?) (are|is|may be|might be) "
+        r"(outdated|broken|deprecated|unreliable|wrong|unsafe|insecure|malicious|compromised|inaccurate)\b",
+    ),
+    _rule(
+        "command_rewrite", "medium",
+        r"(all|every|each|any) (of the |of your )?(shell |terminal |bash |cli |system )?commands? "
+        r"(must|should|need to|needs to|have to|has to|are required to|is required to|shall) "
+        r"(include|start with|begin with|be prefixed|have the prefix|contain|end with|be preceded)\b",
+    ),
+    _rule(
+        "call_ordering", "low",
+        r"(must|always|should) (first )?(call|use|invoke|run) this (tool|function)\b", (40, r"\b(first|before)\b"),
+    ),
+    _rule(
+        "call_ordering", "low",
+        r"before (using|calling|invoking|answering|responding|replying|doing) (any|every|each|other|anything|this)\b",
+    ),
+    _rule(
+        "call_ordering", "low",
+        r"otherwise (the|this) (tool|function|call|request) (will|would|may|might) (not work|fail|be blocked|crash)\b",
+    ),
+)
+
+# Rules for the text of ONE parameter of a tool: its name, then its
+# description. A parameter that asks for the CONTENT of a credential file
+# ("content_from_reading_ssh_id_rsa", "the text of ~/.ssh/id_rsa") or orders
+# the conversation copied in is the published "full schema poisoning". A
+# parameter that holds the PATH of such a file is ordinary for a file tool, so
+# the file rules skip a parameter that speaks of paths (`_PATH_PARAMETER`).
+_PARAMETER_FILE_RULES: tuple[_Rule, ...] = (
+    _rule("parameter_smuggling", "high", r"(contents?|text|data|body|output|copy) (of|from)\b", (40, _CREDENTIAL_FILE)),
+    _rule("parameter_smuggling", "high", _CREDENTIAL_FILE, (12, r"\b(contents?|text|data|body)\b")),
+)
+_PARAMETER_RULES: tuple[_Rule, ...] = (
+    _rule("parameter_smuggling", "high", _COPY_IN, (60, _CONVERSATION)),
+    # A parameter for the conversation without such an order: some tools
+    # really take the chat history, so this only warns.
+    _rule("conversation_parameter", "medium", f"({_CONVERSATION_WORDS})"),
+)
+_PATH_PARAMETER = re.compile(r"\b(paths?|file ?names?|directory|directories|folders?|locations?|globs?)\b")
+
 # A rule that adds nothing once the rule it maps to has matched.
 _SUPERSEDED_BY = {
     "instruction_override_weak": "instruction_override",
     "secret_request": "exfiltration_to_destination",
+    "sensitive_file_read": "parameter_smuggling",
+    "conversation_parameter": "parameter_smuggling",
+    "foreign_tool_reference": "tool_shadowing",
 }
 
 # Where a sentence ends in a matching view (which has single spaces only).
@@ -447,6 +729,32 @@ class _Budget:
         self.left -= 1
         if self.left < 0:
             raise _Unscannable("scan budget exceeded")
+
+
+class _View:
+    """One matching view: as matched (lowercased), with its capitals (for excerpts), and where its sentences end."""
+
+    def __init__(self, cased: str) -> None:
+        self.cased = cased
+        # Lowercasing never changes the length of a matching view (the one
+        # character it would lengthen, U+0130, does not survive `_decompose`), so
+        # positions found in `text` can be used to quote from `cased`.
+        self.text = cased.lower()
+        self._sentence_ends: list[int] | None = None
+
+    @property
+    def sentence_ends(self) -> list[int]:
+        """Where each sentence ends, found once per view and only if a rule asks."""
+        if self._sentence_ends is None:
+            self._sentence_ends = [match.start() for match in _SENTENCE_END_RE.finditer(self.cased)]
+        return self._sentence_ends
+
+    def sentence_around(self, start: int, end: int) -> tuple[int, int]:
+        """The (start, end) of the sentence that holds the text from `start` to `end`."""
+        ends = self.sentence_ends
+        before = bisect.bisect_left(ends, start)
+        after = bisect.bisect_left(ends, end)
+        return (ends[before - 1] if before else 0), (ends[after] if after < len(ends) else len(self.text))
 
 
 def _is_word(ch: str) -> bool:
@@ -517,8 +825,9 @@ class _Occurrences:
             index += 1
 
 
-def _match_chain(rule: _Rule, text: str, budget: _Budget, cased: str = "") -> tuple[int, int] | None:
-    """Return the (start, end) of the first place `rule` matches, or None."""
+def _match_chain(rule: _Rule, view: _View, context: "_Context") -> tuple[int, int] | None:
+    """Return the (start, end) of the first place `rule` matches the view, or None."""
+    text = view.text
     first_pattern = rule.steps[0].pattern
     if next(_first_matches(first_pattern, text), None) is None:
         return None
@@ -527,44 +836,155 @@ def _match_chain(rule: _Rule, text: str, budget: _Budget, cased: str = "") -> tu
         occurrences.append(_Occurrences(step, text))
         if not occurrences[-1]:
             return None  # this step occurs nowhere in the text, so the rule cannot match
-    sentence_ends = [match.start() for match in _SENTENCE_END_RE.finditer(cased or text)] if rule.one_sentence else []
+    sentence_ends = view.sentence_ends if rule.one_sentence else []
+    accept_end = rule.accept_end
+    accept = None if accept_end is None else (lambda end: accept_end(text, end, context))
     for first in _first_matches(first_pattern, text):
-        budget.spend()
+        context.budget.spend()
         if rule.unless_after and rule.unless_after.search(text, max(0, first.start() - _NEGATION_REACH), first.start()):
             continue
         next_end = bisect.bisect_left(sentence_ends, first.end())
         limit = sentence_ends[next_end] if next_end < len(sentence_ends) else len(text)
-        end = _match_rest(tuple(occurrences), first.end(), limit, budget)
+        end = _match_rest(tuple(occurrences), first.end(), limit, context.budget, accept)
         if end is not None:
             return first.start(), end
     return None
 
 
-def _match_rest(occurrences: tuple[_Occurrences, ...], pos: int, limit: int, budget: _Budget) -> int | None:
+def _match_rest(
+    occurrences: tuple[_Occurrences, ...], pos: int, limit: int, budget: _Budget,
+    accept: Callable[[int], bool] | None = None,
+) -> int | None:
     """Match the remaining steps from `pos`, none starting after `limit`; return where the last one ends."""
     if not occurrences:
-        return pos
+        return pos if accept is None or accept(pos) else None
     step = occurrences[0]
     for end in step.ends_of_matches(pos, min(pos + step.max_gap, limit), budget):
-        chain_end = _match_rest(occurrences[1:], end, limit, budget)
+        chain_end = _match_rest(occurrences[1:], end, limit, budget, accept)
         if chain_end is not None:
             return chain_end
     return None
 
 
-def _match_rules(view: str, budget: _Budget, found: dict[str, Finding]) -> None:
+def _match_rules(
+    view: _View, rules: tuple[_Rule, ...], context: "_Context", found: dict[str, Finding], marker: str = ""
+) -> None:
     """Add to `found` a finding for each chain rule that matches `view` and is not settled already."""
-    # Lowercasing never changes the length of a matching view (the one
-    # character it would lengthen, U+0130, does not survive `_decompose`), so
-    # positions found in `lowered` can be used to quote from `view`.
-    lowered = view.lower()
-    for rule in _RULES:
+    for rule in rules:
         # A rule has one severity, so a match in an earlier view cannot be improved on.
         if rule.name in found or _SUPERSEDED_BY.get(rule.name) in found:
             continue
-        span = _match_chain(rule, lowered, budget, view)
+        span = _match_chain(rule, view, context)
         if span:
-            found[rule.name] = Finding(rule.name, rule.severity, _excerpt(view, *span))
+            found[rule.name] = Finding(rule.name, rule.severity, _marked(marker, _excerpt(view.cased, *span)))
+
+
+# --------------------------------------------------------------------------
+# Tools of other servers
+# --------------------------------------------------------------------------
+
+# A tool name as MCP allows it, and a name that is one ordinary word
+# ("search", "Fetch"): such a name counts only where the text calls it a tool
+# or quotes it, or every sentence with "search" in it would name the tool.
+_TOOL_NAME = re.compile(r"[A-Za-z0-9_.-]{2,128}")
+_PLAIN_WORD = re.compile(r"[A-Za-z][a-z]*")
+MAX_FOREIGN_TOOLS = 10_000  # names taken from `foreign_tools`; the rest are ignored
+# A run of name characters in a lowercased view, and how much of one is read:
+# a client may put a prefix before a name ("mcp_tool_send_email").
+_NAME_TOKEN = re.compile(r"[a-z0-9_.-]{2,}")
+_MAX_TOKEN_CHARS = 256
+_MAX_PREFIXES = 8
+_NAME_SEPARATOR = re.compile(r"[._-]+")
+_CALLED_A_TOOL = re.compile(r" (tool|function|command)\b")
+# Around a name: words that give an order about it, a redirection, a destination.
+_ORDER_WORDS = re.compile(
+    r"\b(always|must|whenever|when|instead|before|after|every time|each time|make sure|ensure|should|never"
+    r"|do not|don't|first)\b"
+)
+_REDIRECT = re.compile(
+    r"\b(send|sends|sent|forward|forwards|redirect|redirects|route|routes|bcc|cc|copy|change|replace|add|include"
+    r"|post|upload|transfer|pay|deliver)\b"
+)
+_DESTINATION_OR_PHONE = re.compile(_DESTINATION + r"|\+\d{8,15}\b")
+_REFERENCE_REACH = 200  # characters on each side of a name that are read, within its sentence
+
+
+class _ForeignTools:
+    """The names of tools that belong to other servers, ready to be looked for in a view."""
+
+    def __init__(self, names: Iterable[str]) -> None:
+        if isinstance(names, (str, bytes)):
+            raise TypeError("foreign_tools must be a collection of tool names, not one text")
+        self.distinctive: set[str] = set()
+        self.plain: set[str] = set()
+        for name in itertools.islice(names, MAX_FOREIGN_TOOLS):
+            if isinstance(name, str) and _TOOL_NAME.fullmatch(name):
+                (self.plain if _PLAIN_WORD.fullmatch(name) else self.distinctive).add(name.lower())
+        # A token that ends with a distinctive name after a prefix ("mcp_tool_send_email") is at least
+        # two characters longer than the name (one for the prefix, one for the separator). Shorter
+        # tokens, the common case, skip that search.
+        self._shortest_prefixed = min(map(len, self.distinctive), default=0) + 2
+
+    def __bool__(self) -> bool:
+        return bool(self.distinctive or self.plain)
+
+    def references(self, view: str) -> Iterator[tuple[int, int]]:
+        """The (start, end) of each place in a lowercased view that names one of the tools."""
+        for match in _NAME_TOKEN.finditer(view):
+            token = match.group()
+            if len(token) > _MAX_TOKEN_CHARS:
+                continue
+            name = token.strip("._-")
+            if not name:
+                continue
+            start = match.start() + token.index(name)
+            end = start + len(name)
+            if name in self.distinctive or (name in self.plain and _called_a_tool(view, start, end)):
+                yield start, end
+            elif self.distinctive and len(name) >= self._shortest_prefixed and self._ends_with_a_name(name):
+                yield start, end
+
+    def _ends_with_a_name(self, token: str) -> bool:
+        """Whether a name follows one of the first few separators of `token` ("mcp_tool_send_email")."""
+        for separator in itertools.islice(_NAME_SEPARATOR.finditer(token), _MAX_PREFIXES):
+            if token[separator.end() :] in self.distinctive:
+                return True
+        return False
+
+
+def _called_a_tool(view: str, start: int, end: int) -> bool:
+    """Whether the name at view[start:end] is quoted, or followed by "tool", "function" or "command"."""
+    if _CALLED_A_TOOL.match(view, end):
+        return True
+    return 0 < start and end < len(view) and view[start - 1] in _QUOTES and view[end] == view[start - 1]
+
+
+def _match_foreign_tools(view: _View, context: "_Context", found: dict[str, Finding]) -> None:
+    """Find orders about another server's tool: foreign_tool_reference (medium) or tool_shadowing (high).
+
+    A name alone is nothing. It must share a sentence with an order ("always",
+    "must", "whenever", ...); with a redirection ("send", "bcc", "change") and
+    an address, a URL or a phone number as well, it is shadowing.
+    """
+    if "tool_shadowing" in found or context.foreign is None:
+        return
+    text = view.text
+    for start, end in context.foreign.references(text):
+        context.budget.spend()
+        sentence_start, sentence_end = view.sentence_around(start, end)
+        # The name itself is left out: "send-email" must not count as the verb "send".
+        around = (
+            text[max(sentence_start, start - _REFERENCE_REACH) : start],
+            text[end : min(sentence_end, end + _REFERENCE_REACH)],
+        )
+        if not any(_ORDER_WORDS.search(part) for part in around):
+            continue
+        excerpt = _excerpt(view.cased, start, end, pad=60)
+        redirected = any(_REDIRECT.search(part) for part in around)
+        if redirected and any(_DESTINATION_OR_PHONE.search(part) for part in around):
+            found["tool_shadowing"] = Finding("tool_shadowing", "high", excerpt)
+            return
+        found.setdefault("foreign_tool_reference", Finding("foreign_tool_reference", "medium", excerpt))
 
 
 # --------------------------------------------------------------------------
@@ -588,6 +1008,12 @@ _IMAGE_EXFIL_RES = (
         re.IGNORECASE,
     ),
 )
+# The same leak written as a reference-style image (as in EchoLeak): the image
+# names a label, ![x][label] or ![label], and a line elsewhere defines the
+# label's URL, [label]: https://host/path?data. Both must be in one text.
+_REFERENCE_DEFINITION = re.compile(r"^ {0,3}\[([^\]\n]{1,100})\]: {0,5}<?(?:https?:)?//[^\s<>?#]{1,500}\?", re.M | re.I)
+_REFERENCE_IMAGE = re.compile(r"!\[([^\]\[\n]{0,300})\](?:\[([^\]\[\n]{0,100})\])?")
+_MAX_REFERENCES = 1_000  # definitions, and images, read per text
 
 
 def _image_finding(text: str) -> Finding | None:
@@ -595,7 +1021,29 @@ def _image_finding(text: str) -> Finding | None:
         match = pattern.search(text)
         if match:
             return Finding("markdown_image_exfiltration", "medium", _excerpt(text, *match.span()))
+    return _reference_image_finding(text)
+
+
+def _reference_image_finding(text: str) -> Finding | None:
+    if "![" not in text or "]:" not in text:
+        return None
+    labels: dict[str, re.Match[str]] = {}
+    for match in itertools.islice(_REFERENCE_DEFINITION.finditer(text), _MAX_REFERENCES):
+        labels.setdefault(_label(match.group(1)), match)
+    if not labels:
+        return None
+    for image in itertools.islice(_REFERENCE_IMAGE.finditer(text), _MAX_REFERENCES):
+        if image.group(2) is None and text.startswith("(", image.end()):
+            continue  # an inline image, ![x](url): the patterns above read those
+        definition = labels.get(_label(image.group(2) or image.group(1)))
+        if definition is not None:
+            return Finding("markdown_image_exfiltration", "medium", _excerpt(text, *definition.span()))
     return None
+
+
+def _label(text: str) -> str:
+    """A reference label as markdown compares them: case and runs of spaces do not matter."""
+    return " ".join(text.split()).casefold()
 
 
 def _invisible_finding(text: str) -> Finding | None:
@@ -604,52 +1052,173 @@ def _invisible_finding(text: str) -> Finding | None:
     count = len(text) - len(text.translate(_WITHOUT_INVISIBLE))
     if not count:
         return None
-    hidden_text = len(text.translate(_WITHOUT_HIDDEN_TEXT)) < len(text)
+    flagless = without_flags(text)  # the tag characters of a flag are an everyday use
+    hidden_text = len(flagless.translate(_WITHOUT_HIDDEN_TEXT)) < len(flagless)
     return Finding("invisible_characters", "medium" if hidden_text else "low", f"{count} invisible character(s)")
+
+
+# How many characters written in tag characters (outside flags) make a text
+# "ascii_smuggling". Fewer can be a stray character; this many spell words.
+_SMUGGLED_CHARS = 8
+
+
+def _smuggling_finding(text: str) -> Finding | None:
+    """A high finding for text written in Unicode tag characters, which a model reads and a person cannot see."""
+    if not TAG_CHARACTERS.search(text):
+        return None
+    hidden = " ".join(smuggled_text(text).split())
+    if len(hidden) < _SMUGGLED_CHARS:
+        return None
+    return Finding("ascii_smuggling", "high", _marked("[tags]", hidden[:120]))
+
+
+def _terminal_escape_finding(text: str) -> Finding | None:
+    """Metadata only: a terminal escape (ESC, or the one-character CSI and OSC) in what a server says about itself.
+
+    It can recolour or hide text on a terminal that shows the description, so
+    the person sees something other than what the model reads.
+    """
+    count = text.count("\x1b") + text.count("\x9b") + text.count("\x9d")
+    return Finding("terminal_escape", "medium", f"{count} terminal escape character(s)") if count else None
 
 
 def _excerpt(text: str, start: int, end: int, pad: int = 30) -> str:
     return text[max(0, start - pad) : min(len(text), end + pad)].strip()
 
 
+def _marked(marker: str, excerpt: str) -> str:
+    """An excerpt with the marker of the view it was found in, such as "[base64]"."""
+    return f"{marker} {excerpt}" if marker else excerpt
+
+
 # --------------------------------------------------------------------------
-# Public API
+# Scanning
 # --------------------------------------------------------------------------
 
-def scan(text: str, budget: "_Budget | None" = None) -> list[Finding]:
-    """Return the injection findings in `text`, at most one per rule."""
-    if not text:
-        return []
+class _Context:
+    """What one scan shares between the texts it reads: the rules, the budget, the decoder and the caller's names."""
+
+    def __init__(
+        self,
+        profile: str,
+        budget: _Budget | None = None,
+        parameters: Mapping[str, str] | None = None,
+        foreign_tools: Iterable[str] = (),
+        skip_decoding: Iterable[str] = (),
+    ) -> None:
+        if profile not in PROFILES:
+            raise ValueError(f"profile must be one of {', '.join(PROFILES)}, got {profile!r}")
+        self.metadata = profile == METADATA
+        self.rules = _RULES + _METADATA_RULES if self.metadata else _RULES
+        self.budget = budget or _Budget()
+        self.encoded = EncodedRuns(skip=skip_decoding)
+        named = {}
+        if self.metadata and parameters:
+            pairs = itertools.islice(parameters.items(), MAX_PARAMETERS)
+            named = {name: text for name, text in pairs if isinstance(name, str) and isinstance(text, str)}
+        self.parameters: dict[str, str] = named
+        self.parameter_names = frozenset(name.lower() for name in named)
+        foreign = _ForeignTools(foreign_tools)
+        self.foreign = foreign if self.metadata and foreign else None
+
+
+def _scan(text: str, context: _Context) -> dict[str, Finding]:
+    """The findings in one text, by rule, before superseded ones are dropped."""
     found: dict[str, Finding] = {}
-    for finding in (_invisible_finding(text), _image_finding(text)):
+    if not text:
+        return found
+    invisible = _invisible_finding(text)
+    smuggling = _smuggling_finding(text) if invisible else None
+    escape = _terminal_escape_finding(text) if context.metadata else None
+    for finding in (invisible, _image_finding(text), smuggling, escape):
         if finding:
             found[finding.rule] = finding
-    budget = budget or _Budget()
     try:
-        for view in _matching_views(text):
-            _match_rules(view, budget, found)
+        for cased, marker in _matching_views(text, context):
+            view = _View(cased)
+            _match_rules(view, context.rules, context, found, marker)
+            _match_foreign_tools(view, context, found)
     except _Unscannable as problem:
         found["unscannable_content"] = Finding("unscannable_content", "high", str(problem))
-    return _without_superseded(found)
+    return found
 
 
-def scan_views(texts: Iterable[str]) -> list[Finding]:
+def _scan_parameter(name: str, description: str, context: _Context) -> dict[str, Finding]:
+    """The findings in the text of one tool parameter (see `_PARAMETER_RULES`)."""
+    found: dict[str, Finding] = {}
+    text = f"{name}: {description}" if description else name
+    rules = _PARAMETER_RULES
+    if not _PATH_PARAMETER.search(_unglue(_normalize(text)).lower()):
+        rules = _PARAMETER_FILE_RULES + rules
+    try:
+        for cased, marker in _matching_views(text, context):
+            _match_rules(_View(cased), rules, context, found, marker)
+    except _Unscannable as problem:
+        found["unscannable_content"] = Finding("unscannable_content", "high", str(problem))
+    return found
+
+
+def scan(
+    text: str, budget: "_Budget | None" = None, *, profile: str = RESULT, foreign_tools: Iterable[str] = ()
+) -> list[Finding]:
+    """Return the injection findings in `text`, at most one per rule.
+
+    profile and foreign_tools are as in `scan_views`.
+    """
+    context = _Context(profile, budget=budget, foreign_tools=foreign_tools)
+    return _without_superseded(_scan(text, context))
+
+
+def scan_views(
+    texts: Iterable[str],
+    *,
+    profile: str = RESULT,
+    parameters: Mapping[str, str] | None = None,
+    foreign_tools: Iterable[str] = (),
+    skip_decoding: Iterable[str] = (),
+) -> list[Finding]:
     """Scan several texts that describe one value; return at most one finding per rule.
 
     For a rule found in more than one text, the highest severity wins, and
     among equals the first. See `textutil.text_views` for why one value is
     read as several texts.
+
+    profile:       "result" (the default) or "metadata", for what a server says
+                   about itself (see "Profiles" in the module docstring).
+                   ValueError for anything else.
+    parameters:    metadata only: a tool's parameters, name -> title and
+                   description (`textutil.tool_parameters`). Each is also read on
+                   its own, and the parameter names tell which words in the
+                   description are arguments.
+    foreign_tools: metadata only: names of tools that belong to OTHER servers.
+                   Never pass the names of the scanned server's own tools: they
+                   refer to each other all the time. At most MAX_FOREIGN_TOOLS
+                   are used.
+    skip_decoding: exact texts not to decode as base64 or hex: the "data" of
+                   image and audio content (`textutil.media_payloads`). They are
+                   still scanned as text.
     """
+    context = _Context(
+        profile, parameters=parameters, foreign_tools=foreign_tools, skip_decoding=skip_decoding
+    )
     strongest: dict[str, Finding] = {}
-    budget = _Budget()
     for text in texts:
         if "unscannable_content" in strongest:
             break
-        for finding in scan(text, budget):
-            known = strongest.get(finding.rule)
-            if known is None or SEVERITY_ORDER[finding.severity] > SEVERITY_ORDER[known.severity]:
-                strongest[finding.rule] = finding
+        _keep_strongest(strongest, _scan(text, context).values())
+    for name, description in context.parameters.items():
+        if "unscannable_content" in strongest:
+            break
+        _keep_strongest(strongest, _scan_parameter(name, description, context).values())
     return _without_superseded(strongest)
+
+
+def _keep_strongest(strongest: dict[str, Finding], findings: Iterable[Finding]) -> None:
+    """Merge `findings` into `strongest`: per rule, the higher severity wins, and among equals the first."""
+    for finding in findings:
+        known = strongest.get(finding.rule)
+        if known is None or SEVERITY_ORDER[finding.severity] > SEVERITY_ORDER[known.severity]:
+            strongest[finding.rule] = finding
 
 
 def _without_superseded(found: dict[str, Finding]) -> list[Finding]:

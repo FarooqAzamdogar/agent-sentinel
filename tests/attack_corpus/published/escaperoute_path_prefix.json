@@ -1,0 +1,33 @@
+{
+ "id": "escaperoute_path_prefix",
+ "source": "https://cymulate.com/blog/cve-2025-53109-53110-escaperoute-anthropic/",
+ "about": "A path that starts with the allowed folder's name but is another folder (allowed_dir_sensitive_credentials next to allowed_dir).",
+ "surface": "call",
+ "policy": {
+  "default": "block",
+  "tools": {
+   "read_file": {
+    "action": "allow",
+    "allow_args": [
+     {
+      "arg": "path",
+      "type": "path",
+      "roots": [
+       "~/allowed_dir"
+      ]
+     }
+    ]
+   }
+  }
+ },
+ "call": {
+  "tool": "read_file",
+  "arguments": {
+   "path": "~/allowed_dir_sensitive_credentials/secrets.txt"
+  }
+ },
+ "expect": {
+  "outcome": "stopped",
+  "rule": "tools.read_file.allow_args[0]"
+ }
+}

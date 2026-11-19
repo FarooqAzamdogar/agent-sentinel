@@ -1,0 +1,4851 @@
+{
+ "about": "Real tool, parameter, prompt and resource descriptions of popular public MCP servers, copied from their source code at the commit named in 'sources'. A description with a template has the value the server fills in. None of them may score high with the metadata profile: see tests/test_attack_corpus.py.",
+ "sources": {
+  "01": {
+   "repository": "https://github.com/modelcontextprotocol/servers",
+   "commit": "c799c8552b0f27b7a33a7b9233773da144dddcf5",
+   "path": "src/filesystem/server.ts",
+   "url": "https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/filesystem/server.ts"
+  },
+  "03": {
+   "repository": "https://github.com/modelcontextprotocol/servers",
+   "commit": "c799c8552b0f27b7a33a7b9233773da144dddcf5",
+   "path": "src/git/src/mcp_server_git/server.py",
+   "url": "https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/git/src/mcp_server_git/server.py"
+  },
+  "04": {
+   "repository": "https://github.com/modelcontextprotocol/servers",
+   "commit": "c799c8552b0f27b7a33a7b9233773da144dddcf5",
+   "path": "src/fetch/src/mcp_server_fetch/server.py",
+   "url": "https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/fetch/src/mcp_server_fetch/server.py"
+  },
+  "05": {
+   "repository": "https://github.com/modelcontextprotocol/servers",
+   "commit": "c799c8552b0f27b7a33a7b9233773da144dddcf5",
+   "path": "src/memory/index.ts",
+   "url": "https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/memory/index.ts"
+  },
+  "06": {
+   "repository": "https://github.com/modelcontextprotocol/servers",
+   "commit": "c799c8552b0f27b7a33a7b9233773da144dddcf5",
+   "path": "src/time/src/mcp_server_time/server.py",
+   "url": "https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/time/src/mcp_server_time/server.py"
+  },
+  "07": {
+   "repository": "https://github.com/modelcontextprotocol/servers",
+   "commit": "c799c8552b0f27b7a33a7b9233773da144dddcf5",
+   "path": "src/sequentialthinking/index.ts",
+   "url": "https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/sequentialthinking/index.ts"
+  },
+  "08": {
+   "repository": "https://github.com/modelcontextprotocol/servers",
+   "commit": "c799c8552b0f27b7a33a7b9233773da144dddcf5",
+   "path": "src/everything/tools/echo.ts",
+   "url": "https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/everything/tools/echo.ts"
+  },
+  "09": {
+   "repository": "https://github.com/modelcontextprotocol/servers",
+   "commit": "c799c8552b0f27b7a33a7b9233773da144dddcf5",
+   "path": "src/everything/tools/get-sum.ts",
+   "url": "https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/everything/tools/get-sum.ts"
+  },
+  "11": {
+   "repository": "https://github.com/modelcontextprotocol/servers",
+   "commit": "c799c8552b0f27b7a33a7b9233773da144dddcf5",
+   "path": "src/everything/tools/trigger-long-running-operation.ts",
+   "url": "https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/everything/tools/trigger-long-running-operation.ts"
+  },
+  "12": {
+   "repository": "https://github.com/modelcontextprotocol/servers",
+   "commit": "c799c8552b0f27b7a33a7b9233773da144dddcf5",
+   "path": "src/everything/tools/get-tiny-image.ts",
+   "url": "https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/everything/tools/get-tiny-image.ts"
+  },
+  "13": {
+   "repository": "https://github.com/modelcontextprotocol/servers",
+   "commit": "c799c8552b0f27b7a33a7b9233773da144dddcf5",
+   "path": "src/everything/tools/trigger-sampling-request.ts",
+   "url": "https://github.com/modelcontextprotocol/servers/blob/c799c8552b0f27b7a33a7b9233773da144dddcf5/src/everything/tools/trigger-sampling-request.ts"
+  },
+  "14": {
+   "repository": "https://github.com/modelcontextprotocol/servers-archived",
+   "commit": "9be4674d1ddf8c469e6461a27a337eeb65f76c2e",
+   "path": "src/github/index.ts",
+   "url": "https://github.com/modelcontextprotocol/servers-archived/blob/9be4674d1ddf8c469e6461a27a337eeb65f76c2e/src/github/index.ts"
+  },
+  "15": {
+   "repository": "https://github.com/modelcontextprotocol/servers-archived",
+   "commit": "9be4674d1ddf8c469e6461a27a337eeb65f76c2e",
+   "path": "src/slack/index.ts",
+   "url": "https://github.com/modelcontextprotocol/servers-archived/blob/9be4674d1ddf8c469e6461a27a337eeb65f76c2e/src/slack/index.ts"
+  },
+  "16": {
+   "repository": "https://github.com/modelcontextprotocol/servers-archived",
+   "commit": "9be4674d1ddf8c469e6461a27a337eeb65f76c2e",
+   "path": "src/postgres/index.ts",
+   "url": "https://github.com/modelcontextprotocol/servers-archived/blob/9be4674d1ddf8c469e6461a27a337eeb65f76c2e/src/postgres/index.ts"
+  },
+  "17": {
+   "repository": "https://github.com/modelcontextprotocol/servers-archived",
+   "commit": "9be4674d1ddf8c469e6461a27a337eeb65f76c2e",
+   "path": "src/brave-search/index.ts",
+   "url": "https://github.com/modelcontextprotocol/servers-archived/blob/9be4674d1ddf8c469e6461a27a337eeb65f76c2e/src/brave-search/index.ts"
+  },
+  "18": {
+   "repository": "https://github.com/modelcontextprotocol/servers-archived",
+   "commit": "9be4674d1ddf8c469e6461a27a337eeb65f76c2e",
+   "path": "src/puppeteer/index.ts",
+   "url": "https://github.com/modelcontextprotocol/servers-archived/blob/9be4674d1ddf8c469e6461a27a337eeb65f76c2e/src/puppeteer/index.ts"
+  },
+  "19": {
+   "repository": "https://github.com/modelcontextprotocol/servers-archived",
+   "commit": "9be4674d1ddf8c469e6461a27a337eeb65f76c2e",
+   "path": "src/gitlab/index.ts",
+   "url": "https://github.com/modelcontextprotocol/servers-archived/blob/9be4674d1ddf8c469e6461a27a337eeb65f76c2e/src/gitlab/index.ts"
+  },
+  "20": {
+   "repository": "https://github.com/modelcontextprotocol/servers-archived",
+   "commit": "9be4674d1ddf8c469e6461a27a337eeb65f76c2e",
+   "path": "src/google-maps/index.ts",
+   "url": "https://github.com/modelcontextprotocol/servers-archived/blob/9be4674d1ddf8c469e6461a27a337eeb65f76c2e/src/google-maps/index.ts"
+  },
+  "21": {
+   "repository": "https://github.com/modelcontextprotocol/servers-archived",
+   "commit": "9be4674d1ddf8c469e6461a27a337eeb65f76c2e",
+   "path": "src/sentry/src/mcp_server_sentry/server.py",
+   "url": "https://github.com/modelcontextprotocol/servers-archived/blob/9be4674d1ddf8c469e6461a27a337eeb65f76c2e/src/sentry/src/mcp_server_sentry/server.py"
+  },
+  "22": {
+   "repository": "https://github.com/modelcontextprotocol/servers-archived",
+   "commit": "9be4674d1ddf8c469e6461a27a337eeb65f76c2e",
+   "path": "src/sqlite/src/mcp_server_sqlite/server.py",
+   "url": "https://github.com/modelcontextprotocol/servers-archived/blob/9be4674d1ddf8c469e6461a27a337eeb65f76c2e/src/sqlite/src/mcp_server_sqlite/server.py"
+  },
+  "23": {
+   "repository": "https://github.com/modelcontextprotocol/servers-archived",
+   "commit": "9be4674d1ddf8c469e6461a27a337eeb65f76c2e",
+   "path": "src/redis/src/index.ts",
+   "url": "https://github.com/modelcontextprotocol/servers-archived/blob/9be4674d1ddf8c469e6461a27a337eeb65f76c2e/src/redis/src/index.ts"
+  },
+  "24": {
+   "repository": "https://github.com/modelcontextprotocol/servers-archived",
+   "commit": "9be4674d1ddf8c469e6461a27a337eeb65f76c2e",
+   "path": "src/gdrive/index.ts",
+   "url": "https://github.com/modelcontextprotocol/servers-archived/blob/9be4674d1ddf8c469e6461a27a337eeb65f76c2e/src/gdrive/index.ts"
+  },
+  "25": {
+   "repository": "https://github.com/github/github-mcp-server",
+   "commit": "df32d7ec5786e0e71932767fce9982409cbaec40",
+   "path": "pkg/github/issues.go",
+   "url": "https://github.com/github/github-mcp-server/blob/df32d7ec5786e0e71932767fce9982409cbaec40/pkg/github/issues.go"
+  },
+  "26": {
+   "repository": "https://github.com/github/github-mcp-server",
+   "commit": "df32d7ec5786e0e71932767fce9982409cbaec40",
+   "path": "pkg/github/pullrequests.go",
+   "url": "https://github.com/github/github-mcp-server/blob/df32d7ec5786e0e71932767fce9982409cbaec40/pkg/github/pullrequests.go"
+  },
+  "27": {
+   "repository": "https://github.com/github/github-mcp-server",
+   "commit": "df32d7ec5786e0e71932767fce9982409cbaec40",
+   "path": "pkg/github/repositories.go",
+   "url": "https://github.com/github/github-mcp-server/blob/df32d7ec5786e0e71932767fce9982409cbaec40/pkg/github/repositories.go"
+  },
+  "28": {
+   "repository": "https://github.com/github/github-mcp-server",
+   "commit": "df32d7ec5786e0e71932767fce9982409cbaec40",
+   "path": "pkg/github/search.go",
+   "url": "https://github.com/github/github-mcp-server/blob/df32d7ec5786e0e71932767fce9982409cbaec40/pkg/github/search.go"
+  },
+  "29": {
+   "repository": "https://github.com/github/github-mcp-server",
+   "commit": "df32d7ec5786e0e71932767fce9982409cbaec40",
+   "path": "pkg/github/actions.go",
+   "url": "https://github.com/github/github-mcp-server/blob/df32d7ec5786e0e71932767fce9982409cbaec40/pkg/github/actions.go"
+  },
+  "30": {
+   "repository": "https://github.com/github/github-mcp-server",
+   "commit": "df32d7ec5786e0e71932767fce9982409cbaec40",
+   "path": "pkg/github/notifications.go",
+   "url": "https://github.com/github/github-mcp-server/blob/df32d7ec5786e0e71932767fce9982409cbaec40/pkg/github/notifications.go"
+  },
+  "31": {
+   "repository": "https://github.com/github/github-mcp-server",
+   "commit": "df32d7ec5786e0e71932767fce9982409cbaec40",
+   "path": "pkg/github/context_tools.go",
+   "url": "https://github.com/github/github-mcp-server/blob/df32d7ec5786e0e71932767fce9982409cbaec40/pkg/github/context_tools.go"
+  },
+  "32": {
+   "repository": "https://github.com/github/github-mcp-server",
+   "commit": "df32d7ec5786e0e71932767fce9982409cbaec40",
+   "path": "pkg/github/gists.go",
+   "url": "https://github.com/github/github-mcp-server/blob/df32d7ec5786e0e71932767fce9982409cbaec40/pkg/github/gists.go"
+  },
+  "33": {
+   "repository": "https://github.com/github/github-mcp-server",
+   "commit": "df32d7ec5786e0e71932767fce9982409cbaec40",
+   "path": "pkg/github/toolset_instructions.go",
+   "url": "https://github.com/github/github-mcp-server/blob/df32d7ec5786e0e71932767fce9982409cbaec40/pkg/github/toolset_instructions.go"
+  },
+  "34": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/navigate.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/navigate.ts"
+  },
+  "35": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/snapshot.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/snapshot.ts"
+  },
+  "36": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/screenshot.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/screenshot.ts"
+  },
+  "37": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/tabs.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/tabs.ts"
+  },
+  "38": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/form.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/form.ts"
+  },
+  "39": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/keyboard.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/keyboard.ts"
+  },
+  "40": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/mouse.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/mouse.ts"
+  },
+  "41": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/evaluate.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/evaluate.ts"
+  },
+  "42": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/files.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/files.ts"
+  },
+  "43": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/dialogs.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/dialogs.ts"
+  },
+  "44": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/console.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/console.ts"
+  },
+  "45": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/network.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/network.ts"
+  },
+  "46": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/wait.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/wait.ts"
+  },
+  "47": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/cookies.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/cookies.ts"
+  },
+  "48": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/storage.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/storage.ts"
+  },
+  "49": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/runCode.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/runCode.ts"
+  },
+  "50": {
+   "repository": "https://github.com/microsoft/playwright",
+   "commit": "28c4b2e0ad892723c17c0b8d280207c1da670998",
+   "path": "packages/playwright-core/src/tools/backend/verify.ts",
+   "url": "https://github.com/microsoft/playwright/blob/28c4b2e0ad892723c17c0b8d280207c1da670998/packages/playwright-core/src/tools/backend/verify.ts"
+  },
+  "51": {
+   "repository": "https://github.com/upstash/context7",
+   "commit": "018a603bc99d4cd21feaac1021501185d092ac09",
+   "path": "packages/mcp/src/index.ts",
+   "url": "https://github.com/upstash/context7/blob/018a603bc99d4cd21feaac1021501185d092ac09/packages/mcp/src/index.ts"
+  }
+ },
+ "texts": [
+  {
+   "source": "01",
+   "line": 73,
+   "kind": "parameter",
+   "tool": null,
+   "text": "If provided, returns only the last N lines of the file"
+  },
+  {
+   "source": "01",
+   "line": 79,
+   "kind": "parameter",
+   "tool": null,
+   "text": "If provided, returns only the first N lines of the file"
+  },
+  {
+   "source": "01",
+   "line": 90,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Array of file paths to read. Each path must be a string pointing to a valid file within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 101,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The complete text the file will contain, replacing any it had"
+  },
+  {
+   "source": "01",
+   "line": 108,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Text to append, exactly as given. No newline is added: end it with \\n if the next append should start on a new line."
+  },
+  {
+   "source": "01",
+   "line": 114,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Text to search for - must match exactly"
+  },
+  {
+   "source": "01",
+   "line": 115,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Text to replace with"
+  },
+  {
+   "source": "01",
+   "line": 122,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The replacements to make, applied in order, each to the result of the ones before it. If any one has no match, none is written."
+  },
+  {
+   "source": "01",
+   "line": 129,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Preview changes using git-style diff format"
+  },
+  {
+   "source": "01",
+   "line": 148,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Sort entries by name or size"
+  },
+  {
+   "source": "01",
+   "line": 157,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Patterns for entries to leave out, with their contents, matched against each entry's path relative to path. A pattern with no '*' matches that name at any depth ('node_modules' leaves out every node_modules directory); a pattern with '*' is a glob matched as written, and one ending in '/**' also leaves out the directory it names."
+  },
+  {
+   "source": "01",
+   "line": 167,
+   "kind": "parameter",
+   "tool": null,
+   "text": "How many levels to descend: 1 lists only the entries directly in path. Directories at the last level have no children array. Omit for the whole tree."
+  },
+  {
+   "source": "01",
+   "line": 181,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The file to copy"
+  },
+  {
+   "source": "01",
+   "line": 184,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Where to create the copy; nothing may exist there yet"
+  },
+  {
+   "source": "01",
+   "line": 191,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Glob matched against each entry's path relative to path, never its content: '*.ts' matches directly under path, '**/*.ts' at any depth."
+  },
+  {
+   "source": "01",
+   "line": 391,
+   "kind": "tool",
+   "tool": "read_file",
+   "text": "Read the complete contents of a file as text. DEPRECATED: Use read_text_file instead."
+  },
+  {
+   "source": "01",
+   "line": 409,
+   "kind": "tool",
+   "tool": "read_text_file",
+   "text": "Read the complete contents of a file from the file system as text. Handles various text encodings and provides detailed error messages if the file cannot be read. Use this tool when you need to examine the contents of a single file. Use the 'head' parameter to read only the first N lines of a file, or the 'tail' parameter to read only the last N lines of a file. Operates on the file as text regardless of extension. Only works within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 433,
+   "kind": "tool",
+   "tool": "read_media_file",
+   "text": "Read a file and return it as a base64-encoded content block with its MIME type. Image and audio files are returned as image/audio content; any other file type is returned as an embedded resource. Only works within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 516,
+   "kind": "tool",
+   "tool": "read_multiple_files",
+   "text": "Read the contents of multiple files simultaneously. This is more efficient than reading files one by one when you need to analyze or compare multiple files. Each file's content is returned with its path as a reference. Failed reads for individual files won't stop the entire operation. Only works within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 561,
+   "kind": "tool",
+   "tool": "write_file",
+   "text": "Create a new file or completely overwrite an existing file with new content. Use with caution as it will overwrite existing files without warning. Handles text content with proper encoding. Only works within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 594,
+   "kind": "tool",
+   "tool": "append_file",
+   "text": "Append text to the end of a file, creating the file if it does not exist. The existing content is never changed or replaced. The text is appended exactly as given, with no newline added before or after it, so end it with a newline if the next append should start on a new line. Only works within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 628,
+   "kind": "tool",
+   "tool": "edit_file",
+   "text": "Make line-based edits to a text file. Edits apply in order, each to the result of the ones before it, and each replaces the first match of its oldText with newText. oldText must match the file's text exactly, except that line endings (LF or CRLF) never matter and, when there is no exact match, a run of whole lines matches if each line is equal once leading and trailing whitespace is ignored (newText then takes the file's indentation). Whitespace inside a line must match. If any edit has no match, nothing is written and the error shows the closest lines of the file, numbered, to copy oldText from. Returns a git-style diff showing the changes made. Only works within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 667,
+   "kind": "tool",
+   "tool": "create_directory",
+   "text": "Create a new directory or ensure a directory exists. Can create multiple nested directories in one operation. If the directory already exists, this operation will succeed silently. Perfect for setting up directory structures for projects or ensuring required paths exist. Only works within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 701,
+   "kind": "tool",
+   "tool": "list_directory",
+   "text": "List the files and directories directly inside a path, each marked [FILE] or [DIR]. Use it to see what a directory contains; when you also need each entry's size or want entries sorted by size, use list_directory_with_sizes instead, and for a recursive view use directory_tree. Returns one line per entry. Only works within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 740,
+   "kind": "tool",
+   "tool": "list_directory_with_sizes",
+   "text": "List the files and directories directly inside a path with each file's size, marked [FILE] or [DIR], sorted by name or by size, largest first (sortBy). Use it when sizes matter, such as finding the largest files; for names only, use list_directory, which returns less text. Returns one line per entry, followed by the totals. Only works within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 859,
+   "kind": "tool",
+   "tool": "directory_tree",
+   "text": "Get a recursive tree view of files and directories as a JSON structure. Each entry includes 'name', 'type' (file/directory), and 'children' for directories. Files have no children array, while directories always have a children array (which may be empty), except at the last level when 'depth' limits the tree: those directories are not read and have no children array. The output is formatted with 2-space indentation for readability. Only works within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 950,
+   "kind": "tool",
+   "tool": "move_file",
+   "text": "Move or rename files and directories. Can move files between directories and rename them in a single operation. If the destination exists, the operation will fail. Works across different directories and can be used for simple renaming within the same directory. Both source and destination must be within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 991,
+   "kind": "tool",
+   "tool": "copy_file",
+   "text": "Copy a file to a new location, without reading its content into the conversation. Copies one regular file, keeping its permissions and modification time; directories are not copied. If the destination exists, the operation will fail: it never overwrites. Both source and destination must be within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 1030,
+   "kind": "tool",
+   "tool": "search_files",
+   "text": "Find files and directories by NAME, not by content: this tool never reads or searches inside files. It walks the tree under 'path' and matches a glob pattern against each entry's path relative to 'path' (case-sensitive). Use '*.ext' to match entries directly under 'path', and '**/*.ext' or '**/name' to match at any depth. Returns full paths to all matching items. Great for finding files when you don't know their exact location. Only searches within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 1085,
+   "kind": "tool",
+   "tool": "get_file_info",
+   "text": "Retrieve detailed metadata about a file or directory. Returns comprehensive information including size, creation time, last modified time, permissions, type and hard-link count. This tool is perfect for understanding file characteristics without reading the actual content. Only works within allowed directories."
+  },
+  {
+   "source": "01",
+   "line": 1120,
+   "kind": "tool",
+   "tool": "list_allowed_directories",
+   "text": "Returns the list of directories that this server is allowed to access. Subdirectories within these allowed directories are also accessible. Use this to understand which directories and their nested paths are available before trying to access files."
+  },
+  {
+   "source": "03",
+   "line": 1514,
+   "kind": "tool",
+   "tool": "git_commit_message",
+   "text": "Asks the model for a commit message for the staged changes"
+  },
+  {
+   "source": "03",
+   "line": 1517,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The path to the Git repository."
+  },
+  {
+   "source": "03",
+   "line": 1525,
+   "kind": "tool",
+   "tool": "git_summarize_changes",
+   "text": "Asks the model to summarize the working tree's staged and unstaged changes, or the diff against a branch or commit"
+  },
+  {
+   "source": "03",
+   "line": 1535,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Branch or commit to diff against. Defaults to the working tree's staged and unstaged changes"
+  },
+  {
+   "source": "03",
+   "line": 1547,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Shows the working tree status"
+  },
+  {
+   "source": "03",
+   "line": 1557,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Shows changes in the working directory that are not yet staged"
+  },
+  {
+   "source": "03",
+   "line": 1570,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Shows changes that are staged for commit"
+  },
+  {
+   "source": "03",
+   "line": 1581,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Shows differences between branches or commits, or across a revision range (main..feature, main...feature)"
+  },
+  {
+   "source": "03",
+   "line": 1594,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Records changes to the repository"
+  },
+  {
+   "source": "03",
+   "line": 1604,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Adds file contents to the staging area"
+  },
+  {
+   "source": "03",
+   "line": 1614,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Unstages all staged changes"
+  },
+  {
+   "source": "03",
+   "line": 1624,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Shows the commit logs"
+  },
+  {
+   "source": "03",
+   "line": 1635,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Maximum number of commits to show. Must be at least 1."
+  },
+  {
+   "source": "03",
+   "line": 1641,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Start timestamp for filtering commits. Accepts: ISO 8601 format (e.g., '2024-01-15T14:30:25'), relative dates (e.g., '2 weeks ago', 'yesterday'), or absolute dates (e.g., '2024-01-15', 'Jan 15 2024')"
+  },
+  {
+   "source": "03",
+   "line": 1647,
+   "kind": "parameter",
+   "tool": null,
+   "text": "End timestamp for filtering commits. Accepts: ISO 8601 format (e.g., '2024-01-15T14:30:25'), relative dates (e.g., '2 weeks ago', 'yesterday'), or absolute dates (e.g., '2024-01-15', 'Jan 15 2024')"
+  },
+  {
+   "source": "03",
+   "line": 1658,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Creates a new branch from an optional base branch or commit"
+  },
+  {
+   "source": "03",
+   "line": 1669,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Branch, tag or commit SHA to create the branch from. Defaults to the current branch, or to the current commit when HEAD is detached"
+  },
+  {
+   "source": "03",
+   "line": 1681,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Switches branches"
+  },
+  {
+   "source": "03",
+   "line": 1691,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Merges a branch into the current branch. Fast-forward only unless fast_forward_only is false; refuses a dirty working tree, and aborts a merge that conflicts, leaving the repository unchanged"
+  },
+  {
+   "source": "03",
+   "line": 1705,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Branch, tag or commit to merge into the current branch"
+  },
+  {
+   "source": "03",
+   "line": 1711,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Only fast-forward, failing if the branches have diverged. False allows a merge commit"
+  },
+  {
+   "source": "03",
+   "line": 1722,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Shows the contents of a commit, or of a file or directory given as <revision>:<path>"
+  },
+  {
+   "source": "03",
+   "line": 1732,
+   "kind": "parameter",
+   "tool": null,
+   "text": "List Git branches"
+  },
+  {
+   "source": "03",
+   "line": 1742,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whether to list local branches ('local'), remote branches ('remote') or all branches('all')."
+  },
+  {
+   "source": "03",
+   "line": 1748,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The commit sha that branch should contain. Do not pass anything to this param if no commit sha is specified"
+  },
+  {
+   "source": "03",
+   "line": 1754,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The commit sha that branch should NOT contain. Do not pass anything to this param if no commit sha is specified"
+  },
+  {
+   "source": "03",
+   "line": 1762,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Lists the repository's remotes with their fetch and push URLs, like `git remote -v`. Credentials embedded in a URL's userinfo, query values or fragment are shown as <redacted>; path segments are shown as configured"
+  },
+  {
+   "source": "04",
+   "line": 1036,
+   "kind": "parameter",
+   "tool": null,
+   "text": "URL to fetch"
+  },
+  {
+   "source": "04",
+   "line": 1040,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Maximum number of characters to return."
+  },
+  {
+   "source": "04",
+   "line": 1053,
+   "kind": "parameter",
+   "tool": null,
+   "text": "On return output starting at this character index, useful if a previous fetch was truncated and more context is required."
+  },
+  {
+   "source": "04",
+   "line": 1061,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Get the actual HTML content of the requested page, without simplification."
+  },
+  {
+   "source": "04",
+   "line": 1068,
+   "kind": "parameter",
+   "tool": null,
+   "text": "How long to wait, in milliseconds, to connect to the server and for each read of its response before giving up. Raise it for a slow server or a large download; lower it to fail fast."
+  },
+  {
+   "source": "04",
+   "line": 1110,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Fetch a URL and extract its contents as markdown"
+  },
+  {
+   "source": "05",
+   "line": 1168,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The name of the entity"
+  },
+  {
+   "source": "05",
+   "line": 1169,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The type of the entity"
+  },
+  {
+   "source": "05",
+   "line": 1172,
+   "kind": "parameter",
+   "tool": null,
+   "text": "An array of observation contents associated with the entity"
+  },
+  {
+   "source": "05",
+   "line": 1176,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The name of the entity where the relation starts"
+  },
+  {
+   "source": "05",
+   "line": 1177,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The name of the entity where the relation ends"
+  },
+  {
+   "source": "05",
+   "line": 1178,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The type of the relation"
+  },
+  {
+   "source": "05",
+   "line": 1188,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The search query to match against entity names, types, and observation content"
+  },
+  {
+   "source": "05",
+   "line": 1199,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Return at most this many observations per entity (the first ones, in the order they were added) and add each entity's total as observationCount. Use 0 for names, types and counts only: a cheap overview of a large graph, after which open_nodes reads the entities you need in full. Omit to return every observation."
+  },
+  {
+   "source": "05",
+   "line": 1207,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Return only entities whose entityType is one of these (exact match), and only the relations that touch one of them. Omit to return every entity."
+  },
+  {
+   "source": "05",
+   "line": 1216,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Return at most this many matching entities (the first matches, in stored order), with the relations that touch them. Omit to return every match."
+  },
+  {
+   "source": "05",
+   "line": 1228,
+   "kind": "parameter",
+   "tool": null,
+   "text": "How many observations the entity holds in total; present only when observationLimit was given"
+  },
+  {
+   "source": "05",
+   "line": 1290,
+   "kind": "tool",
+   "tool": "create_entities",
+   "text": "Create multiple new entities in the knowledge graph. An entity whose name already exists, or repeats an earlier entity in the same call, is skipped and its observations are not added; the result lists the skipped names in `skipped`. Use add_observations to add observations to an existing entity."
+  },
+  {
+   "source": "05",
+   "line": 1295,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The entities to create, each with a name unique in the graph"
+  },
+  {
+   "source": "05",
+   "line": 1341,
+   "kind": "tool",
+   "tool": "create_relations",
+   "text": "Create multiple new relations between entities in the knowledge graph. Relations should be in active voice"
+  },
+  {
+   "source": "05",
+   "line": 1346,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The relations to create. Both ends must name existing entities; a relation already in the graph is not added again"
+  },
+  {
+   "source": "05",
+   "line": 1377,
+   "kind": "tool",
+   "tool": "add_observations",
+   "text": "Add new observations to existing entities in the knowledge graph"
+  },
+  {
+   "source": "05",
+   "line": 1385,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The name of the entity to add the observations to"
+  },
+  {
+   "source": "05",
+   "line": 1388,
+   "kind": "parameter",
+   "tool": null,
+   "text": "An array of observation contents to add"
+  },
+  {
+   "source": "05",
+   "line": 1391,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The observations to add, grouped by entity. Each entity must already exist; an observation it already has is not added again"
+  },
+  {
+   "source": "05",
+   "line": 1427,
+   "kind": "tool",
+   "tool": "delete_entities",
+   "text": "Delete whole entities from the knowledge graph, together with every relation that points to or from them and all their observations. Use it only to remove an entity entirely; to remove a link between two entities and keep both, use delete_relations, and to remove facts from an entity, use delete_observations. Cannot be undone."
+  },
+  {
+   "source": "05",
+   "line": 1432,
+   "kind": "parameter",
+   "tool": null,
+   "text": "An array of entity names to delete"
+  },
+  {
+   "source": "05",
+   "line": 1465,
+   "kind": "tool",
+   "tool": "delete_observations",
+   "text": "Delete specific observations from entities in the knowledge graph"
+  },
+  {
+   "source": "05",
+   "line": 1473,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The name of the entity containing the observations"
+  },
+  {
+   "source": "05",
+   "line": 1476,
+   "kind": "parameter",
+   "tool": null,
+   "text": "An array of observations to delete"
+  },
+  {
+   "source": "05",
+   "line": 1479,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The observations to delete, grouped by entity, each matched by its exact text"
+  },
+  {
+   "source": "05",
+   "line": 1521,
+   "kind": "tool",
+   "tool": "delete_relations",
+   "text": "Delete specific relations (from, to, relationType) from the knowledge graph and keep the entities they connect. Each relation must match an existing one exactly on all three fields; if unsure, call open_nodes (or search_nodes) first to read the stored relationType. Use it to remove a link between two entities; to remove an entity itself, use delete_entities. Cannot be undone."
+  },
+  {
+   "source": "05",
+   "line": 1526,
+   "kind": "parameter",
+   "tool": null,
+   "text": "An array of relations to delete"
+  },
+  {
+   "source": "05",
+   "line": 1559,
+   "kind": "tool",
+   "tool": "read_graph",
+   "text": "Read the entire knowledge graph: every entity with its observations, and every relation. The result grows with the graph, so use this only when you need everything; prefer search_nodes to find entities by keyword and open_nodes to read entities whose names you know."
+  },
+  {
+   "source": "05",
+   "line": 1595,
+   "kind": "tool",
+   "tool": "search_nodes",
+   "text": "Search the knowledge graph for entities whose name, type or observations contain the query (case-insensitive). Use this when you have a keyword, a topic or part of a name but not the exact entity names. Prefer open_nodes when you already know the exact names, and use read_graph only when you need the whole graph. Returns the matching entities and every relation that touches one of them."
+  },
+  {
+   "source": "05",
+   "line": 1632,
+   "kind": "tool",
+   "tool": "open_nodes",
+   "text": "Retrieve specific entities by their exact names, with every relation that touches one of them. Use this when you already know the names (from the conversation, or from an earlier search_nodes or read_graph result); it is the cheapest way to read entities you can name. Prefer search_nodes when you only have a keyword or part of a name. Names that do not exist are skipped."
+  },
+  {
+   "source": "05",
+   "line": 1637,
+   "kind": "parameter",
+   "tool": null,
+   "text": "An array of entity names to retrieve"
+  },
+  {
+   "source": "05",
+   "line": 1679,
+   "kind": "tool",
+   "tool": "open_nodes",
+   "text": "The full knowledge graph with all entities and relations"
+  },
+  {
+   "source": "06",
+   "line": 60,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Set only when the source time occurs twice on this date because a clock change repeats it (a DST fall-back): the same conversion at its second occurrence. source and target are the first."
+  },
+  {
+   "source": "06",
+   "line": 311,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Get current time in a specific timezone"
+  },
+  {
+   "source": "06",
+   "line": 318,
+   "kind": "parameter",
+   "tool": null,
+   "text": "IANA timezone name (e.g., 'America/New_York', 'Europe/London'). Optional: defaults to the server's local timezone, 'UTC', when omitted."
+  },
+  {
+   "source": "06",
+   "line": 327,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Convert time between timezones"
+  },
+  {
+   "source": "06",
+   "line": 337,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Source IANA timezone name (e.g., 'America/New_York', 'Europe/London'). Optional: defaults to the server's local timezone, 'UTC', when omitted."
+  },
+  {
+   "source": "06",
+   "line": 341,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Time to convert in 24-hour format (HH:MM)"
+  },
+  {
+   "source": "06",
+   "line": 346,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Target IANA timezone name (e.g., 'Asia/Tokyo', 'America/San_Francisco'). Optional: defaults to the server's local timezone, 'UTC', when omitted."
+  },
+  {
+   "source": "06",
+   "line": 356,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Get the time a given number of days, hours, minutes and seconds ago in a specific timezone"
+  },
+  {
+   "source": "06",
+   "line": 370,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whole days before now"
+  },
+  {
+   "source": "06",
+   "line": 373,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whole hours before now"
+  },
+  {
+   "source": "06",
+   "line": 376,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whole minutes before now"
+  },
+  {
+   "source": "06",
+   "line": 379,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whole seconds before now"
+  },
+  {
+   "source": "07",
+   "line": 64,
+   "kind": "parameter",
+   "tool": null,
+   "text": "A detailed tool for dynamic and reflective problem-solving through thoughts.\nEach thought can build on, question, or revise previous insights as understanding deepens.\n\nWhen to use this tool:\n- Breaking down complex problems into steps\n- Planning and design with room for revision\n- Analysis that might need course correction\n- Problems where the full scope might not be clear initially\n- Tasks that need to maintain context over multiple steps\n- Situations where irrelevant information needs to be filtered out\n\nYou should:\n1. Estimate totalThoughts up front and adjust it up or down as you go; thoughtNumber may exceed it\n2. Question or revise earlier thoughts (isRevision with revisesThought), or branch (branchFromThought with branchId)\n3. Express uncertainty, and ignore information irrelevant to the current step\n4. Generate a solution hypothesis, verify it against the earlier steps, and repeat until satisfied\n5. Set nextThoughtNeeded to false only when truly done and a satisfactory answer is reached"
+  },
+  {
+   "source": "07",
+   "line": 82,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Your current thinking step"
+  },
+  {
+   "source": "07",
+   "line": 83,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whether another thought step is needed"
+  },
+  {
+   "source": "07",
+   "line": 90,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Current thought number (numeric value, e.g., 1, 2, 3)"
+  },
+  {
+   "source": "07",
+   "line": 95,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Estimated total thoughts needed (numeric value, e.g., 5, 10)"
+  },
+  {
+   "source": "07",
+   "line": 100,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whether this revises previous thinking"
+  },
+  {
+   "source": "07",
+   "line": 106,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Which thought is being reconsidered"
+  },
+  {
+   "source": "07",
+   "line": 112,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Branching point thought number"
+  },
+  {
+   "source": "07",
+   "line": 113,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Branch identifier"
+  },
+  {
+   "source": "07",
+   "line": 116,
+   "kind": "parameter",
+   "tool": null,
+   "text": "If more thoughts are needed"
+  },
+  {
+   "source": "08",
+   "line": 7,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Message to echo"
+  },
+  {
+   "source": "08",
+   "line": 14,
+   "kind": "tool",
+   "tool": "echo",
+   "text": "Echoes back the input string"
+  },
+  {
+   "source": "09",
+   "line": 7,
+   "kind": "parameter",
+   "tool": null,
+   "text": "First number"
+  },
+  {
+   "source": "09",
+   "line": 8,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Second number"
+  },
+  {
+   "source": "09",
+   "line": 15,
+   "kind": "tool",
+   "tool": "get-sum",
+   "text": "Returns the sum of two numbers"
+  },
+  {
+   "source": "11",
+   "line": 11,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Duration of the operation in seconds"
+  },
+  {
+   "source": "11",
+   "line": 12,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Number of steps in the operation"
+  },
+  {
+   "source": "11",
+   "line": 19,
+   "kind": "tool",
+   "tool": "trigger-long-running-operation",
+   "text": "Demonstrates a long running operation with progress updates."
+  },
+  {
+   "source": "12",
+   "line": 12,
+   "kind": "tool",
+   "tool": "get-tiny-image",
+   "text": "Returns a tiny MCP logo image."
+  },
+  {
+   "source": "13",
+   "line": 24,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The prompt to send to the LLM"
+  },
+  {
+   "source": "13",
+   "line": 28,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Maximum number of tokens to generate"
+  },
+  {
+   "source": "13",
+   "line": 35,
+   "kind": "tool",
+   "tool": "trigger-sampling-request",
+   "text": "Trigger a Request from the Server for LLM Sampling. Deprecated: Sampling is deprecated as of protocol version 2026-07-28. The server asks with a multi-round-trip request on every protocol version."
+  },
+  {
+   "source": "14",
+   "line": 76,
+   "kind": "tool",
+   "tool": "create_or_update_file",
+   "text": "Create or update a single file in a GitHub repository"
+  },
+  {
+   "source": "14",
+   "line": 81,
+   "kind": "tool",
+   "tool": "search_repositories",
+   "text": "Search for GitHub repositories"
+  },
+  {
+   "source": "14",
+   "line": 86,
+   "kind": "tool",
+   "tool": "create_repository",
+   "text": "Create a new GitHub repository in your account"
+  },
+  {
+   "source": "14",
+   "line": 91,
+   "kind": "tool",
+   "tool": "get_file_contents",
+   "text": "Get the contents of a file or directory from a GitHub repository"
+  },
+  {
+   "source": "14",
+   "line": 96,
+   "kind": "tool",
+   "tool": "push_files",
+   "text": "Push multiple files to a GitHub repository in a single commit"
+  },
+  {
+   "source": "14",
+   "line": 101,
+   "kind": "tool",
+   "tool": "create_issue",
+   "text": "Create a new issue in a GitHub repository"
+  },
+  {
+   "source": "14",
+   "line": 106,
+   "kind": "tool",
+   "tool": "create_pull_request",
+   "text": "Create a new pull request in a GitHub repository"
+  },
+  {
+   "source": "14",
+   "line": 111,
+   "kind": "tool",
+   "tool": "fork_repository",
+   "text": "Fork a GitHub repository to your account or specified organization"
+  },
+  {
+   "source": "14",
+   "line": 116,
+   "kind": "tool",
+   "tool": "create_branch",
+   "text": "Create a new branch in a GitHub repository"
+  },
+  {
+   "source": "14",
+   "line": 121,
+   "kind": "tool",
+   "tool": "list_commits",
+   "text": "Get list of commits of a branch in a GitHub repository"
+  },
+  {
+   "source": "14",
+   "line": 126,
+   "kind": "tool",
+   "tool": "list_issues",
+   "text": "List issues in a GitHub repository with filtering options"
+  },
+  {
+   "source": "14",
+   "line": 131,
+   "kind": "tool",
+   "tool": "update_issue",
+   "text": "Update an existing issue in a GitHub repository"
+  },
+  {
+   "source": "14",
+   "line": 136,
+   "kind": "tool",
+   "tool": "add_issue_comment",
+   "text": "Add a comment to an existing issue"
+  },
+  {
+   "source": "14",
+   "line": 141,
+   "kind": "tool",
+   "tool": "search_code",
+   "text": "Search for code across GitHub repositories"
+  },
+  {
+   "source": "14",
+   "line": 146,
+   "kind": "tool",
+   "tool": "search_issues",
+   "text": "Search for issues and pull requests across GitHub repositories"
+  },
+  {
+   "source": "14",
+   "line": 151,
+   "kind": "tool",
+   "tool": "search_users",
+   "text": "Search for users on GitHub"
+  },
+  {
+   "source": "14",
+   "line": 156,
+   "kind": "tool",
+   "tool": "get_issue",
+   "text": "Get details of a specific issue in a GitHub repository."
+  },
+  {
+   "source": "14",
+   "line": 161,
+   "kind": "tool",
+   "tool": "get_pull_request",
+   "text": "Get details of a specific pull request"
+  },
+  {
+   "source": "14",
+   "line": 166,
+   "kind": "tool",
+   "tool": "list_pull_requests",
+   "text": "List and filter repository pull requests"
+  },
+  {
+   "source": "14",
+   "line": 171,
+   "kind": "tool",
+   "tool": "create_pull_request_review",
+   "text": "Create a review on a pull request"
+  },
+  {
+   "source": "14",
+   "line": 176,
+   "kind": "tool",
+   "tool": "merge_pull_request",
+   "text": "Merge a pull request"
+  },
+  {
+   "source": "14",
+   "line": 181,
+   "kind": "tool",
+   "tool": "get_pull_request_files",
+   "text": "Get the list of files changed in a pull request"
+  },
+  {
+   "source": "14",
+   "line": 186,
+   "kind": "tool",
+   "tool": "get_pull_request_status",
+   "text": "Get the combined status of all status checks for a pull request"
+  },
+  {
+   "source": "14",
+   "line": 191,
+   "kind": "tool",
+   "tool": "update_pull_request_branch",
+   "text": "Update a pull request branch with the latest changes from the base branch"
+  },
+  {
+   "source": "14",
+   "line": 196,
+   "kind": "tool",
+   "tool": "get_pull_request_comments",
+   "text": "Get the review comments on a pull request"
+  },
+  {
+   "source": "14",
+   "line": 201,
+   "kind": "tool",
+   "tool": "get_pull_request_reviews",
+   "text": "Get the reviews on a pull request"
+  },
+  {
+   "source": "15",
+   "line": 56,
+   "kind": "tool",
+   "tool": "slack_list_channels",
+   "text": "List public or pre-defined channels in the workspace with pagination"
+  },
+  {
+   "source": "15",
+   "line": 62,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Maximum number of channels to return (default 100, max 200)"
+  },
+  {
+   "source": "15",
+   "line": 68,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Pagination cursor for next page of results"
+  },
+  {
+   "source": "15",
+   "line": 76,
+   "kind": "tool",
+   "tool": "slack_post_message",
+   "text": "Post a new message to a Slack channel"
+  },
+  {
+   "source": "15",
+   "line": 82,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the channel to post to"
+  },
+  {
+   "source": "15",
+   "line": 86,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The message text to post"
+  },
+  {
+   "source": "15",
+   "line": 95,
+   "kind": "tool",
+   "tool": "slack_reply_to_thread",
+   "text": "Reply to a specific message thread in Slack"
+  },
+  {
+   "source": "15",
+   "line": 101,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the channel containing the thread"
+  },
+  {
+   "source": "15",
+   "line": 105,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The timestamp of the parent message in the format '1234567890.123456'. Timestamps in the format without the period can be converted by adding the period such that 6 numbers come after it."
+  },
+  {
+   "source": "15",
+   "line": 109,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The reply text"
+  },
+  {
+   "source": "15",
+   "line": 118,
+   "kind": "tool",
+   "tool": "slack_add_reaction",
+   "text": "Add a reaction emoji to a message"
+  },
+  {
+   "source": "15",
+   "line": 124,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the channel containing the message"
+  },
+  {
+   "source": "15",
+   "line": 128,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The timestamp of the message to react to"
+  },
+  {
+   "source": "15",
+   "line": 132,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The name of the emoji reaction (without ::)"
+  },
+  {
+   "source": "15",
+   "line": 141,
+   "kind": "tool",
+   "tool": "slack_get_channel_history",
+   "text": "Get recent messages from a channel"
+  },
+  {
+   "source": "15",
+   "line": 147,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the channel"
+  },
+  {
+   "source": "15",
+   "line": 151,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Number of messages to retrieve (default 10)"
+  },
+  {
+   "source": "15",
+   "line": 161,
+   "kind": "tool",
+   "tool": "slack_get_thread_replies",
+   "text": "Get all replies in a message thread"
+  },
+  {
+   "source": "15",
+   "line": 180,
+   "kind": "tool",
+   "tool": "slack_get_users",
+   "text": "Get a list of all users in the workspace with their basic profile information"
+  },
+  {
+   "source": "15",
+   "line": 191,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Maximum number of users to return (default 100, max 200)"
+  },
+  {
+   "source": "15",
+   "line": 200,
+   "kind": "tool",
+   "tool": "slack_get_user_profile",
+   "text": "Get detailed profile information for a specific user"
+  },
+  {
+   "source": "15",
+   "line": 206,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the user"
+  },
+  {
+   "source": "16",
+   "line": 99,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Run a read-only SQL query"
+  },
+  {
+   "source": "17",
+   "line": 13,
+   "kind": "tool",
+   "tool": "brave_web_search",
+   "text": "Performs a web search using the Brave Search API, ideal for general queries, news, articles, and online content. Use this for broad information gathering, recent events, or when you need diverse web sources. Supports pagination, content filtering, and freshness controls. Maximum 20 results per request, with offset for pagination. "
+  },
+  {
+   "source": "17",
+   "line": 23,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Search query (max 400 chars, 50 words)"
+  },
+  {
+   "source": "17",
+   "line": 27,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Number of results (1-20, default 10)"
+  },
+  {
+   "source": "17",
+   "line": 32,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Pagination offset (max 9, default 0)"
+  },
+  {
+   "source": "17",
+   "line": 42,
+   "kind": "tool",
+   "tool": "brave_local_search",
+   "text": "Searches for local businesses and places using Brave's Local Search API. Best for queries related to physical locations, businesses, restaurants, services, etc. Returns detailed information including:\n- Business names and addresses\n- Ratings and review counts\n- Phone numbers and opening hours\nUse this when the query implies 'near me' or mentions specific locations. Automatically falls back to web search if no local results are found."
+  },
+  {
+   "source": "17",
+   "line": 56,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Local search query (e.g. 'pizza near Central Park')"
+  },
+  {
+   "source": "17",
+   "line": 60,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Number of results (1-20, default 5)"
+  },
+  {
+   "source": "18",
+   "line": 21,
+   "kind": "tool",
+   "tool": "puppeteer_navigate",
+   "text": "Navigate to a URL"
+  },
+  {
+   "source": "18",
+   "line": 25,
+   "kind": "parameter",
+   "tool": null,
+   "text": "URL to navigate to"
+  },
+  {
+   "source": "18",
+   "line": 26,
+   "kind": "parameter",
+   "tool": null,
+   "text": "PuppeteerJS LaunchOptions. Default null. If changed and not null, browser restarts. Example: { headless: true, args: ['--no-sandbox'] }"
+  },
+  {
+   "source": "18",
+   "line": 27,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Allow dangerous LaunchOptions that reduce security. When false, dangerous args like --no-sandbox will throw errors. Default false."
+  },
+  {
+   "source": "18",
+   "line": 34,
+   "kind": "tool",
+   "tool": "puppeteer_screenshot",
+   "text": "Take a screenshot of the current page or a specific element"
+  },
+  {
+   "source": "18",
+   "line": 38,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Name for the screenshot"
+  },
+  {
+   "source": "18",
+   "line": 39,
+   "kind": "parameter",
+   "tool": null,
+   "text": "CSS selector for element to screenshot"
+  },
+  {
+   "source": "18",
+   "line": 40,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Width in pixels (default: 800)"
+  },
+  {
+   "source": "18",
+   "line": 41,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Height in pixels (default: 600)"
+  },
+  {
+   "source": "18",
+   "line": 42,
+   "kind": "parameter",
+   "tool": null,
+   "text": "If true, capture the screenshot as a base64-encoded data URI (as text) instead of binary image content. Default false."
+  },
+  {
+   "source": "18",
+   "line": 49,
+   "kind": "tool",
+   "tool": "puppeteer_click",
+   "text": "Click an element on the page"
+  },
+  {
+   "source": "18",
+   "line": 53,
+   "kind": "parameter",
+   "tool": null,
+   "text": "CSS selector for element to click"
+  },
+  {
+   "source": "18",
+   "line": 60,
+   "kind": "tool",
+   "tool": "puppeteer_fill",
+   "text": "Fill out an input field"
+  },
+  {
+   "source": "18",
+   "line": 64,
+   "kind": "parameter",
+   "tool": null,
+   "text": "CSS selector for input field"
+  },
+  {
+   "source": "18",
+   "line": 65,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Value to fill"
+  },
+  {
+   "source": "18",
+   "line": 72,
+   "kind": "tool",
+   "tool": "puppeteer_select",
+   "text": "Select an element on the page with Select tag"
+  },
+  {
+   "source": "18",
+   "line": 76,
+   "kind": "parameter",
+   "tool": null,
+   "text": "CSS selector for element to select"
+  },
+  {
+   "source": "18",
+   "line": 77,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Value to select"
+  },
+  {
+   "source": "18",
+   "line": 84,
+   "kind": "tool",
+   "tool": "puppeteer_hover",
+   "text": "Hover an element on the page"
+  },
+  {
+   "source": "18",
+   "line": 88,
+   "kind": "parameter",
+   "tool": null,
+   "text": "CSS selector for element to hover"
+  },
+  {
+   "source": "18",
+   "line": 95,
+   "kind": "tool",
+   "tool": "puppeteer_evaluate",
+   "text": "Execute JavaScript in the browser console"
+  },
+  {
+   "source": "18",
+   "line": 99,
+   "kind": "parameter",
+   "tool": null,
+   "text": "JavaScript code to execute"
+  },
+  {
+   "source": "19",
+   "line": 367,
+   "kind": "tool",
+   "tool": "create_or_update_file",
+   "text": "Create or update a single file in a GitLab project"
+  },
+  {
+   "source": "19",
+   "line": 372,
+   "kind": "tool",
+   "tool": "search_repositories",
+   "text": "Search for GitLab projects"
+  },
+  {
+   "source": "19",
+   "line": 377,
+   "kind": "tool",
+   "tool": "create_repository",
+   "text": "Create a new GitLab project"
+  },
+  {
+   "source": "19",
+   "line": 382,
+   "kind": "tool",
+   "tool": "get_file_contents",
+   "text": "Get the contents of a file or directory from a GitLab project"
+  },
+  {
+   "source": "19",
+   "line": 387,
+   "kind": "tool",
+   "tool": "push_files",
+   "text": "Push multiple files to a GitLab project in a single commit"
+  },
+  {
+   "source": "19",
+   "line": 392,
+   "kind": "tool",
+   "tool": "create_issue",
+   "text": "Create a new issue in a GitLab project"
+  },
+  {
+   "source": "19",
+   "line": 397,
+   "kind": "tool",
+   "tool": "create_merge_request",
+   "text": "Create a new merge request in a GitLab project"
+  },
+  {
+   "source": "19",
+   "line": 402,
+   "kind": "tool",
+   "tool": "fork_repository",
+   "text": "Fork a GitLab project to your account or specified namespace"
+  },
+  {
+   "source": "19",
+   "line": 407,
+   "kind": "tool",
+   "tool": "create_branch",
+   "text": "Create a new branch in a GitLab project"
+  },
+  {
+   "source": "20",
+   "line": 150,
+   "kind": "tool",
+   "tool": "maps_geocode",
+   "text": "Convert an address into geographic coordinates"
+  },
+  {
+   "source": "20",
+   "line": 156,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The address to geocode"
+  },
+  {
+   "source": "20",
+   "line": 165,
+   "kind": "tool",
+   "tool": "maps_reverse_geocode",
+   "text": "Convert coordinates into an address"
+  },
+  {
+   "source": "20",
+   "line": 171,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Latitude coordinate"
+  },
+  {
+   "source": "20",
+   "line": 175,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Longitude coordinate"
+  },
+  {
+   "source": "20",
+   "line": 184,
+   "kind": "tool",
+   "tool": "maps_search_places",
+   "text": "Search for places using Google Places API"
+  },
+  {
+   "source": "20",
+   "line": 190,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Search query"
+  },
+  {
+   "source": "20",
+   "line": 198,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional center point for the search"
+  },
+  {
+   "source": "20",
+   "line": 202,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Search radius in meters (max 50000)"
+  },
+  {
+   "source": "20",
+   "line": 211,
+   "kind": "tool",
+   "tool": "maps_place_details",
+   "text": "Get detailed information about a specific place"
+  },
+  {
+   "source": "20",
+   "line": 217,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The place ID to get details for"
+  },
+  {
+   "source": "20",
+   "line": 226,
+   "kind": "tool",
+   "tool": "maps_distance_matrix",
+   "text": "Calculate travel distance and time for multiple origins and destinations"
+  },
+  {
+   "source": "20",
+   "line": 233,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Array of origin addresses or coordinates"
+  },
+  {
+   "source": "20",
+   "line": 238,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Array of destination addresses or coordinates"
+  },
+  {
+   "source": "20",
+   "line": 242,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Travel mode (driving, walking, bicycling, transit)"
+  },
+  {
+   "source": "20",
+   "line": 252,
+   "kind": "tool",
+   "tool": "maps_elevation",
+   "text": "Get elevation data for locations on the earth"
+  },
+  {
+   "source": "20",
+   "line": 266,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Array of locations to get elevation for"
+  },
+  {
+   "source": "20",
+   "line": 275,
+   "kind": "tool",
+   "tool": "maps_directions",
+   "text": "Get directions between two points"
+  },
+  {
+   "source": "20",
+   "line": 281,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Starting point address or coordinates"
+  },
+  {
+   "source": "20",
+   "line": 285,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Ending point address or coordinates"
+  },
+  {
+   "source": "21",
+   "line": 200,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Retrieve a Sentry issue by ID or URL"
+  },
+  {
+   "source": "21",
+   "line": 204,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Sentry issue ID or URL"
+  },
+  {
+   "source": "21",
+   "line": 227,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Retrieve and analyze a Sentry issue by ID or URL. Use this tool when you need to:\n                - Investigate production errors and crashes\n                - Access detailed stacktraces from Sentry\n                - Analyze error patterns and frequencies\n                - Get information about when issues first/last occurred\n                - Review error counts and status"
+  },
+  {
+   "source": "22",
+   "line": 180,
+   "kind": "parameter",
+   "tool": null,
+   "text": "A living document of discovered business insights"
+  },
+  {
+   "source": "22",
+   "line": 205,
+   "kind": "parameter",
+   "tool": null,
+   "text": "A prompt to seed the database with initial data and demonstrate what you can do with an SQLite MCP Server + Claude"
+  },
+  {
+   "source": "22",
+   "line": 209,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Topic to seed the database with initial data"
+  },
+  {
+   "source": "22",
+   "line": 247,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Execute a SELECT query on the SQLite database"
+  },
+  {
+   "source": "22",
+   "line": 258,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Execute an INSERT, UPDATE, or DELETE query on the SQLite database"
+  },
+  {
+   "source": "22",
+   "line": 269,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Create a new table in the SQLite database"
+  },
+  {
+   "source": "22",
+   "line": 280,
+   "kind": "parameter",
+   "tool": null,
+   "text": "List all tables in the SQLite database"
+  },
+  {
+   "source": "22",
+   "line": 288,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Get the schema information for a specific table"
+  },
+  {
+   "source": "22",
+   "line": 299,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Add a business insight to the memo"
+  },
+  {
+   "source": "23",
+   "line": 75,
+   "kind": "tool",
+   "tool": "set",
+   "text": "Set a Redis key-value pair with optional expiration"
+  },
+  {
+   "source": "23",
+   "line": 85,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Value to store"
+  },
+  {
+   "source": "23",
+   "line": 89,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional expiration time in seconds"
+  },
+  {
+   "source": "23",
+   "line": 97,
+   "kind": "tool",
+   "tool": "get",
+   "text": "Get value by key from Redis"
+  },
+  {
+   "source": "23",
+   "line": 103,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Redis key to retrieve"
+  },
+  {
+   "source": "23",
+   "line": 111,
+   "kind": "tool",
+   "tool": "delete",
+   "text": "Delete one or more keys from Redis"
+  },
+  {
+   "source": "23",
+   "line": 120,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Key or array of keys to delete"
+  },
+  {
+   "source": "23",
+   "line": 128,
+   "kind": "tool",
+   "tool": "list",
+   "text": "List Redis keys matching a pattern"
+  },
+  {
+   "source": "23",
+   "line": 134,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Pattern to match keys (default: *)"
+  },
+  {
+   "source": "24",
+   "line": 135,
+   "kind": "tool",
+   "tool": "search",
+   "text": "Search for files in Google Drive"
+  },
+  {
+   "source": "25",
+   "line": 799,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The read operation to perform on a single issue.\nOptions are:\n1. get - Get issue details. Also returns best-effort hierarchy flags (`has_parent`, `has_children`); `parent` and `sub_issues_summary` are optional relationship summaries, and `closed_by_pull_requests` summarizes the pull requests configured to close the issue as `total_count` plus up to 5 `references`.\n2. get_comments - Get issue comments.\n3. get_sub_issues - Get sub-issues (children) of the issue.\n4. get_parent - Get the parent issue, if this issue is a sub-issue of another.\n5. get_labels - Get labels assigned to the issue."
+  },
+  {
+   "source": "25",
+   "line": 810,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The owner of the repository"
+  },
+  {
+   "source": "25",
+   "line": 814,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The name of the repository"
+  },
+  {
+   "source": "25",
+   "line": 818,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The number of the issue"
+  },
+  {
+   "source": "25",
+   "line": 830,
+   "kind": "tool",
+   "tool": "issue_read",
+   "text": "Get information about a specific issue in a GitHub repository."
+  },
+  {
+   "source": "25",
+   "line": 1305,
+   "kind": "tool",
+   "tool": "list_issue_types",
+   "text": "List supported issue types for a repository or its owner organization. When repo is omitted, returns org-level issue types directly."
+  },
+  {
+   "source": "25",
+   "line": 1315,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The account owner of the repository or organization."
+  },
+  {
+   "source": "25",
+   "line": 1319,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The name of the repository. When provided, returns issue types for this specific repository. When omitted, returns org-level issue types directly."
+  },
+  {
+   "source": "25",
+   "line": 1405,
+   "kind": "tool",
+   "tool": "add_issue_comment",
+   "text": "Add a comment and/or reaction to a specific issue or issue comment in a GitHub repository. Use this tool with pull requests as well (in this case pass pull request number as issue_number), but only if user is not asking specifically to add or react to review comments. At least one of body or reaction is required."
+  },
+  {
+   "source": "25",
+   "line": 1415,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Repository owner"
+  },
+  {
+   "source": "25",
+   "line": 1419,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Repository name"
+  },
+  {
+   "source": "25",
+   "line": 1423,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Issue or pull request number to comment on or react to."
+  },
+  {
+   "source": "25",
+   "line": 1427,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The numeric ID of the issue or pull request comment to react to. Use this for reactions to comments; omit it to react to the issue or pull request itself. Cannot be combined with body."
+  },
+  {
+   "source": "25",
+   "line": 1432,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Comment content. Required unless reaction is provided."
+  },
+  {
+   "source": "25",
+   "line": 1437,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Emoji reaction to add. Required unless body is provided."
+  },
+  {
+   "source": "25",
+   "line": 1594,
+   "kind": "tool",
+   "tool": "update_issue_comment",
+   "text": "Update the body of an existing issue or pull request conversation comment. This tool cannot update pull request review comments."
+  },
+  {
+   "source": "25",
+   "line": 1612,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The numeric ID of the issue or pull request conversation comment to update. Do not use a pull request review comment ID."
+  },
+  {
+   "source": "25",
+   "line": 1617,
+   "kind": "parameter",
+   "tool": null,
+   "text": "New comment content"
+  },
+  {
+   "source": "25",
+   "line": 1703,
+   "kind": "tool",
+   "tool": "sub_issue_write",
+   "text": "Add a sub-issue to a parent issue in a GitHub repository."
+  },
+  {
+   "source": "25",
+   "line": 1713,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The action to perform on a single sub-issue\nOptions are:\n- 'add' - add a sub-issue to a parent issue in a GitHub repository.\n- 'remove' - remove a sub-issue from a parent issue in a GitHub repository.\n- 'reprioritize' - change the order of sub-issues within a parent issue in a GitHub repository. Use either 'after_id' or 'before_id' to specify the new position.\nWrites issue hierarchy. To move a sub-issue to a new parent, use `add` with `replace_parent=true`; there is no writable parent field."
+  },
+  {
+   "source": "25",
+   "line": 1730,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The number of the parent issue"
+  },
+  {
+   "source": "25",
+   "line": 1734,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the sub-issue to add. ID is not the same as issue number"
+  },
+  {
+   "source": "25",
+   "line": 1738,
+   "kind": "parameter",
+   "tool": null,
+   "text": "When true, replaces the sub-issue's current parent issue. Use with 'add' method only."
+  },
+  {
+   "source": "25",
+   "line": 1742,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the sub-issue to be prioritized after (either after_id OR before_id should be specified)"
+  },
+  {
+   "source": "25",
+   "line": 1746,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the sub-issue to be prioritized before (either after_id OR before_id should be specified)"
+  },
+  {
+   "source": "25",
+   "line": 1988,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional repository owner. If provided with repo, only issues for this repository are listed."
+  },
+  {
+   "source": "25",
+   "line": 1992,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional repository name. If provided with owner, only issues for this repository are listed."
+  },
+  {
+   "source": "25",
+   "line": 1996,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Sort field by number of matches of categories, defaults to best match"
+  },
+  {
+   "source": "25",
+   "line": 2699,
+   "kind": "tool",
+   "tool": "issue_write",
+   "text": "Create a new or update an existing issue in a GitHub repository."
+  },
+  {
+   "source": "25",
+   "line": 2715,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Write operation to perform on a single issue.\nOptions are:\n- 'create' - creates a new issue.\n- 'update' - updates an existing issue."
+  },
+  {
+   "source": "25",
+   "line": 2732,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Issue number to update"
+  },
+  {
+   "source": "25",
+   "line": 2736,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Issue number of the parent issue. Only used when method is 'create' and cannot be combined with issue_fields. The new issue is created and attached to this parent in the same operation."
+  },
+  {
+   "source": "25",
+   "line": 2741,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Repository owner of the parent issue. Must be provided with parent_repo. Omit both to use owner and repo. Only used when method is 'create' and parent_issue_number is provided."
+  },
+  {
+   "source": "25",
+   "line": 2745,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Repository name of the parent issue. Must be provided with parent_owner. Omit both to use owner and repo. Only used when method is 'create' and parent_issue_number is provided."
+  },
+  {
+   "source": "25",
+   "line": 2753,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Issue body content"
+  },
+  {
+   "source": "25",
+   "line": 2757,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Usernames to assign to this issue"
+  },
+  {
+   "source": "25",
+   "line": 2764,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Labels to apply to this issue"
+  },
+  {
+   "source": "25",
+   "line": 2771,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Milestone number"
+  },
+  {
+   "source": "25",
+   "line": 2778,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Type of this issue. For updates, pass null to remove the current type. Only use if issue types are enabled for this repository. Use list_issue_types to get valid type values for this repository or its owner organization. If the repository doesn't support issue types, omit this parameter."
+  },
+  {
+   "source": "25",
+   "line": 2787,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Reason for the state change. Ignored unless state is changed."
+  },
+  {
+   "source": "25",
+   "line": 2792,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Issue number that this issue is a duplicate of. Required when state_reason is 'duplicate'."
+  },
+  {
+   "source": "25",
+   "line": 2796,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Issue field values to set or clear. Each item requires 'field_name' and exactly one of 'value', 'field_option_name', or 'delete: true'."
+  },
+  {
+   "source": "25",
+   "line": 2803,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Issue field name (case-insensitive). Must match a field returned by list_issue_fields for this repository or its organization."
+  },
+  {
+   "source": "25",
+   "line": 2808,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Value to set. Use for text, number, and date fields (date as YYYY-MM-DD). For single-select fields, prefer 'field_option_name' so the option is validated before the API call. Cannot be combined with 'field_option_name' or 'delete: true'."
+  },
+  {
+   "source": "25",
+   "line": 2815,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Option name for single-select fields. Validated against the field's options before the API call. Cannot be combined with 'value' or 'delete: true'."
+  },
+  {
+   "source": "25",
+   "line": 2821,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Set to true to clear this field's current value on the issue. When false or omitted, this property is ignored. Cannot be true when 'value' or 'field_option_name' is provided."
+  },
+  {
+   "source": "25",
+   "line": 3749,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter by state, by default both open and closed issues are returned when not provided"
+  },
+  {
+   "source": "25",
+   "line": 3754,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter by labels"
+  },
+  {
+   "source": "25",
+   "line": 3761,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Order issues by field. If provided, the 'direction' also needs to be provided."
+  },
+  {
+   "source": "25",
+   "line": 3766,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Order direction. If provided, the 'orderBy' also needs to be provided."
+  },
+  {
+   "source": "25",
+   "line": 3771,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter by date (ISO 8601 timestamp)"
+  },
+  {
+   "source": "25",
+   "line": 3775,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter by custom issue field values. Each entry takes a field_name and a value; the server looks up the field and coerces the value to its type (single-select option name, text, number, or YYYY-MM-DD date)."
+  },
+  {
+   "source": "25",
+   "line": 3781,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Name of the custom field (e.g. \"Priority\"). Case-insensitive."
+  },
+  {
+   "source": "25",
+   "line": 3785,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Value to filter on. For single-select fields, the option name (e.g. \"P1\"). For dates, YYYY-MM-DD. For numbers, the numeric value as a string. For text, the text value."
+  },
+  {
+   "source": "25",
+   "line": 3804,
+   "kind": "tool",
+   "tool": "list_issues",
+   "text": "List issues in a GitHub repository. For pagination, use the 'endCursor' from the previous response's 'pageInfo' in the 'after' parameter."
+  },
+  {
+   "source": "26",
+   "line": 34,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Action to specify what pull request data needs to be retrieved from GitHub. \nPossible options: \n 1. get - Get details of a specific pull request.\n 2. get_diff - Get the diff of a pull request.\n 3. get_status - Get combined commit status of a head commit in a pull request.\n 4. get_files - Get the list of files changed in a pull request. Use with pagination parameters to control the number of results returned.\n 5. get_commits - Get the list of commits on a pull request. Use with pagination parameters to control the number of results returned.\n 6. get_review_comments - Get review threads on a pull request. Each thread contains logically grouped review comments made on the same code location during pull request reviews. Returns thread metadata and comments with nullable current and original line-range coordinates (line, start_line, original_line, original_start_line). Current coordinates are omitted when unavailable, such as for outdated comments. Use cursor-based pagination (perPage, after) to control results.\n 7. get_reviews - Get the reviews on a pull request. When asked for review comments, use get_review_comments method. Use with pagination parameters to control the number of results returned.\n 8. get_comments - Get comments on a pull request. Use this if user doesn't specifically want review comments. Use with pagination parameters to control the number of results returned.\n 9. get_check_runs - Get check runs for the head commit of a pull request. Check runs are the individual CI/CD jobs and checks that run on the PR."
+  },
+  {
+   "source": "26",
+   "line": 58,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Pull request number"
+  },
+  {
+   "source": "26",
+   "line": 69,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Cursor for pagination, used only by the get_review_comments method. Pass the endCursor from the previous page's PageInfo to fetch the next page."
+  },
+  {
+   "source": "26",
+   "line": 77,
+   "kind": "tool",
+   "tool": "pull_request_read",
+   "text": "Get information on a specific pull request in GitHub repository."
+  },
+  {
+   "source": "26",
+   "line": 707,
+   "kind": "tool",
+   "tool": "create_pull_request",
+   "text": "Create a new pull request in a GitHub repository."
+  },
+  {
+   "source": "26",
+   "line": 735,
+   "kind": "parameter",
+   "tool": null,
+   "text": "PR description"
+  },
+  {
+   "source": "26",
+   "line": 739,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Branch containing changes"
+  },
+  {
+   "source": "26",
+   "line": 743,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Branch to merge into"
+  },
+  {
+   "source": "26",
+   "line": 747,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Create as draft PR"
+  },
+  {
+   "source": "26",
+   "line": 751,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Allow maintainer edits"
+  },
+  {
+   "source": "26",
+   "line": 755,
+   "kind": "parameter",
+   "tool": null,
+   "text": "GitHub usernames or ORG/team-slug team reviewers to request reviews from"
+  },
+  {
+   "source": "26",
+   "line": 934,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Pull request number to update"
+  },
+  {
+   "source": "26",
+   "line": 942,
+   "kind": "parameter",
+   "tool": null,
+   "text": "New description"
+  },
+  {
+   "source": "26",
+   "line": 951,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Mark pull request as draft (true) or ready for review (false)"
+  },
+  {
+   "source": "26",
+   "line": 955,
+   "kind": "parameter",
+   "tool": null,
+   "text": "New base branch name"
+  },
+  {
+   "source": "26",
+   "line": 977,
+   "kind": "tool",
+   "tool": "update_pull_request",
+   "text": "Update an existing pull request in a GitHub repository."
+  },
+  {
+   "source": "26",
+   "line": 1260,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Pull request number. Required when body is provided."
+  },
+  {
+   "source": "26",
+   "line": 1264,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The numeric ID of the pull request review comment to reply or react to. Use the number from a #discussion_r... anchor, not the GraphQL thread node ID (PRRT_...)."
+  },
+  {
+   "source": "26",
+   "line": 1269,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The text of the reply. Required unless reaction is provided."
+  },
+  {
+   "source": "26",
+   "line": 1285,
+   "kind": "tool",
+   "tool": "add_reply_to_pull_request_comment",
+   "text": "Add a reply and/or reaction to an existing pull request comment. This can create a new comment linked as a reply to the specified comment, add an emoji reaction to the specified comment, or do both. At least one of body or reaction is required."
+  },
+  {
+   "source": "26",
+   "line": 1547,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter by state"
+  },
+  {
+   "source": "26",
+   "line": 1552,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter by head user/org and branch"
+  },
+  {
+   "source": "26",
+   "line": 1556,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter by base branch"
+  },
+  {
+   "source": "26",
+   "line": 1565,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Sort direction"
+  },
+  {
+   "source": "26",
+   "line": 1581,
+   "kind": "tool",
+   "tool": "list_pull_requests",
+   "text": "List pull requests in a GitHub repository. If the user specifies an author, then DO NOT use this tool and use the search_pull_requests tool instead."
+  },
+  {
+   "source": "26",
+   "line": 1690,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Title for merge commit"
+  },
+  {
+   "source": "26",
+   "line": 1694,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Extra detail for merge commit"
+  },
+  {
+   "source": "26",
+   "line": 1698,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Merge method"
+  },
+  {
+   "source": "26",
+   "line": 1703,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The expected SHA of the pull request's HEAD ref"
+  },
+  {
+   "source": "26",
+   "line": 1714,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Merge a pull request in a GitHub repository."
+  },
+  {
+   "source": "26",
+   "line": 1805,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Search query using GitHub pull request search syntax"
+  },
+  {
+   "source": "26",
+   "line": 1809,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional repository owner. If provided with repo, only pull requests for this repository are listed."
+  },
+  {
+   "source": "26",
+   "line": 1813,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional repository name. If provided with owner, only pull requests for this repository are listed."
+  },
+  {
+   "source": "26",
+   "line": 1850,
+   "kind": "tool",
+   "tool": "search_pull_requests",
+   "text": "Search for pull requests in GitHub repositories using issues search syntax already scoped to is:pr"
+  },
+  {
+   "source": "26",
+   "line": 1898,
+   "kind": "tool",
+   "tool": "update_pull_request_branch",
+   "text": "Update the branch of a pull request with the latest changes from the base branch."
+  },
+  {
+   "source": "26",
+   "line": 1998,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The write operation to perform on pull request review."
+  },
+  {
+   "source": "26",
+   "line": 2015,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Review comment text"
+  },
+  {
+   "source": "26",
+   "line": 2019,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Review action to perform."
+  },
+  {
+   "source": "26",
+   "line": 2024,
+   "kind": "parameter",
+   "tool": null,
+   "text": "SHA of commit to review"
+  },
+  {
+   "source": "26",
+   "line": 2028,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The node ID of the review thread (e.g., PRRT_kwDOxxx). Required for resolve_thread and unresolve_thread methods. Get thread IDs from pull_request_read with method get_review_comments."
+  },
+  {
+   "source": "26",
+   "line": 2036,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional reason for resolving a Copilot code review thread: addressed, wont-fix, or invalid."
+  },
+  {
+   "source": "26",
+   "line": 2046,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Create and/or submit, delete review of a pull request.\n\nAvailable methods:\n- create: Create a new review of a pull request. If \"event\" parameter is provided, the review is submitted. If \"event\" is omitted, a pending review is created.\n- submit_pending: Submit an existing pending review of a pull request. This requires that a pending review exists for the current user on the specified pull request. The \"body\" and \"event\" parameters are used when submitting the review.\n- delete_pending: Delete an existing pending review of a pull request. This requires that a pending review exists for the current user on the specified pull request.\n- resolve_thread: Resolve a review thread. Requires only \"threadId\" parameter with the thread's node ID (e.g., PRRT_kwDOxxx). The owner, repo, and pullNumber parameters are not used for this method. Resolving an already-resolved thread is a no-op.\n- unresolve_thread: Unresolve a previously resolved review thread. Requires only \"threadId\" parameter. The owner, repo, and pullNumber parameters are not used for this method. Unresolving an already-unresolved thread is a no-op."
+  },
+  {
+   "source": "26",
+   "line": 2483,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The relative path to the file that necessitates a comment"
+  },
+  {
+   "source": "26",
+   "line": 2487,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The text of the review comment"
+  },
+  {
+   "source": "26",
+   "line": 2491,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The level at which the comment is targeted"
+  },
+  {
+   "source": "26",
+   "line": 2496,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The line of the blob in the pull request diff that the comment applies to. For multi-line comments, the last line of the range"
+  },
+  {
+   "source": "26",
+   "line": 2500,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The side of the diff to comment on. LEFT indicates the previous state, RIGHT indicates the new state"
+  },
+  {
+   "source": "26",
+   "line": 2505,
+   "kind": "parameter",
+   "tool": null,
+   "text": "For multi-line comments, the first line of the range that the comment applies to"
+  },
+  {
+   "source": "26",
+   "line": 2509,
+   "kind": "parameter",
+   "tool": null,
+   "text": "For multi-line comments, the starting side of the diff that the comment applies to. LEFT indicates the previous state, RIGHT indicates the new state"
+  },
+  {
+   "source": "26",
+   "line": 2521,
+   "kind": "tool",
+   "tool": "add_comment_to_pending_review",
+   "text": "Add review comment to the requester's latest pending pull request review. A pending review needs to already exist to call this (check with the user if not sure)."
+  },
+  {
+   "source": "27",
+   "line": 52,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Commit SHA, branch name, or tag name"
+  },
+  {
+   "source": "27",
+   "line": 57,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Level of detail to include for changed files. \"none\" omits stats and files entirely. \"stats\" (default) includes per-file metadata: filename, status, and lines-of-code counts (additions, deletions, changes), with no patch content. \"full_patch\" additionally includes the unified diff content for each file and can be very large."
+  },
+  {
+   "source": "27",
+   "line": 67,
+   "kind": "tool",
+   "tool": "get_commit",
+   "text": "Get details for a commit from a GitHub repository"
+  },
+  {
+   "source": "27",
+   "line": 209,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Commit SHA, branch or tag name to list commits of. If not provided, uses the default branch of the repository. If a commit SHA is provided, will list commits up to that SHA."
+  },
+  {
+   "source": "27",
+   "line": 213,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Author username or email address to filter commits by"
+  },
+  {
+   "source": "27",
+   "line": 217,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Only commits containing this file path will be returned"
+  },
+  {
+   "source": "27",
+   "line": 221,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Only commits after this date will be returned (ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD)"
+  },
+  {
+   "source": "27",
+   "line": 225,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Only commits before this date will be returned (ISO 8601 format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD)"
+  },
+  {
+   "source": "27",
+   "line": 240,
+   "kind": "tool",
+   "tool": "list_commits",
+   "text": "Get list of commits of a branch in a GitHub repository. Returns at least 30 results per page by default, but can return more if specified using the perPage parameter (up to 100)."
+  },
+  {
+   "source": "27",
+   "line": 361,
+   "kind": "tool",
+   "tool": "list_branches",
+   "text": "List branches in a GitHub repository"
+  },
+  {
+   "source": "27",
+   "line": 453,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Create or update a single file in a GitHub repository. \nIf updating, you should provide the SHA of the file you want to update. Use this tool to create or update a file in a GitHub repository remotely; do not use it for local file operations.\n\nTo obtain the current blob SHA before updating, call the get_file_contents tool with the same owner, repo, and path, and set its ref parameter to this tool's branch value. The first text result reports the blob SHA for the requested path.\n\nSHA MUST be provided for existing file updates."
+  },
+  {
+   "source": "27",
+   "line": 469,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Repository owner (username or organization)"
+  },
+  {
+   "source": "27",
+   "line": 477,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Path where to create/update the file"
+  },
+  {
+   "source": "27",
+   "line": 481,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Content of the file, exactly as it should appear once written. Do not base64-encode it; this server does that before calling the REST API."
+  },
+  {
+   "source": "27",
+   "line": 485,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Commit message"
+  },
+  {
+   "source": "27",
+   "line": 489,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Branch to create/update the file in"
+  },
+  {
+   "source": "27",
+   "line": 493,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The blob SHA of the file being replaced. Required if the file already exists. Retrieve it with get_file_contents using the same owner, repo, and path, with ref set to this tool's branch value."
+  },
+  {
+   "source": "27",
+   "line": 497,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Set true to update a symbolic link itself; content must be its new target path."
+  },
+  {
+   "source": "27",
+   "line": 680,
+   "kind": "tool",
+   "tool": "create_repository",
+   "text": "Create a new GitHub repository in your account or specified organization"
+  },
+  {
+   "source": "27",
+   "line": 694,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Repository description"
+  },
+  {
+   "source": "27",
+   "line": 698,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Organization to create the repository in (omit to create in your personal account)"
+  },
+  {
+   "source": "27",
+   "line": 702,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whether the repository should be private. Defaults to true (private) when omitted."
+  },
+  {
+   "source": "27",
+   "line": 707,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Initialize with README"
+  },
+  {
+   "source": "27",
+   "line": 793,
+   "kind": "tool",
+   "tool": null,
+   "text": "Delete a GitHub repository after the user confirms the exact owner/repository name"
+  },
+  {
+   "source": "27",
+   "line": 995,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Path to file/directory"
+  },
+  {
+   "source": "27",
+   "line": 1000,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Accepts optional git refs such as `refs/tags/{tag}`, `refs/heads/{branch}` or `refs/pull/{pr_number}/head`"
+  },
+  {
+   "source": "27",
+   "line": 1004,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Accepts optional commit SHA. If specified, it will be used instead of ref"
+  },
+  {
+   "source": "27",
+   "line": 1261,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Organization to fork to"
+  },
+  {
+   "source": "27",
+   "line": 1339,
+   "kind": "tool",
+   "tool": "delete_file",
+   "text": "Delete a file from a GitHub repository"
+  },
+  {
+   "source": "27",
+   "line": 1358,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Path to the file to delete"
+  },
+  {
+   "source": "27",
+   "line": 1366,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Branch to delete the file from"
+  },
+  {
+   "source": "27",
+   "line": 1552,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Name for new branch"
+  },
+  {
+   "source": "27",
+   "line": 1556,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Source branch (defaults to repo default)"
+  },
+  {
+   "source": "27",
+   "line": 1662,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Branch to push to"
+  },
+  {
+   "source": "27",
+   "line": 1666,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Array of file objects to push, each object with path (string) and content (string)"
+  },
+  {
+   "source": "27",
+   "line": 1673,
+   "kind": "parameter",
+   "tool": null,
+   "text": "path to the file"
+  },
+  {
+   "source": "27",
+   "line": 1677,
+   "kind": "parameter",
+   "tool": null,
+   "text": "file content"
+  },
+  {
+   "source": "27",
+   "line": 1877,
+   "kind": "tool",
+   "tool": "list_tags",
+   "text": "List git tags in a GitHub repository"
+  },
+  {
+   "source": "27",
+   "line": 1971,
+   "kind": "tool",
+   "tool": "get_tag",
+   "text": "Get details about a specific git tag in a GitHub repository"
+  },
+  {
+   "source": "27",
+   "line": 2104,
+   "kind": "tool",
+   "tool": "list_releases",
+   "text": "List releases in a GitHub repository"
+  },
+  {
+   "source": "27",
+   "line": 2208,
+   "kind": "tool",
+   "tool": "get_latest_release",
+   "text": "Get the latest release in a GitHub repository"
+  },
+  {
+   "source": "27",
+   "line": 2285,
+   "kind": "tool",
+   "tool": "get_release_by_tag",
+   "text": "Get a specific release by its tag name in a GitHub repository"
+  },
+  {
+   "source": "27",
+   "line": 2303,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Tag name (e.g., 'v1.0.0')"
+  },
+  {
+   "source": "27",
+   "line": 2386,
+   "kind": "tool",
+   "tool": "list_starred_repositories",
+   "text": "List starred repositories"
+  },
+  {
+   "source": "27",
+   "line": 2396,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Username to list starred repositories for. Defaults to the authenticated user."
+  },
+  {
+   "source": "27",
+   "line": 2400,
+   "kind": "parameter",
+   "tool": null,
+   "text": "How to sort the results. Can be either 'created' (when the repository was starred) or 'updated' (when the repository was last pushed to)."
+  },
+  {
+   "source": "27",
+   "line": 2405,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The direction to sort the results by."
+  },
+  {
+   "source": "27",
+   "line": 2517,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Star a GitHub repository"
+  },
+  {
+   "source": "27",
+   "line": 2584,
+   "kind": "tool",
+   "tool": "unstar_repository",
+   "text": "Unstar a GitHub repository"
+  },
+  {
+   "source": "27",
+   "line": 2769,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Get git blame information for a file, showing the commit that last modified each line. Ranges share commit metadata via the top-level 'commits' map keyed by SHA. Use 'start_line'/'end_line' to restrict the result to a window of the file, and 'perPage'/'after' to cursor-page through returned ranges. Matching ranges are capped at 1000; when the cap is hit 'truncated' is set to true and 'total_ranges' reports the pre-cap match count."
+  },
+  {
+   "source": "27",
+   "line": 2793,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Path to the file in the repository, relative to the repository root"
+  },
+  {
+   "source": "27",
+   "line": 2797,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Git reference (branch, tag, or commit SHA). Defaults to the repository's default branch (HEAD)."
+  },
+  {
+   "source": "27",
+   "line": 2801,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional 1-based starting line of the window of interest. Only ranges overlapping [start_line, end_line] are returned, clamped to the window."
+  },
+  {
+   "source": "27",
+   "line": 2806,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional 1-based ending line of the window of interest. Must be >= start_line when both are provided."
+  },
+  {
+   "source": "27",
+   "line": 3063,
+   "kind": "tool",
+   "tool": "list_repository_collaborators",
+   "text": "List collaborators of a GitHub repository. Results are paginated; the response includes `nextPage`, `prevPage`, `firstPage`, and `lastPage` fields. To get the next page, use the `nextPage` value as the `page` parameter."
+  },
+  {
+   "source": "27",
+   "line": 3082,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter by affiliation. Can be one of: 'outside' (outside collaborators), 'direct' (all with permissions regardless of org membership), 'all' (all collaborators). Default: 'all'"
+  },
+  {
+   "source": "27",
+   "line": 3088,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Page number for pagination (default 1, min 1)"
+  },
+  {
+   "source": "27",
+   "line": 3089,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Results per page for pagination (default 30, min 1, max 100)"
+  },
+  {
+   "source": "28",
+   "line": 29,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Repository search query. Examples: 'machine learning in:name stars:>1000 language:python', 'topic:react', 'user:facebook'. Supports advanced search syntax for precise filtering."
+  },
+  {
+   "source": "28",
+   "line": 33,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Sort repositories by field, defaults to best match"
+  },
+  {
+   "source": "28",
+   "line": 43,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Return minimal repository information (default: true). When false, modern clients receive additional curated repository details, not the complete GitHub API object. Legacy clients retain full GitHub API repository objects."
+  },
+  {
+   "source": "28",
+   "line": 55,
+   "kind": "tool",
+   "tool": "search_repositories",
+   "text": "Find GitHub repositories by name, description, readme, topics, or other metadata. Perfect for discovering projects, finding examples, or locating specific repositories across GitHub."
+  },
+  {
+   "source": "28",
+   "line": 266,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Search query (GitHub code search REST). Implicit AND between terms; supports `OR`, `NOT`, and `\"quoted phrase\"` for exact match. Qualifiers: `repo:owner/repo`, `org:`, `user:`, `language:`, `path:dir` (prefix match), `filename:exact.ext`, `extension:`, `in:file`, `in:path`, `size:`, `is:archived`, `is:fork`. Max 256 chars. Examples: `WithContext language:go org:github`; `\"package main\" repo:o/r`; `func extension:go path:cmd repo:o/r`; `NOT TODO language:go repo:o/r`."
+  },
+  {
+   "source": "28",
+   "line": 270,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Sort field ('indexed' only)"
+  },
+  {
+   "source": "28",
+   "line": 274,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Sort order for results"
+  },
+  {
+   "source": "28",
+   "line": 290,
+   "kind": "tool",
+   "tool": "search_code",
+   "text": "Fast and precise code search across ALL GitHub repositories using GitHub's native search engine. Best for finding exact symbols, functions, classes, or specific code patterns."
+  },
+  {
+   "source": "28",
+   "line": 493,
+   "kind": "parameter",
+   "tool": null,
+   "text": "User search query. Examples: 'john smith', 'location:seattle', 'followers:>100'. Search is automatically scoped to type:user."
+  },
+  {
+   "source": "28",
+   "line": 497,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Sort users by number of followers or repositories, or when the person joined GitHub."
+  },
+  {
+   "source": "28",
+   "line": 514,
+   "kind": "tool",
+   "tool": "search_users",
+   "text": "Find GitHub users by username, real name, or other profile information. Useful for locating developers, contributors, or team members."
+  },
+  {
+   "source": "28",
+   "line": 536,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Organization search query. Examples: 'microsoft', 'location:california', 'created:>=2025-01-01'. Search is automatically scoped to type:org."
+  },
+  {
+   "source": "28",
+   "line": 540,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Sort field by category"
+  },
+  {
+   "source": "28",
+   "line": 557,
+   "kind": "tool",
+   "tool": "search_orgs",
+   "text": "Find GitHub organizations by name, location, or other organization metadata. Ideal for discovering companies, open source foundations, or teams."
+  },
+  {
+   "source": "28",
+   "line": 579,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Commit search query (GitHub commit search REST). Searches commit messages on the default branch only. Scope the search with `repo:owner/repo`, `org:`, or `user:` (queries without a scope qualifier match across all of GitHub and are usually not what you want). Other qualifiers: `author:`, `committer:`, `author-name:`, `committer-name:`, `author-email:`, `committer-email:`, `author-date:`, `committer-date:` (supports `>`, `<`, `>=`, `<=`, and `YYYY-MM-DD..YYYY-MM-DD` ranges), `merge:true|false`, `hash:`, `tree:`, `parent:`, `is:public`. Examples: `repo:owner/repo fix panic`; `org:github author:defunkt committer-date:>=2024-01-01`; `\"refactor cache\" repo:o/r`; `hash:abc1234 repo:o/r`."
+  },
+  {
+   "source": "28",
+   "line": 583,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Sort by author or committer date (defaults to best match)"
+  },
+  {
+   "source": "28",
+   "line": 600,
+   "kind": "tool",
+   "tool": "search_commits",
+   "text": "Search for commits across GitHub repositories using GitHub's commit search syntax. Useful for finding specific changes, authors, or messages across one or many repositories. Searches the default branch only."
+  },
+  {
+   "source": "29",
+   "line": 202,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Tools for listing GitHub Actions resources.\nUse this tool to list workflows in a repository, or list workflow runs, jobs, and artifacts for a specific workflow or workflow run."
+  },
+  {
+   "source": "29",
+   "line": 215,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The action to perform"
+  },
+  {
+   "source": "29",
+   "line": 228,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The unique identifier of the resource. This will vary based on the \"method\" provided, so ensure you provide the correct ID:\n- Do not provide any resource ID for 'list_workflows' method.\n- Provide a workflow ID or workflow file name (e.g. ci.yaml) for 'list_workflow_runs' method, or omit to list all workflow runs in the repository.\n- Provide a workflow run ID for 'list_workflow_jobs' and 'list_workflow_run_artifacts' methods."
+  },
+  {
+   "source": "29",
+   "line": 236,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filters for workflow runs. **ONLY** used when method is 'list_workflow_runs'"
+  },
+  {
+   "source": "29",
+   "line": 240,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter to a specific GitHub user's workflow runs."
+  },
+  {
+   "source": "29",
+   "line": 244,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter workflow runs to a specific Git branch. Use the name of the branch."
+  },
+  {
+   "source": "29",
+   "line": 248,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter workflow runs to a specific event type"
+  },
+  {
+   "source": "29",
+   "line": 286,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter workflow runs to only runs with a specific status"
+  },
+  {
+   "source": "29",
+   "line": 293,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filters for workflow jobs. **ONLY** used when method is 'list_workflow_jobs'"
+  },
+  {
+   "source": "29",
+   "line": 297,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filters jobs by their completed_at timestamp"
+  },
+  {
+   "source": "29",
+   "line": 304,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Page number for pagination (default: 1)"
+  },
+  {
+   "source": "29",
+   "line": 309,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Results per page for pagination (default: 30, max: 100)"
+  },
+  {
+   "source": "29",
+   "line": 384,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Get details about specific GitHub Actions resources.\nUse this tool to get details about individual workflows, workflow runs, jobs, and artifacts by their unique IDs."
+  },
+  {
+   "source": "29",
+   "line": 396,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The method to execute"
+  },
+  {
+   "source": "29",
+   "line": 409,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The unique identifier of the resource. This will vary based on the \"method\" provided, so ensure you provide the correct ID:\n- Provide a workflow ID or workflow file name (e.g. ci.yaml) for 'get_workflow' method.\n- Provide a workflow run ID for 'get_workflow_run', 'get_workflow_run_usage', and 'get_workflow_run_logs_url' methods.\n- Provide an artifact ID for 'download_workflow_run_artifact' method.\n- Provide a job ID for 'get_workflow_job' method."
+  },
+  {
+   "source": "29",
+   "line": 485,
+   "kind": "tool",
+   "tool": "actions_run_trigger",
+   "text": "Trigger GitHub Actions workflow operations, including running, re-running, cancelling workflow runs, and deleting workflow run logs."
+  },
+  {
+   "source": "29",
+   "line": 509,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The workflow ID (numeric) or workflow file name (e.g., main.yml, ci.yaml). Required for 'run_workflow' method."
+  },
+  {
+   "source": "29",
+   "line": 513,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The git reference for the workflow. The reference can be a branch or tag name. Required for 'run_workflow' method."
+  },
+  {
+   "source": "29",
+   "line": 517,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Inputs the workflow accepts. Only used for 'run_workflow' method."
+  },
+  {
+   "source": "29",
+   "line": 522,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the workflow run. Required for all methods except 'run_workflow'."
+  },
+  {
+   "source": "29",
+   "line": 577,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Get logs for GitHub Actions workflow jobs.\nUse this tool to retrieve logs for a specific job or all failed jobs in a workflow run.\nFor single job logs, provide job_id. For all failed jobs in a run, provide run_id with failed_only=true."
+  },
+  {
+   "source": "29",
+   "line": 598,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The unique identifier of the workflow job. Required when getting logs for a single job."
+  },
+  {
+   "source": "29",
+   "line": 602,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The unique identifier of the workflow run. Required when failed_only is true to get logs for all failed jobs in the run."
+  },
+  {
+   "source": "29",
+   "line": 606,
+   "kind": "parameter",
+   "tool": null,
+   "text": "When true, gets logs for all failed jobs in the workflow run specified by run_id. Requires run_id to be provided."
+  },
+  {
+   "source": "29",
+   "line": 610,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Returns actual log content instead of URLs"
+  },
+  {
+   "source": "29",
+   "line": 614,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Number of lines to return from the end of the log"
+  },
+  {
+   "source": "30",
+   "line": 35,
+   "kind": "tool",
+   "tool": "list_notifications",
+   "text": "Lists all GitHub notifications for the authenticated user, including unread notifications, mentions, review requests, assignments, and updates on issues or pull requests. Use this tool whenever the user asks what to work on next, requests a summary of their GitHub activity, wants to see pending reviews, or needs to check for new updates or tasks. This tool is the primary way to discover actionable items, reminders, and outstanding work on GitHub. Always call this tool when asked what to work on next, what is pending, or what needs attention in GitHub."
+  },
+  {
+   "source": "30",
+   "line": 45,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter notifications to, use default unless specified. Read notifications are ones that have already been acknowledged by the user. Participating notifications are those that the user is directly involved in, such as issues or pull requests they have commented on or created."
+  },
+  {
+   "source": "30",
+   "line": 50,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Only show notifications updated after the given time (ISO 8601 format)"
+  },
+  {
+   "source": "30",
+   "line": 54,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Only show notifications updated before the given time (ISO 8601 format)"
+  },
+  {
+   "source": "30",
+   "line": 58,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional repository owner. If provided with repo, only notifications for this repository are listed."
+  },
+  {
+   "source": "30",
+   "line": 62,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional repository name. If provided with owner, only notifications for this repository are listed."
+  },
+  {
+   "source": "30",
+   "line": 180,
+   "kind": "tool",
+   "tool": "dismiss_notification",
+   "text": "Dismiss a notification by marking it as read or done"
+  },
+  {
+   "source": "30",
+   "line": 190,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the notification thread"
+  },
+  {
+   "source": "30",
+   "line": 194,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The new state of the notification (read/done)"
+  },
+  {
+   "source": "30",
+   "line": 263,
+   "kind": "tool",
+   "tool": "mark_all_notifications_read",
+   "text": "Mark all notifications as read"
+  },
+  {
+   "source": "30",
+   "line": 273,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Describes the last point that notifications were checked (optional). Default: Now"
+  },
+  {
+   "source": "30",
+   "line": 277,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional repository owner. If provided with repo, only notifications for this repository are marked as read."
+  },
+  {
+   "source": "30",
+   "line": 281,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Optional repository name. If provided with owner, only notifications for this repository are marked as read."
+  },
+  {
+   "source": "30",
+   "line": 361,
+   "kind": "tool",
+   "tool": "get_notification_details",
+   "text": "Get detailed information for a specific GitHub notification, always call this tool when the user asks for details about a specific notification, if you don't know the ID list notifications first."
+  },
+  {
+   "source": "30",
+   "line": 371,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the notification"
+  },
+  {
+   "source": "30",
+   "line": 441,
+   "kind": "tool",
+   "tool": "manage_notification_subscription",
+   "text": "Manage a notification subscription: ignore, watch, or delete a notification thread subscription."
+  },
+  {
+   "source": "30",
+   "line": 452,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the notification thread."
+  },
+  {
+   "source": "30",
+   "line": 456,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Action to perform: ignore, watch, or delete the notification subscription."
+  },
+  {
+   "source": "30",
+   "line": 544,
+   "kind": "tool",
+   "tool": "manage_repository_notification_subscription",
+   "text": "Manage a repository notification subscription: ignore, watch, or delete repository notifications subscription for the provided repository."
+  },
+  {
+   "source": "30",
+   "line": 555,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The account owner of the repository."
+  },
+  {
+   "source": "30",
+   "line": 559,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The name of the repository."
+  },
+  {
+   "source": "30",
+   "line": 563,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Action to perform: ignore, watch, or delete the repository notification subscription."
+  },
+  {
+   "source": "31",
+   "line": 122,
+   "kind": "tool",
+   "tool": "get_me",
+   "text": "Get details of the authenticated GitHub user. Use this when a request is about the user's own profile for GitHub. Or when information is missing to build other tool calls."
+  },
+  {
+   "source": "31",
+   "line": 207,
+   "kind": "tool",
+   "tool": "get_teams",
+   "text": "Get details of the teams the user is a member of. Limited to organizations accessible with current credentials"
+  },
+  {
+   "source": "31",
+   "line": 309,
+   "kind": "tool",
+   "tool": "get_team_members",
+   "text": "Get member usernames of a specific team in an organization. Limited to organizations accessible with current credentials"
+  },
+  {
+   "source": "32",
+   "line": 28,
+   "kind": "parameter",
+   "tool": null,
+   "text": "GitHub username (omit for authenticated user's gists)"
+  },
+  {
+   "source": "32",
+   "line": 32,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Only gists updated after this time (ISO 8601 timestamp)"
+  },
+  {
+   "source": "32",
+   "line": 41,
+   "kind": "tool",
+   "tool": "list_gists",
+   "text": "List gists for a user"
+  },
+  {
+   "source": "32",
+   "line": 119,
+   "kind": "tool",
+   "tool": "get_gist",
+   "text": "Get gist content of a particular gist, by gist ID"
+  },
+  {
+   "source": "32",
+   "line": 129,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The ID of the gist"
+  },
+  {
+   "source": "32",
+   "line": 181,
+   "kind": "tool",
+   "tool": "create_gist",
+   "text": "Create a new gist"
+  },
+  {
+   "source": "32",
+   "line": 191,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Description of the gist"
+  },
+  {
+   "source": "32",
+   "line": 195,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filename for simple single-file gist creation"
+  },
+  {
+   "source": "32",
+   "line": 199,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Content for simple single-file gist creation"
+  },
+  {
+   "source": "32",
+   "line": 203,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whether the gist is public"
+  },
+  {
+   "source": "32",
+   "line": 285,
+   "kind": "tool",
+   "tool": "update_gist",
+   "text": "Update an existing gist"
+  },
+  {
+   "source": "32",
+   "line": 295,
+   "kind": "parameter",
+   "tool": null,
+   "text": "ID of the gist to update"
+  },
+  {
+   "source": "32",
+   "line": 299,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Updated description of the gist"
+  },
+  {
+   "source": "32",
+   "line": 303,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filename to update or create"
+  },
+  {
+   "source": "32",
+   "line": 307,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Content for the file"
+  },
+  {
+   "source": "34",
+   "line": 28,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The URL to navigate to"
+  },
+  {
+   "source": "34",
+   "line": 47,
+   "kind": "tool",
+   "tool": "browser_navigate_back",
+   "text": "Go back to the previous page in the history"
+  },
+  {
+   "source": "34",
+   "line": 65,
+   "kind": "tool",
+   "tool": "browser_navigate_forward",
+   "text": "Go forward to the next page in the history"
+  },
+  {
+   "source": "34",
+   "line": 83,
+   "kind": "tool",
+   "tool": "browser_reload",
+   "text": "Reload the current page"
+  },
+  {
+   "source": "35",
+   "line": 26,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Human-readable element description used to obtain permission to interact with the element"
+  },
+  {
+   "source": "35",
+   "line": 40,
+   "kind": "tool",
+   "tool": "browser_snapshot",
+   "text": "Capture accessibility snapshot of the current page, this is better than screenshot"
+  },
+  {
+   "source": "35",
+   "line": 43,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Save snapshot to a file instead of returning it in the response. Relative file names are resolved against the workspace root."
+  },
+  {
+   "source": "35",
+   "line": 44,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Limit the depth of the snapshot tree"
+  },
+  {
+   "source": "35",
+   "line": 45,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Include each element's bounding box as [box=x,y,width,height] in the snapshot. Coordinates are viewport-relative, in CSS pixels (Element.getBoundingClientRect)"
+  },
+  {
+   "source": "35",
+   "line": 59,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whether to perform a double click instead of a single click"
+  },
+  {
+   "source": "35",
+   "line": 60,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Button to click, defaults to left"
+  },
+  {
+   "source": "35",
+   "line": 61,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Modifier keys to press"
+  },
+  {
+   "source": "35",
+   "line": 69,
+   "kind": "tool",
+   "tool": "browser_click",
+   "text": "Perform click on a web page"
+  },
+  {
+   "source": "35",
+   "line": 105,
+   "kind": "tool",
+   "tool": "browser_drag",
+   "text": "Perform drag and drop between two elements"
+  },
+  {
+   "source": "35",
+   "line": 107,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Human-readable source element description used to obtain the permission to interact with the element"
+  },
+  {
+   "source": "35",
+   "line": 109,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Human-readable target element description used to obtain the permission to interact with the element"
+  },
+  {
+   "source": "35",
+   "line": 136,
+   "kind": "tool",
+   "tool": "browser_hover",
+   "text": "Hover over element on page"
+  },
+  {
+   "source": "35",
+   "line": 152,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Array of values to select in the dropdown. This can be a single value or multiple values."
+  },
+  {
+   "source": "35",
+   "line": 160,
+   "kind": "tool",
+   "tool": "browser_select_option",
+   "text": "Select an option in a dropdown"
+  },
+  {
+   "source": "35",
+   "line": 180,
+   "kind": "tool",
+   "tool": "browser_generate_locator",
+   "text": "Generate locator for the given element to use in tests"
+  },
+  {
+   "source": "35",
+   "line": 198,
+   "kind": "tool",
+   "tool": "browser_check",
+   "text": "Check a checkbox or radio button"
+  },
+  {
+   "source": "35",
+   "line": 216,
+   "kind": "tool",
+   "tool": "browser_uncheck",
+   "text": "Uncheck a checkbox or radio button"
+  },
+  {
+   "source": "36",
+   "line": 30,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Image format for the screenshot. If unset, inferred from the filename extension, otherwise png."
+  },
+  {
+   "source": "36",
+   "line": 31,
+   "kind": "parameter",
+   "tool": null,
+   "text": "File name to save the screenshot to. Relative file names are resolved against the workspace root. If not specified, the screenshot is saved into the output directory as `page-{timestamp}.{png|jpeg|webp}`."
+  },
+  {
+   "source": "36",
+   "line": 32,
+   "kind": "parameter",
+   "tool": null,
+   "text": "When true, takes a screenshot of the full scrollable page, instead of the currently visible viewport. Cannot be used with element screenshots."
+  },
+  {
+   "source": "36",
+   "line": 33,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Image resolution scale. \"css\" produces a screenshot sized in CSS pixels (smaller, consistent across devices). \"device\" produces a high-resolution screenshot using device pixels (larger, accounts for the device pixel ratio). Default is css."
+  },
+  {
+   "source": "36",
+   "line": 53,
+   "kind": "tool",
+   "tool": "browser_take_screenshot",
+   "text": "Take a screenshot of the current page. Use browser_snapshot for actions by default. With the vision capability enabled, use screenshot coordinates with the coordinate-based mouse tools for elements not exposed in the accessibility snapshot."
+  },
+  {
+   "source": "37",
+   "line": 27,
+   "kind": "tool",
+   "tool": "browser_tabs",
+   "text": "List, create, close, or select a browser tab."
+  },
+  {
+   "source": "37",
+   "line": 29,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Operation to perform"
+  },
+  {
+   "source": "37",
+   "line": 30,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Tab index, used for close/select. If omitted for close, current tab is closed."
+  },
+  {
+   "source": "37",
+   "line": 31,
+   "kind": "parameter",
+   "tool": null,
+   "text": "URL to navigate to in the new tab, used for new."
+  },
+  {
+   "source": "37",
+   "line": 32,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Name of an isolated browser context to create the new tab in, used for new. Tabs in the same isolated context share cookies and storage, tabs in different contexts are fully isolated. If omitted or \"default\", the tab is created in the default context."
+  },
+  {
+   "source": "38",
+   "line": 28,
+   "kind": "tool",
+   "tool": "browser_fill_form",
+   "text": "Fill multiple form fields"
+  },
+  {
+   "source": "38",
+   "line": 31,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Human-readable field name"
+  },
+  {
+   "source": "38",
+   "line": 32,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Type of the field"
+  },
+  {
+   "source": "38",
+   "line": 33,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Value to fill in the field. If the field is a checkbox, the value should be `true` or `false`. If the field is a combobox, the value should be the text of the option."
+  },
+  {
+   "source": "38",
+   "line": 34,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Fields to fill in"
+  },
+  {
+   "source": "39",
+   "line": 28,
+   "kind": "tool",
+   "tool": "browser_press_key",
+   "text": "Press a key on the keyboard"
+  },
+  {
+   "source": "39",
+   "line": 30,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Name of the key to press or a character to generate, such as `ArrowLeft` or `a`"
+  },
+  {
+   "source": "39",
+   "line": 56,
+   "kind": "tool",
+   "tool": "browser_press_sequentially",
+   "text": "Type text key by key on the keyboard"
+  },
+  {
+   "source": "39",
+   "line": 58,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Text to type"
+  },
+  {
+   "source": "39",
+   "line": 59,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whether to submit entered text (press Enter after)"
+  },
+  {
+   "source": "39",
+   "line": 79,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Text to type into the element"
+  },
+  {
+   "source": "39",
+   "line": 81,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whether to type one character at a time. Useful for triggering key handlers in the page. By default entire text is filled in at once."
+  },
+  {
+   "source": "39",
+   "line": 89,
+   "kind": "tool",
+   "tool": "browser_type",
+   "text": "Type text into editable element"
+  },
+  {
+   "source": "39",
+   "line": 129,
+   "kind": "tool",
+   "tool": "browser_keydown",
+   "text": "Press a key down on the keyboard"
+  },
+  {
+   "source": "39",
+   "line": 149,
+   "kind": "tool",
+   "tool": "browser_keyup",
+   "text": "Press a key up on the keyboard"
+  },
+  {
+   "source": "40",
+   "line": 26,
+   "kind": "tool",
+   "tool": "browser_mouse_move_xy",
+   "text": "Move mouse to a given position"
+  },
+  {
+   "source": "40",
+   "line": 28,
+   "kind": "parameter",
+   "tool": null,
+   "text": "X coordinate"
+  },
+  {
+   "source": "40",
+   "line": 29,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Y coordinate"
+  },
+  {
+   "source": "40",
+   "line": 48,
+   "kind": "tool",
+   "tool": "browser_mouse_down",
+   "text": "Press mouse down"
+  },
+  {
+   "source": "40",
+   "line": 50,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Button to press, defaults to left"
+  },
+  {
+   "source": "40",
+   "line": 71,
+   "kind": "tool",
+   "tool": "browser_mouse_up",
+   "text": "Press mouse up"
+  },
+  {
+   "source": "40",
+   "line": 93,
+   "kind": "tool",
+   "tool": "browser_mouse_wheel",
+   "text": "Scroll mouse wheel"
+  },
+  {
+   "source": "40",
+   "line": 113,
+   "kind": "tool",
+   "tool": "browser_mouse_click_xy",
+   "text": "Click mouse button at a given position"
+  },
+  {
+   "source": "40",
+   "line": 118,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Number of clicks, defaults to 1"
+  },
+  {
+   "source": "40",
+   "line": 119,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Time to wait between mouse down and mouse up in milliseconds, defaults to 0"
+  },
+  {
+   "source": "40",
+   "line": 149,
+   "kind": "tool",
+   "tool": "browser_mouse_drag_xy",
+   "text": "Drag left mouse button to a given position"
+  },
+  {
+   "source": "40",
+   "line": 151,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Start X coordinate"
+  },
+  {
+   "source": "40",
+   "line": 152,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Start Y coordinate"
+  },
+  {
+   "source": "40",
+   "line": 153,
+   "kind": "parameter",
+   "tool": null,
+   "text": "End X coordinate"
+  },
+  {
+   "source": "40",
+   "line": 154,
+   "kind": "parameter",
+   "tool": null,
+   "text": "End Y coordinate"
+  },
+  {
+   "source": "41",
+   "line": 28,
+   "kind": "parameter",
+   "tool": null,
+   "text": "() => { /* code */ } or (element) => { /* code */ } when element is provided"
+  },
+  {
+   "source": "41",
+   "line": 29,
+   "kind": "parameter",
+   "tool": null,
+   "text": "File name to save the result to. Relative file names are resolved against the workspace root. If not provided, result is returned as text."
+  },
+  {
+   "source": "41",
+   "line": 37,
+   "kind": "tool",
+   "tool": "browser_evaluate",
+   "text": "Evaluate JavaScript expression on page or element"
+  },
+  {
+   "source": "42",
+   "line": 28,
+   "kind": "tool",
+   "tool": "browser_file_upload",
+   "text": "Upload one or multiple files"
+  },
+  {
+   "source": "42",
+   "line": 30,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The absolute paths to the files to upload. Can be single file or multiple files. If omitted, file chooser is cancelled."
+  },
+  {
+   "source": "42",
+   "line": 69,
+   "kind": "tool",
+   "tool": "browser_drop",
+   "text": "Drop files or MIME-typed data onto an element, as if dragged from outside the page. At least one of \"paths\" or \"data\" must be provided."
+  },
+  {
+   "source": "42",
+   "line": 71,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Absolute paths to files to drop onto the element."
+  },
+  {
+   "source": "42",
+   "line": 72,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Data to drop, as a map of MIME type to string value (e.g. {\"text/plain\": \"hello\", \"text/uri-list\": \"https://example.com\"})."
+  },
+  {
+   "source": "43",
+   "line": 26,
+   "kind": "tool",
+   "tool": "browser_handle_dialog",
+   "text": "Handle a dialog"
+  },
+  {
+   "source": "43",
+   "line": 28,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whether to accept the dialog."
+  },
+  {
+   "source": "43",
+   "line": 29,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The text of the prompt in case of a prompt dialog."
+  },
+  {
+   "source": "44",
+   "line": 25,
+   "kind": "tool",
+   "tool": "browser_console_messages",
+   "text": "Returns all console messages"
+  },
+  {
+   "source": "44",
+   "line": 27,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Level of the console messages to return. Each level includes the messages of more severe levels. Defaults to \"info\"."
+  },
+  {
+   "source": "44",
+   "line": 28,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Return all console messages since the beginning of the session, not just since the last navigation. Defaults to false."
+  },
+  {
+   "source": "44",
+   "line": 29,
+   "kind": "parameter",
+   "tool": null,
+   "text": "File name to save the console messages to. Relative file names are resolved against the workspace root. If not provided, messages are returned as text."
+  },
+  {
+   "source": "44",
+   "line": 50,
+   "kind": "tool",
+   "tool": "browser_console_clear",
+   "text": "Clear all console messages"
+  },
+  {
+   "source": "45",
+   "line": 36,
+   "kind": "tool",
+   "tool": "browser_network_requests",
+   "text": "Returns a numbered list of network requests since loading the page. Use browser_network_request with the number to get full details."
+  },
+  {
+   "source": "45",
+   "line": 38,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whether to include successful static resources like images, fonts, scripts, etc. Defaults to false."
+  },
+  {
+   "source": "45",
+   "line": 39,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Only return requests whose URL matches this regexp (e.g. \"/api/.*user\")."
+  },
+  {
+   "source": "45",
+   "line": 40,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Return all network requests since the beginning of the session, not just since the last navigation. Defaults to false."
+  },
+  {
+   "source": "45",
+   "line": 41,
+   "kind": "parameter",
+   "tool": null,
+   "text": "File name to save the network requests to. Relative file names are resolved against the workspace root. If not provided, requests are returned as text."
+  },
+  {
+   "source": "45",
+   "line": 80,
+   "kind": "tool",
+   "tool": "browser_network_request",
+   "text": "Returns full details (headers and body) of a single network request, or a single part if `part` is set. Use the number from browser_network_requests."
+  },
+  {
+   "source": "45",
+   "line": 82,
+   "kind": "parameter",
+   "tool": null,
+   "text": "1-based index of the request, as printed by browser_network_requests."
+  },
+  {
+   "source": "45",
+   "line": 83,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Return only this part of the request. Omit to return full details."
+  },
+  {
+   "source": "45",
+   "line": 84,
+   "kind": "parameter",
+   "tool": null,
+   "text": "File name to save the result to. Relative file names are resolved against the workspace root. If not provided, output is returned as text."
+  },
+  {
+   "source": "45",
+   "line": 110,
+   "kind": "tool",
+   "tool": "browser_network_clear",
+   "text": "Clear all network requests"
+  },
+  {
+   "source": "45",
+   "line": 271,
+   "kind": "tool",
+   "tool": "browser_network_state_set",
+   "text": "Sets the browser network state to online or offline. When offline, all network requests will fail."
+  },
+  {
+   "source": "45",
+   "line": 273,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Set to \"offline\" to simulate offline mode, \"online\" to restore network connectivity"
+  },
+  {
+   "source": "46",
+   "line": 28,
+   "kind": "tool",
+   "tool": "browser_wait_for",
+   "text": "Wait for text to appear or disappear or a specified time to pass. When both text and textGone are provided, waits for the first one to happen"
+  },
+  {
+   "source": "46",
+   "line": 31,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The text to wait for"
+  },
+  {
+   "source": "46",
+   "line": 32,
+   "kind": "parameter",
+   "tool": null,
+   "text": "The text to wait for to disappear"
+  },
+  {
+   "source": "47",
+   "line": 27,
+   "kind": "tool",
+   "tool": "browser_cookie_list",
+   "text": "List all cookies (optionally filtered by domain/path)"
+  },
+  {
+   "source": "47",
+   "line": 29,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter cookies by domain"
+  },
+  {
+   "source": "47",
+   "line": 30,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Filter cookies by path"
+  },
+  {
+   "source": "47",
+   "line": 63,
+   "kind": "tool",
+   "tool": "browser_cookie_get",
+   "text": "Get a specific cookie by name"
+  },
+  {
+   "source": "47",
+   "line": 65,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Cookie name to get"
+  },
+  {
+   "source": "47",
+   "line": 89,
+   "kind": "tool",
+   "tool": "browser_cookie_set",
+   "text": "Set a cookie with optional flags (domain, path, expires, httpOnly, secure, sameSite)"
+  },
+  {
+   "source": "47",
+   "line": 92,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Cookie value"
+  },
+  {
+   "source": "47",
+   "line": 93,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Cookie domain"
+  },
+  {
+   "source": "47",
+   "line": 95,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Cookie expiration as Unix timestamp"
+  },
+  {
+   "source": "47",
+   "line": 96,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whether the cookie is HTTP only"
+  },
+  {
+   "source": "47",
+   "line": 97,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Whether the cookie is secure"
+  },
+  {
+   "source": "47",
+   "line": 98,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Cookie SameSite attribute"
+  },
+  {
+   "source": "47",
+   "line": 138,
+   "kind": "tool",
+   "tool": "browser_cookie_delete",
+   "text": "Delete a specific cookie (optionally only on a given domain/path)"
+  },
+  {
+   "source": "47",
+   "line": 140,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Cookie name to delete"
+  },
+  {
+   "source": "47",
+   "line": 141,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Only delete the cookie on this domain"
+  },
+  {
+   "source": "47",
+   "line": 142,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Only delete the cookie on this path"
+  },
+  {
+   "source": "47",
+   "line": 162,
+   "kind": "tool",
+   "tool": "browser_cookie_clear",
+   "text": "Clear all cookies"
+  },
+  {
+   "source": "48",
+   "line": 27,
+   "kind": "tool",
+   "tool": "browser_storage_state",
+   "text": "Save storage state (cookies, local storage) to a file for later reuse"
+  },
+  {
+   "source": "48",
+   "line": 29,
+   "kind": "parameter",
+   "tool": null,
+   "text": "File name to save the storage state to. Relative file names are resolved against the workspace root. If not specified, the storage state is saved into the output directory as `storage-state-{timestamp}.json`."
+  },
+  {
+   "source": "48",
+   "line": 50,
+   "kind": "tool",
+   "tool": "browser_set_storage_state",
+   "text": "Restore storage state (cookies, local storage) from a file. This clears existing cookies and local storage before restoring."
+  },
+  {
+   "source": "48",
+   "line": 52,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Path to the storage state file to restore from. Relative file names are resolved against the workspace root."
+  },
+  {
+   "source": "49",
+   "line": 33,
+   "kind": "parameter",
+   "tool": null,
+   "text": "A JavaScript function containing Playwright code to execute. It will be invoked with a single argument, page, which you can use for any page interaction. For example: `async (page) => { await page.getByRole('button', { name: 'Submit' }).click(); return await page.title(); }`"
+  },
+  {
+   "source": "49",
+   "line": 34,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Load code from the specified file. Relative file names are resolved against the workspace root. If both code and filename are provided, code will be ignored."
+  },
+  {
+   "source": "49",
+   "line": 42,
+   "kind": "tool",
+   "tool": "browser_run_code_unsafe",
+   "text": "Run a Playwright code snippet. Unsafe: executes arbitrary JavaScript in the Playwright server process and is RCE-equivalent."
+  },
+  {
+   "source": "50",
+   "line": 29,
+   "kind": "tool",
+   "tool": "browser_verify_element_visible",
+   "text": "Verify element is visible on the page"
+  },
+  {
+   "source": "50",
+   "line": 31,
+   "kind": "parameter",
+   "tool": null,
+   "text": "ROLE of the element. Can be found in the snapshot like this: `- {ROLE} \"Accessible Name\":`"
+  },
+  {
+   "source": "50",
+   "line": 32,
+   "kind": "parameter",
+   "tool": null,
+   "text": "ACCESSIBLE_NAME of the element. Can be found in the snapshot like this: `- role \"{ACCESSIBLE_NAME}\"`"
+  },
+  {
+   "source": "50",
+   "line": 58,
+   "kind": "parameter",
+   "tool": null,
+   "text": "TEXT to verify. Can be found in the snapshot like this: `- role \"Accessible Name\": {TEXT}` or like this: `- text: {TEXT}`"
+  },
+  {
+   "source": "50",
+   "line": 82,
+   "kind": "tool",
+   "tool": "browser_verify_list_visible",
+   "text": "Verify list is visible on the page"
+  },
+  {
+   "source": "50",
+   "line": 84,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Human-readable list description"
+  },
+  {
+   "source": "50",
+   "line": 85,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Exact target element reference that points to the list"
+  },
+  {
+   "source": "50",
+   "line": 86,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Items to verify"
+  },
+  {
+   "source": "50",
+   "line": 114,
+   "kind": "tool",
+   "tool": "browser_verify_value",
+   "text": "Verify element value"
+  },
+  {
+   "source": "50",
+   "line": 116,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Type of the element"
+  },
+  {
+   "source": "50",
+   "line": 117,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Human-readable element description"
+  },
+  {
+   "source": "50",
+   "line": 118,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Exact target element reference from the page snapshot"
+  },
+  {
+   "source": "50",
+   "line": 119,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Value to verify. For checkbox, use \"true\" or \"false\"."
+  },
+  {
+   "source": "51",
+   "line": 291,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Context7 provides up-to-date documentation and code examples for libraries and frameworks."
+  },
+  {
+   "source": "51",
+   "line": 331,
+   "kind": "tool",
+   "tool": "resolve-library-id",
+   "text": "Resolves a package/product name to a Context7-compatible library ID and returns matching libraries.\n\nYou MUST call this function before 'Query Documentation' tool to obtain a valid Context7-compatible library ID UNLESS the user explicitly provides a library ID in the format '/org/project' or '/org/project/version' in their query.\n\nEach result includes:\n- Library ID: Context7-compatible identifier (format: /org/project)\n- Name: Library or package name\n- Description: Short summary\n- Code Snippets: Number of available code examples\n- Source Reputation: Authority indicator (High, Medium, Low, or Unknown)\n- Benchmark Score: Quality indicator (100 is the highest score)\n- Versions: List of versions if available. Use one of those versions if the user provides a version in their query. The format of the version is /org/project/version.\n\nFor best results, select libraries based on name match, source reputation, snippet coverage, benchmark score, and relevance to your use case.\n\nSelection Process:\n1. Analyze the query to understand what library/package the user is looking for\n2. Return the most relevant match based on:\n- Name similarity to the query (exact matches prioritized)\n- Description relevance to the query's intent\n- Documentation coverage (prioritize libraries with higher Code Snippet counts)\n- Source reputation (consider libraries with High or Medium reputation more authoritative)\n- Benchmark Score: Quality indicator (100 is the highest score)\n\nResponse Format:\n- Return the selected library ID in a clearly marked section\n- Provide a brief explanation for why this library was chosen\n- If multiple good matches exist, acknowledge this but proceed with the most relevant one\n- If no good matches exist, clearly state this and suggest query refinements\n\nFor ambiguous queries, request clarification before proceeding with a best-guess match.\n\nIMPORTANT: Do not call this tool more than 3 times per question. If you cannot find what you need after 3 calls, use the best result you have."
+  },
+  {
+   "source": "51",
+   "line": 374,
+   "kind": "parameter",
+   "tool": null,
+   "text": "What to look up in the library's documentation. This is used to rank library results by relevance to what the user is trying to accomplish. The query is sent to the Context7 API for processing. Do not include any sensitive or confidential information such as API keys, passwords, credentials, personal data, or proprietary code in your query."
+  },
+  {
+   "source": "51",
+   "line": 379,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Library name to search for and retrieve a Context7-compatible library ID. Use the official library name with proper punctuation — e.g., 'Next.js' instead of 'nextjs', 'Customer.io' instead of 'customerio', 'Three.js' instead of 'threejs'."
+  },
+  {
+   "source": "51",
+   "line": 432,
+   "kind": "tool",
+   "tool": "query-docs",
+   "text": "Retrieves and queries up-to-date documentation and code examples from Context7 for any programming library or framework.\n\nYou must call 'Resolve Context7 Library ID' tool first to obtain the exact Context7-compatible library ID required to use this tool, UNLESS the user explicitly provides a library ID in the format '/org/project' or '/org/project/version' in their query.\n\nDo not call this tool more than 3 times per question.\n\nIf you know the programming language the user is working in, pass it as `language` so the results match their setup."
+  },
+  {
+   "source": "51",
+   "line": 444,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Exact Context7-compatible library ID (e.g., '/mongodb/docs', '/vercel/next.js', '/supabase/supabase', '/vercel/next.js/v16.2.9') retrieved from 'resolve-library-id' or directly from user query in the format '/org/project' or '/org/project/version'."
+  },
+  {
+   "source": "51",
+   "line": 449,
+   "kind": "parameter",
+   "tool": null,
+   "text": "What to look up in the library's documentation, scoped to a single concept. Be specific and include relevant details, but keep each query to one topic — if the user's question spans multiple distinct concepts, make a separate call per concept instead of combining them, unless the question is about how the concepts interact. Good: 'How to set up authentication with JWT in Express.js' or 'React useEffect cleanup function examples'. Bad (too vague): 'auth' or 'hooks'. Bad (too broad): 'routing and auth and caching in Next.js'. The query is sent to the Context7 API for processing. Do not include any sensitive or confidential information such as API keys, passwords, credentials, personal data, or proprietary code in your query."
+  },
+  {
+   "source": "51",
+   "line": 456,
+   "kind": "parameter",
+   "tool": null,
+   "text": "Programming language the user is writing code in, such as 'Python', 'TypeScript', 'Go', or 'C#'. Ranks code examples in that language first. Leave it out when the language is unknown or does not apply."
+  },
+  {
+   "source": "04",
+   "line": 947,
+   "kind": "tool",
+   "tool": "fetch",
+   "text": "Fetches a URL from the internet and optionally extracts its contents as markdown.\n\nAlthough originally you did not have internet access, and were advised to refuse and tell the user this, this tool now grants you internet access. Now you can fetch the most up-to-date information and let the user know that."
+  },
+  {
+   "source": "33",
+   "line": 13,
+   "kind": "server_instructions",
+   "tool": null,
+   "text": "## Issues\n\nCheck 'list_issue_types' first for organizations to use proper issue types. Use 'search_issues' before creating new issues to avoid duplicates. Always set 'state_reason' when closing issues."
+  },
+  {
+   "source": "33",
+   "line": 19,
+   "kind": "server_instructions",
+   "tool": null,
+   "text": "## Pull Requests\n\nPR review workflow: Always use 'pull_request_review_write' with method 'create' to create a pending review, then 'add_comment_to_pending_review' to add comments, and finally 'pull_request_review_write' with method 'submit_pending' to submit the review for complex reviews with line-specific comments."
+  },
+  {
+   "source": "33",
+   "line": 24,
+   "kind": "server_instructions",
+   "tool": null,
+   "text": "Before creating a pull request, search for pull request templates in the repository. Template files are called pull_request_template.md or they're located in '.github/PULL_REQUEST_TEMPLATE' directory. Use the template content to structure the PR description and then call create_pull_request tool."
+  },
+  {
+   "source": "33",
+   "line": 32,
+   "kind": "server_instructions",
+   "tool": null,
+   "text": "## Discussions\n\nUse 'list_discussion_categories' to understand available categories before creating discussions. Filter by category for better organization."
+  },
+  {
+   "source": "33",
+   "line": 38,
+   "kind": "server_instructions",
+   "tool": null,
+   "text": "## Projects\n\nWorkflow: 1) list_project_fields (get field IDs), 2) list_project_items (with pagination), 3) optional updates.\n\nProject lifecycle: Use create_project to create a new ProjectsV2 for a user or organization (requires owner_type and title). Returns the new project's id, number, title, and url; pass the returned number as project_number to subsequent project tools.\n\nViews: Use list_project_views and get_project_view to inspect views. Use create_project_view, update_project_view, and delete_project_view for basic name, layout, and filter management; visible_fields is create-only and unavailable for roadmap views.\n\nIteration fields: Use create_iteration_field to add a new ITERATION field (e.g. \"Sprint\") to an existing project. Required: field_name, iteration_duration (days), start_date (YYYY-MM-DD). Only pass the iterations array when iterations need varying durations, breaks between them, or specific titles; otherwise omit it and GitHub creates three default iterations of iteration_duration days starting on start_date.\n\nStatus updates: Use list_project_status_updates to read recent project status updates (newest first). Use get_project_status_update with a node ID to get a single update. Use create_project_status_update to create a new status update for a project.\n\nField usage:\n\t- Call list_project_fields first to understand available fields and get IDs/types before filtering.\n\t- Use EXACT returned field names (case-insensitive match). Don't invent names or IDs.\n\t- Iteration synonyms (sprint/cycle) only if that field exists; map to the actual name (e.g. sprint:@current).\n\t- Only include filters for fields that exist and are relevant.\n\nPagination (mandatory):\n\t- Loop while pageInfo.hasNextPage=true using after=pageInfo.nextCursor.\n\t- Keep query, fields, per_page IDENTICAL on every page.\n\t- Use before=pageInfo.prevCursor only when explicitly navigating to a previous page.\n\nCounting rules:\n\t- Count items array length after full pagination.\n\t- Never count field objects, content, or nested arrays as separate items.\n\nSummary vs list:\n\t- Summaries ONLY if user uses verbs: analyze | summarize | summary | report | overview | insights.\n\t- Listing verbs (list/show/get/fetch/display/enumerate) → enumerate + total.\n\nSelf-check before returning:\n\t- Paginated fully\n\t- Correct IDs used\n\t- Field names valid\n\t- Summary only if requested.\n\nReturn COMPLETE data or state what's missing (e.g. pages skipped).\n\nlist_project_items query rules:\nQuery string - For advanced filtering of project items using GitHub's project filtering syntax:\n\nMUST reflect user intent; strongly prefer explicit content type if narrowed:\n\t- \"open issues\" → state:open is:issue\n\t- \"merged PRs\" → state:merged is:pr\n\t- \"items updated this week\" → updated:>@today-7d (omit type only if mixed desired)\n\t- \"list all P1 priority items\" → priority:p1 (omit state if user wants all, omit type if user specifies \"items\")\n\t- \"list all open P2 issues\" → is:issue state:open priority:p2 (include state if user wants open or closed, include type if user specifies \"issues\" or \"PRs\")\n\t- \"all open issues I'm working on\" → is:issue state:open assignee:@me\n\nQuery Construction Heuristics:\n\ta. Extract type nouns: issues → is:issue | PRs, Pulls, or Pull Requests → is:pr | tasks/tickets → is:issue (ask if ambiguity)\n\tb. Map temporal phrases: \"this week\" → updated:>@today-7d\n\tc. Map negations: \"excluding wontfix\" → -label:wontfix\n\td. Map priority adjectives: \"high/sev1/p1\" → priority:high OR priority:p1 (choose based on field presence)\n\te. When filtering by label, always use wildcard matching to account for cross-repository differences or emojis: (e.g. \"bug 🐛\" → label:*bug*)\n\tf. When filtering by milestone, always use wildcard matching to account for cross-repository differences: (e.g. \"v1.0\" → milestone:*v1.0*)\n\nSyntax Essentials (items):\n   AND: space-separated. (label:bug priority:high).\n   OR: comma inside one qualifier (label:bug,critical).\n   NOT: leading '-' (-label:wontfix).\n   Hyphenate multi-word field names. (team-name:\"Backend Team\", story-points:>5).\n   Quote multi-word values. (status:\"In Review\" team-name:\"Backend Team\").\n   Ranges: points:1..3, updated:<@today-30d.\n   Wildcards: title:*crash*, label:bug*.\n   Assigned to User: assignee:@me | assignee:username | no:assignee\n\nCommon Qualifier Glossary (items):\n   is:issue | is:pr | state:open|closed|merged | assignee:@me|username | label:NAME | status:VALUE |\n   priority:p1|high | sprint-name:@current | team-name:\"Backend Team\" | parent-issue:\"org/repo#123\" |\n   updated:>@today-7d | title:*text* | -label:wontfix | label:bug,critical | no:assignee | has:label\n\nNever:\n   - Infer field IDs; fetch via list_project_fields.\n   - Drop 'fields' param on subsequent pages if field values are needed."
+  },
+  {
+   "source": "33",
+   "line": 9,
+   "kind": "server_instructions",
+   "tool": null,
+   "text": "Always call 'get_me' first to understand current user permissions and context."
+  }
+ ]
+}

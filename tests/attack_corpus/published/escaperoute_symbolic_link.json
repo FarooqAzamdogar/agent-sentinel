@@ -1,0 +1,33 @@
+{
+ "id": "escaperoute_symbolic_link",
+ "source": "https://cymulate.com/blog/cve-2025-53109-53110-escaperoute-anthropic/",
+ "about": "A path inside the allowed folder that goes through a symbolic link to the home folder.",
+ "surface": "call",
+ "policy": {
+  "default": "block",
+  "tools": {
+   "read_file": {
+    "action": "allow",
+    "allow_args": [
+     {
+      "arg": "path",
+      "type": "path",
+      "roots": [
+       "~/allowed_dir"
+      ]
+     }
+    ]
+   }
+  }
+ },
+ "call": {
+  "tool": "read_file",
+  "arguments": {
+   "path": "~/allowed_dir/link_to_home/.ssh/id_rsa"
+  }
+ },
+ "expect": {
+  "outcome": "known_miss"
+ },
+ "why": "Paths are judged as text: nothing follows symbolic links (SECURITY.md, known limits). The tool must resolve links itself."
+}
