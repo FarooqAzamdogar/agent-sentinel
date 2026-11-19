@@ -85,9 +85,9 @@ Tests are in `tests/`, one file (or a few) per module. From the project folder, 
 | MCP protocol | `test_protocol.py`, `test_protocol_elicitation.py`, `test_protocol_coverage.py` |
 | Claude Code | `test_claude_hooks.py` (recorded events in `claude_code_events/`), `test_hook_state.py`, `test_cli_hook.py`, `test_recipes.py` |
 | Commands | `test_cli.py`, `test_cli_commands.py`, and `test_cli_<command>.py` for each command; `test_auditlog.py`, `test_fix_hints.py`, `test_home.py`, `test_clients.py`, `test_config_file.py`, `test_wrapping.py` |
-| Everything together | `test_integration.py`, `test_second_review.py` (one test for each gap found in the 0.4.0 review) |
+| Everything together | `test_integration.py`, `test_second_review.py` (one test for each gap found in the 0.4.0 review), `test_end_to_end.py` (real processes, as a user runs them: the library, every command, the Claude Code hook, and the proxy in both protocol eras; about a minute) |
 
-Shared helpers: `tests/support.py` (the example policy, a typical injection), `tests/cli_support.py` (an in-process command runner, temporary folders, and `IsolatedHomeTest`), `tests/scripted_mcp_server.py` (a server driven by a scenario, for `inspect` and `init`).
+Shared helpers: `tests/support.py` (the example policy, a typical injection), `tests/cli_support.py` (an in-process command runner, temporary folders, and `IsolatedHomeTest`), `tests/scripted_mcp_server.py` (a server driven by a scenario, for `inspect` and `init`), `tests/e2e_mcp_server.py` (a server whose tools make it send requests, notifications and any reply, for `test_end_to_end.py`).
 
 - **Test names are sentences** that say the behaviour: `test_a_blocked_call_gets_a_reference`.
 - **Test the failure paths**, the error messages, and at least one hostile input for every new parser.

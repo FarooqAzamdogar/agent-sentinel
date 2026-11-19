@@ -731,6 +731,13 @@ class Proxy:
             # These are requests: a notification cannot ask for them, and one could not be
             # held for approval, cancelled or answered like a request.
             return self._refuse_malformed_request(message, "it has no id")
+        if "id" in message and self._id_in_flight(message["id"]):
+            # A reply is matched to its request by id, and checked as the reply to that kind
+            # of request: under a reused id, a tool list could pass as a tool's result and
+            # skip the list's checks (pins, quarantine, hiding), or a result could set the
+            # flow marks of another tool. MCP forbids reusing an id; the request is dropped,
+            # unanswered, because any answer under that id would be taken for the first one's.
+            return self._dropped("a client request that reuses the id of a request still waiting for its reply")
 
         # What every request must pass first: the protocol revision's rules, then the
         # secret guard on what it carries to the server besides a call's arguments
@@ -1397,8 +1404,7 @@ class Proxy:
             return _Outcome(to_server=message)  # a notification: no reply will come
         modern = _is_modern_request(message)
         with self._state:
-            # If the client reuses an id that is still in flight, the newer
-            # request wins. The reply is scanned either way; honest clients do not reuse ids.
+            # A request that reuses an id still in flight never gets here (_id_in_flight).
             full = message["id"] not in self._pending and len(self._pending) >= MAX_PENDING_REQUESTS
             if not full:
                 self._pending[message["id"]] = _PendingRequest(message["method"], label, marks, call_id, modern)
@@ -1411,6 +1417,16 @@ class Proxy:
             )
             return self._refused(message, refusal)
         return _Outcome(to_server=message)
+
+    def _id_in_flight(self, msg_id: Any) -> bool:
+        """Whether a request of the client's with this id still waits: forwarded and unanswered, or held for approval.
+
+        An id is free again once its reply came, or once the client cancelled it.
+        """
+        with self._state:
+            return msg_id in self._pending or any(
+                waiting.message.get("id") == msg_id and not waiting.cancelled for waiting in self._waiting.values()
+            )
 
     def _forget_cancelled_request(self, message: JsonObject) -> bool:
         """Forget a request the client cancelled. True when it was only held for approval, never forwarded.

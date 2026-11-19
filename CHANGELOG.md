@@ -42,6 +42,7 @@ The biggest release so far: commands that set up real MCP clients, Claude Code h
 - The client's answers to server requests are rebuilt and pass the secret guard.
 - Capabilities are minimised: the server's copy of the client's capabilities loses sampling, elicitation and roots when `server_requests` blocks them.
 - Tasks are refused everywhere.
+- A client request that reuses the id of a request still waiting for its reply is dropped (MCP forbids reusing an id): its reply could otherwise be checked as the wrong kind of reply, so that a tool list skipped its checks.
 - The protocol coverage table (`mcp_protocol.COVERAGE`, in the README) says what happens to every MCP message.
 
 ### Detection and secrets

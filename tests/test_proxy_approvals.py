@@ -286,6 +286,17 @@ class WhileACallWaits(ApprovalTest):
         answered = [r for r in read_audit(self.audit) if r["event"] == "approval"][0]
         self.assertIn("cancelled", answered["reason"])
 
+    def test_a_request_that_reuses_the_id_of_a_held_call_is_dropped(self):
+        gate = self.gate()
+        h = self.proxy(FakeApprover(gate=gate))
+        h.from_client(call(1, "send_email", EMAIL))
+        h.from_client(call(1, "read_file", {"path": "a.txt"}))  # its reply would be taken for the held call's
+        gate.set()
+        sent, to_client = self.settled(h)
+        self.assertEqual([message["params"]["name"] for message in sent], ["send_email"])
+        self.assertEqual(to_client, [])
+        self.assertIn("reuses the id of a request still waiting for its reply", self.output(h))
+
     def test_a_call_sent_without_an_id_is_refused_so_a_later_cancel_still_finds_its_call(self):
         gate = self.gate()
         approver = FakeApprover(gate=gate)

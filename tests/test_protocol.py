@@ -104,9 +104,10 @@ class ProtocolVersions(unittest.TestCase):
         self.assertEqual(self.forwarded_initialize(initialize(1, MODERN))["protocolVersion"], "2025-11-25")
 
     def test_every_known_legacy_version_is_passed_on_unchanged(self):
-        for version in ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"):
+        # A new id each time: the server never answers here, and an id still in flight cannot be used again.
+        for msg_id, version in enumerate(("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"), start=1):
             with self.subTest(version=version):
-                self.assertEqual(self.forwarded_initialize(initialize(1, version))["protocolVersion"], version)
+                self.assertEqual(self.forwarded_initialize(initialize(msg_id, version))["protocolVersion"], version)
         self.assertEqual(self.h.warnings.getvalue(), "")
 
     def test_an_initialize_without_a_protocol_version_is_refused(self):

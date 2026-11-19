@@ -162,6 +162,49 @@ class ToolPinning(unittest.TestCase):
                 ToolPins(bad)
 
 
+class RequestIdsInFlight(unittest.TestCase):
+    """A client request may not reuse the id of a request that still waits for its reply.
+
+    A reply is matched to its request by id, and checked as the reply to that
+    kind of request: with two requests under one id, a tool list could be
+    taken for a tool's result and skip the list's checks (pins, quarantine,
+    hiding), and a result could set the flow marks of the wrong tool.
+    """
+
+    BEFORE = ToolPinning.BEFORE
+    AFTER = ToolPinning.AFTER
+
+    def test_a_request_that_reuses_an_id_in_flight_is_dropped(self):
+        h = Harness()
+        h.from_client(request(1, "tools/list"))
+        h.from_client(call(1, "read_file", {"path": "a.txt"}))
+        self.assertEqual(h.sent_to_server(), [request(1, "tools/list")])
+        self.assertEqual(h.sent_to_client(), [])  # an answer under id 1 would be taken for the first request's
+        self.assertIn("reuses the id of a request still waiting for its reply", h.warnings.getvalue())
+
+    def test_a_changed_tool_list_cannot_pass_as_the_result_of_a_call_under_the_same_id(self):
+        h = Harness()
+        h.round_trip(request(1, "tools/list"), {"tools": [dict(self.BEFORE)]})
+        h.from_client(request(2, "tools/list"))
+        h.from_client(call(2, "search_web", {"q": "soup"}))
+        h.sent_to_server()
+        h.from_server(reply(2, {"tools": [dict(self.AFTER)]}))
+        (delivered,) = h.sent_to_client()
+        self.assertEqual(delivered["result"]["tools"], [])  # checked as a tool list: the changed tool is removed
+        h.from_client(call(3, "search_web", {"q": "soup"}))
+        self.assertEqual(h.sent_to_server(), [])  # and quarantined
+
+    def test_an_id_can_be_used_again_once_its_reply_came_or_it_was_cancelled(self):
+        h = Harness()
+        h.round_trip(call(1, "read_file", {"path": "a.txt"}), text_result("one"))
+        self.assertEqual(h.round_trip(call(1, "read_file", {"path": "b.txt"}), text_result("two"))["id"], 1)
+        h.from_client(call(2, "read_file", {"path": "c.txt"}))
+        h.from_client({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 2}})
+        h.sent_to_server()
+        h.from_client(call(2, "read_file", {"path": "d.txt"}))
+        self.assertEqual(h.sent_to_server(), [call(2, "read_file", {"path": "d.txt"})])
+
+
 class WhatTheAgentMayAskFor(unittest.TestCase):
     def setUp(self):
         self.h = Harness()
