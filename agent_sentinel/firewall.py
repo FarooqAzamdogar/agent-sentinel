@@ -398,6 +398,14 @@ class Firewall:
             event, tool, Decision(False, reason, public_reason=public_reason, rule=rule, call_id=call_id)
         )
 
+    def note(self, tool: str, reason: str, event: str, call_id: str | None = None) -> None:
+        """Record something the operator should know about that blocks nothing: audit action "note".
+
+        For example a tool kept although its name breaks the MCP naming rules,
+        or a tool the proxy hid from the tool list. Nothing reaches the agent.
+        """
+        self._audit(event, tool, "note", Decision(True, reason, call_id=call_id), None)
+
     def refuse(
         self, tool: str, reason: str, event: str = "call", public_reason: str = "", rule: str = RULE_MALFORMED,
         call_id: str | None = None,

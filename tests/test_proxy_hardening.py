@@ -136,8 +136,11 @@ class ToolPinning(unittest.TestCase):
 
     def test_key_order_is_not_a_change(self):
         h = Harness()
-        h.round_trip(request(1, "tools/list"), {"tools": [{"name": "t", "description": "d", "title": "T"}]})
-        delivered = h.round_trip(request(2, "tools/list"), {"tools": [{"title": "T", "description": "d", "name": "t"}]})
+        # search_t: a name the example policy allows, so the tool is not hidden from the list.
+        h.round_trip(request(1, "tools/list"), {"tools": [{"name": "search_t", "description": "d", "title": "T"}]})
+        delivered = h.round_trip(
+            request(2, "tools/list"), {"tools": [{"title": "T", "description": "d", "name": "search_t"}]}
+        )
         self.assertEqual(len(delivered["result"]["tools"]), 1)
 
     def test_pins_in_a_file_survive_a_restart(self):
