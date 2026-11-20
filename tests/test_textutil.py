@@ -505,6 +505,10 @@ class MediaBlocks(unittest.TestCase):
         self.assertEqual(text_views(result)[0].count(payload), 3)  # without `media`, nothing is put aside
 
 
+# Binary data with no printable stretch at all: the bytes 0 to 255 without the printable ASCII ones.
+NO_PRINTABLE_STRETCH = bytes(byte for byte in range(256) if not 0x20 <= byte < 0x7F)
+
+
 def b64(text):
     return base64.b64encode(text.encode()).decode()
 
@@ -553,7 +557,7 @@ class EncodedRunsDecoder(unittest.TestCase):
         self.assertEqual(EncodedRuns().decoded(base64.b64encode(bytes(range(1, 40)) + b"hello").decode()), [])
 
     def test_binary_runs_are_returned_as_latin_1_only_when_asked_for(self):
-        data = base64.b64encode(bytes(range(256)) * 40).decode()
+        data = base64.b64encode(NO_PRINTABLE_STRETCH * 40).decode()
         self.assertEqual(EncodedRuns().decoded(data), [])
         (run,) = EncodedRuns(binary=True).decoded(data)
         self.assertTrue(run.binary)
@@ -563,9 +567,10 @@ class EncodedRunsDecoder(unittest.TestCase):
 
     def test_a_long_binary_run_is_judged_by_a_sample(self):
         decoder = EncodedRuns()
-        decoder.decoded(base64.b64encode(bytes(range(256)) * 400).decode())  # 100 KiB of binary data
+        decoder.decoded(base64.b64encode(NO_PRINTABLE_STRETCH * 640).decode())  # 100 KiB of binary data
         self.assertEqual(decoder.attempts_left, 63)
-        self.assertGreater(decoder.bytes_left, 64 * 1024 - 300)  # only the sample was decoded
+        # Only the sample is charged; the first _SCAN_BYTES were read for text, and held none.
+        self.assertGreater(decoder.bytes_left, 64 * 1024 - 300)
 
     def test_runs_that_do_not_look_encoded_cost_nothing(self):
         decoder = EncodedRuns()
@@ -576,9 +581,51 @@ class EncodedRunsDecoder(unittest.TestCase):
         self.assertEqual(decoder.attempts_left, 64)
 
     def test_binary_and_mostly_unprintable_runs_are_not_text(self):
+        import random
         decoder = EncodedRuns()
-        self.assertEqual(decoder.decoded(base64.b64encode(bytes(range(256))).decode()), [])
+        self.assertEqual(decoder.decoded(base64.b64encode(NO_PRINTABLE_STRETCH).decode()), [])
         self.assertEqual(decoder.decoded(b64("\x01\x02\x03\x04" * 10 + "abc")), [])
+        for seed in range(20):  # random bytes hold short printable stretches, which are not text
+            with self.subTest(seed=seed):
+                data = random.Random(seed).randbytes(3000)
+                self.assertEqual(EncodedRuns().decoded(base64.b64encode(data).decode()), [])
+
+    def test_text_behind_a_long_binary_header_or_between_binary_blocks_is_read(self):
+        # Round 2 (DET-C2-2): 42 NUL bytes ("AAAA..." for 56 characters), or text, binary data, then text.
+        import random
+        noise = random.Random(9).randbytes(1000)
+        for raw, pieces in [
+            (b"\0" * 42 + self.SENTENCE.encode(), [self.SENTENCE]),
+            (b"\0" * 5000 + self.SENTENCE.encode(), [self.SENTENCE]),  # padding is passed over whole
+            (b"\xff" * 300 + self.SENTENCE.encode(), [self.SENTENCE]),
+            (noise + self.SENTENCE.encode(), [self.SENTENCE]),
+            (b"Hello there, friend. " + b"\0" * 24 + self.SENTENCE.encode(), ["Hello there, friend. ", self.SENTENCE]),
+            (self.SENTENCE.encode() + noise + self.SENTENCE.encode(), [self.SENTENCE, self.SENTENCE]),
+            (bytes(range(256)), [bytes(range(32, 127)).decode()]),  # the printable characters in order
+        ]:
+            with self.subTest(raw=raw[:8], length=len(raw)):
+                (run,) = EncodedRuns().decoded(base64.b64encode(raw).decode())
+                self.assertFalse(run.binary)
+                found = run.text.split("\N{REPLACEMENT CHARACTER}")
+                for piece in pieces:
+                    self.assertTrue(any(piece.strip() in part for part in found), (piece, run.text[:200]))
+        # Padding with a character or two after it is binary data, as before.
+        self.assertEqual(EncodedRuns().decoded("ff" * 30 + "41"), [])
+        # Text further in than _SCAN_BYTES (after binary data that is not padding) is not read: documented.
+        # (Hex: in base64, a "/" in the run would have the part after it tried on its own.)
+        far = (noise * 5 + self.SENTENCE.encode()).hex()
+        self.assertEqual(EncodedRuns().decoded(far), [])
+        self.assertEqual(len(EncodedRuns().decoded((noise + self.SENTENCE.encode()).hex())), 1)
+
+    def test_the_secret_guard_reads_binary_runs_with_text_in_them_as_latin_1(self):
+        text = b"Here is the report you asked for, in full."
+        header = bytes(range(1, 31)) * 10
+        for raw, read in [(header + text + header, header + text + header),
+                          (b"\0" * 300 + text + header, text + header)]:  # padding (one byte repeated) is passed over
+            with self.subTest(raw=raw[:2]):
+                (run,) = EncodedRuns(binary=True).decoded(raw.hex())
+                self.assertTrue(run.binary)
+                self.assertEqual(run.text, read.decode("latin-1"))
 
     def test_the_limits_hold(self):
         runs = [b64(f"{self.SENTENCE} Number {n:02d}.") for n in range(20)]

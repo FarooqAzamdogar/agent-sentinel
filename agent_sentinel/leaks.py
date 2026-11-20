@@ -291,6 +291,9 @@ _MAX_UNWRAPPED_CHARS = 100_000
 # with case ignored, since upper-casing it loses nothing for whoever receives it.
 _HEX_VALUE = re.compile(r"[0-9A-Fa-f-]+")
 
+# The characters a number's JSON text can hold ("-12.5e+30", "NaN", "-Infinity").
+_NUMBER_TEXT_CHARS = frozenset("0123456789+-.eE" + "NaNInfinity")
+
 # Exact values (canaries, values of environment variables) shorter than this are
 # not looked for: they would match ordinary text. A canary is checked for this
 # length when the policy is loaded; an environment variable is checked when read.
@@ -557,6 +560,8 @@ class SecretGuard:
         self._values = tuple(values)
         # The values a number can carry: those of ASCII digits only (a PIN, an account number).
         self._digit_values = tuple(value for value in values if value.plain.isascii() and value.plain.isdigit())
+        # The custom formats a number can carry: those whose prefix could stand in a number's JSON text.
+        self._number_formats = tuple(custom for custom in self._custom if _NUMBER_TEXT_CHARS.issuperset(custom.prefix))
         # The values in the form `shows_a_value` compares them in: (the fold function, the folded values).
         self._folded: tuple[Callable[[str], str], tuple[str, ...]] | None = None
 
@@ -564,6 +569,16 @@ class SecretGuard:
     def has_values(self) -> bool:
         """True when the guard has known values or canaries to look for."""
         return bool(self._values)
+
+    @property
+    def reads_numbers(self) -> bool:
+        """True when a number can carry something the guard looks for, so that numbers are worth reading.
+
+        A known value or canary of digits only, or a custom format whose prefix
+        could stand in a number's JSON text ("4111"). No built-in format can:
+        each has letters in it.
+        """
+        return bool(self._digit_values or self._number_formats)
 
     # ---- finding ---------------------------------------------------------------
 
@@ -631,7 +646,7 @@ class SecretGuard:
         for value in self._digit_values:
             if value.plain in number:
                 return value.kind, value.source
-        for custom in self._custom:
+        for custom in self._number_formats:
             if custom.found_in(number):
                 return custom.name, CUSTOM
         return None
@@ -719,7 +734,7 @@ class SecretGuard:
         # Collecting the texts first costs a walk; it pays only when there are values to rule out.
         within = texts_in(value, keys=True) if self._values else None
         redaction = _Redaction(self, for_agent=False, within=within)
-        numbers = bool(self._digit_values or self._custom)
+        numbers = self.reads_numbers
         holder: list[Any] = [None]
         stack: list[tuple[Any, Any, Any]] = [(value, holder, 0)]
         while stack:

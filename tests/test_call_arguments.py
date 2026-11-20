@@ -245,6 +245,42 @@ class NumbersAreRead(unittest.TestCase):
         guard = SecretGuard([CustomFormat("card", "4111", "0-9", 12, 12)])
         self.assertEqual([found.kind for found in guard.find_in_numbers(["4111111111111111"])], ["card"])
 
+    def test_numbers_are_read_only_when_something_can_be_found_in_them(self):
+        # Round 2 (DET-C2-3): a walk over every number of a large call costs time; it is skipped when no
+        # known value, canary or custom format can be spelled by a number.
+        from agent_sentinel.leaks import CustomFormat
+        self.assertFalse(SecretGuard().reads_numbers)
+        self.assertFalse(SecretGuard([CustomFormat("acme", "acme_", "A-Za-z0-9", 20, 40)],
+                                     known_values={"WORD": "abcdefgh"}, canaries=[CANARY]).reads_numbers)
+        self.assertTrue(SecretGuard(known_values={"PIN": PIN}).reads_numbers)
+        self.assertTrue(SecretGuard(canaries=[ACCOUNT_CANARY]).reads_numbers)
+        self.assertTrue(SecretGuard([CustomFormat("card", "4111", "0-9", 12, 12)]).reads_numbers)
+        block = Firewall(Policy.from_dict({"default": "allow", "secrets": {"in_arguments": "block"}}))
+        with mock.patch("agent_sentinel.firewall.numbers_in", wraps=numbers_in) as walked:
+            self.assertTrue(block.check_call("t", {"n": int(PIN)}).allowed)
+            walked.assert_not_called()
+            self.assertFalse(firewall().check_call("t", {"n": int(PIN)}).allowed)
+            walked.assert_called_once()
+
+    def test_large_calls_of_objects_and_strings_are_checked_quickly(self):
+        block = Firewall(Policy.from_dict({"default": "allow", "secrets": {"in_arguments": "block"}}))
+        for name, args in [
+            ("small objects", {"a": [{"k": "v"} for _ in range(300_000)]}),
+            ("short strings", {"a": ["ab"] * 1_000_000}),
+            ("deep arrays", {"a": [json.loads("[" * 200 + "1" + "]" * 200) for _ in range(2_000)]}),
+        ]:
+            with self.subTest(args=name):
+                started = time.perf_counter()
+                self.assertTrue(block.check_call("t", args).allowed)
+                self.assertLess(time.perf_counter() - started, 10)
+
+    def test_arguments_that_are_json_already_are_not_copied(self):
+        value = {"a": [1, 2.5, "x", None, True, {"b": []}]}
+        self.assertIs(normalised_arguments(value), value)
+        for other in ({"a": (1, 2)}, {"a": PurePosixPath("/x")}, {1: "a"}, {"a": Level.HIGH}):
+            with self.subTest(value=other):
+                self.assertIsNot(normalised_arguments(other), other)
+
 
 class TheFirewallChecksTheCopy(TempFolderTest):
     def test_a_canary_in_a_path_an_enum_or_a_dataclass_is_refused(self):

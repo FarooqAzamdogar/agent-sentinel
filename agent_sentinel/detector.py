@@ -488,6 +488,8 @@ class _Rule:
     unless_after: re.Pattern[str] | None  # the rule does not apply when this matches right before the first step
     # A last check on where the chain ends: (lowercased view, end, context) -> may the chain end there?
     accept_end: Callable[[str, int, "_Context"], bool] | None = None
+    # A check on what stands before the first step: (lowercased view, start, context) -> may the chain start there?
+    accept_start: Callable[[str, int, "_Context"], bool] | None = None
 
 
 def _rule(
@@ -498,6 +500,7 @@ def _rule(
     one_sentence: bool = False,
     unless_after: str = "",
     accept_end: Callable[[str, int, "_Context"], bool] | None = None,
+    accept_start: Callable[[str, int, "_Context"], bool] | None = None,
 ) -> _Rule:
     """Build a rule: a first pattern, then (max_gap, pattern) pairs.
 
@@ -507,7 +510,7 @@ def _rule(
     steps = [_Step(re.compile(first), 0)]
     steps += [_Step(re.compile(pattern), gap) for gap, pattern in then]
     unless = re.compile(unless_after) if unless_after else None
-    return _Rule(name, severity, tuple(steps), one_sentence, unless, accept_end)
+    return _Rule(name, severity, tuple(steps), one_sentence, unless, accept_end, accept_start)
 
 
 _OVERRIDE = r"(ignore|disregard|forget|override)\b"
@@ -593,11 +596,16 @@ _CREDENTIAL_FILE = (
     r"|\.cursor[/\\]|\.npmrc\b|\.pypirc\b|\.netrc\b|\.git-credentials\b|/proc/(self|\d{1,7})/environ\b"
     r"|/etc/(passwd|shadow)\b|\.kube[/\\]config\b|\.docker[/\\]config\.json\b|\.gnupg\b|\.config[/\\]gh\b)"
 )
-# Reading or handing on a file.
+# What a file's content is called: "the contents of ~/.ssh/id_rsa", "the full text from .env".
+_CONTENT_OF = (
+    r"(?:the |its |their |your )?(?:full |entire |whole |raw |complete )?(?:contents?|text|data|body) (?:of|from)\b"
+)
+# Reading or handing on a file. "Add" only before the content of something:
+# "add your key to .env" writes a file, "add the contents of .env" reads one.
 _READ = (
     r"(read(s|ing)?|open(s|ing)?|cat|load(s|ing)?|includ(e|es|ing)|attach(es|ing)?|upload(s|ing)?|send(s|ing)?"
     r"|pass(es|ing)?|cop(y|ies|ying)|get(s|ting)?|fetch(es|ing)?|access(es|ing)?|print(s|ing)?|show(s|ing)?"
-    r"|dump(s|ing)?|grep|retriev(e|es|ing)|extract(s|ing)?)\b"
+    r"|dump(s|ing)?|grep|retriev(e|es|ing)|extract(s|ing)?|add(s|ing)?(?= " + _CONTENT_OF + r"))\b"
 )
 # Putting a value somewhere: into an argument, in these rules.
 _PUT = (
@@ -612,7 +620,7 @@ _COPY_IN = (
     r"(includ(e|es|ing)|pass(es|ing)?|put(s|ting)?|past(e|es|ing)|insert(s|ing)?|cop(y|ies|ying)|dump(s|ing)?"
     r"|append(s|ing)?|attach(es|ing)?|send(s|ing)?)\b"
 )
-_INTO = r"\b(as|in|into|inside|within)\b"
+_INTO = r"\b(as|in|into|inside|within|to)\b"
 # The argument a value is put into: a generic word, a quoted name, or any
 # word. `_names_a_parameter` then accepts only a real parameter (see there).
 _ARGUMENT = (
@@ -685,10 +693,15 @@ def _holds_a_path(name: str) -> bool:
     return _PATH_PARAMETER.search(name.replace("_", " ")) is not None
 
 
-def _argument_rules(name: str, severity: str, accept_end: Callable[[str, int, "_Context"], bool]) -> tuple[_Rule, ...]:
+def _argument_rules(
+    name: str, severity: str, accept_end: Callable[[str, int, "_Context"], bool], *, any_name_with_a_sign: bool = False
+) -> tuple[_Rule, ...]:
     """Smuggling through an argument: a credential file's content, or the conversation, put into an argument.
 
     The chain is the same everywhere; `accept_end` says which arguments count.
+    The last form names the argument first: "set notes to the contents of
+    ~/.ssh/id_rsa", "notes=<contents of ~/.ssh/id_rsa>"; with
+    any_name_with_a_sign, any name written straight before "=" counts there.
     """
     return (
         _rule(name, severity, _CREDENTIAL_FILE, (100, r"\b" + _PUT), (60, _INTO), (40, _ARGUMENT),
@@ -697,7 +710,37 @@ def _argument_rules(name: str, severity: str, accept_end: Callable[[str, int, "_
               one_sentence=True, accept_end=accept_end),
         _rule(name, severity, _PUT, (60, _CONVERSATION), (60, _INTO), (40, _ARGUMENT),
               one_sentence=True, accept_end=accept_end),
+        _rule(name, severity, _GIVEN_THE_CONTENT, (40, _CREDENTIAL_FILE),
+              one_sentence=True, accept_start=_argument_before(accept_end, any_name_with_a_sign=any_name_with_a_sign)),
     )
+
+
+# An argument given the content of something, after the argument's name:
+# "(notes) to the contents of", "(notes)=<contents of", "(notes): the text of",
+# "(the notes field) with the data from". The name is judged by `_argument_before`.
+_GIVEN_THE_CONTENT = r"(=|:|to|with) ?[<{\[(\"'`]{0,2} ?" + _CONTENT_OF
+
+
+def _argument_before(
+    accept: Callable[[str, int, "_Context"], bool], *, any_name_with_a_sign: bool
+) -> Callable[[str, int, "_Context"], bool]:
+    """A check that the word right before a chain's start is an argument, as `accept` judges arguments.
+
+    any_name_with_a_sign: also accept any name written straight before "=" ("key=<contents of ...>"),
+    which is how a call's argument is written; for the medium rule, which needs no real parameter.
+    """
+
+    def check(view: str, start: int, context: "_Context") -> bool:
+        end = start
+        while end > 0 and view[end - 1] == " ":
+            end -= 1
+        if any_name_with_a_sign and view.startswith("=", start) and end == start and _LAST_NAME.search(
+            view, max(0, end - 66), end
+        ):
+            return True
+        return accept(view, end, context)
+
+    return check
 
 
 _QUOTES = ("`", "'", '"')
@@ -794,7 +837,7 @@ _METADATA_RULES: tuple[_Rule, ...] = (
 # argument; a credential file read alone is medium, as in descriptions.
 _RESULT_RULES: tuple[_Rule, ...] = (
     *_argument_rules("parameter_smuggling", "high", _names_a_real_parameter),
-    *_argument_rules("parameter_request", "medium", _names_a_parameter),
+    *_argument_rules("parameter_request", "medium", _names_a_parameter, any_name_with_a_sign=True),
     _rule("sensitive_file_read", "medium", _READ, (60, _CREDENTIAL_FILE), one_sentence=True),
 )
 
@@ -1002,6 +1045,8 @@ def _match_chain(rule: _Rule, view: _View, context: "_Context") -> tuple[int, in
     for first in _first_matches(first_pattern, text):
         context.budget.spend()
         if rule.unless_after and rule.unless_after.search(text, max(0, first.start() - _NEGATION_REACH), first.start()):
+            continue
+        if rule.accept_start is not None and not rule.accept_start(text, first.start(), context):
             continue
         next_end = bisect.bisect_left(sentence_ends, first.end())
         limit = sentence_ends[next_end] if next_end < len(sentence_ends) else len(text)
@@ -1432,7 +1477,8 @@ def _host_label_finding(text: str) -> Finding | None:
 
 
 # Terminal sequences that hide or rewrite what a person sees (colours alone do
-# not): SGR 8 "conceal", cursor movement and erasing, OSC 8 hyperlinks (the
+# not): SGR 8 "conceal", cursor movement and erasing (also the cursor saved
+# and restored, ESC 7 and ESC 8), a screen reset, OSC 8 hyperlinks (the
 # address shown is not the one opened) and OSC 52 (writes the clipboard).
 # ESC [ or the one-character CSI, ESC ] or the one-character OSC. Each kind is
 # looked for with one search; only SGR sequences with an 8 in them are read
@@ -1444,6 +1490,11 @@ def _host_label_finding(text: str) -> Finding | None:
 _CSI = r"(?:\x1b\[|\x9b)"
 _HIDING_SEQUENCES = (
     ("cursor movement or erasing", re.compile(_CSI + r"[0-?]*[ -/]{0,8}[ABCDEFGHJKLMPXadefsu`]")),
+    # Without CSI: save and restore the cursor (ESC 7, ESC 8: text written
+    # between them is then written over) and move it up a line (ESC M).
+    ("cursor movement or erasing", re.compile(r"\x1b[78M]")),
+    # A full reset (ESC c) clears the screen; the alignment test (ESC # 8) fills it with "E".
+    ("screen reset", re.compile(r"\x1b(?:c|#8)")),
     ("hyperlink", re.compile(r"(?:\x1b\]|\x9d)8;")),
     ("clipboard", re.compile(r"(?:\x1b\]|\x9d)52;")),
 )
@@ -1452,7 +1503,7 @@ _MAX_SEQUENCES = 10_000
 
 
 def _hiding_escape_finding(text: str) -> Finding | None:
-    """terminal_escape_hiding: a sequence that conceals, moves the cursor, erases, links or writes the clipboard."""
+    """terminal_escape_hiding: a sequence that conceals, moves the cursor, erases, resets, links or sets a clipboard."""
     if "\x1b" not in text and "\x9b" not in text and "\x9d" not in text:
         return None
     kinds = {kind for kind, pattern in _HIDING_SEQUENCES if pattern.search(text)}

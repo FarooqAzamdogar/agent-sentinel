@@ -100,6 +100,7 @@ from .session import (
 )
 from .textutil import (
     UnscannableError,
+    keys_and_strings,
     normalised_arguments,
     numbers_in,
     printable,
@@ -913,14 +914,16 @@ class Firewall:
         secrets.in_arguments is "block". Known values and canaries are always
         looked for: the operator listed them by name, and they never belong in a call.
         Numbers are read too, as JSON writes them (SecretGuard.find_in_numbers):
-        a PIN or an account number sent as a number is still the value.
+        a PIN or an account number sent as a number is still the value. Only
+        when the guard has something a number can spell (reads_numbers): a
+        walk over every number of a large call costs time.
         """
         guard = self._secret_guard()
         formats = self.policy.secrets_in_arguments == "block"
         if not formats and not guard.has_values:
             return []
         found = guard.find_in_texts(_call_spellings(tool, args), formats=formats)
-        numbers = numbers_in(args)
+        numbers = numbers_in(args) if guard.reads_numbers else []
         if numbers:
             found += [item for item in guard.find_in_numbers(numbers, formats=formats) if item not in found]
         return found
@@ -1269,8 +1272,7 @@ def _call_spellings(tool: str | None, args: Any) -> list[str]:
     token is not seen. The one-per-line text is not cut (it is what the guard
     has always read).
     """
-    everything = texts_in(args, keys=True)
-    strings = texts_in(args, keys=False)
+    everything, strings = keys_and_strings(args)
     spellings = ["\n".join(everything if tool is None else [tool, *everything])]
     if len(strings) > 1:
         spellings.append(_joined(strings, MAX_JOINED_ARGUMENT_CHARS))

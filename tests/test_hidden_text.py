@@ -50,8 +50,12 @@ class InvisibleCarriers(unittest.TestCase):
     def test_what_is_not_text_or_too_short_spells_nothing(self):
         self.assertIsNone(decode_invisible("❤️ and 葛\U000e0100"))
         self.assertIsNone(decode_invisible("x" + "​" * 200))  # all zero bits: NUL bytes
-        self.assertIsNone(decode_invisible("x" + bits("short")[:60]))
+        self.assertIsNone(decode_invisible("x" + bits("short")[:7]))  # fewer than eight bits
         self.assertIsNone(decode_invisible("plain text"))
+        # Round 2: a run of eight bits or more is read (runs too short alone are joined, see SplitCarriers),
+        # but fewer than eight characters are no smuggling.
+        self.assertEqual(decode_invisible("x" + bits("short")).hidden, "short")
+        self.assertNotIn("invisible_smuggling", rules("x" + bits("short")))
 
     def test_hidden_text_is_a_high_finding_and_the_rules_read_it(self):
         for text in ("Nice \U0001f600" + selectors(INJECTION), "Nice." + bits(INJECTION)):
@@ -100,6 +104,65 @@ class StrayBytesDoNotHideAPayload(unittest.TestCase):
                 self.assertEqual(found.get("invisible_smuggling"), "high")
                 self.assertEqual(found.get("instruction_override"), "high")
                 self.assertFalse(checked({"content": [{"type": "text", "text": text}]}).decision.allowed)
+
+
+class SplitCarriers(unittest.TestCase):
+    """Round 2 of the review (DET-C2-1): carriers split into short runs, or with other invisible characters
+    between them, were neither decoded nor removed when forwarded."""
+
+    ZERO, ONE = "\N{ZERO WIDTH SPACE}", "\N{ZERO WIDTH NON-JOINER}"
+
+    def carried(self):
+        return bits(INJECTION, self.ZERO, self.ONE)
+
+    def test_groups_of_bits_with_something_invisible_between_them(self):
+        carried = self.carried()
+        for between in ("\N{LEFT-TO-RIGHT MARK}", "\N{COMBINING GRAPHEME JOINER}", "\N{WORD JOINER}",
+                        "\N{VARIATION SELECTOR-1}", "\N{SOFT HYPHEN}", " ", "\n", "\N{LEFT-TO-RIGHT MARK}" * 40):
+            text = "Nice day." + between.join(carried[i:i + 7] for i in range(0, len(carried), 7))
+            with self.subTest(between=ascii(between[:2])):
+                found = rules(text)
+                self.assertEqual(found.get("invisible_smuggling"), "high")
+                self.assertEqual(found.get("instruction_override"), "high")
+                self.assertFalse(checked({"content": [{"type": "text", "text": text}]}).decision.allowed)
+                cleaned = clean_for_forwarding(text)
+                self.assertFalse(set(cleaned) & {self.ZERO, self.ONE})
+                self.assertIsNone(decode_invisible(cleaned))
+
+    def test_short_runs_with_visible_text_between_them_are_read_together(self):
+        payload = INJECTION.encode()
+        for size in (1, 7, 12):  # bytes per run; 12 bits per run is not a whole byte
+            if size == 12:
+                bit_text = "".join(format(byte, "08b") for byte in payload)
+                runs = [bit_text[i:i + 12] for i in range(0, len(bit_text), 12)]
+                runs = [run.replace("0", self.ZERO).replace("1", self.ONE) for run in runs]
+            else:
+                runs = [bits_of(payload[i:i + size], self.ZERO, self.ONE) for i in range(0, len(payload), size)]
+            words = ["word"] * len(runs)
+            text = " ".join(word + run for word, run in zip(words, runs))
+            with self.subTest(size=size):
+                found = decode_invisible(text)
+                # The last run of 12-bit runs holds 4 bits, fewer than a run needs: the last character is lost.
+                self.assertTrue(found.hidden.startswith(INJECTION[:-1]), found.hidden)
+                self.assertEqual(rules(text).get("instruction_override"), "high")
+        # Variation selectors in short runs after several emoji.
+        chunks = [selectors(INJECTION[i:i + 4]) for i in range(0, len(INJECTION), 4)]
+        text = " ".join("\U0001f600" + chunk for chunk in chunks)
+        self.assertEqual(decode_invisible(text).hidden, INJECTION)
+        self.assertEqual(rules(text).get("invisible_smuggling"), "high")
+
+    def test_a_stray_carrier_in_front_does_not_shift_the_bits(self):
+        for stray in (self.ZERO, self.ONE * 3, self.ZERO * 7):
+            with self.subTest(stray=len(stray)):
+                self.assertEqual(decode_invisible("ok " + stray + self.carried()).hidden, INJECTION)
+
+    def test_ordinary_text_with_single_invisible_characters_spells_nothing(self):
+        for text in ("\N{ARABIC LETTER HEH}\N{ZERO WIDTH NON-JOINER}\N{ARABIC LETTER ALEF} " * 50,
+                     "\U0001f468\N{ZERO WIDTH JOINER}\U0001f469\N{ZERO WIDTH JOINER}\U0001f467 " * 50,
+                     "long\N{ZERO WIDTH SPACE}word " * 80, "\N{HEAVY BLACK HEART}\N{VARIATION SELECTOR-16} " * 60):
+            with self.subTest(text=ascii(text[:12])):
+                self.assertIsNone(decode_invisible(text))
+                self.assertEqual(clean_for_forwarding(text), text)
 
 
 def bits_of(data, zero, one):
@@ -153,6 +216,26 @@ class CleaningForForwarding(unittest.TestCase):
                      "\N{LATIN SMALL LETTER E WITH ACUTE}\N{VARIATION SELECTOR-15}"):
             with self.subTest(text=ascii(text)):
                 self.assertEqual(clean_for_forwarding(text), text[0])
+
+    def test_a_selector_after_each_emoji_or_symbol_goes_unless_unicode_defines_the_pair(self):
+        # Round 2 (DET-C2-4): U+FE00..U+FE0D after an emoji carried four bits each and was kept.
+        payload = INJECTION.encode()
+        nibbles = "".join("\U0001f600" + chr(0xFE00 + (byte >> 4)) + "\U0001f600" + chr(0xFE00 + (byte & 15))
+                          for byte in payload)
+        cleaned = clean_for_forwarding(nibbles)
+        self.assertFalse({chr(code) for code in range(0xFE00, 0xFE0E)} & set(cleaned))
+        for text, kept in [
+            ("\U0001f600\N{VARIATION SELECTOR-4}", "\U0001f600"),
+            ("\N{COPYRIGHT SIGN}\N{VARIATION SELECTOR-2}", "\N{COPYRIGHT SIGN}"),
+            ("1+\N{VARIATION SELECTOR-6}2", "1+2"),  # a math symbol keeps only VS1
+            ("\N{INTERSECTION}\N{VARIATION SELECTOR-1}", "\N{INTERSECTION}\N{VARIATION SELECTOR-1}"),
+            ("\N{CJK UNIFIED IDEOGRAPH-4FAE}\N{VARIATION SELECTOR-2}",
+             "\N{CJK UNIFIED IDEOGRAPH-4FAE}\N{VARIATION SELECTOR-2}"),
+            ("\N{CJK UNIFIED IDEOGRAPH-4FAE}\N{VARIATION SELECTOR-9}", "\N{CJK UNIFIED IDEOGRAPH-4FAE}"),
+            ("\U0001f600\N{VARIATION SELECTOR-16}", "\U0001f600\N{VARIATION SELECTOR-16}"),
+        ]:
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(clean_for_forwarding(text), kept)
 
     def test_runs_of_zero_width_characters_go_and_single_ones_stay(self):
         zero, one = "\N{ZERO WIDTH SPACE}", "\N{ZERO WIDTH NON-JOINER}"
@@ -359,6 +442,15 @@ class HostileInputStaysQuick(unittest.TestCase):
             "a selector after each letter": "a\N{VARIATION SELECTOR-1}" * 250_000,
             "zero-width runs": ("\N{ZERO WIDTH SPACE}" * 9 + "a") * 50_000,
             "selectors spelling binary data": "\U0001f600" + "\N{VARIATION SELECTOR-16}\U000e01ef" * 150_000,
+            # Round 2: runs with invisible characters between their carriers, short runs, pieces of text.
+            "carriers with marks between": ("\N{ZERO WIDTH SPACE}\N{LEFT-TO-RIGHT MARK}" * 7 + "a") * 60_000,
+            "carriers far apart": ("\N{ZERO WIDTH SPACE}" + "\N{LEFT-TO-RIGHT MARK}" * 5_000) * 100,
+            "seven carriers and spaces": ("\N{ZERO WIDTH SPACE} " * 7 + "a") * 40_000,
+            "many short runs": ("\N{ZERO WIDTH SPACE}\N{ZERO WIDTH NON-JOINER}" * 4 + "a") * 50_000,
+            "selector pairs between words": ("a" + "\N{VARIATION SELECTOR-3}\N{VARIATION SELECTOR-5}") * 120_000,
+            "random binary base64": (b64_of(__import__("random").Random(4).randbytes(6_000)) + " ") * 100,
+            "padding then binary data": (b64_of(b"\0" * 3_000 + bytes(range(1, 32)) * 100) + " ") * 100,
+            "printable pieces in binary data": (b64_of((bytes(range(31)) + b"x" * 40) * 60) + " ") * 100,
         }
         for name, text in cases.items():
             with self.subTest(case=name):
