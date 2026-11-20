@@ -77,6 +77,7 @@ _HEADINGS = {
 _REFUSED_HEADINGS = {
     "refused": "REFUSED when a person was asked",
     "unavailable": "REFUSED: nobody could be asked",
+    "refused (repeat)": "REFUSED without asking: a person refused it, or its tool, a short while ago",
 }
 _BLOCKED_AFTER_APPROVAL = "BLOCKED after it was approved"
 
@@ -157,6 +158,8 @@ def explain_record(record: dict[str, Any], policy: Policy | None) -> None:
     heading = _HEADINGS.get(action, printable(action, limit=20).upper())
     if record.get("event") == "approval":
         heading = "APPROVED" if action == "allow" else _REFUSED_HEADINGS.get(approval or "", _BLOCKED_AFTER_APPROVAL)
+    elif action == "block" and approval == "refused (repeat)":
+        heading = _REFUSED_HEADINGS[approval]
     ref = f"ref {field_text(record, 'ref', 20)}  " if "ref" in record else ""
     print(f"{ref}{field_text(record, 'time', 40)}  {heading}  {field_text(record, 'event', 40)} "
           f"{field_text(record, 'tool', 120)}")

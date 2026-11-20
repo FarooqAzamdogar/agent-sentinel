@@ -29,7 +29,16 @@ the policy lets it through as the proxy would: injection.block_severity, and
 secrets.in_results for a result (a secret that is replaced passes).
 
 Each case is checked on its own, as the first call of a new session, the way
-`check` does: rate limits never carry over from one case to the next.
+`check` does: rate limits never carry over from one case to the next. A
+case of either kind may have a "history": earlier calls and results of its
+session, played first, as `check --history` plays them (cli_check.parse_history):
+
+    {"tool": "send_email", "args": {"to": "eve@evil.example"}, "expect": "block",
+     "history": [{"result": "fetch_page", "content": "a page"},
+                 {"call": "send_email", "args": {"to": "eve@evil.example"}, "answer": "refuse"}]}
+
+so that flow marks, session limits, approval memory and the tail scan can be
+tested. At most MAX_HISTORY_STEPS steps in all the cases of one file.
 
 The file is read as strictly as a policy: an unknown key, a repeated key, a
 wrong type or a missing "expect" is an error (exit code 2), and nothing runs.
@@ -39,12 +48,14 @@ Exit code 1 when any case fails, 0 when all pass.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import ntpath
 import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from .cli_check import check_mark, outcome_of
+from .cli_check import HistoryStep, check_mark, outcome_of, parse_history, replay_history
+from .cli_check import MAX_HISTORY_STEPS as MAX_STEPS_PER_CASE
 from .cli_common import (
     EXIT_ERROR,
     EXIT_FAIL,
@@ -86,9 +97,11 @@ MAX_CASES = 10_000
 MAX_NAME_CHARS = 200
 # All the scan_file files of one case file together. Each one is also limited to MAX_INPUT_BYTES.
 MAX_SCAN_FILE_BYTES = 64 * 1024 * 1024
+# The history steps of all the cases of one file together (each case: at most MAX_STEPS_PER_CASE).
+MAX_HISTORY_STEPS = 20_000
 
-_CALL_KEYS = ("name", "tool", "args", "marks", "proxy", "expect", "expect_rule")
-_SCAN_KEYS = ("name", "scan", "scan_file", "as", "expect")
+_CALL_KEYS = ("name", "tool", "args", "marks", "proxy", "expect", "expect_rule", "history")
+_SCAN_KEYS = ("name", "scan", "scan_file", "as", "expect", "history")
 _SCAN_EXPECT = ("block", "pass")
 # A scan case's "as": how the text is read, and the scan_result event that reads it that way.
 SCAN_AS = {"result": "result", "description": "tool_description", "instructions": "server_instructions"}
@@ -109,6 +122,7 @@ class Case:
     text: str | None = None  # a scan case
     source: str | None = None  # "scan" or the scan_file path as written
     read_as: str = "result"  # a scan case: a key of SCAN_AS
+    history: tuple[HistoryStep, ...] = ()  # earlier calls and results, played first
 
 
 @dataclass(frozen=True)
@@ -165,10 +179,11 @@ def _cases(data: Any, folder: str) -> list[Case]:
     if len(entries) > MAX_CASES:
         raise CommandError(f"cases has {len(entries)} entries; at most {MAX_CASES} are read")
     budget = [MAX_SCAN_FILE_BYTES]
-    return [_case(entry, f"cases[{index}]", folder, budget) for index, entry in enumerate(entries)]
+    steps = [MAX_HISTORY_STEPS]
+    return [_case(entry, f"cases[{index}]", folder, budget, steps) for index, entry in enumerate(entries)]
 
 
-def _case(entry: Any, where: str, folder: str, budget: list[int]) -> Case:
+def _case(entry: Any, where: str, folder: str, budget: list[int], steps: list[int] | None = None) -> Case:
     if not isinstance(entry, dict):
         raise CommandError(f"{where} must be an object, got {type_name(entry)}")
     kinds = [key for key in ("tool", "scan", "scan_file") if key in entry]
@@ -179,17 +194,29 @@ def _case(entry: Any, where: str, folder: str, budget: list[int]) -> Case:
     if "expect" not in entry:
         raise CommandError(f'{where} has no "expect"')
     name = _optional_text(entry, "name", where, MAX_NAME_CHARS)
+    history = _history(entry, where, steps if steps is not None else [MAX_HISTORY_STEPS])
     if is_call:
-        return _call_case(entry, where, name)
+        return dataclasses.replace(_call_case(entry, where, name), history=history)
     expect = _choice(entry["expect"], f"{where}.expect", _SCAN_EXPECT)
     read_as = _choice(entry["as"], f"{where}.as", tuple(SCAN_AS)) if "as" in entry else "result"
     if "scan" in entry:
         text = entry["scan"]
         if not isinstance(text, str):
             raise CommandError(f"{where}.scan must be text, got {type_name(text)}")
-        return Case(where, expect, name=name, text=text, source="scan", read_as=read_as)
+        return Case(where, expect, name=name, text=text, source="scan", read_as=read_as, history=history)
     return Case(where, expect, name=name, text=_scan_file(entry["scan_file"], where, folder, budget),
-                source=entry["scan_file"], read_as=read_as)
+                source=entry["scan_file"], read_as=read_as, history=history)
+
+
+def _history(entry: dict[str, Any], where: str, steps: list[int]) -> tuple[HistoryStep, ...]:
+    """A case's "history", counted against the steps all the cases of the file may have together."""
+    if "history" not in entry:
+        return ()
+    history = parse_history(entry["history"], f"{where}.history", most=MAX_STEPS_PER_CASE)
+    steps[0] -= len(history)
+    if steps[0] < 0:
+        raise CommandError(f"{where}: the cases have more than {MAX_HISTORY_STEPS} history steps together")
+    return tuple(history)
 
 
 def _call_case(entry: dict[str, Any], where: str, name: str | None) -> Case:
@@ -290,11 +317,12 @@ def _optional_text(entry: dict[str, Any], key: str, where: str, limit: int) -> s
 # ---- running a case ------------------------------------------------------------------------
 
 def run_case(policy: Policy, case: Case) -> Outcome:
-    """Check one case against the policy, with a Firewall of its own: no log, no approver, no earlier calls."""
+    """Check one case against the policy, with a Firewall of its own: no log, no approver, only its own history."""
     store = MemorySessionStore()
     if case.marks:
         store.add(case.marks, "the case's marks")
     firewall = Firewall(policy, session_store=store)
+    replay_history(firewall, list(case.history))
     if case.tool is not None:
         decision = firewall.check_call(case.tool, case.args, defer_ask=True)
         got = outcome_of(decision, as_proxy=case.proxy)
@@ -307,6 +335,7 @@ def run_case(policy: Policy, case: Case) -> Outcome:
 
 
 def _what(case: Case) -> str:
+    history = f" [after {len(case.history)} history step(s)]" if case.history else ""
     if case.tool is not None:
         call = shown_call(case.tool, case.args)
         extras = []
@@ -314,11 +343,11 @@ def _what(case: Case) -> str:
             extras.append(f"marks {', '.join(case.marks)}")
         if case.proxy:
             extras.append("as the proxy")
-        return call + (f" [{'; '.join(extras)}]" if extras else "")
+        return call + (f" [{'; '.join(extras)}]" if extras else "") + history
     read_as = "" if case.read_as == "result" else f" as {case.read_as}"
     if case.source == "scan":
-        return f"scan{read_as} {shown_args(case.text, limit=60)}"
-    return f"scan_file{read_as} {printable(case.source, limit=100)}"
+        return f"scan{read_as} {shown_args(case.text, limit=60)}{history}"
+    return f"scan_file{read_as} {printable(case.source, limit=100)}{history}"
 
 
 def _print_outcome(case: Case, outcome: Outcome) -> None:

@@ -21,6 +21,9 @@ from typing import Any
 
 from .elicitation import RULE_FORM as RULE_ELICITATION_FORM, RULE_URL as RULE_ELICITATION_URL
 from .policy import (
+    IDENTICAL_CALLS_LIMIT,
+    SESSION_CALLS_LIMIT,
+    SINK_BYTES_LIMIT,
     RULE_CALLER,
     RULE_DEFAULT,
     RULE_HOOK_CONFIG_CHANGES,
@@ -44,12 +47,18 @@ MAX_RULE_ID_CHARS = 600
 
 # A position as rule ids write it (policy.RULE_INDEX): "[3]", no leading zeros, at most nine digits.
 _INDEX = RULE_INDEX
-_TOOL_PART = re.compile(rf"tools\.(.+)\.(deny_args{_INDEX}|allow_args{_INDEX}|other_args|max_calls_per_minute)")
+_TOOL_PART = re.compile(
+    rf"tools\.(.+)\.(deny_args{_INDEX}|allow_args{_INDEX}|other_args|max_calls_per_minute|max_calls_per_session"
+    rf"|max_distinct{_INDEX})"
+)
 
 # The fixed rule ids (policy.RULE_*) and the kind of hint each gets.
 _FIXED_KINDS = {
     RULE_DEFAULT: "default",
     "limits.max_calls_per_minute": "limit_global",
+    SESSION_CALLS_LIMIT: "session_limit",
+    SINK_BYTES_LIMIT: "session_limit",
+    IDENTICAL_CALLS_LIMIT: "session_limit",
     RULE_SECRETS: "secrets",
     RULE_SECRETS_IN_RESULTS: "secrets_results",
     RULE_SECRETS_CANARIES: "canary",
@@ -68,16 +77,19 @@ _FIXED_KINDS = {
 _INDEXED_KINDS = (
     (re.compile(rf"deny_args{_INDEX}"), "deny_global"),
     (re.compile(rf"flows{_INDEX}"), "flow"),
+    (re.compile(rf"flows{_INDEX}\.(unless_args{_INDEX}|other_args)"), "flow_exception"),
+    (re.compile(rf"limits\.max_distinct{_INDEX}"), "session_limit"),
     (re.compile(rf"secrets\.patterns{_INDEX}"), "secret_pattern"),
 )
-_PART_KINDS = {"other_args": "other_args", "max_calls_per_minute": "limit_tool"}
+_PART_KINDS = {"other_args": "other_args", "max_calls_per_minute": "limit_tool",
+               "max_calls_per_session": "session_limit"}
 
 # Kinds whose block protects against an attack rather than reflecting a gap in the
 # policy. `suggest` never proposes to loosen them; `report` says so next to them.
 PROTECTIVE_KINDS = frozenset({
     "deny_global", "deny_tool", "secrets", "secrets_results", "canary", "known_value", "secret_pattern",
-    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "hook_failed", "config_change",
-    "elicitation",
+    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "flow_exception", "hook_failed",
+    "config_change", "elicitation",
 })
 
 
@@ -110,7 +122,10 @@ def classify(rule: Any) -> RuleId:
     part = _TOOL_PART.fullmatch(rule)
     if part:
         tool_rule, which = part.group(1), part.group(2)
-        kind = _PART_KINDS.get(which) or ("deny_tool" if which.startswith("deny_args") else "allow_tool")
+        kind = _PART_KINDS.get(which)
+        if kind is None:
+            kind = ("deny_tool" if which.startswith("deny_args") else
+                    "session_limit" if which.startswith("max_distinct") else "allow_tool")
         return RuleId(kind, text, tool_rule=tool_rule)
     if rule.startswith("tools.") and len(rule) > len("tools."):
         return RuleId("tool", text, tool_rule=rule[len("tools."):])
@@ -145,6 +160,13 @@ def fix_hint(
                  person asked, or nobody could be asked ("unavailable")
     """
     rule_id = classify(rule)
+    if approval == "refused (repeat)":
+        return (
+            "The policy sends this call to a person, and it was refused without asking: a person refused this "
+            "same call a short while ago, or refused several calls of this tool (approvals.refusal_window_seconds, "
+            "approvals.max_refusals_per_tool). That stops a hijacked agent from asking until someone gives in. "
+            "If a refusal was a mistake, start a new session (restart the client or the proxy), or wait."
+        )
     if approval == "refused":
         return (
             "The policy sends this call to a person, and it was refused there: the person said no, or did not "
@@ -202,6 +224,15 @@ def fix_hint(
         )
     if kind == "flow":
         return _flow_hint(rule_id.text, rule, policy)
+    if kind == "flow_exception":
+        return _flow_exception_hint(rule_id.text, rule, matched_arg, policy)
+    if kind == "session_limit":
+        whose = f"the tool rule {_name(rule_id.tool_rule)}" if rule_id.tool_rule else "the policy's limits"
+        return (
+            f"The call reached the session limit {rule_id.text} of {whose}. It counts for as long as the session "
+            "lasts (a proxy's process; a Claude Code session), so a slow or piecemeal leak cannot stay under a "
+            "rate limit. Raise it if such a session is normal; a new session starts the count again."
+        )
     return _FIXED_HINTS.get(kind, _FIXED_HINTS["unknown"])
 
 
@@ -282,6 +313,24 @@ def _flow_hint(text: str, rule: Any, policy: Policy | None) -> str:
         "with its 'then' label are refused, which stops data from leaving after an injection. It holds until a "
         "new session starts (restart the client or the proxy). If a tool should not count, change its labels or "
         "the flow rule."
+    )
+
+
+def _flow_exception_hint(text: str, rule: Any, matched_arg: Any, policy: Policy | None) -> str:
+    entry = None
+    if policy is not None and isinstance(rule, str) and ".unless_args[" in rule:
+        flow_index, entry_index = re.findall(r"\[(\d+)\]", rule)[:2]
+        flows = policy.flows
+        flow = flows[int(flow_index)] if int(flow_index) < len(flows) else None
+        if flow is not None and int(entry_index) < len(flow.unless_args):
+            entry = flow.unless_args[int(entry_index)].describe()
+    what = f" ({printable(entry, limit=200)})" if entry else ""
+    argument = f" argument {_name(matched_arg)}" if isinstance(matched_arg, str) else " an argument"
+    return (
+        f"A flow rule applied because{argument} did not meet its exception {text}{what}. The flow narrows a sink "
+        "after the agent has read such content: only calls that meet its unless_args go through. If the value is "
+        "a safe destination, widen that unless_args entry (try it with `agent-sentinel check --history`); if "
+        "not, the block is doing its job."
     )
 
 

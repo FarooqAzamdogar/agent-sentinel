@@ -33,9 +33,14 @@ in the policy file:
     tools.send_email.allow_args[0]       a tool rule's allow rule
     tools.send_email.other_args          an argument no allow rule names
     tools.send_email.max_calls_per_minute, limits.max_calls_per_minute   rate limits
+    tools.send_email.max_calls_per_session, limits.max_calls_per_session  session limits on calls
+    tools.send_email.max_distinct[0], limits.max_distinct[0]             session limits on different values
+    limits.max_sink_bytes_per_session, limits.max_identical_calls        the other session limits
     server_requests.sampling/createMessage
     client_requests.completion/complete
     flows[0]                             the first flow rule
+    flows[0].unless_args[1]              the exception of a flow rule that the call did not meet
+    flows[0].other_args                  an argument that no unless_args entry of the flow names
     secrets.patterns[0]                  the first custom secret format
     hook.config_changes                  the Claude Code hook refused a change to Claude Code's settings
 
@@ -67,6 +72,8 @@ from .policy_errors import (
     unknown_keys_message,
 )
 from .session import BUILTIN_LABELS, SINK, UNTRUSTED, SessionMarks, is_label
+from .session import MAX_COUNTERS as SESSION_MAX_COUNTERS
+from .session import MAX_DISTINCT_VALUES as SESSION_MAX_VALUES
 from .textutil import printable, texts_in
 
 ACTIONS = ("allow", "ask", "block")
@@ -154,15 +161,40 @@ MAX_KNOWN_VALUE_NAMES = 100
 # or skills made during a session. "audit" records it; "block" also refuses it.
 CONFIG_CHANGES = ("audit", "block")
 
+# ---- session limits and approval memory (0.6) ---------------------------------------------
+
+# The rule ids of the session limits that are not per tool rule.
+SESSION_CALLS_LIMIT = "limits.max_calls_per_session"
+SINK_BYTES_LIMIT = "limits.max_sink_bytes_per_session"
+IDENTICAL_CALLS_LIMIT = "limits.max_identical_calls"
+# Bounds on the settings (a session keeps hashes of the values max_distinct counts: see session.py).
+MAX_SESSION_CALLS = 10**9
+MAX_SINK_BYTES = 10**12
+MAX_IDENTICAL_CALLS = 10**6
+MAX_DISTINCT_ENTRIES = 20  # entries of one max_distinct list
+MAX_DISTINCT_VALUES = 1_000  # the largest "max" of an entry
+# approvals: how long a refused ask is remembered, and how many refusals of one tool pause its asks.
+DEFAULT_REFUSAL_WINDOW_SECONDS = 600
+DEFAULT_MAX_REFUSALS_PER_TOOL = 3
+MAX_REFUSAL_WINDOW_SECONDS = 86_400
+MAX_REFUSALS_SETTING = 1_000
+MAX_SERVER_LABEL_RULES = 1_000
+
 # Higher is stricter. When several wildcard rules match, the strictest verdict wins.
 _STRICTNESS = {"allow": 0, "ask": 1, "block": 2}
 
 # The keys a policy file may have, at the top, in "secrets" and in "hook".
 _TOP_LEVEL_KEYS = (
     "default", "deny_args", "tools", "server_requests", "client_requests", "injection", "secrets", "limits",
-    "flows", "classify_by_annotations", "hide_blocked_tools", "hook",
+    "flows", "classify_by_annotations", "hide_blocked_tools", "server_labels", "approvals", "hook",
 )
 _SECRETS_KEYS = ("in_arguments", "in_results", "known_values_from_env", "canaries", "patterns")
+_INJECTION_KEYS = ("block_severity", "warn_severity", "mark_at", "mark")
+_LIMITS_KEYS = (
+    "max_calls_per_minute", "max_calls_per_session", "max_distinct", "max_sink_bytes_per_session",
+    "max_identical_calls",
+)
+_APPROVALS_KEYS = ("refusal_window_seconds", "max_refusals_per_tool")
 _HOOK_KEYS = ("config_changes", "treat_auto_as_non_prompting")
 
 
@@ -268,6 +300,23 @@ class ArgRule:
 
 
 @dataclass(frozen=True)
+class DistinctLimit:
+    """One entry of max_distinct: at most `max` different values of argument `arg` in one session.
+
+    {"arg": "to", "max": 5}: the agent may write to at most five recipients.
+    Values are compared as text after NFKC, case folding and trimming, so
+    "Bob@Example.com " and "bob@example.com" are one value; each entry of a
+    list counts as a value of its own.
+    """
+
+    arg: str
+    max: int
+
+    def describe(self) -> str:
+        return f"at most {self.max} different value(s) of argument {quoted(self.arg)} in one session"
+
+
+@dataclass(frozen=True)
 class ToolRule(_NamedRule):
     deny_args: tuple[ArgRule, ...] = ()
     allow_args: tuple[ArgRule, ...] = ()
@@ -277,6 +326,31 @@ class ToolRule(_NamedRule):
     max_calls_per_minute: int | None = None
     # Flow labels of the tools this rule matches, such as ("untrusted",) or ("private", "sink").
     labels: tuple[str, ...] = ()
+    # Session limits (0.6): calls in one session, and different values of an argument.
+    max_calls_per_session: int | None = None
+    max_distinct: tuple[DistinctLimit, ...] = ()
+
+
+@dataclass(frozen=True)
+class ServerLabelRule:
+    """One entry of server_labels: everything the server of this name delivers sets these marks.
+
+    The name is a server's name as `proxy --name` gives it, and may hold "*"
+    as tool names do. A proxy started without --name matches only a rule
+    named "*".
+    """
+
+    name: str
+    labels: tuple[str, ...]
+    _pieces: tuple[str, ...] = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_pieces", tuple(self.name.split("*")) if isinstance(self.name, str) else ("",))
+
+    def matches(self, server: str | None) -> bool:
+        if server is None:
+            return isinstance(self.name, str) and self.name != "" and not self.name.strip("*")
+        return _glob_matches(self._pieces, server)
 
 
 @dataclass(frozen=True)
@@ -301,16 +375,28 @@ class FlowRule:
     after: tuple[str, ...]  # marks that must all be set; never "sink"
     then: str = SINK  # the label of the tool being called
     action: str = "block"  # "ask" or "block"
+    # The exception (0.6): a call whose arguments pass these entries, read as allow_args are, is not
+    # affected. other_args "block" (the default here, unlike a tool rule) also needs every argument
+    # to be named by an entry. Without unless_args, the flow applies to every such call.
+    unless_args: tuple[ArgRule, ...] = ()
+    other_args: str = "block"
 
     def __post_init__(self) -> None:
         if isinstance(self.after, list):  # a list written in code; a text stays as it is and is refused
             object.__setattr__(self, "after", tuple(self.after))
+        if isinstance(self.unless_args, list):
+            object.__setattr__(self, "unless_args", tuple(self.unless_args))
 
     def describe(self) -> str:
         """What this rule does, for the operator."""
         does = "refused" if self.action == "block" else "sent to a human for approval"
         read = " and ".join(f"'{label}'" for label in self.after)
-        return f"after {read} content reached the agent, a call to a tool labelled '{self.then}' is {does}"
+        text = f"after {read} content reached the agent, a call to a tool labelled '{self.then}' is {does}"
+        if not self.unless_args:
+            return text
+        exception = "; ".join(entry.describe() for entry in self.unless_args)
+        others = ", and no other argument" if self.other_args == "block" else ""
+        return f"{text}, unless its arguments meet unless_args ({exception}{others})"
 
 
 @dataclass(frozen=True)
@@ -425,6 +511,20 @@ class Policy:
 
     Added in 0.6:
 
+    warn_severity                    injection.warn_severity: a result whose worst finding is at or above
+                                     it, but below block_severity, reaches the agent with a notice
+                                     (Decision.notice). None (the default): no notice.
+    mark_at, injection_mark          injection.mark_at and injection.mark: delivered content with a
+                                     finding at or above mark_at gives the session the mark
+                                     `injection_mark` ("untrusted"). mark_at None (the default): never.
+    server_labels                    ServerLabelRule entries: what a server delivers sets these marks.
+    max_calls_per_session, max_sink_bytes_per_session, max_identical_calls, max_distinct
+                                     the session limits in "limits" (ToolRule has max_calls_per_session
+                                     and max_distinct too); see session_limits.py.
+    refusal_window_seconds, max_refusals_per_tool
+                                     "approvals": how long a call a person refused is refused again
+                                     without asking (0: never), and after how many refusals of one tool
+                                     within that time its asks are refused too (0: never).
     hook                             the "hook" section (HookOptions): settings only the Claude Code hook reads.
     """
 
@@ -450,6 +550,16 @@ class Policy:
     classify_by_annotations: bool = True
     hide_blocked_tools: bool = False
     # ---- added in 0.6
+    warn_severity: str | None = None
+    mark_at: str | None = None
+    injection_mark: str = UNTRUSTED
+    server_labels: tuple[ServerLabelRule, ...] = ()
+    max_calls_per_session: int | None = None
+    max_sink_bytes_per_session: int | None = None
+    max_identical_calls: int | None = None
+    max_distinct: tuple[DistinctLimit, ...] = ()
+    refusal_window_seconds: int = DEFAULT_REFUSAL_WINDOW_SECONDS
+    max_refusals_per_tool: int = DEFAULT_MAX_REFUSALS_PER_TOOL
     hook: HookOptions = field(default_factory=HookOptions)
 
     def __post_init__(self) -> None:
@@ -467,9 +577,25 @@ class Policy:
             _check_code_arg_rules(rule.allow_args, f"{where}.allow_args", deny=False)
             for label in rule.labels:
                 _expect_label(label, f"{where}.labels")
+            _check_session_limits(rule.max_calls_per_session, rule.max_distinct, where)
         _check_code_arg_rules(self.deny_args, "deny_args", deny=True)
         if self.max_calls_per_minute is not None:
             _expect_calls_per_minute(self.max_calls_per_minute, "limits")
+        _check_session_limits(self.max_calls_per_session, self.max_distinct, "limits")
+        for key, highest in (("max_sink_bytes_per_session", MAX_SINK_BYTES),
+                             ("max_identical_calls", MAX_IDENTICAL_CALLS)):
+            if getattr(self, key) is not None:
+                _expect_whole(getattr(self, key), f"limits.{key}", 1, highest)
+        _expect_whole(self.refusal_window_seconds, "approvals.refusal_window_seconds", 0, MAX_REFUSAL_WINDOW_SECONDS)
+        _expect_whole(self.max_refusals_per_tool, "approvals.max_refusals_per_tool", 0, MAX_REFUSALS_SETTING)
+        for entry in self.server_labels:
+            if not isinstance(entry, ServerLabelRule) or not entry.labels:
+                raise PolicyError("server_labels must hold ServerLabelRule entries, each with at least one label")
+            for label in entry.labels:
+                _expect_mark_label(label, f"server_labels.{entry.name}")
+        _expect_severity(self.warn_severity, "injection.warn_severity", "null gives no notice")
+        _expect_severity(self.mark_at, "injection.mark_at", "null sets no mark")
+        _expect_mark_label(self.injection_mark, "injection.mark")
         for request in self.server_requests:
             _expect_choice(request.action, f"server_requests.{request.name}", ("allow", "block"))
         for request in self.client_requests or ():
@@ -535,9 +661,15 @@ class Policy:
         tools = [_tool_rule(name, spec) for name, spec in tool_specs.items()]
 
         injection = data.get("injection", {})
-        _expect_object(injection, "injection", allowed_keys=("block_severity",))
+        _expect_object(injection, "injection", allowed_keys=_INJECTION_KEYS)
         severity = injection.get("block_severity", "high")
         _expect_severity(severity)
+        warn_severity = injection.get("warn_severity")
+        _expect_severity(warn_severity, "injection.warn_severity", "null gives no notice")
+        mark_at = injection.get("mark_at")
+        _expect_severity(mark_at, "injection.mark_at", "null sets no mark")
+        injection_mark = injection.get("mark", UNTRUSTED)
+        _expect_mark_label(injection_mark, "injection.mark")
 
         secrets = data.get("secrets", {})
         _expect_object(secrets, "secrets", allowed_keys=_SECRETS_KEYS)
@@ -547,7 +679,9 @@ class Policy:
         _expect_in_results(in_results)
 
         limits = data.get("limits", {})
-        _expect_object(limits, "limits", allowed_keys=("max_calls_per_minute",))
+        _expect_object(limits, "limits", allowed_keys=_LIMITS_KEYS)
+        approvals = data.get("approvals", {})
+        _expect_object(approvals, "approvals", allowed_keys=_APPROVALS_KEYS)
 
         classify = data.get("classify_by_annotations", True)
         _expect_bool(classify, "classify_by_annotations")
@@ -574,6 +708,22 @@ class Policy:
             flows=_flow_rules(data.get("flows", [])),
             classify_by_annotations=classify,
             hide_blocked_tools=hide,
+            warn_severity=warn_severity,
+            mark_at=mark_at,
+            injection_mark=injection_mark,
+            server_labels=_server_label_rules(data.get("server_labels", {})),
+            max_calls_per_session=_whole_setting(limits, "max_calls_per_session", "limits", 1, MAX_SESSION_CALLS),
+            max_sink_bytes_per_session=_whole_setting(limits, "max_sink_bytes_per_session", "limits", 1,
+                                                      MAX_SINK_BYTES),
+            max_identical_calls=_whole_setting(limits, "max_identical_calls", "limits", 1, MAX_IDENTICAL_CALLS),
+            max_distinct=_distinct_limits(limits.get("max_distinct", []), "limits.max_distinct"),
+            refusal_window_seconds=_whole_setting(
+                approvals, "refusal_window_seconds", "approvals", 0, MAX_REFUSAL_WINDOW_SECONDS,
+                DEFAULT_REFUSAL_WINDOW_SECONDS,
+            ),
+            max_refusals_per_tool=_whole_setting(
+                approvals, "max_refusals_per_tool", "approvals", 0, MAX_REFUSALS_SETTING, DEFAULT_MAX_REFUSALS_PER_TOOL,
+            ),
             hook=_hook_options(data.get("hook", {})),
         )
 
@@ -603,7 +753,7 @@ class Policy:
         verdict = self._verdict_without_flows(tool, args)
         if marks is None or verdict.action == "block":
             return verdict
-        flow = self.flow_verdict(tool, marks, extra_labels)
+        flow = self.flow_verdict(tool, marks, extra_labels, args=args if args is not None else {})
         # A flow that is at least as strict wins a tie: its reason says more (what was read, and where from).
         if flow is not None and _STRICTNESS[flow.action] >= _STRICTNESS[verdict.action]:
             return flow
@@ -733,31 +883,48 @@ class Policy:
         return frozenset(label for rule in self.tools if rule.labels and rule.matches(tool) for label in rule.labels)
 
     def flow_verdict(
-        self, tool: str, marks: SessionMarks | Iterable[str], extra_labels: Iterable[str] = ()
+        self, tool: str, marks: SessionMarks | Iterable[str], extra_labels: Iterable[str] = (),
+        args: dict[str, Any] | None = None,
     ) -> Verdict | None:
         """The verdict of the flow rules for a call of `tool` in a session with these marks, or None.
 
         A flow rule applies when the tool has the rule's `then` label (from the
         policy, or in `extra_labels`) and the session has every mark in its
-        `after`. Of the rules that apply, the strictest wins, and the first in
-        the file among equals; its id is "flows[<index>]". None when no rule
-        applies. The agent is told NOT_PERMITTED, as for any rule; the reason,
-        for the audit log, says what was read and which tool delivered it.
+        `after`, unless the rule has unless_args and the call's `args` meet
+        them (read as allow_args are; with the rule's other_args). Of the rules
+        that apply, the strictest wins, and the first in the file among equals;
+        its id is "flows[<index>]", or "flows[<index>].unless_args[<j>]" (or
+        ".other_args") for the part of the exception the call did not meet,
+        with that argument as matched_arg. Without `args`, no exception holds.
+        None when no rule applies. The agent is told NOT_PERMITTED, as for any
+        rule; the reason, for the audit log, says what was read and which tool
+        delivered it.
         """
         if not self.flows or not isinstance(tool, str):
             return None
         if not isinstance(marks, SessionMarks):
             marks = SessionMarks.of(marks)
         labels = self.tool_labels(tool) | frozenset(extra_labels)
-        chosen: tuple[int, FlowRule] | None = None
+        chosen: tuple[int, FlowRule, Verdict | None] | None = None
         for index, flow in enumerate(self.flows):
             if flow.then in labels and marks.has_all(flow.after):
+                unmet = _unmet_exception(index, flow, args)
+                if flow.unless_args and unmet is None:
+                    continue  # the call meets the exception: this flow does not apply
                 if chosen is None or _STRICTNESS[flow.action] > _STRICTNESS[chosen[1].action]:
-                    chosen = (index, flow)
+                    chosen = (index, flow, unmet)
         if chosen is None:
             return None
-        index, flow = chosen
-        return Verdict(flow.action, _flow_reason(index, flow, tool, marks), NOT_PERMITTED, f"flows[{index}]")
+        index, flow, unmet = chosen
+        reason = _flow_reason(index, flow, tool, marks)
+        if unmet is None:
+            return Verdict(flow.action, reason, NOT_PERMITTED, f"flows[{index}]")
+        reason += f"; the call does not meet the flow's exception ({unmet.reason})"
+        return Verdict(flow.action, reason, NOT_PERMITTED, unmet.rule, unmet.matched_arg)
+
+    def server_marks(self, server: str | None) -> frozenset[str]:
+        """The marks server_labels gives everything the server of this name delivers (proxy --name; None: no name)."""
+        return frozenset(label for rule in self.server_labels if rule.matches(server) for label in rule.labels)
 
     def call_limits(self, tool: str) -> list[tuple[str, int]]:
         """Return the (bucket name, calls per minute) limits that apply to a call of `tool`.
@@ -792,6 +959,8 @@ class Policy:
         found.extend(_overridden_glob_warnings(self.tools))
         found.extend(_missing_root_warnings(self))
         found.extend(_flow_warnings(self))
+        found.extend(_injection_warnings(self))
+        found.extend(_session_limit_warnings(self))
         found.extend(_client_request_warnings(self))
         found.extend(known_value_warnings(self))
         return found
@@ -829,14 +998,16 @@ class Policy:
             return secret_part
         if rule_id == "limits.max_calls_per_minute" and self.max_calls_per_minute is not None:
             return f"at most {self.max_calls_per_minute} call(s) per minute for all tools together"
+        session_limit = self._describe_session_limit(rule_id)
+        if session_limit is not None:
+            return session_limit
         indexed = re.fullmatch(rf"deny_args{_INDEX}", rule_id)
         if indexed:
             entry = _entry(self.deny_args, indexed.group(1))
             return None if entry is None else f"policy-wide deny rule, {entry.describe()}"
-        indexed = re.fullmatch(rf"flows{_INDEX}", rule_id)
+        indexed = re.fullmatch(rf"flows{_INDEX}(?:\.unless_args{_INDEX}|\.(other_args))?", rule_id)
         if indexed:
-            flow = _entry(self.flows, indexed.group(1))
-            return None if flow is None else f"flow rule: {flow.describe()}"
+            return self._describe_flow_part(*indexed.groups())
         for section, requests, who in (
             ("server_requests", self.server_requests, "server"),
             ("client_requests", self.client_requests or (), "client"),
@@ -852,6 +1023,39 @@ class Policy:
             if found is not None:
                 return found
         return None
+
+    def _describe_session_limit(self, rule_id: str) -> str | None:
+        """describe_rule for the session limits in "limits" (those of a tool rule: _describe_tool_rule_part)."""
+        if rule_id == SESSION_CALLS_LIMIT and self.max_calls_per_session is not None:
+            return f"at most {self.max_calls_per_session} call(s) in one session for all tools together"
+        if rule_id == SINK_BYTES_LIMIT and self.max_sink_bytes_per_session is not None:
+            return (f"at most {self.max_sink_bytes_per_session} byte(s) of arguments (as JSON) sent to tools "
+                    "labelled 'sink' in one session")
+        if rule_id == IDENTICAL_CALLS_LIMIT and self.max_identical_calls is not None:
+            return f"the same call (tool and arguments) at most {self.max_identical_calls} time(s) in one session"
+        indexed = re.fullmatch(rf"limits\.max_distinct{_INDEX}", rule_id)
+        if indexed:
+            entry = _entry(self.max_distinct, indexed.group(1))
+            return None if entry is None else f"session limit: {entry.describe()}, for all tools together"
+        return None
+
+    def _describe_flow_part(self, index: str, entry: str | None, other_args: str | None) -> str | None:
+        """describe_rule for "flows[i]", "flows[i].unless_args[j]" and "flows[i].other_args"."""
+        flow = _entry(self.flows, index)
+        if flow is None:
+            return None
+        text = f"flow rule: {flow.describe()}"
+        if entry is not None:
+            exception = _entry(flow.unless_args, entry)
+            if exception is None:
+                return None
+            return f"{text}; the call did not meet its exception unless_args[{entry}] ({exception.describe()})"
+        if other_args is not None:
+            if not flow.unless_args or flow.other_args != "block":
+                return None
+            named = ", ".join(quoted(allow.arg) for allow in flow.unless_args)
+            return f"{text}; the call had an argument its unless_args do not name ({named})"
+        return text
 
     def _describe_secret_rule(self, rule_id: str) -> str | None:
         """describe_rule for the parts of the secret guard. Never names a canary or a value."""
@@ -901,8 +1105,11 @@ def _flow_reason(index: int, flow: FlowRule, tool: str, marks: SessionMarks) -> 
         for label in flow.after:
             cause = marks.marks.get(label)
             source = f" from '{printable(cause.tool, limit=80)}'" if cause is not None and cause.tool else ""
+            how = [f"server '{printable(cause.server, limit=64)}'"] if cause is not None and cause.server else []
+            how += [printable(cause.channel, limit=100)] if cause is not None and cause.channel else []
+            via = f" ({', '.join(how)})" if how else ""
             when = f" at {cause.time}" if cause is not None and cause.time else ""
-            parts.append(f"'{label}' content{source}{when}")
+            parts.append(f"'{label}' content{source}{via}{when}")
         seen = "the agent has read " + " and ".join(parts)
     outcome = "is refused" if flow.action == "block" else "needs approval"
     return (
@@ -917,9 +1124,23 @@ def _apply_rule(rule: ToolRule, args: dict[str, Any]) -> Verdict:
     denied = _denied_argument(rule.deny_args, args, f"{where}.deny_args")
     if denied is not None:
         return denied
+    refused = _allow_list_failure(rule.allow_args, rule.other_args, args, where, "allow_args")
+    if refused is not None:
+        return refused
+    return _rule_verdict(rule.action, f"rule '{rule.name}' says {rule.action}", where)
 
-    for index, allow in enumerate(rule.allow_args):
-        rule_id = f"{where}.allow_args[{index}]"
+
+def _allow_list_failure(
+    entries: tuple[ArgRule, ...], other_args: str, args: dict[str, Any], where: str, list_name: str
+) -> Verdict | None:
+    """The block for the first entry of an allow list (allow_args, or a flow's unless_args) the call fails, or None.
+
+    Each entry's argument must be given (unless it is optional) with a value
+    the entry accepts; with other_args "block", every top-level argument must
+    be named by an entry. Ids: "<where>.<list_name>[<i>]" and "<where>.other_args".
+    """
+    for index, allow in enumerate(entries):
+        rule_id = f"{where}.{list_name}[{index}]"
         if allow.arg not in args:
             if allow.optional:
                 continue
@@ -927,17 +1148,30 @@ def _apply_rule(rule: ToolRule, args: dict[str, Any]) -> Verdict:
         if not _is_allowed(allow, args[allow.arg]):
             return _argument_block(VALUE_NOT_PERMITTED.format(allow.arg), rule_id, allow.arg)
 
-    if rule.other_args == "block":
+    if other_args == "block":
         # Top level only. An allowed argument cannot carry more arguments inside
         # it, because _is_allowed refuses objects.
-        named = {allow.arg for allow in rule.allow_args}
+        named = {allow.arg for allow in entries}
         for name in args:
             if name not in named:
                 # The name is chosen by the agent: shorten and escape it before repeating it.
                 reason = f"argument '{printable(name, limit=60)}' is not accepted by the policy"
                 return _argument_block(reason, f"{where}.other_args", _bounded_name(name))
+    return None
 
-    return _rule_verdict(rule.action, f"rule '{rule.name}' says {rule.action}", where)
+
+def _unmet_exception(index: int, flow: FlowRule, args: dict[str, Any] | None) -> Verdict | None:
+    """The part of a flow's unless_args that the call does not meet (a Verdict naming it), or None.
+
+    None also for a flow without unless_args (it has no exception). Arguments
+    that are not known, or not an object, meet no exception.
+    """
+    if not flow.unless_args:
+        return None
+    where = f"flows[{index}]"
+    if not isinstance(args, dict):
+        return Verdict("block", "the call's arguments are not known", NOT_PERMITTED, where)
+    return _allow_list_failure(flow.unless_args, flow.other_args, args, where, "unless_args")
 
 
 def _denied_argument(rules: tuple[ArgRule, ...], args: dict[str, Any], where: str) -> Verdict | None:
@@ -1056,6 +1290,12 @@ def _describe_tool_rule_part(rule: ToolRule, rule_id: str) -> str | None:
         return f"tool rule '{rule.name}' accepts only the arguments its allow_args name ({named})"
     if part == "max_calls_per_minute" and rule.max_calls_per_minute is not None:
         return f"tool rule '{rule.name}': at most {rule.max_calls_per_minute} call(s) per minute"
+    if part == "max_calls_per_session" and rule.max_calls_per_session is not None:
+        return f"tool rule '{rule.name}': at most {rule.max_calls_per_session} call(s) in one session"
+    indexed = re.fullmatch(rf"max_distinct{_INDEX}", part)
+    if indexed:
+        limit = _entry(rule.max_distinct, indexed.group(1))
+        return None if limit is None else f"tool rule '{rule.name}', session limit: {limit.describe()}"
     indexed = re.fullmatch(rf"(deny_args|allow_args){_INDEX}", part)
     if indexed:
         entries = rule.deny_args if indexed.group(1) == "deny_args" else rule.allow_args
@@ -1145,6 +1385,9 @@ def _flow_warnings(policy: Policy) -> list[str]:
     if not policy.flows:
         return []
     given = {label for rule in policy.tools for label in rule.labels}
+    given.update(label for rule in policy.server_labels for label in rule.labels)
+    if policy.mark_at is not None:
+        given.add(policy.injection_mark)
     from_annotations = {UNTRUSTED, SINK} if policy.classify_by_annotations else set()
     used = {label for flow in policy.flows for label in (*flow.after, flow.then)}
     found = []
@@ -1166,12 +1409,60 @@ def _flow_warnings(policy: Policy) -> list[str]:
                     + (f"; did you mean '{hint}'?" if hint else "")
                 )
         for index, flow in enumerate(policy.flows):
+            if flow.unless_args:
+                continue  # the calls that meet its exception still go through
             if flow.action == "block" and flow.then in rule.labels and set(flow.after) <= set(rule.labels):
                 labels = ", ".join(f"'{label}'" for label in (*flow.after, flow.then))
                 found.append(
                     f"tools.{rule.name}: it has the labels {labels}, so once one of its results reaches the agent, "
                     f"flows[{index}] refuses every later call to it"
                 )
+    return found
+
+
+def _injection_warnings(policy: Policy) -> list[str]:
+    """Warn about injection settings that can never take effect, and marks that nothing uses."""
+    found = []
+    warn, block = policy.warn_severity, policy.block_severity
+    if warn is not None and block is not None and SEVERITY_ORDER[warn] > SEVERITY_ORDER[block]:
+        found.append(
+            f"injection.warn_severity '{warn}' is above block_severity '{block}': such content is withheld, so "
+            "the notice is never given"
+        )
+    used = {label for flow in policy.flows for label in flow.after}
+    marks = [("injection.mark", policy.injection_mark)] if policy.mark_at is not None else []
+    marks += [(f"server_labels.{rule.name}", label) for rule in policy.server_labels for label in rule.labels]
+    for where, label in marks:
+        if label not in used:
+            found.append(f"{where}: no flow rule has '{label}' in its 'after', so this mark changes nothing")
+    return found
+
+
+def _session_limit_warnings(policy: Policy) -> list[str]:
+    """Warn about session limits a session cannot keep counting: past the bounds of session.py, calls are refused.
+
+    A max_distinct set never holds more than its "max" (the call that would
+    pass it is refused and not counted), and each rule id has one counter or
+    set (a wildcard rule shares one), so these sums are what a session can
+    come to hold at most.
+    """
+    distinct = [*policy.max_distinct, *(entry for rule in policy.tools for entry in rule.max_distinct)]
+    counters = [policy.max_calls_per_session, policy.max_sink_bytes_per_session]
+    counters += [rule.max_calls_per_session for rule in policy.tools]
+    found = []
+    values = sum(entry.max for entry in distinct)
+    if values > SESSION_MAX_VALUES:
+        found.append(
+            f"the max_distinct limits add up to {values} values, more than the {SESSION_MAX_VALUES} a session can "
+            "keep: once it holds that many, every call they count is refused (rule 'session') before its own limit "
+            "is reached; lower their 'max'"
+        )
+    used = sum(1 for limit in counters if limit is not None)
+    if used > SESSION_MAX_COUNTERS or len(distinct) > SESSION_MAX_COUNTERS:
+        found.append(
+            f"the policy has more session limits than the {SESSION_MAX_COUNTERS} counters (and sets of values) a "
+            "session can keep: once they are all in use, every call they count is refused (rule 'session')"
+        )
     return found
 
 
@@ -1219,7 +1510,8 @@ def _tool_rule(name: Any, spec: Any) -> ToolRule:
     elif not isinstance(spec, dict):
         raise PolicyError(f"{where} must be an action ({listed(ACTIONS)}) or an object, got {type_name(spec)}")
     _expect_object(
-        spec, where, allowed_keys=("action", "deny_args", "allow_args", "other_args", "max_calls_per_minute", "labels")
+        spec, where, allowed_keys=("action", "deny_args", "allow_args", "other_args", "max_calls_per_minute", "labels",
+                                   "max_calls_per_session", "max_distinct")
     )
     if "action" not in spec:
         # No default on purpose: a rule left without an action while editing must not come to mean allow.
@@ -1235,6 +1527,8 @@ def _tool_rule(name: Any, spec: Any) -> ToolRule:
         other_args=other_args,
         max_calls_per_minute=_calls_per_minute(spec, where),
         labels=_labels(spec.get("labels", []), f"{where}.labels", allow_sink=True),
+        max_calls_per_session=_whole_setting(spec, "max_calls_per_session", where, 1, MAX_SESSION_CALLS),
+        max_distinct=_distinct_limits(spec.get("max_distinct", []), f"{where}.max_distinct"),
     )
 
 
@@ -1273,7 +1567,7 @@ def _flow_rules(specs: Any) -> tuple[FlowRule, ...]:
     flows = []
     for index, spec in enumerate(specs):
         where = f"flows[{index}]"
-        _expect_object(spec, where, allowed_keys=("after", "then", "action"))
+        _expect_object(spec, where, allowed_keys=("after", "then", "action", "unless_args", "other_args"))
         if "after" not in spec or "action" not in spec:
             # No default action, as for tool rules; and a flow with nothing in "after" would be a plain block.
             raise PolicyError(f"{where} needs 'after' (a list of labels) and 'action' ('ask' or 'block')")
@@ -1286,7 +1580,14 @@ def _flow_rules(specs: Any) -> tuple[FlowRule, ...]:
         if action == "allow":
             raise PolicyError(f"{where}.action must be 'ask' or 'block': a flow rule can only add a restriction")
         _expect_choice(action, f"{where}.action", ("ask", "block"))
-        flows.append(FlowRule(after, then, action))
+        unless_args = _arg_rules(spec.get("unless_args", []), f"{where}.unless_args", deny=False)
+        if "unless_args" in spec and not unless_args:
+            raise PolicyError(f"{where}.unless_args must have at least one entry, or be left out")
+        if "other_args" in spec and not unless_args:
+            raise PolicyError(f"{where}.other_args is read with unless_args only: add unless_args, or remove it")
+        other_args = spec.get("other_args", "block")
+        _expect_choice(other_args, f"{where}.other_args", ("allow", "block"))
+        flows.append(FlowRule(after, then, action, unless_args, other_args))
     return tuple(flows)
 
 
@@ -1300,6 +1601,92 @@ def _check_flow(flow: FlowRule, where: str) -> None:
             raise PolicyError(f"{where}.after: 'sink' is never a mark")
     _expect_label(flow.then, f"{where}.then")
     _expect_choice(flow.action, f"{where}.action", ("ask", "block"))
+    if not isinstance(flow.unless_args, tuple) or not all(isinstance(entry, ArgRule) for entry in flow.unless_args):
+        raise PolicyError(f"{where}.unless_args must be a tuple of ArgRule")
+    _check_code_arg_rules(flow.unless_args, f"{where}.unless_args", deny=False)
+    if any(entry.arg == ANY_ARG for entry in flow.unless_args):
+        raise PolicyError(f"{where}.unless_args: '{ANY_ARG}' is only supported in deny_args")
+    _expect_choice(flow.other_args, f"{where}.other_args", ("allow", "block"))
+    if flow.other_args != "block" and not flow.unless_args:
+        raise PolicyError(f"{where}.other_args is read with unless_args only")
+
+
+def _server_label_rules(specs: Any) -> tuple[ServerLabelRule, ...]:
+    """Read server_labels: {"<server name, may hold *>": ["label", ...]}."""
+    _expect_object(specs, "server_labels")
+    if len(specs) > MAX_SERVER_LABEL_RULES:
+        raise PolicyError(f"server_labels can name at most {MAX_SERVER_LABEL_RULES} servers")
+    rules = []
+    for name, labels in specs.items():
+        _expect_name(name, "server_labels: server name")
+        where = f"server_labels.{name}"
+        found = _labels(labels, where, allow_sink=False)
+        if not found:
+            raise PolicyError(f"{where} must name at least one label")
+        rules.append(ServerLabelRule(name, found))
+    return tuple(rules)
+
+
+def _distinct_limits(specs: Any, where: str) -> tuple[DistinctLimit, ...]:
+    """Read a max_distinct list: [{"arg": "to", "max": 5}, ...]."""
+    if not isinstance(specs, list):
+        raise PolicyError(f"{where} must be a list ([ ... ]), got {type_name(specs)}")
+    if len(specs) > MAX_DISTINCT_ENTRIES:
+        raise PolicyError(f"{where} can hold at most {MAX_DISTINCT_ENTRIES} entries")
+    limits: list[DistinctLimit] = []
+    for index, spec in enumerate(specs):
+        entry = f"{where}[{index}]"
+        _expect_object(spec, entry, allowed_keys=("arg", "max"))
+        if "arg" not in spec or "max" not in spec:
+            raise PolicyError(f"{entry} needs 'arg' (an argument name) and 'max' (how many different values)")
+        limit = DistinctLimit(spec["arg"], spec["max"])
+        _check_distinct(limit, entry)
+        if any(known.arg == limit.arg for known in limits):
+            raise PolicyError(f"{entry}: the argument {quoted(limit.arg)} is listed twice")
+        limits.append(limit)
+    return tuple(limits)
+
+
+def _check_distinct(limit: Any, where: str) -> None:
+    if not isinstance(limit, DistinctLimit):
+        raise PolicyError(f"{where} must be a DistinctLimit")
+    _expect_name(limit.arg, f"{where}: argument name")
+    if "*" in limit.arg:
+        raise PolicyError(f"{where}: argument name {limit.arg!r} holds a '*'; max_distinct counts one named argument")
+    _expect_whole(limit.max, f"{where}.max", 1, MAX_DISTINCT_VALUES)
+
+
+def _check_session_limits(calls: Any, distinct: Any, where: str) -> None:
+    """Check max_calls_per_session and max_distinct given in code (the loader checks the same)."""
+    if calls is not None:
+        _expect_whole(calls, f"{where}.max_calls_per_session", 1, MAX_SESSION_CALLS)
+    if not isinstance(distinct, tuple) or len(distinct) > MAX_DISTINCT_ENTRIES:
+        raise PolicyError(f"{where}.max_distinct must be a tuple of at most {MAX_DISTINCT_ENTRIES} DistinctLimit")
+    for index, limit in enumerate(distinct):
+        _check_distinct(limit, f"{where}.max_distinct[{index}]")
+
+
+def _whole_setting(spec: dict[str, Any], key: str, where: str, lowest: int, highest: int,
+                   default: int | None = None) -> int | None:
+    """Read an optional whole-number setting; `default` when the key is absent."""
+    if key not in spec:
+        return default
+    value = spec[key]
+    _expect_whole(value, f"{where}.{key}", lowest, highest)
+    return value
+
+
+def _expect_whole(value: Any, where: str, lowest: int, highest: int) -> None:
+    # bool is a subclass of int in Python, and `true` is not a number.
+    if isinstance(value, bool) or not isinstance(value, int) or not lowest <= value <= highest:
+        raise PolicyError(f"{where} must be a whole number from {lowest} to {highest}, got {quoted(value)}")
+
+
+def _expect_mark_label(label: Any, where: str) -> None:
+    """A label that content sets as a mark: any label but "sink"."""
+    _expect_label(label, where)
+    if label == SINK:
+        raise PolicyError(f"{where}: 'sink' describes what a tool does, not content, so it is never a mark")
 
 
 def _client_request_rules(specs: Any) -> tuple[ClientRequestRule, ...]:
@@ -1536,11 +1923,13 @@ def _expect_bool(value: Any, where: str) -> None:
         raise PolicyError(f"{where} must be true or false (without quotes), got {quoted(value)}")
 
 
-def _expect_severity(severity: Any) -> None:
+def _expect_severity(
+    severity: Any, where: str = "injection.block_severity", null_means: str = "null turns blocking off"
+) -> None:
     # The type check comes first: a list or object here cannot be looked up in a dict.
     if severity is not None and (not isinstance(severity, str) or severity not in SEVERITY_ORDER):
-        message = choice_message("injection.block_severity", severity, tuple(SEVERITY_ORDER))
-        raise PolicyError(f"{message}. null turns blocking off")
+        message = choice_message(where, severity, tuple(SEVERITY_ORDER))
+        raise PolicyError(f"{message}. {null_means}")
 
 
 def _expect_name(name: Any, what: str) -> None:

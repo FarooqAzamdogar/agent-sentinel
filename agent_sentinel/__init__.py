@@ -9,6 +9,8 @@ Module map:
     matchers.py       the ways a policy judges one argument's value (pattern, one_of, path, url, ...)
     policy_errors.py  error messages that help fix a policy file
     session.py        what the agent has read this session, for flow rules (memory or file store)
+    session_limits.py session limits, approval memory, and what an approval question shows
+    tail_scan.py      reads the end of the last delivered result with the start of the next (DET-5)
     filelock.py       operating-system file locks (audit log, session files)
     firewall.py       combines the three and writes the audit log   (the public core)
     tool_guard.py     guard(): the firewall around a tool function
