@@ -1952,7 +1952,9 @@ class Proxy:
         removing a character joins the text on either side of it: what is
         forwarded is always what was checked. (Pins are taken earlier, of
         what the server sent.) What the first check found for the agent and
-        the session (the warn notice, the content's marks) is kept.
+        the session (the warn notice, the content's marks) is kept, and a
+        notice keeps one ref: the second check's "note" record carries the
+        first's.
 
         cross_message: the content is a result the model reads after the last
         one (Firewall.check_result's tail scan).
@@ -1975,7 +1977,7 @@ class Proxy:
             return checked
         again = self._firewall.check_result(
             label, cleaned, event=event, log_clean=False, call_id=call_id, foreign_tools=foreign_tools,
-            cross_message=cross_message,
+            cross_message=cross_message, notice_ref=checked.decision.ref if checked.decision.notice else None,
         )
         if not again.decision.allowed:
             return again

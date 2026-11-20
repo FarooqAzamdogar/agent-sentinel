@@ -21,11 +21,26 @@ and without HTML tags and comments, with tag characters spelled out. What
 one view drops is padding an attacker can put between two halves: an HTML
 comment is gone from the view without tags, but it is text in the others.
 So a tail is kept for each kind of view: the last TAIL_CHARS characters of
-that view of the text. The next text is read in each kind as that kind's
-tail + " " + the first HEAD_CHARS characters of its own view of the same
-kind. Two halves are then seen whenever the detector would see them in one
-message, in any of those views (the decoded base64 and hex runs aside: the
-detector reads each of those on its own).
+that view of the text. The next text is read in each kind with that kind's
+tail: the first HEAD_CHARS characters of its own view of the same kind. Two
+halves are then seen whenever the detector would see them in one message,
+in any of those views (the decoded base64 and hex runs aside: the detector
+reads each of those on its own).
+
+How the two are put together (_readings)
+----------------------------------------
+A view drops the blanks at its ends, so each end keeps one space where its
+text had a blank there (in that kind of view: a zero-width space is a blank
+where invisible characters read as spaces, and nothing where they are
+deleted). Where the boundary has a blank, the two are read as they are.
+Where it has none, they are read twice: joined, as one message would read
+them ("instruc" + "tions": a server that cuts its output by size cuts words
+in two), and with a space between ("previous" + "instructions": two words
+written apart). Short texts roll into one tail the same way; where two of
+them meet with no blank, the tail holds SEAM, and is read with every seam
+joined and with every seam a space. A tail of mixed seams (a word cut in
+two at one, two words written apart at another) is read only in those two
+ways.
 
 The views are made the detector's way (detector.view_sources, views_of), but
 only of the ends of a text, so that a long result costs little more than one
@@ -46,12 +61,18 @@ A tail is kept as text: in memory for a proxy or a library Firewall, in the
 session file in hook mode. So the end it is cut from is first given to
 `redact` (the firewall passes its secret guard's), with SECRET_REACH more
 characters than are kept, so that a secret the cut goes through starts
-outside the tail. The firewall keeps no tail of content refused for a secret.
+outside the tail. A tail rolled from short texts is given to `redact` again,
+with its seams joined, for a secret the pieces make together. The firewall
+keeps no tail of content refused for a secret.
 
 Not covered: a client that shows the model structuredContent while the
 content items hold other text; a split between a notification and a result
 (each channel has its own tail); content that is withheld (it is not kept,
-so the piece after it is read with the text before it).
+so the piece after it is read with the text before it); results that reach
+the model in another order than they were delivered in (the tail is read
+when content is checked and kept when it is delivered: parallel calls whose
+replies come back in the other order, or hook processes that run at once,
+where the last to write keeps its tail).
 """
 
 from __future__ import annotations
@@ -59,7 +80,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Sequence
 
-from .detector import VIEW_KINDS, Finding, reads_as, scan, view_sources, views_of
+from .detector import VIEW_KINDS, Finding, reads_as, scan, view_of, view_sources, views_of
 from .session import TAIL_CHARS
 from .textutil import MAX_CONTAINERS, texts_in
 
@@ -71,6 +92,14 @@ HEAD_CHARS = 2_048
 SECRET_REACH = 4_096
 JOINED = "[joined] "  # the start of the excerpt of a finding the tail scan made
 Tail = tuple[str, ...]  # a channel's tail: the end of each kind of view, in VIEW_KINDS order
+# In a tail rolled from short texts: where two of them met with no blank between them. No view holds it (a
+# view deletes or spaces every control character), so it is never text that arrived.
+SEAM = "\x00"
+# A letter put next to an end of a piece, and how much of the piece it is read with: whether the view keeps
+# a space between them tells whether the piece has a blank at that end (_blank_at). Runs of blanks are one
+# character by then (compacted), and "_" or a written-out "\n" two at most.
+_PROBE = "a"
+_PROBE_CHARS = 16
 
 # The members of an MCP reply that hold what a client shows the model: a tool result's (and a prompt
 # message's) "content", the "contents" of resources/read, the "messages" of prompts/get.
@@ -204,13 +233,20 @@ def compacted(text: str) -> str:
 
 
 def start_of(text: str, kind: str = VIEW_KINDS[0]) -> str:
-    """The first HEAD_CHARS characters of the view of kind `kind` of `text`: what is read after a tail."""
+    """The first HEAD_CHARS characters of the view of kind `kind` of `text`: what is read after a tail.
+
+    It starts with a space when the text starts with a blank in that kind of view.
+    """
     return _Ends(text).start(kind)
 
 
 def end_of(text: str, kind: str = VIEW_KINDS[0]) -> str:
-    """The last TAIL_CHARS characters of the view of kind `kind` of `text`: what is kept as its tail."""
-    return _Ends(text).end(kind)
+    """The last TAIL_CHARS characters of the view of kind `kind` of `text`: what is kept as its tail.
+
+    It ends with a space when the text ends with a blank in that kind of
+    view (and starts with one when the whole text is kept and starts with one).
+    """
+    return _Ends(text).end(kind)[0]
 
 
 _Views = dict[str, tuple[str, str]]  # kind -> (the compacted piece of its source, the view of that piece)
@@ -234,10 +270,24 @@ class _Ends:
         self._whole: dict[int, _Views] = {}
 
     def start(self, kind: str) -> str:
-        return self._views(kind, from_end=False)[kind][1][:HEAD_CHARS]
+        """The start of the view of this kind, with a space first if the text starts with a blank in it."""
+        piece, view = self._views(kind, from_end=False)[kind]
+        if not view:
+            return ""
+        return (" " if _blank_at(piece, kind, at_end=False) else "") + view[:HEAD_CHARS]
 
-    def end(self, kind: str) -> str:
-        return self._views(kind, from_end=True)[kind][1][-TAIL_CHARS:]
+    def end(self, kind: str) -> tuple[str, bool]:
+        """(The end of the view of this kind, with a space for a blank at either end of it; whether it is all of it).
+
+        A space at the start only when it is all of it: the start of a cut end
+        is no boundary.
+        """
+        piece, view = self._views(kind, from_end=True)[kind]
+        if not view:
+            return "", True
+        whole = len(view) < TAIL_CHARS  # shorter than wanted: the piece is the whole source (_grown)
+        lead = " " if whole and _blank_at(piece, kind, at_end=False) else ""
+        return lead + view[-TAIL_CHARS:] + (" " if _blank_at(piece, kind, at_end=True) else ""), whole
 
     def _views(self, kind: str, from_end: bool) -> _Views:
         source = self._sources[kind]
@@ -292,6 +342,19 @@ def _redacted(views: _Views, redact: Callable[[str], str]) -> _Views:
     return redacted
 
 
+def _blank_at(piece: str, kind: str, at_end: bool) -> bool:
+    """Whether `piece` (compacted) has a blank at its start (or end) in the view of kind `kind`.
+
+    A blank is what that view reads as a space and drops at its ends: a
+    space, a zero-width space where invisible characters are spaced, "_"
+    where it is read as a space ... Told by reading the piece's edge next to
+    a letter: the view keeps a space between them, or not.
+    """
+    if at_end:
+        return view_of(kind, piece[-_PROBE_CHARS:] + _PROBE).endswith(" " + _PROBE)
+    return view_of(kind, _PROBE + piece[:_PROBE_CHARS]).startswith(_PROBE + " ")
+
+
 # ---- the scan -------------------------------------------------------------------------------
 
 def read_with_tail(
@@ -300,9 +363,10 @@ def read_with_tail(
     """The tail scan of `text`, whose own findings are `known`, after the kept `tail` (a Tail, or () for none).
 
     Returns the findings of matches that start in the tail and end in the
-    text (_joined_findings), in any kind of view, and the tail to keep once
-    the text is delivered (_next_tail). `redact` replaces the secrets in the
-    end that the new tail is cut from (see the module docstring).
+    text (_joined_findings), in any kind of view and either reading of the
+    boundary (_readings), and the tail to keep once the text is delivered
+    (_next_tail). `redact` replaces the secrets in the end that the new tail
+    is cut from (see the module docstring).
     """
     ends = _Ends(text, redact)
     before = [entry if isinstance(entry, str) else "" for entry in tuple(tail)[: len(VIEW_KINDS)]]
@@ -312,24 +376,55 @@ def read_with_tail(
     after: list[str] = []
     for kind, kept in zip(VIEW_KINDS, before):
         if kept.strip():
-            pair = (kept, ends.start(kind))
-            if pair not in read:  # most texts read the same in several kinds of view
-                read.add(pair)
-                found += _joined_findings(*pair, known)
-        after.append(_next_tail(kept, ends.end(kind)))
+            for pair in _readings(kept, ends.start(kind)):
+                if pair not in read:  # most texts read the same in several kinds of view
+                    read.add(pair)
+                    found += _joined_findings(*pair, known)
+        after.append(_next_tail(kept, *ends.end(kind), redact))
     return found, tuple(after)
 
 
-def _next_tail(tail: str, end: str) -> str:
-    """The tail of one kind to keep once a text whose view ends with `end` (end_of) is delivered after `tail`."""
-    if tail and len(end) < TAIL_CHARS:
-        end = f"{tail} {end}".strip()  # short texts roll into one tail; one with nothing to read keeps it
-    return end[-TAIL_CHARS:]
+def _readings(tail: str, head: str) -> list[tuple[str, str]]:
+    """The ways a kept tail and the start of the new text (_Ends.start) are read together: (left, right) pairs.
+
+    Where the boundary has a blank (a space at the end of the tail or the
+    start of the head), as they are. Else joined (a word cut in two) and
+    with a space between (two words written apart). The seams of a rolled
+    tail are read all joined and all spaced.
+    """
+    if not head.strip():
+        return []
+    lefts = dict.fromkeys((tail.replace(SEAM, ""), tail.replace(SEAM, " ")))
+    gaps = ("",) if tail.endswith(" ") or head.startswith(" ") else ("", " ")
+    return [(left, gap + head) for left in lefts for gap in gaps]
+
+
+def _next_tail(tail: str, end: str, whole: bool, redact: Callable[[str], str] | None = None) -> str:
+    """The tail of one kind to keep once a text is delivered after `tail`; `end`, `whole`: _Ends.end of the text.
+
+    A text with nothing to read keeps the tail as it was. A short text (all
+    of it is in `end`) rolls into the tail: with SEAM between them when the
+    boundary has no blank. A secret that `redact` finds once the seams are
+    joined (the pieces make it together) is replaced; that tail is then read
+    joined only.
+    """
+    if not end.strip():
+        return tail
+    if not tail or not whole:
+        return end[-TAIL_CHARS:]
+    rolled = tail + ("" if tail.endswith(" ") or end.startswith(" ") else SEAM) + end
+    if redact is not None and SEAM in rolled:
+        joined = rolled.replace(SEAM, "")
+        kept = redact(joined)
+        if kept != joined:
+            rolled = kept
+    return rolled[-TAIL_CHARS:]
 
 
 def _joined_findings(tail: str, head: str, known: list[Finding]) -> list[Finding]:
-    """The findings of a match that starts in `tail` and ends in `head` (start_of the new text), read as one text.
+    """The findings of a match that starts in `tail` and ends in `head`, read as one text: `tail + head`.
 
+    (A pair from _readings: `head` starts with the space between them, if any.)
     `known` are the findings of the new text itself: a rule it matches is
     reported for it already. For a rule the tail matches on its own
     (reported with the content it came from), the joined text is read again
@@ -340,14 +435,14 @@ def _joined_findings(tail: str, head: str, known: list[Finding]) -> list[Finding
     if not head.strip():
         return []
     have = {finding.rule for finding in known}
-    joined = [finding for finding in scan(tail + " " + head) if finding.rule not in have]
+    joined = [finding for finding in scan(tail + head) if finding.rule not in have]
     if not joined:
         return []
     alone = {finding.rule for finding in scan(tail)}
     found = [finding for finding in joined if finding.rule not in alone]
     for rule in sorted({finding.rule for finding in joined} & alone):
         rest = _after_own_match(tail, rule)
-        found += [finding for finding in scan(rest + " " + head) if finding.rule == rule]
+        found += [finding for finding in scan(rest + head) if finding.rule == rule]
     return [Finding(finding.rule, finding.severity, JOINED + finding.excerpt) for finding in found]
 
 

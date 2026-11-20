@@ -26,7 +26,8 @@ memory and the tail scan of --result can be tried:
 A call that needs approval is answered as "answer" says ("approve", the
 default, or "refuse", as a person would). A result is checked like a real
 one and, if it passes, delivered: it sets its marks and is kept for the
-tail scan.
+tail scan. "seconds_ago" dates a step for approval memory and the rate
+limits; steps go oldest first.
 
 Exit codes: 0 allow, 1 block, 3 ask, 2 an error in the input. With --result,
 a result that would be withheld counts as a block. The result is checked as
@@ -278,13 +279,23 @@ def parse_history(data: Any, where: str, most: int = MAX_HISTORY_STEPS) -> list[
         an earlier call; "answer" is used when the policy says ask (default "approve").
     {"result": TOOL, "content": TEXT or JSON, "seconds_ago": N}
         a result of TOOL that reached the agent (if the policy lets it through).
-    "seconds_ago" (default 0) dates the step, for approval memory, whose window is in seconds.
+    "seconds_ago" (default 0) dates the step, for approval memory and the
+    rate limits (both count in seconds). Steps go oldest first: a step's
+    seconds_ago is never more than the one before it.
     """
     if not isinstance(data, list):
         raise CommandError(f"{where} must be a list of steps ([ ... ]), got {type_name(data)}")
     if len(data) > most:
         raise CommandError(f"{where} has {len(data)} steps; at most {most} are read")
-    return [_history_step(entry, f"{where}[{index}]") for index, entry in enumerate(data)]
+    steps = [_history_step(entry, f"{where}[{index}]") for index, entry in enumerate(data)]
+    for index in range(1, len(steps)):
+        before, step = steps[index - 1].seconds_ago, steps[index].seconds_ago
+        if step > before:
+            raise CommandError(
+                f"{where}[{index}].seconds_ago is {step:g}, more than the {before:g} of the step before it: "
+                "steps go oldest first"
+            )
+    return steps
 
 
 def _history_step(entry: Any, where: str) -> HistoryStep:
@@ -327,17 +338,19 @@ def replay_history(firewall: Firewall, steps: list[HistoryStep]) -> list[str]:
     A call is checked (and counted) like a real one; one that needs approval
     is answered by a person as the step says. A result is checked like a real
     one and, if it passes, delivered (its marks, its tail). Each step happens
-    `seconds_ago` before now on the firewall's clock; afterwards it is now again.
+    `seconds_ago` before now on the firewall's clocks: the one approval memory
+    reads, and the one the rate limits count calls in (so calls an hour apart
+    do not count as made in the same minute). Afterwards it is now again.
     """
-    now = time.time()
+    now, ticks = time.time(), time.monotonic()
     lines = []
     try:
         for step in steps:
-            at = now - step.seconds_ago
-            firewall._clock = lambda at=at: at
+            firewall._clock = lambda at=now - step.seconds_ago: at
+            firewall._rate_clock = lambda at=ticks - step.seconds_ago: at
             lines.append(_played(firewall, step))
     finally:
-        firewall._clock = time.time
+        firewall._clock, firewall._rate_clock = time.time, None
     return lines
 
 

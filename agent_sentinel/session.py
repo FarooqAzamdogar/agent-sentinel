@@ -264,7 +264,8 @@ class SessionState:
 
     tails:     channel ("result" or "notification") -> a list of at most TAIL_TEXTS texts of
                at most TAIL_CHARS characters: the end of the text the model read on it, in
-               each kind of the detector's views (see tail_scan.py).
+               each kind of the detector's views (see tail_scan.py; a text may hold
+               tail_scan.SEAM, a control character, where two short texts met).
     counts:    counter of a session limit (a hash of its name) -> calls or bytes counted.
     distinct:  set of a max_distinct limit (a hash of its name) -> hashes of the values seen.
     identical: hash of a call (tool and arguments) -> how many times it was made;

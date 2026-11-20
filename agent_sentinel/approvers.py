@@ -146,8 +146,9 @@ class ApprovalRequest:
                resources/subscribe is checked as "resources/read", but it asks
                for updates for as long as the session lasts.
     marks:     what the session has read, "untrusted (from 'fetch')" (Firewall.approval_context).
-               Shown by the dialog and given to a command; never put in an
-               elicitation, which a client might let the model read.
+               Shown by the dialog and given to a command. An elicitation,
+               which a client might let the model read, lists their labels
+               only ("untrusted"), not the tools and servers that set them.
     destinations: where the call would send data, as the url, email and path
                matchers read its arguments. Shown everywhere.
     """
@@ -256,12 +257,14 @@ def approval_text(request: ApprovalRequest, timeout: float, how_to_answer: str =
     """The question, as the person reads it.
 
     for_client: the text goes into an elicitation. Then the policy's reason
-                is left out (a client might let the model read it), and the
-                characters that Markdown or HTML would act on are escaped in
-                the whole text, so that what the server named the tool or the
-                agent wrote cannot hide part of the question in a client that
-                renders the message (an HTML comment, a link that shows other
-                text than its address, an entity for an invisible character).
+                is left out (a client might let the model read it), the
+                session's marks are listed by label only (not the tools and
+                servers that set them), and the characters that Markdown or
+                HTML would act on are escaped in the whole text, so that what
+                the server named the tool or the agent wrote cannot hide part
+                of the question in a client that renders the message (an HTML
+                comment, a link that shows other text than its address, an
+                entity for an invisible character).
     """
     where = f" on the server '{request.server}'" if request.server else ""
     arguments = "\n".join(argument_lines(request.arguments))
@@ -274,9 +277,10 @@ def approval_text(request: ApprovalRequest, timeout: float, how_to_answer: str =
     ]
     if request.destinations:
         lines.append(f"Where it sends data: {_context_list(request.destinations)}")
+    if request.marks:
+        marks = _mark_labels(request.marks) if for_client else request.marks
+        lines.append(f"What the agent has read in this session: {_context_list(marks)}")
     if not for_client:
-        if request.marks:
-            lines.append(f"What the agent has read in this session: {_context_list(request.marks)}")
         lines.append(f"Why you are asked: {printable(request.reason, limit=300)}")
     lines.append(
         f"If nobody answers within {_seconds(timeout)}, the call is refused. Reference: {request.ref}"
@@ -285,6 +289,14 @@ def approval_text(request: ApprovalRequest, timeout: float, how_to_answer: str =
         lines.append(how_to_answer)
     text = "\n".join(lines)
     return _without_markup(text) if for_client else text
+
+
+_MARK_CAUSE = " (from "  # where Firewall.approval_context starts a mark's cause
+
+
+def _mark_labels(marks: tuple[str, ...]) -> tuple[str, ...]:
+    """The labels of the marks, each once: "untrusted (from 'fetch')" is "untrusted". For an elicitation."""
+    return tuple(dict.fromkeys(mark.split(_MARK_CAUSE, 1)[0] for mark in marks))
 
 
 def _context_list(entries: tuple[str, ...]) -> str:

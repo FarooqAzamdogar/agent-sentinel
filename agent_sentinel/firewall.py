@@ -228,6 +228,9 @@ def new_ref() -> str:
     return token_hex(4)
 
 
+_REF = re.compile(r"[0-9a-f]{8}")  # what new_ref makes
+
+
 def new_call_id() -> str:
     """A fresh call id: sixteen random lowercase hex characters, shared by the audit records of one call."""
     return token_hex(8)
@@ -433,9 +436,11 @@ class Firewall:
         self.session_store: SessionStore = session_store if session_store is not None else MemorySessionStore()
         self._limiter = rate_limiter if rate_limiter is not None else _RateLimiter()
         self._audit_failed = False
-        # Wall-clock seconds, for approval memory (every hook process agrees on it). Tests and
-        # `check --history` set it to replay earlier calls.
+        # Wall-clock seconds, for approval memory (every hook process agrees on it), and the seconds the
+        # rate limits count calls in (None: time.monotonic()). Tests and `check --history` set both to
+        # replay earlier calls.
         self._clock: Callable[[], float] = time.time
+        self._rate_clock: Callable[[], float] | None = None
         # Guards the two collections below; each check takes it only briefly.
         self._state_lock = threading.Lock()
         # Labels learned from MCP tool annotations: tool name -> labels. Only ever grows.
@@ -626,8 +631,14 @@ class Firewall:
         call_id: str | None = None,
         foreign_tools: Iterable[str] = (),
         cross_message: bool = True,
+        notice_ref: str | None = None,
     ) -> CheckedResult:
         """Like `scan_result`, and also return the content that may be passed on: for a caller that forwards it.
+
+        notice_ref: the ref a notice gets (injection.warn_severity), instead
+        of a new one: for a caller that checks a changed copy of content it
+        checked already (the proxy: the copy cleaned for forwarding), so that
+        both audit records carry the ref the agent is shown.
 
         With the policy's secrets.in_results "redact", the secrets in a result
         are replaced first (see leaks.SecretGuard.redact_result), and the copy
@@ -646,8 +657,11 @@ class Firewall:
         as it is. The audit record lists the kinds replaced under "redacted",
         never the secrets; decision.redacted holds the same.
         """
+        if notice_ref is not None and (not isinstance(notice_ref, str) or not _REF.fullmatch(notice_ref)):
+            raise ValueError("notice_ref must be a ref: 8 characters from 0-9 and a-f")
         return self._checked_content(
-            tool, content, event, log_clean, call_id, foreign_tools, can_replace=True, cross_message=cross_message
+            tool, content, event, log_clean, call_id, foreign_tools, can_replace=True, cross_message=cross_message,
+            notice_ref=notice_ref,
         )
 
     def find_secrets(self, value: Any) -> list[Found]:
@@ -941,7 +955,8 @@ class Firewall:
         state cannot be trusted, one entry that says so. Destinations: where
         the call would send data, as the url, email and path matchers read
         its arguments (session_limits.destinations). Both printable and
-        bounded. Operator text: never show it to the agent.
+        bounded. Operator text: never show it to the agent (an elicitation,
+        which a client may let the model read, lists the marks' labels only).
         """
         state = self.session_marks()
         if state.everything:
@@ -984,7 +999,8 @@ class Firewall:
             if repeated is not None:  # also before the rate limit, for the same reason
                 return self._refused_ask(verdict, repeated, call_id, APPROVAL_REPEAT)
 
-        bucket = self._limiter.over_limit(self.policy.call_limits(tool), time.monotonic())
+        now = time.monotonic() if self._rate_clock is None else self._rate_clock()
+        bucket = self._limiter.over_limit(self.policy.call_limits(tool), now)
         if bucket is not None:
             reason = f"rate limit reached for '{bucket}'"
             return Decision(False, reason, public_reason=_RATE_REFUSAL, rule=limit_rule(bucket), call_id=call_id)
@@ -1165,12 +1181,14 @@ class Firewall:
         foreign_tools: Iterable[str],
         can_replace: bool,
         cross_message: bool = True,
+        notice_ref: str | None = None,
     ) -> CheckedResult:
         """scan_result and check_result: the secret step (for results), then the detector, then one audit record.
 
         can_replace: whether the caller passes on the content this returns. If
         not, a result that would need redacting is refused instead.
         cross_message: whether the tail scan applies (see scan_result).
+        notice_ref: the ref of a notice, if it gets one (see check_result).
         """
         if isinstance(content, str):
             views = [without_field_breaks(content)]  # as text_views reads the strings of a structured value
@@ -1209,7 +1227,7 @@ class Firewall:
             )
             findings = merge_findings(findings, joined)
             tail = (channel, kept) if secret_problem is None else None
-        decision = self._result_decision(findings, redacted, secret_problem, call_id, event, tail)
+        decision = self._result_decision(findings, redacted, secret_problem, call_id, event, tail, notice_ref)
         logged = bool(findings) or bool(redacted) or secret_problem is not None or log_clean
         decision = self._finish(event, tool, decision, log=logged)
         return CheckedResult(decision, content if decision.allowed else None)
@@ -1275,14 +1293,15 @@ class Firewall:
 
     def _result_decision(
         self, findings: list[Finding], redacted: tuple[str, ...], secret_problem: str | None, call_id: str | None,
-        event: str = "result", tail: ChannelTail | None = None,
+        event: str = "result", tail: ChannelTail | None = None, notice_ref: str | None = None,
     ) -> Decision:
         """The Decision on a result, from the detector's findings and the secret step.
 
         Every decision carries the content's marks (injection.mark_at) and its
         tail, which only matter once it is delivered (also when monitor mode
         lets through what would be blocked). An allowed result of RESULT_EVENTS
-        at or above injection.warn_severity gets the notice and a ref.
+        at or above injection.warn_severity gets the notice and a ref
+        (`notice_ref`, or a new one).
         """
         worst = max_severity(findings)
         threshold = self.policy.block_severity
@@ -1308,7 +1327,7 @@ class Firewall:
         ref = notice = None
         if event in RESULT_EVENTS and worst is not None and warn is not None:
             if SEVERITY_ORDER[worst] >= SEVERITY_ORDER[warn]:
-                ref = new_ref()
+                ref = notice_ref or new_ref()
                 notice = notice_text(ref)
                 reason += f"; the agent is told to treat it as data (injection.warn_severity '{warn}')"
         rule = None

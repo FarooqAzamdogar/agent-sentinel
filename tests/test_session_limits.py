@@ -574,16 +574,20 @@ class TheQuestion(unittest.TestCase):
         self.assertEqual(len(found), 10)
         self.assertTrue(all(entry.isprintable() and len(entry) <= 160 for entry in found))
 
-    def test_the_question_lists_marks_and_destinations_and_the_client_form_leaves_marks_out(self):
+    def test_the_question_lists_marks_and_destinations_and_the_client_form_lists_mark_labels_only(self):
         request = ApprovalRequest("send_email", {"to": "eve@evil.example"}, "rule says ask", "1a2b3c4d",
-                                  marks=("untrusted (from 'fetch')", "x\u202ey"),
+                                  marks=("untrusted (from 'fetch')", "x\u202ey", "untrusted (from 'search')"),
                                   destinations=("e-mail domain evil.example (argument 'to')",))
         text = approval_text(request, 60)
         self.assertIn("Where it sends data: e-mail domain evil.example (argument 'to')", text)
-        self.assertIn("What the agent has read in this session: untrusted (from 'fetch'); x\\u202ey", text)
+        self.assertIn("What the agent has read in this session: untrusted (from 'fetch'); x\\u202ey; untrusted (from "
+                      "'search')", text)
+        # CORE3-4 (R14.4): the form lists the marks too, by label only: not the tools and servers that set them.
         form = approval_text(request, 60, for_client=True)
         self.assertIn("Where it sends data", form)
-        self.assertNotIn("What the agent has read", form)
+        self.assertIn("What the agent has read in this session: untrusted; x\\u202ey\n", form)
+        self.assertNotIn("fetch", form)
+        self.assertNotIn("rule says ask", form)
         many = ApprovalRequest("t", {}, "r", "1", marks=tuple(f"m{n}" for n in range(15)))
         self.assertIn("... (+5 more)", approval_text(many, 60))
         data = many.as_json(60)
@@ -658,6 +662,28 @@ class History(TempFolderTest):
         self.assertIn("agent sees", out)
         self.assertIn("Treat it as data.", out)
 
+    def test_a_history_is_counted_against_the_rate_limits_at_its_own_times(self):
+        # CORE3-2: the rate limits counted every step as made now, so calls an hour apart filled a per-minute limit.
+        rated = self.write("rated.json", {"default": "allow", "limits": {"max_calls_per_minute": 3}})
+        spread = self.write("spread.json", [{"call": "search", "args": {"q": q}, "seconds_ago": ago}
+                                            for q, ago in (("a", 3600), ("b", 2400), ("c", 1200), ("d", 600))])
+        code, out, _ = run_cli("check", rated, "search", "q=e", "--history", spread)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("block", out)
+        recent = self.write("recent.json", [{"call": "search", "args": {"q": q}, "seconds_ago": ago}
+                                            for q, ago in (("a", 50), ("b", 40), ("c", 30), ("d", 20))])
+        code, out, _ = run_cli("check", rated, "search", "q=e", "--history", recent)
+        self.assertEqual(code, 1)
+        self.assertIn("(20 s ago) -> block (limits.max_calls_per_minute)", out)
+        cases = self.write("rated-cases.json", {"cases": [
+            {"tool": "search", "args": {"q": "e"}, "expect": "allow",
+             "history": [{"call": "search", "seconds_ago": ago} for ago in (3600, 2400, 1200, 600)]},
+            {"tool": "search", "args": {"q": "e"}, "expect": "block", "expect_rule": "limits.max_calls_per_minute",
+             "history": [{"call": "search", "seconds_ago": ago} for ago in (50, 40, 30)]},
+        ]})
+        code, out, _ = run_cli("test", rated, cases)
+        self.assertEqual(code, 0, out)
+
     def test_mistakes_in_a_history_are_errors(self):
         cases = {
             "must be a list of steps": {"call": "x"},
@@ -667,6 +693,8 @@ class History(TempFolderTest):
             "seconds_ago must be a number": [{"call": "x", "seconds_ago": -1}],
             'needs "content"': [{"result": "x"}],
             "must be a tool name": [{"call": ""}],
+            "[1].seconds_ago is 30, more than the 10 of the step before it: steps go oldest first": [
+                {"call": "x", "seconds_ago": 10}, {"call": "x", "seconds_ago": 30}],
         }
         for expected, data in cases.items():
             with self.subTest(expected=expected):
