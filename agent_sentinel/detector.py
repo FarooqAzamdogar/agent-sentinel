@@ -29,19 +29,28 @@ those steps go into further, *decoded* views, and a rule may match in any:
   * "_" and the written-out escapes \\n, \\t and \\r become a space
     (`_unglue`), because snake_case, _markdown emphasis_ and JSON kept inside
     a string otherwise glue a trigger word to its neighbour;
+  * punctuation inside a word is removed (`_joined_words`): markdown
+    emphasis, strike-through and code markers between two letters
+    ("Ig**nor**e"), a hyphen between two letters, with or without a line
+    break after it ("ig-\\nnore"), a single line break inside a word, and the
+    spaces or dots of letter spacing ("i g n o r e", four letters or more);
   * Unicode tag characters are read as the ASCII they copy (`textutil.decode_tags`):
     a model reads a sentence written in them although a person sees nothing;
+  * runs of variation selectors and of two invisible characters used as bits
+    are read as what they spell (`textutil.decode_invisible`);
   * runs of base64 and hex are decoded, one level deep and within fixed
     limits (`textutil.EncodedRuns`): at most 64 runs tried, 16 kept and
-    64 KiB decoded per scan. Runs placed in front of a payload can use those
-    limits up, so a payload can still pass this way.
+    64 KiB decoded per scan. A run that starts with a few binary bytes is
+    still read. Runs placed in front of a payload can use those limits up,
+    so a payload can still pass this way.
 
 The chain rules are matched against every view in lowercase; a view that is
-the same as one already matched is skipped. A finding made in the tag view or
-in a decoded run has an excerpt that starts with "[tags]", "[base64]" or
-"[hex]", so the audit log says where the text came from. `scan_views` merges
-the findings for several texts that describe one value, such as the views
-`textutil.text_views` makes of a tool result.
+the same as one already matched is skipped. A finding made in the tag view,
+the invisible view or in a decoded run has an excerpt that starts with
+"[tags]", "[invisible]", "[base64]" or "[hex]", so the audit log says where
+the text came from. `scan_views` merges the findings for several texts that
+describe one value, such as the views `textutil.text_views` makes of a tool
+result.
 
 Profiles
 --------
@@ -49,11 +58,20 @@ Text a tool returns can say anything: a web page may well tell its reader to
 "always use the search box" or to "read the .env file". A tool's description
 should only describe the tool. So the rules come in two profiles:
 
-  * "result" (the default): the rules in `_RULES`, for tool results and
-    anything else;
-  * "metadata": those rules plus `_METADATA_RULES`, for what a server says
+  * "result" (the default): the rules in `_RULES` plus `_RESULT_RULES`, for
+    tool results, errors and anything else. `_RESULT_RULES` are the
+    description rules that output poisoning reuses: a result or an error
+    that orders a credential file or the conversation put into an argument
+    is high when the argument is one the agent's tools really have (the
+    caller's `parameter_names`), and medium otherwise;
+  * "metadata": `_RULES` plus `_METADATA_RULES`, for what a server says
     about itself: tool descriptions, list entries, server instructions. They
     know the published ways of poisoning a tool description.
+
+Both profiles also read links and images that can carry data out
+(link_exfiltration, image_alphabet, encoded_host_label: medium, high only
+when a secret is named in the same sentence) and terminal sequences that can
+hide or rewrite text (terminal_escape_hiding, medium).
 
 In metadata only COMBINATIONS are high: a concealment phrase ("do not mention
 this ... to the user"), and an order to put the content of a credential file
@@ -115,12 +133,16 @@ import unicodedata
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 from .textutil import (
     FIELD_BREAK,
+    HIDDEN_TEXT_CHARS,
     MAX_PARAMETERS,
     TAG_CHARACTERS,
     EncodedRuns,
+    Unhidden,
+    decode_invisible,
     decode_tags,
     smuggled_text,
     without_field_breaks,
@@ -359,10 +381,50 @@ def _unglue(view: str) -> str:
     return view if unglued == view else " ".join(unglued.split())
 
 
-def _matching_views(text: str, context: "_Context") -> Iterator[tuple[str, str]]:
+# Punctuation inside a word that a reader looks through: markdown emphasis,
+# strike-through and code markers between two letters ("Ig**nor**e",
+# "ig~~no~~re", "ig`no`re"), a hyphen between two letters, with or without a
+# line break after it ("ig-nore", "ig-\nnore"), and a single line break
+# between two letters. Each alternative is a short run that cannot overlap the
+# next, so the pattern reads a text in one pass.
+_IN_WORD = re.compile(r"(?<=[^\W\d_])(?:[*_~`]{1,8}|-[ \t]{0,8}(?:\r?\n[ \t]{0,8})?|\r?\n)(?=[^\W\d_])")
+# The same without the single line break, for the view of a structured value
+# that has one field per line (textutil.text_views): its line breaks are not
+# inside words, and its strings are read joined by spaces in another view.
+_IN_WORD_ON_A_LINE = re.compile(r"(?<=[^\W\d_])(?:[*_~`]{1,8}|-[ \t]{0,8}(?:\r?\n[ \t]{0,8})?)(?=[^\W\d_])")
+_IN_WORD_MARKS = frozenset("*_~`-\n")
+# Emphasis, strike-through and code markers on one side of a word ("**not**",
+# "~~never~~"): "Do **not** tell the user" reads "Do not tell the user". The
+# underscore is not here: `_unglue` already reads it as a space.
+_MARKERS_AT_A_WORD = re.compile(r"[*~`]{1,8}(?=[^\W\d_])|(?<=[^\W\d_])[*~`]{1,8}")
+# Letter spacing: four or more single letters, each with one space, or each
+# with one dot, after it ("i g n o r e", "i.g.n.o.r.e"). Shorter runs are
+# ordinary text: "e.g.", "U.S.", "a b c".
+_SPACED_LETTERS = re.compile(r"(?<![^\W\d_])(?:(?:[^\W\d_] ){3,}|(?:[^\W\d_]\.){3,})[^\W\d_](?![^\W\d_])")
+
+
+def _joined_words(text: str) -> str:
+    """`text` with the punctuation inside and around words taken out and letter spacing closed up.
+
+    Read as a further view only: "well-known" becoming "wellknown" there
+    changes nothing the other views see.
+    """
+    joined = text
+    if not _IN_WORD_MARKS.isdisjoint(text):
+        joined = (_IN_WORD_ON_A_LINE if FIELD_BREAK in text else _IN_WORD).sub("", joined)
+    if "*" in joined or "~" in joined or "`" in joined:
+        joined = _MARKERS_AT_A_WORD.sub("", joined)
+    return _SPACED_LETTERS.sub(lambda match: match.group()[::2], joined)
+
+
+def _matching_views(
+    text: str, context: "_Context", unhidden: Unhidden | None = None, decode: bool = True
+) -> Iterator[tuple[str, str]]:
     """The views of `text` the chain rules are matched in, each with the marker its excerpts get.
 
     The plain view first, then each decoded view that differs from those before it.
+    unhidden: what the invisible carriers in `text` spell (textutil.decode_invisible), if anything.
+    decode:   False for a text that is not to be decoded as base64 or hex (the data of a picture).
     """
     plain = _normalize(text)
     yield plain, ""
@@ -371,15 +433,22 @@ def _matching_views(text: str, context: "_Context") -> Iterator[tuple[str, str]]
     candidates = [(_unglue(plain if decoded == text else _normalize(decoded)), "")]
     if "<" in decoded:
         candidates.append((_unglue(_normalize(_TAG_RE.sub("", decoded))), ""))
+    joined = _joined_words(decoded)
+    if joined != decoded:
+        candidates.append((_unglue(_normalize(joined)), ""))
     if len(text.translate(_WITHOUT_INVISIBLE)) != len(text):
         candidates.append((_normalize(text, _FOLD_SPACED), ""))
         candidates.append((_unglue(_normalize(decoded, _FOLD_SPACED)), ""))
         if TAG_CHARACTERS.search(text):
             candidates.append((_unglue(_normalize(decode_tags(text))), "[tags]"))
+        if unhidden is not None:
+            candidates.append((_unglue(_normalize(unhidden.view)), "[invisible]"))
     for view, marker in candidates:
         if view not in seen:
             seen.add(view)
             yield view, marker
+    if not decode:
+        return
     # Last, and one level only: a decoded run is not decoded again.
     for run in context.encoded.decoded(text):
         view = _unglue(_normalize(run.text))
@@ -571,9 +640,46 @@ def _names_a_parameter(view: str, end: int, context: "_Context") -> bool:
     return quoted and _ARGUMENT_WORD_AFTER.match(view, end) is not None
 
 
+def _names_a_real_parameter(view: str, end: int, context: "_Context") -> bool:
+    """Whether the word that ends at `end` is one of the parameters the caller says the agent's tools have.
+
+    For tool output, where a generic word ("the parameter") or a quoted name
+    proves nothing: only a real parameter name, written alone or before a
+    generic word ("the 'sidenote' parameter"), makes the chain high. Not one
+    that holds a path, as in `_names_a_parameter`.
+    """
+    if not context.parameter_names:
+        return False
+    match = _LAST_NAME.search(view, max(0, end - 66), end)
+    if match is None:
+        return False
+    name = match.group("name")
+    if _GENERIC_ARGUMENT.fullmatch(name):
+        named = _NAMED_ARGUMENT.search(view, max(0, end - 140), end)
+        if named is None:
+            return False
+        name = named.group("quoted") or named.group("word")
+    return not _holds_a_path(name) and name in context.parameter_names
+
+
 def _holds_a_path(name: str) -> bool:
     """Whether an argument's name says it holds a path ("path", "file_name", "folder")."""
     return _PATH_PARAMETER.search(name.replace("_", " ")) is not None
+
+
+def _argument_rules(name: str, severity: str, accept_end: Callable[[str, int, "_Context"], bool]) -> tuple[_Rule, ...]:
+    """Smuggling through an argument: a credential file's content, or the conversation, put into an argument.
+
+    The chain is the same everywhere; `accept_end` says which arguments count.
+    """
+    return (
+        _rule(name, severity, _CREDENTIAL_FILE, (100, r"\b" + _PUT), (60, _INTO), (40, _ARGUMENT),
+              one_sentence=True, accept_end=accept_end),
+        _rule(name, severity, _PUT, (100, _CREDENTIAL_FILE), (60, _INTO), (40, _ARGUMENT),
+              one_sentence=True, accept_end=accept_end),
+        _rule(name, severity, _PUT, (60, _CONVERSATION), (60, _INTO), (40, _ARGUMENT),
+              one_sentence=True, accept_end=accept_end),
+    )
 
 
 _QUOTES = ("`", "'", '"')
@@ -614,21 +720,7 @@ _METADATA_RULES: tuple[_Rule, ...] = (
     # Smuggling through an argument: a credential file's content, the
     # conversation, put into an argument of the tool. High, because it takes
     # all of: the thing, the putting, and an argument the tool really has.
-    _rule(
-        "parameter_smuggling", "high",
-        _CREDENTIAL_FILE, (100, r"\b" + _PUT), (60, _INTO), (40, _ARGUMENT),
-        one_sentence=True, accept_end=_names_a_parameter,
-    ),
-    _rule(
-        "parameter_smuggling", "high",
-        _PUT, (100, _CREDENTIAL_FILE), (60, _INTO), (40, _ARGUMENT),
-        one_sentence=True, accept_end=_names_a_parameter,
-    ),
-    _rule(
-        "parameter_smuggling", "high",
-        _PUT, (60, _CONVERSATION), (60, _INTO), (40, _ARGUMENT),
-        one_sentence=True, accept_end=_names_a_parameter,
-    ),
+    *_argument_rules("parameter_smuggling", "high", _names_a_parameter),
     _rule("sensitive_file_read", "medium", _READ, (60, _CREDENTIAL_FILE), one_sentence=True),
     _rule(
         "authority_tag", "medium",
@@ -674,6 +766,20 @@ _METADATA_RULES: tuple[_Rule, ...] = (
     ),
 )
 
+# ---- the result profile: output poisoning --------------------------------------
+#
+# A pinned server can poison its OUTPUT instead of its descriptions: a result
+# or an error that tells the model to call a tool again with ~/.ssh/id_rsa or
+# the conversation in an argument ("Advanced Tool Poisoning"). Output can say
+# anything, so the chain is high only when it names a parameter the agent's
+# tools really have (the caller's parameter_names), and medium for any other
+# argument; a credential file read alone is medium, as in descriptions.
+_RESULT_RULES: tuple[_Rule, ...] = (
+    *_argument_rules("parameter_smuggling", "high", _names_a_real_parameter),
+    *_argument_rules("parameter_request", "medium", _names_a_parameter),
+    _rule("sensitive_file_read", "medium", _READ, (60, _CREDENTIAL_FILE), one_sentence=True),
+)
+
 # Rules for the text of ONE parameter of a tool: its name, then its
 # description. A parameter that asks for the CONTENT of a credential file
 # ("content_from_reading_ssh_id_rsa", "the text of ~/.ssh/id_rsa") or orders
@@ -692,14 +798,25 @@ _PARAMETER_RULES: tuple[_Rule, ...] = (
 )
 _PATH_PARAMETER = re.compile(r"\b(paths?|file ?names?|directory|directories|folders?|locations?|globs?)\b")
 
-# A rule that adds nothing once the rule it maps to has matched.
-_SUPERSEDED_BY = {
-    "instruction_override_weak": "instruction_override",
-    "secret_request": "exfiltration_to_destination",
-    "sensitive_file_read": "parameter_smuggling",
-    "conversation_parameter": "parameter_smuggling",
-    "foreign_tool_reference": "tool_shadowing",
+# A rule that adds nothing once one of the rules it maps to has matched. A
+# credential file that is to be sent somewhere is already a secret_request or
+# an exfiltration; a description's terminal_escape covers every escape.
+_SUPERSEDED_BY: dict[str, tuple[str, ...]] = {
+    "instruction_override_weak": ("instruction_override",),
+    "secret_request": ("exfiltration_to_destination",),
+    "sensitive_file_read": (
+        "parameter_smuggling", "parameter_request", "secret_request", "exfiltration_to_destination",
+    ),
+    "parameter_request": ("parameter_smuggling",),
+    "conversation_parameter": ("parameter_smuggling",),
+    "foreign_tool_reference": ("tool_shadowing",),
+    "terminal_escape_hiding": ("terminal_escape",),
 }
+
+
+def _superseded(rule: str, found: Mapping[str, Finding]) -> bool:
+    """Whether a rule that supersedes `rule` is among `found`."""
+    return any(stronger in found for stronger in _SUPERSEDED_BY.get(rule, ()))
 
 # Where a sentence ends in a matching view (which has single spaces only).
 # Matched against the view BEFORE it is lowercased: a capital after the full stop is the evidence.
@@ -747,6 +864,27 @@ class _View:
         # positions found in `text` can be used to quote from `cased`.
         self.text = cased.lower()
         self._sentence_ends: list[int] | None = None
+        # Rules share patterns (the high and medium forms of one chain, a verb
+        # that starts several chains): each is searched for once per view.
+        self._spans: dict[re.Pattern[str], tuple[list[int], list[int]]] = {}
+        self._may_start: dict[re.Pattern[str], bool] = {}
+
+    def spans(self, pattern: re.Pattern[str]) -> tuple[list[int], list[int]]:
+        """(starts, ends) of the matches of `pattern` in the view, found in one pass and kept."""
+        found = self._spans.get(pattern)
+        if found is None:
+            spans = [match.span() for match in pattern.finditer(self.text)]
+            found = ([start for start, _ in spans], [end for _, end in spans])  # ends sorted: matches do not overlap
+            self._spans[pattern] = found
+        return found
+
+    def may_start(self, pattern: re.Pattern[str]) -> bool:
+        """Whether a rule's first pattern matches anywhere in the view, not inside a word (asked once per pattern)."""
+        found = self._may_start.get(pattern)
+        if found is None:
+            found = next(_first_matches(pattern, self.text), None) is not None
+            self._may_start[pattern] = found
+        return found
 
     @property
     def sentence_ends(self) -> list[int]:
@@ -795,13 +933,11 @@ class _Occurrences:
     repeats a rule's first words thousands of times is read thousands of times.
     """
 
-    def __init__(self, step: _Step, text: str) -> None:
+    def __init__(self, step: _Step, view: _View) -> None:
         self.max_gap = step.max_gap
         self._pattern = step.pattern
-        self._text = text
-        spans = [match.span() for match in step.pattern.finditer(text)]
-        self._starts = [start for start, _ in spans]
-        self._ends = [end for _, end in spans]  # sorted, because matches do not overlap
+        self._text = view.text
+        self._starts, self._ends = view.spans(step.pattern)
 
     def __bool__(self) -> bool:
         return bool(self._starts)
@@ -835,11 +971,11 @@ def _match_chain(rule: _Rule, view: _View, context: "_Context") -> tuple[int, in
     """Return the (start, end) of the first place `rule` matches the view, or None."""
     text = view.text
     first_pattern = rule.steps[0].pattern
-    if next(_first_matches(first_pattern, text), None) is None:
+    if not view.may_start(first_pattern):
         return None
     occurrences = []
     for step in rule.steps[1:]:
-        occurrences.append(_Occurrences(step, text))
+        occurrences.append(_Occurrences(step, view))
         if not occurrences[-1]:
             return None  # this step occurs nowhere in the text, so the rule cannot match
     sentence_ends = view.sentence_ends if rule.one_sentence else []
@@ -878,7 +1014,7 @@ def _match_rules(
     """Add to `found` a finding for each chain rule that matches `view` and is not settled already."""
     for rule in rules:
         # A rule has one severity, so a match in an earlier view cannot be improved on.
-        if rule.name in found or _SUPERSEDED_BY.get(rule.name) in found:
+        if rule.name in found or _superseded(rule.name, found):
             continue
         span = _match_chain(rule, view, context)
         if span:
@@ -1052,6 +1188,263 @@ def _label(text: str) -> str:
     return " ".join(text.split()).casefold()
 
 
+# ---- links, image alphabets and host names that can carry data out ---------
+#
+# Medium, because documentation writes all of these: API references put
+# {placeholders} in links, README files have rows of badges from one host,
+# cloud and CDN hosts have long hashed names. High only when a secret is
+# named in the same sentence, outside the address itself.
+
+# A link a client may render: markdown (an image or not), an HTML link or
+# image, an autolink, a reference definition. Group "url" is the address. A
+# markdown address stops at a bracket or parenthesis, and each part has a
+# length bound, so no character is read by more than a few attempts.
+_LINK_RES = (
+    re.compile(r"!?\[[^\]\[]{0,300}\]\( {0,5}<?(?P<url>(?:https?:)?//[^\s()\[\]]{1,2000})"),
+    re.compile(r"<(?:a|img)\b[^<>]{0,300}?\b(?:href|src) {0,5}= {0,5}[\"']?(?P<url>(?:https?:)?//[^\s\"'<>]{1,2000})",
+               re.IGNORECASE),
+    re.compile(r"<(?P<url>https?://[^\s<>]{1,2000})>", re.IGNORECASE),
+    re.compile(r"^ {0,3}\[[^\]\n]{1,100}\]: {0,5}<?(?P<url>(?:https?:)?//[^\s<>]{1,2000})", re.MULTILINE),
+)
+_IMAGE_RES = (
+    re.compile(r"!\[[^\]\[]{0,300}\]\( {0,5}<?(?P<url>(?:https?:)?//[^\s()\[\]]{1,2000})"),
+    re.compile(r"<img\b[^<>]{0,300}?\bsrc {0,5}= {0,5}[\"']?(?P<url>(?:https?:)?//[^\s\"'<>]{1,2000})", re.IGNORECASE),
+)
+_MAX_LINKS = 1_000  # links, images and host names read per text
+# An address: its host, and the rest (path, query, fragment).
+_URL_PARTS = re.compile(r"(?:[A-Za-z][A-Za-z0-9+.-]{0,20}:)?//(?P<host>[^/?#]{0,300})(?P<rest>.*)", re.DOTALL)
+# A slot for data in an address: {data}, {{data}}, $VAR, ${VAR}, <SECRET>, [DATA],
+# and the same braces and angle brackets percent-encoded.
+_PLACEHOLDER = re.compile(
+    r"\{\{? {0,2}[A-Za-z_$][\w.$-]{0,40} {0,2}\}\}?|\$\{?[A-Za-z_][A-Za-z0-9_]{1,40}\}?|<[A-Za-z_][\w -]{0,40}>"
+    r"|\[[A-Z][A-Z0-9_]{2,40}\]|%7[Bb][\w.$%-]{1,60}?%7[Dd]|%3[Cc][\w%-]{1,60}?%3[Ee]"
+)
+# Encoded data in an address: a run of base64 of 32 characters or more (in
+# any part), or of hex (in the query or fragment: paths are full of hashes).
+_BASE64_DATA = re.compile(r"[A-Za-z0-9+_-]{32,}")
+_HEX_DATA = re.compile(r"[0-9A-Fa-f]{32,}")
+_UPPER = re.compile(r"[A-Z]")
+_LOWER = re.compile(r"[a-z]")
+# A secret named in a sentence: what raises these rules to high.
+_SECRET_WORD = re.compile(_SECRET)
+# Where a sentence ends in text as it arrived: a full stop, question or
+# exclamation mark before a space, or a blank line.
+_SENTENCE_BREAK = re.compile(r"[.!?][\"')\]]?(?=\s)|\n[ \t]*\n")
+_SENTENCE_REACH = 200
+
+
+def _secret_named_near(text: str, start: int, end: int) -> bool:
+    """Whether a secret is named in the sentence around text[start:end], outside that span."""
+    before = _SENTENCE_BREAK.split(text[max(0, start - _SENTENCE_REACH) : start])[-1]
+    after = _SENTENCE_BREAK.split(text[end : end + _SENTENCE_REACH], maxsplit=1)[0]
+    return _SECRET_WORD.search(f"{before.lower()} \n {after.lower()}") is not None
+
+
+def _carries_data(rest: str) -> bool:
+    """Whether the path, query or fragment of an address has a slot for data, or encoded data, in it."""
+    if _PLACEHOLDER.search(rest):
+        return True
+    for run in _BASE64_DATA.findall(rest):
+        separators = run.count("-") + run.count("_")
+        if _UPPER.search(run) and _LOWER.search(run) and any(ch.isdigit() for ch in run) and separators * 8 <= len(run):
+            return True  # random-looking: a word slug has a separator every few letters
+    query = rest.partition("?")[2] or rest.partition("#")[2]
+    return _HEX_DATA.search(query) is not None
+
+
+def _links(text: str, patterns: tuple[re.Pattern[str], ...]) -> Iterator[re.Match[str]]:
+    """The first _MAX_LINKS matches of the patterns in `text`, the patterns one after the other."""
+    return itertools.islice(itertools.chain.from_iterable(pattern.finditer(text) for pattern in patterns), _MAX_LINKS)
+
+
+def _link_finding(text: str) -> Finding | None:
+    """link_exfiltration: a link or image whose address has a slot for data, or encoded data, after its host."""
+    if "//" not in text:
+        return None
+    medium = None
+    for match in _links(text, _LINK_RES):
+        parts = _URL_PARTS.match(match.group("url"))
+        if parts is None or not _carries_data(parts.group("rest")):
+            continue
+        excerpt = _excerpt(text, *match.span())
+        if _secret_named_near(text, *match.span("url")):
+            return Finding("link_exfiltration", "high", excerpt)
+        medium = medium or Finding("link_exfiltration", "medium", excerpt)
+    return medium
+
+
+# Text that orders data written out one image per character, as CamoLeak's did.
+_ONE_IMAGE_PER_CHARACTER = re.compile(
+    r"\b(?:one|an?|each|every|single|separate) (?:image|picture|img|pixel|emoji)s? "
+    r"(?:per|for (?:each|every|one)) (?:character|letter|char|byte|digit|symbol)s?\b"
+    r"|\b(?:each|every) (?:character|letter|char|byte|digit|symbol)\b[^.\n]{0,60}?"
+    r"\b(?:as|with|to|by|into) (?:an? |its |the )?(?:image|picture|img)s?\b"
+    r"|\b(?:character|letter|char)[- ]by[- ](?:character|letter|char)\b[^.\n]{0,60}?\b(?:image|picture|img)s?\b",
+    re.IGNORECASE,
+)
+# An image alphabet: this many images to one host whose addresses differ only
+# in one part of one or two characters ("a.png", "b.png", ...). Badge rows
+# differ in longer parts ("pypi/v", "pypi/l", "license", ...).
+_ALPHABET_IMAGES = 8
+_ADDRESS_PARTS = re.compile(r"[/?&=#]+")
+_MAX_ADDRESS_PARTS = 16
+_IMG_TAG = re.compile(r"<img\b", re.IGNORECASE)
+
+
+def _image_alphabet_finding(text: str) -> Finding | None:
+    """image_alphabet: images that spell data one character at a time, or text that orders it."""
+    if "![" not in text and _IMG_TAG.search(text) is None:
+        return None
+    images = list(_links(text, _IMAGE_RES))
+    if len(images) < 2:
+        return None
+    span = _alphabet_span(images)
+    if span is None:
+        order = _ONE_IMAGE_PER_CHARACTER.search(text)
+        span = order.span() if order else None
+    if span is None:
+        return None
+    severity = "high" if _secret_named_near(text, *span) else "medium"
+    return Finding("image_alphabet", severity, _excerpt(text, *span))
+
+
+def _alphabet_span(images: list[re.Match[str]]) -> tuple[int, int] | None:
+    """Where the first image of an image alphabet is, if the images hold one."""
+    groups: dict[tuple[Any, ...], tuple[int, int, set[str]]] = {}
+    for image in images:
+        parts = _URL_PARTS.match(image.group("url"))
+        if parts is None:
+            continue
+        host = parts.group("host").rpartition("@")[2].lower()
+        pieces = [piece for piece in _ADDRESS_PARTS.split(parts.group("rest")) if piece][:_MAX_ADDRESS_PARTS]
+        for index, piece in enumerate(pieces):
+            short = piece.rsplit(".", 1)[0] if "." in piece[1:] else piece  # "a.png" is "a"
+            if not 1 <= len(short) <= 2:
+                continue
+            key = (host, len(pieces), index, tuple(pieces[:index]), tuple(pieces[index + 1 :]))
+            start, end, seen = groups.setdefault(key, (*image.span(), set()))
+            seen.add(short)
+            if len(seen) >= _ALPHABET_IMAGES:
+                return start, end
+    return None
+
+
+# Host names: of an address, and after a command that looks a name up or
+# connects to it (DNS exfiltration puts the data in the labels of the name).
+_URL_HOST = re.compile(r"\b(?:https?|wss?|ftp)://(?:[^\s/?#@]{0,256}@)?(?P<host>[^\s/?#:\"'<>()\[\]]{1,253})",
+                       re.IGNORECASE)
+_COMMAND_HOST = re.compile(
+    r"\b(?:ping6?|nslookup|dig|host|curl|wget|nc|ncat|telnet|traceroute|tracert|resolve-dnsname)\b"
+    r"(?: {1,4}-{1,2}[A-Za-z][\w-]{0,20}(?:[ =][\w.]{1,10})?){0,6}"  # options: "-c 2", "--count=2"
+    r" {1,4}(?P<host>[\w${}<>%-]{1,63}(?:\.[\w${}<>%-]{1,63}){1,8})",
+    re.IGNORECASE,
+)
+# What _COMMAND_HOST needs to find before it is worth running: a text without
+# any of these words has no host after a command.
+_NETWORK_COMMANDS = (
+    "ping", "nslookup", "dig ", "host ", "curl", "wget", "nc ", "ncat", "telnet", "tracert", "traceroute",
+    "resolve-dnsname",
+)
+# A label that holds data: a slot for it, or a long run of hex or base32.
+_HOST_PLACEHOLDER = re.compile(r"\{[^{}]{1,40}\}|\$\{?[A-Za-z_]\w{0,40}\}?|<[^<>]{1,40}>|%7[Bb]")
+_HEX_LABEL = re.compile(r"[0-9a-f]{16,63}")
+_BASE32_LABEL = re.compile(r"[a-z2-7]{16,63}")
+_BASE32_DIGITS = re.compile(r"[2-7]+")
+
+
+def _encoded_label(host: str) -> bool:
+    """Whether a label of the host name (not its top-level domain) looks like data rather than a name."""
+    labels = host.lower().strip(".").split(".")
+    for label in labels[:-1]:
+        if _HOST_PLACEHOLDER.search(label):
+            return True
+        if label.startswith("xn--"):  # an international name, written in Punycode
+            continue
+        has_digit = any(ch.isdigit() for ch in label)
+        if len(label) >= 32 and label.count("-") < 3 and has_digit:
+            return True
+        if _HEX_LABEL.fullmatch(label) and has_digit and any(ch.isalpha() for ch in label):
+            return True
+        if _BASE32_LABEL.fullmatch(label) and len(_BASE32_DIGITS.findall(label)) >= 2:
+            return True
+    return False
+
+
+def _host_label_finding(text: str) -> Finding | None:
+    """encoded_host_label: a host name, in an address or after a network command, with data in a label."""
+    lowered = text.lower()
+    patterns = [_URL_HOST] if "://" in text else []
+    if any(command in lowered for command in _NETWORK_COMMANDS):
+        patterns.append(_COMMAND_HOST)
+    medium = None
+    for match in _links(text, tuple(patterns)):
+        host = match.group("host")
+        if "." not in host or not _encoded_label(host):
+            continue
+        excerpt = _excerpt(text, *match.span("host"))
+        if _secret_named_near(text, *match.span("host")):
+            return Finding("encoded_host_label", "high", excerpt)
+        medium = medium or Finding("encoded_host_label", "medium", excerpt)
+    return medium
+
+
+# Terminal sequences that hide or rewrite what a person sees (colours alone do
+# not): SGR 8 "conceal", cursor movement and erasing, OSC 8 hyperlinks (the
+# address shown is not the one opened) and OSC 52 (writes the clipboard).
+# ESC [ or the one-character CSI, ESC ] or the one-character OSC. Each kind is
+# looked for with one search; only SGR sequences with an 8 in them are read
+# one by one, to tell conceal from the 8 of a colour.
+_CSI = r"(?:\x1b\[|\x9b)"
+_HIDING_SEQUENCES = (
+    ("cursor movement or erasing", re.compile(_CSI + r"[0-?]{0,64}[ -/]{0,8}[ABCDEFGHJKLMPXadefsu`]")),
+    ("hyperlink", re.compile(r"(?:\x1b\]|\x9d)8;")),
+    ("clipboard", re.compile(r"(?:\x1b\]|\x9d)52;")),
+)
+_SGR_WITH_AN_EIGHT = re.compile(_CSI + r"(?P<parameters>[0-?]{0,63}8[0-?]{0,63})m")
+_MAX_SEQUENCES = 10_000
+
+
+def _hiding_escape_finding(text: str) -> Finding | None:
+    """terminal_escape_hiding: a sequence that conceals, moves the cursor, erases, links or writes the clipboard."""
+    if "\x1b" not in text and "\x9b" not in text and "\x9d" not in text:
+        return None
+    kinds = {kind for kind, pattern in _HIDING_SEQUENCES if pattern.search(text)}
+    if "8" in text:
+        for match in itertools.islice(_SGR_WITH_AN_EIGHT.finditer(text), _MAX_SEQUENCES):
+            if _conceals(match.group("parameters")):
+                kinds.add("concealed text")
+                break
+    if not kinds:
+        return None
+    excerpt = f"terminal sequences that can hide text: {', '.join(sorted(kinds))}"
+    return Finding("terminal_escape_hiding", "medium", excerpt)
+
+
+def _conceals(parameters: str) -> bool:
+    """Whether an SGR parameter list turns on "conceal" (8): not the 8 of a colour such as 38;5;8."""
+    values = parameters.split(";")
+    index = 0
+    while index < len(values):
+        value = values[index].lstrip("0") or "0"
+        if value in ("38", "48", "58"):  # a colour: 5;n or 2;r;g;b follows
+            index += 3 if index + 1 < len(values) and values[index + 1] == "5" else 5
+            continue
+        if value == "8":
+            return True
+        index += 1
+    return False
+
+
+def _invisible_smuggling_finding(unhidden: Unhidden | None) -> Finding | None:
+    """invisible_smuggling: text spelled by variation selectors or invisible bits, which a person cannot see."""
+    if unhidden is None:
+        return None
+    hidden = " ".join(unhidden.hidden.split())
+    if len(hidden) < HIDDEN_TEXT_CHARS:
+        return None
+    return Finding("invisible_smuggling", "high", _marked("[invisible]", hidden[:120]))
+
+
 def _invisible_finding(text: str) -> Finding | None:
     # Counted by how much shorter the text gets without them: that runs inside
     # str.translate, where a loop over the characters would be slow.
@@ -1112,6 +1505,12 @@ def _marked(marker: str, excerpt: str) -> str:
 # Scanning
 # --------------------------------------------------------------------------
 
+# Parameter names taken from `parameter_names` (the names of a server's tools
+# together); the rest are ignored. Longer names than this cannot be matched.
+MAX_PARAMETER_NAMES = 10_000
+_MAX_PARAMETER_NAME_CHARS = 64
+
+
 class _Context:
     """What one scan shares between the texts it reads: the rules, the budget, the decoder and the caller's names."""
 
@@ -1121,37 +1520,49 @@ class _Context:
         budget: _Budget | None = None,
         parameters: Mapping[str, str] | None = None,
         foreign_tools: Iterable[str] = (),
-        skip_decoding: Iterable[str] = (),
+        parameter_names: Iterable[str] = (),
     ) -> None:
         if profile not in PROFILES:
             raise ValueError(f"profile must be one of {', '.join(PROFILES)}, got {profile!r}")
+        if isinstance(parameter_names, (str, bytes)):
+            raise TypeError("parameter_names must be a collection of names, not one text")
         self.metadata = profile == METADATA
-        self.rules = _RULES + _METADATA_RULES if self.metadata else _RULES
+        self.rules = _RULES + _METADATA_RULES if self.metadata else _RULES + _RESULT_RULES
         self.budget = budget or _Budget()
-        self.encoded = EncodedRuns(skip=skip_decoding)
+        self.encoded = EncodedRuns()
         named = {}
         if self.metadata and parameters:
             pairs = itertools.islice(parameters.items(), MAX_PARAMETERS)
             named = {name: text for name, text in pairs if isinstance(name, str) and isinstance(text, str)}
         self.parameters: dict[str, str] = named
-        self.parameter_names = frozenset(name.lower() for name in named)
+        given = itertools.islice(parameter_names, MAX_PARAMETER_NAMES)
+        self.parameter_names = frozenset(name.lower() for name in named) | frozenset(
+            name.lower() for name in given if isinstance(name, str) and len(name) <= _MAX_PARAMETER_NAME_CHARS
+        )
         foreign = _ForeignTools(foreign_tools)
         self.foreign = foreign if self.metadata and foreign else None
 
 
-def _scan(text: str, context: _Context) -> dict[str, Finding]:
-    """The findings in one text, by rule, before superseded ones are dropped."""
+def _scan(text: str, context: _Context, decode: bool = True) -> dict[str, Finding]:
+    """The findings in one text, by rule, before superseded ones are dropped.
+
+    decode: False for a text that is not decoded as base64 or hex (the data of a picture).
+    """
     found: dict[str, Finding] = {}
     if not text:
         return found
     invisible = _invisible_finding(text)
     smuggling = _smuggling_finding(text) if invisible else None
+    unhidden = decode_invisible(text) if invisible else None
     escape = _terminal_escape_finding(text) if context.metadata else None
-    for finding in (invisible, _image_finding(text), smuggling, escape):
+    for finding in (
+        invisible, _image_finding(text), smuggling, _invisible_smuggling_finding(unhidden), escape,
+        _hiding_escape_finding(text), _link_finding(text), _image_alphabet_finding(text), _host_label_finding(text),
+    ):
         if finding:
             found[finding.rule] = finding
     try:
-        for cased, marker in _matching_views(text, context):
+        for cased, marker in _matching_views(text, context, unhidden, decode):
             view = _View(cased)
             _match_rules(view, context.rules, context, found, marker)
             _match_foreign_tools(view, context, found)
@@ -1193,7 +1604,8 @@ def scan_views(
     profile: str = RESULT,
     parameters: Mapping[str, str] | None = None,
     foreign_tools: Iterable[str] = (),
-    skip_decoding: Iterable[str] = (),
+    parameter_names: Iterable[str] = (),
+    undecoded: Iterable[str] = (),
 ) -> list[Finding]:
     """Scan several texts that describe one value; return at most one finding per rule.
 
@@ -1213,18 +1625,24 @@ def scan_views(
                    Never pass the names of the scanned server's own tools: they
                    refer to each other all the time. At most MAX_FOREIGN_TOOLS
                    are used.
-    skip_decoding: exact texts not to decode as base64 or hex: the "data" of
-                   image and audio content (`textutil.media_payloads`). They are
-                   still scanned as text.
+    parameter_names: the names of the parameters the agent's tools really
+                   have, for the output-poisoning rules of the result profile
+                   (see "Profiles"). At most MAX_PARAMETER_NAMES are used.
+    undecoded:     texts scanned without decoding base64 or hex in them: the
+                   "data" of image and audio blocks a client renders
+                   (`textutil.text_views(media=...)`). They are still scanned
+                   as text, each on its own.
     """
-    context = _Context(
-        profile, parameters=parameters, foreign_tools=foreign_tools, skip_decoding=skip_decoding
-    )
+    context = _Context(profile, parameters=parameters, foreign_tools=foreign_tools, parameter_names=parameter_names)
     strongest: dict[str, Finding] = {}
     for text in texts:
         if "unscannable_content" in strongest:
             break
         _keep_strongest(strongest, _scan(text, context).values())
+    for text in undecoded:
+        if "unscannable_content" in strongest:
+            break
+        _keep_strongest(strongest, _scan(text, context, decode=False).values())
     for name, description in context.parameters.items():
         if "unscannable_content" in strongest:
             break
@@ -1242,7 +1660,7 @@ def _keep_strongest(strongest: dict[str, Finding], findings: Iterable[Finding]) 
 
 def _without_superseded(found: dict[str, Finding]) -> list[Finding]:
     """The findings, minus any whose stronger rule matched too (possibly in another view)."""
-    return [finding for finding in found.values() if _SUPERSEDED_BY.get(finding.rule) not in found]
+    return [finding for finding in found.values() if not _superseded(finding.rule, found)]
 
 
 def max_severity(findings: list[Finding]) -> str | None:

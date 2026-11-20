@@ -399,9 +399,15 @@ def covered_by_results_hooks(tool: str) -> bool:
     return _RESULTS_MATCHER.fullmatch(tool) is not None
 
 
+def _argument_names(event: dict[str, Any]) -> list[str]:
+    """The names of the call's arguments: a result that orders a credential file into one of them is high."""
+    arguments = event.get("tool_input")
+    return [name for name in arguments if isinstance(name, str)] if isinstance(arguments, dict) else []
+
+
 def _post_tool_use(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
     tool, call_id, output = event["tool_name"], event.get("tool_use_id"), event["tool_response"]
-    checked = firewall.check_result(tool, output, call_id=call_id)
+    checked = firewall.check_result(tool, output, call_id=call_id, parameter_names=_argument_names(event))
     decision = _delivered(firewall, tool, checked.decision, call_id)
     if decision.allowed:
         if not decision.redacted:
@@ -447,7 +453,10 @@ def _redacted_output(tool: str, content: Any) -> dict[str, Any]:
 
 def _post_tool_use_failure(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
     tool, call_id = event["tool_name"], event.get("tool_use_id")
-    decision = firewall.scan_result(tool, event["error"], event="tool_error", log_clean=False, call_id=call_id)
+    decision = firewall.scan_result(
+        tool, event["error"], event="tool_error", log_clean=False, call_id=call_id,
+        parameter_names=_argument_names(event),
+    )
     decision = _delivered(firewall, tool, decision, call_id)
     if decision.allowed:
         return HookAnswer()

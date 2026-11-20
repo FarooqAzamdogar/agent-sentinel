@@ -227,7 +227,7 @@ from .policy import (
 )
 from .policy_errors import file_error_message, type_name
 from .session import SessionStateError
-from .textutil import UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable
+from .textutil import UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable, tool_parameters
 
 # How long a tool call waits for an in-flight tools/list reply to be checked.
 TOOL_LIST_WAIT_SECONDS = 15
@@ -578,6 +578,9 @@ class Proxy:
         # Every tool name this server has listed (at most MAX_KNOWN_NAMES), so that a description that
         # names one of the server's own tools is not taken for shadowing (_foreign_tools). Guarded by `_state`.
         self._listed_tools: set[str] = set()
+        # The parameter names of the tools let through (at most MAX_KNOWN_NAMES): a result or error that orders
+        # a credential file into one of them is high (Firewall.check_result's parameter_names). Guarded by `_state`.
+        self._parameter_names: set[str] = set()
 
         # `_state` guards the collections below. It is a Condition so that
         # tool calls can wait for tool lists to finish being checked.
@@ -1871,7 +1874,11 @@ class Proxy:
         The reply holds that checked copy, never `value` itself. The flow
         marks of the request are set just before the reply is returned.
         """
-        checked = self._checked_for_forwarding(pending.label, value, "result", log_clean, pending.call_id)
+        with self._state:
+            parameter_names = frozenset(self._parameter_names)
+        checked = self._checked_for_forwarding(
+            pending.label, value, "result", log_clean, pending.call_id, parameter_names=parameter_names
+        )
         decision = checked.decision
         if not decision.allowed:
             self._report_block(f"blocked {_reply_description(pending)}", decision)
@@ -1886,7 +1893,7 @@ class Proxy:
 
     def _checked_for_forwarding(
         self, label: str, value: Any, event: str, log_clean: bool, call_id: str | None = None,
-        foreign_tools: Iterable[str] = (),
+        foreign_tools: Iterable[str] = (), parameter_names: Iterable[str] = (),
     ) -> CheckedResult:
         """Check something the server sent (Firewall.check_result), and return the copy that may be forwarded.
 
@@ -1901,7 +1908,8 @@ class Proxy:
         what the server sent.)
         """
         checked = self._firewall.check_result(
-            label, value, event=event, log_clean=log_clean, call_id=call_id, foreign_tools=foreign_tools
+            label, value, event=event, log_clean=log_clean, call_id=call_id, foreign_tools=foreign_tools,
+            parameter_names=parameter_names,
         )
         if not checked.decision.allowed:
             return checked
@@ -1916,7 +1924,8 @@ class Proxy:
         if cleaned == checked.content:
             return checked
         again = self._firewall.check_result(
-            label, cleaned, event=event, log_clean=False, call_id=call_id, foreign_tools=foreign_tools
+            label, cleaned, event=event, log_clean=False, call_id=call_id, foreign_tools=foreign_tools,
+            parameter_names=parameter_names,
         )
         if not again.decision.allowed or not checked.decision.redacted:
             return again
@@ -2138,6 +2147,9 @@ class Proxy:
             if kind == "tools":
                 # Annotations are pinned with the rest of the tool, and they can only add flow labels.
                 self._firewall.learn_annotations(item["name"], item.get("annotations"))
+                names = list(tool_parameters(item))
+                with self._state:
+                    self._parameter_names.update(names[: max(0, MAX_KNOWN_NAMES - len(self._parameter_names))])
             return None, forwarded
         if pinned:
             # Remember the name: the agent may already know it from an

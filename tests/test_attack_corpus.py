@@ -119,7 +119,8 @@ def run_case(case):
     surface = case["surface"]
     if surface in READ_SURFACES:
         checked = guard.check_result(
-            "t", case["content"], event=surface, foreign_tools=case.get("foreign_tools", ()), call_id="corpus"
+            "t", case["content"], event=surface, foreign_tools=case.get("foreign_tools", ()), call_id="corpus",
+            parameter_names=case.get("parameter_names", ()),
         )
         return checked.decision, checked.content
     if surface == "call":

@@ -611,6 +611,22 @@ class HostileInputIsScannedQuickly(unittest.TestCase):
             "wrapped base64 lines": ("QUJD" * 19 + "\n") * 12_000,
         })
 
+    def test_the_views_and_rules_added_in_0_6_do_not_stall_the_scanner(self):
+        # Words joined (emphasis, hyphens, letter spacing), invisible carriers, binary base64 runs, links,
+        # images, host names and terminal sequences; more cases in test_hidden_text and test_result_rules.
+        cases = {
+            "emphasis between letters": "a*" * 250_000,
+            "letter spacing": "a " * 250_000,
+            "variation selectors": "\U0001f600" + "\U000e0139" * 300_000,
+            "invisible bits": "⁢⁤" * 250_000,
+            "binary base64 runs": ("AAAA" + "/w==" * 8 + " ") * 20_000,
+            "unfinished links": "[a](//" * 100_000,
+            "host names after commands": "ping -c 1 " * 50_000,
+            "hiding escapes": "\x1b[8m\x1b[2K" * 100_000,
+        }
+        for profile in ("result", "metadata"):
+            self.assert_quick(cases, profile=profile)
+
     def test_many_names_of_other_tools_do_not_slow_the_scan(self):
         names = [f"tool_number_{n}" for n in range(20_000)]
         text = " ".join(f"always call tool_number_{n} first" for n in range(5_000))
@@ -826,7 +842,12 @@ class OtherDescriptionWarnings(unittest.TestCase):
         self.assertEqual(
             described("Get \x9b8m the weather."), {"terminal_escape": "medium", "invisible_characters": "low"}
         )
-        self.assertEqual(severities("Get the weather.\x1b[8m hidden\x1b[0m"), {"invisible_characters": "low"})
+        # 0.6: in results only sequences that can hide text count (terminal_escape_hiding); colours stay low.
+        self.assertEqual(
+            severities("Get the weather.\x1b[8m hidden\x1b[0m"),
+            {"invisible_characters": "low", "terminal_escape_hiding": "medium"},
+        )
+        self.assertEqual(severities("Get the \x1b[1;31mweather\x1b[0m."), {"invisible_characters": "low"})
 
 
 class ToolsOfOtherServers(unittest.TestCase):
@@ -971,12 +992,14 @@ class EncodedText(unittest.TestCase):
             with self.subTest(text=text[:40]):
                 self.assertNotIn("high", severities(text).values())
 
-    def test_image_and_audio_data_are_not_decoded(self):
+    def test_the_data_of_a_rendered_picture_is_not_decoded_but_the_same_text_elsewhere_is(self):
+        # 0.6: exempt by position (text_views' media), not by value; and a data: URI in text is decoded.
         payload = b64(INJECTION)
-        self.assertEqual(scan_views([payload], skip_decoding=[payload]), [])
+        self.assertEqual(scan_views([], undecoded=[payload]), [])
+        self.assertIn("instruction_override", {f.rule for f in scan_views([payload], undecoded=[payload])})
         for text in [f"![x](data:image/png;base64,{payload})", f"<audio src='data:audio/wav;base64,{payload}'>"]:
             with self.subTest(text=text[:30]):
-                self.assertNotIn("instruction_override", rules(text))
+                self.assertIn("instruction_override", rules(text))
 
     def test_runs_placed_before_a_payload_can_use_up_the_limits(self):
         # Documented limit: at most 64 runs are tried, 16 kept and 64 KiB decoded per scan.

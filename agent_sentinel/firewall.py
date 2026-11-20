@@ -100,7 +100,8 @@ from .session import (
 )
 from .textutil import (
     UnscannableError,
-    media_payloads,
+    normalised_arguments,
+    numbers_in,
     printable,
     text_views,
     texts_in,
@@ -159,10 +160,10 @@ _LONG_RUN = re.compile(r"[A-Za-z0-9_+/=-]{20,}")
 # A piece of 6 or more characters with a digit, or with a capital letter
 # after its first character, is treated as part of a key (_cut_piece).
 _EDGE_RUN = re.compile(r"^[A-Za-z0-9_+/=-]{6,}|[A-Za-z0-9_+/=-]{6,}$")
-# The marker of the view an excerpt was found in: "[tags] ", "[base64] " or "[hex] "
+# The marker of the view an excerpt was found in: "[tags] ", "[invisible] ", "[base64] " or "[hex] "
 # (detector._marked). Only these: other text in brackets at the start of an
 # excerpt, such as "[7c4a8d09ca3762af61e59520] ", came from the text and is masked like the rest.
-_VIEW_MARKER = re.compile(r"\[(?:tags|base64|hex)\] ")
+_VIEW_MARKER = re.compile(r"\[(?:tags|invisible|base64|hex)\] ")
 # What the log keeps of an excerpt that may show a known value or canary (see _logged_excerpt).
 _EXCERPT_LEFT_OUT = "[excerpt not logged: it may show a value the policy guards]"
 
@@ -415,6 +416,15 @@ class Firewall:
                    has one (a hook gets the client's tool_use_id). Default: a new
                    random id. Either way it is in `decision.call_id`; pass it to
                    scan_result for the call's result.
+
+        The arguments are checked as JSON: every check (the secret guard, the
+        policy, an approver, the audit record) reads the copy that
+        textutil.normalised_arguments makes, in which a path is its text, an
+        Enum its value, a pydantic model what model_dump(mode="json") gives,
+        and so on. The tool itself still gets the original objects (`run`,
+        guard()). Arguments that cannot be made JSON (an object of unknown
+        kind, a generator, a value that holds itself) are refused, as content
+        that cannot be read is: rule "unscannable", in monitor mode too.
         """
         call_id = _checked_call_id(call_id)
         if args is None:
@@ -423,6 +433,13 @@ class Firewall:
             return self.refuse(
                 printable(tool, limit=80), "the tool name must be text and the arguments an object",
                 rule=RULE_MALFORMED, call_id=call_id,
+            )
+        try:
+            args = normalised_arguments(args)
+        except UnscannableError as exc:
+            return self.refuse(
+                tool, f"the arguments cannot be checked: {exc}", public_reason=_UNSCANNABLE_REFUSAL,
+                rule=RULE_UNSCANNABLE, call_id=call_id,
             )
         decision = self._decide_call(tool, args, defer_ask and not self.monitor, call_id)
         if decision.pending:
@@ -490,6 +507,7 @@ class Firewall:
         *,
         call_id: str | None = None,
         foreign_tools: Iterable[str] = (),
+        parameter_names: Iterable[str] = (),
     ) -> Decision:
         """Scan what a tool returned before the agent reads it.
 
@@ -511,11 +529,19 @@ class Firewall:
                    to OTHER servers (see `foreign_tool_names`). A description
                    that gives orders about one of them is reported as tool
                    shadowing. Never pass the scanned server's own tool names.
+        parameter_names: for the other events: the names of the parameters the
+                   agent's tools have (the proxy: those of the server's checked
+                   tools/list; the hook: the call's argument names). A result or
+                   error that orders a credential file or the conversation put
+                   into one of them is high ("parameter_smuggling"); into an
+                   argument not among them, medium ("parameter_request").
 
-        The base64 "data" of image and audio content is not decoded by the
-        detector (it is still scanned as text). A clean result does not set
-        flow marks: call `mark_delivered` once it is certain the result
-        reaches the agent.
+        The base64 "data" of an image or audio content block that a client
+        renders as media (a result's content, a message's content) is not
+        decoded by the detector and takes part in no phrase; it is still
+        scanned as text. The same text anywhere else is read like any other.
+        A clean result does not set flow marks: call `mark_delivered` once it
+        is certain the result reaches the agent.
 
         Secrets (the policy's secrets.in_results, for the RESULT_EVENTS
         "result" and "tool_error"): with "block", a result holding what looks
@@ -525,7 +551,9 @@ class Firewall:
         their secrets replaced. With "block", a JWT is never a reason to
         refuse, and canaries are not looked for in results.
         """
-        checked = self._checked_content(tool, content, event, log_clean, call_id, foreign_tools, can_replace=False)
+        checked = self._checked_content(
+            tool, content, event, log_clean, call_id, foreign_tools, parameter_names, can_replace=False
+        )
         return checked.decision
 
     def check_result(
@@ -537,6 +565,7 @@ class Firewall:
         *,
         call_id: str | None = None,
         foreign_tools: Iterable[str] = (),
+        parameter_names: Iterable[str] = (),
     ) -> CheckedResult:
         """Like `scan_result`, and also return the content that may be passed on: for a caller that forwards it.
 
@@ -557,7 +586,9 @@ class Firewall:
         as it is. The audit record lists the kinds replaced under "redacted",
         never the secrets; decision.redacted holds the same.
         """
-        return self._checked_content(tool, content, event, log_clean, call_id, foreign_tools, can_replace=True)
+        return self._checked_content(
+            tool, content, event, log_clean, call_id, foreign_tools, parameter_names, can_replace=True
+        )
 
     def find_secrets(self, value: Any) -> list[Found]:
         """The secrets in something the agent's side sends out other than a call: what check_call's guard would find.
@@ -568,7 +599,8 @@ class Firewall:
         a call's arguments, under the same settings: the built-in and custom
         formats unless secrets.in_arguments is "allow", the known values and
         canaries always. Keys and strings are read one per line and joined,
-        as a call's arguments are, so a token split over two strings is seen.
+        as a call's arguments are, so a token split over two strings is seen;
+        numbers are read as JSON writes them.
 
         Each Found names a kind of secret, never the secret; `secret_rule`
         gives the rule id of a refusal. Raises UnscannableError for a value
@@ -858,7 +890,8 @@ class Firewall:
         set_secret_environment gave another.
         """
         policy = self.policy
-        settings = (policy.secrets_patterns, policy.secrets_known_values_from_env, policy.secrets_canaries)
+        ignore_case = policy.secrets_known_values_ignore_case
+        settings = (policy.secrets_patterns, policy.secrets_known_values_from_env, policy.secrets_canaries, ignore_case)
         state = self._guard_state
         if state is not None and state[0] == settings:
             return state[1]
@@ -869,7 +902,7 @@ class Firewall:
                          pattern.max_len)
             for pattern in policy.secrets_patterns
         ]
-        guard = SecretGuard(custom, values, policy.secrets_canaries)
+        guard = SecretGuard(custom, values, policy.secrets_canaries, ignore_case=ignore_case)
         self._guard_state = (settings, guard, warnings)
         return guard
 
@@ -879,12 +912,18 @@ class Firewall:
         Formats (built-in and custom) are looked for only when the policy's
         secrets.in_arguments is "block". Known values and canaries are always
         looked for: the operator listed them by name, and they never belong in a call.
+        Numbers are read too, as JSON writes them (SecretGuard.find_in_numbers):
+        a PIN or an account number sent as a number is still the value.
         """
         guard = self._secret_guard()
         formats = self.policy.secrets_in_arguments == "block"
         if not formats and not guard.has_values:
             return []
-        return guard.find_in_texts(_call_spellings(tool, args), formats=formats)
+        found = guard.find_in_texts(_call_spellings(tool, args), formats=formats)
+        numbers = numbers_in(args)
+        if numbers:
+            found += [item for item in guard.find_in_numbers(numbers, formats=formats) if item not in found]
+        return found
 
     def _verdict(self, tool: str, args: dict[str, Any]) -> Verdict:
         """The policy's verdict, with the flow rules applied when the policy has any."""
@@ -958,6 +997,7 @@ class Firewall:
         log_clean: bool,
         call_id: str | None,
         foreign_tools: Iterable[str],
+        parameter_names: Iterable[str],
         can_replace: bool,
     ) -> CheckedResult:
         """scan_result and check_result: the secret step (for results), then the detector, then one audit record.
@@ -965,23 +1005,22 @@ class Firewall:
         can_replace: whether the caller passes on the content this returns. If
         not, a result that would need redacting is refused instead.
         """
-        if isinstance(content, str):
-            views = [without_field_breaks(content)]  # as text_views reads the strings of a structured value
-        else:
-            try:
-                views = text_views(content, strict=True)
-            except UnscannableError as exc:
-                # Fail closed: content that cannot be read cannot be called clean.
-                refusal = self.refuse(
-                    tool, str(exc), event=event, public_reason=_UNSCANNABLE_REFUSAL, rule=RULE_UNSCANNABLE,
-                    call_id=call_id,
-                )
-                return CheckedResult(refusal)
+        try:
+            views, media = _views_of(content)
+        except UnscannableError as exc:
+            # Fail closed: content that cannot be read cannot be called clean.
+            refusal = self.refuse(
+                tool, str(exc), event=event, public_reason=_UNSCANNABLE_REFUSAL, rule=RULE_UNSCANNABLE,
+                call_id=call_id,
+            )
+            return CheckedResult(refusal)
 
         redacted: tuple[str, ...] = ()
         secret_problem = None
         if event in RESULT_EVENTS and self.policy.secrets_in_results != "off":
-            content, views, redacted, secret_problem = self._secrets_in_result(content, views, can_replace)
+            content, views, media, redacted, secret_problem = self._secrets_in_result(
+                content, views, media, can_replace
+            )
 
         # The detector reads what will be passed on: after redaction, the copy.
         metadata = event in METADATA_EVENTS
@@ -990,7 +1029,8 @@ class Firewall:
             profile=METADATA if metadata else RESULT,
             parameters=tool_parameters(content) if event == "tool_description" else None,
             foreign_tools=foreign_tools if metadata else (),
-            skip_decoding=() if isinstance(content, str) else media_payloads(content),
+            parameter_names=() if metadata else parameter_names,
+            undecoded=media,
         )
         decision = self._result_decision(findings, redacted, secret_problem, call_id)
         logged = bool(findings) or bool(redacted) or secret_problem is not None or log_clean
@@ -998,41 +1038,38 @@ class Firewall:
         return CheckedResult(decision, content if decision.allowed else None)
 
     def _secrets_in_result(
-        self, content: Any, views: list[str], can_replace: bool
-    ) -> tuple[Any, list[str], tuple[str, ...], str | None]:
-        """Apply secrets.in_results: (content, its views, kinds replaced, why it must be refused or None).
+        self, content: Any, views: list[str], media: list[str], can_replace: bool
+    ) -> tuple[Any, list[str], list[str], tuple[str, ...], str | None]:
+        """Apply secrets.in_results: (content, its views, its media, kinds replaced, why it must be refused or None).
 
-        The content and views returned are what the detector reads next and
-        what is passed on if nothing refuses it: the redacted copy, or the
-        content as given. Canaries are not looked for: a canary must stay in
-        the private text it marks, so that it is caught if that text is sent
-        out in a call. A JWT is redacted but never a reason to refuse.
+        The content, views and media returned are what the detector reads next
+        and what is passed on if nothing refuses it: the redacted copy, or the
+        content as given. The guard reads the media data too. Canaries are not
+        looked for: a canary must stay in the private text it marks, so that it
+        is caught if that text is sent out in a call. A JWT is redacted but
+        never a reason to refuse.
         """
         guard = self._secret_guard()
         if self.policy.secrets_in_results == "block":
-            found = guard.find_in_texts(views, canaries=False)
+            found = guard.find_in_texts([*views, *media], canaries=False)
             if found:
-                return content, views, (), f"the result holds what looks like a secret ({_kinds(found)})"
-            return content, views, (), None
+                return content, views, media, (), f"the result holds what looks like a secret ({_kinds(found)})"
+            return content, views, media, (), None
 
         # "redact". Most results hold no secret: one pass over the views says so,
         # before any string is copied.
-        if not guard.find_in_texts(views, canaries=False, redaction_only=True):
-            return content, views, (), None
+        if not guard.find_in_texts([*views, *media], canaries=False, redaction_only=True):
+            return content, views, media, (), None
         try:
             copy, kinds = guard.redact_result(content)
-            if not kinds:
-                copy_views = views
-            elif isinstance(copy, str):
-                copy_views = [without_field_breaks(copy)]
-            else:
-                copy_views = text_views(copy, strict=True)
+            copy_views, copy_media = (views, media) if not kinds else _views_of(copy)
         except (CannotRedact, UnscannableError) as exc:
-            return content, views, (), f"the result holds what looks like a secret that cannot be redacted: {exc}"
+            reason = f"the result holds what looks like a secret that cannot be redacted: {exc}"
+            return content, views, media, (), reason
         # Redaction works string by string. What it could not replace (a secret
         # split over several strings, or one past the decoding limits of a
         # single string) is still there, and the result is refused.
-        left = guard.find_in_texts(copy_views, canaries=False)
+        left = guard.find_in_texts([*copy_views, *copy_media], canaries=False)
         if not can_replace and (kinds or left):
             # scan_result: its caller passes on the content it holds, which cannot be changed from here.
             every_kind = ", ".join(dict.fromkeys([*kinds, *(item.kind for item in left)]))
@@ -1040,14 +1077,14 @@ class Firewall:
                 f"the result holds what looks like a secret ({every_kind}); secrets.in_results is 'redact', "
                 "but this caller cannot pass on a redacted copy (Firewall.check_result can)"
             )
-            return content, views, (), reason
+            return content, views, media, (), reason
         if left:
             why = (
                 f"what looks like a secret ({_kinds(left)}) is still there after redaction: it is split over "
                 "several strings, or encoded where it cannot be replaced"
             )
-            return copy, copy_views, kinds, why
-        return copy, copy_views, kinds, None
+            return copy, copy_views, copy_media, kinds, why
+        return copy, copy_views, copy_media, kinds, None
 
     def _result_decision(
         self, findings: list[Finding], redacted: tuple[str, ...], secret_problem: str | None, call_id: str | None
@@ -1178,6 +1215,17 @@ def _call_id_for(event: str, call_id: str | None) -> str | None:
     if call_id is not None:
         return _checked_call_id(call_id)
     return new_call_id() if event == "call" else None
+
+
+def _views_of(content: Any) -> tuple[list[str], list[str]]:
+    """What the detector reads of a result: (its text views, the data of the media blocks a client renders).
+
+    Raises UnscannableError for content that cannot be read (textutil.text_views, strict).
+    """
+    if isinstance(content, str):
+        return [without_field_breaks(content)], []  # as text_views reads the strings of a structured value
+    media: list[str] = []
+    return text_views(content, strict=True, media=media), media
 
 
 def _error_texts(exc: BaseException) -> list[str]:

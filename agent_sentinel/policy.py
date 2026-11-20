@@ -154,7 +154,9 @@ _TOP_LEVEL_KEYS = (
     "default", "deny_args", "tools", "server_requests", "client_requests", "injection", "secrets", "limits",
     "flows", "classify_by_annotations", "hide_blocked_tools",
 )
-_SECRETS_KEYS = ("in_arguments", "in_results", "known_values_from_env", "canaries", "patterns")
+_SECRETS_KEYS = (
+    "in_arguments", "in_results", "known_values_from_env", "known_values_ignore_case", "canaries", "patterns",
+)
 
 
 def limit_rule(bucket: str) -> str:
@@ -389,6 +391,11 @@ class Policy:
     hide_blocked_tools               whether the proxy hides tools that tool_level_action says "block"
                                      from tools/list (default false). Hiding is not enforcement:
                                      a call to a hidden tool is still checked and refused.
+
+    Added in 0.6:
+
+    secrets_known_values_ignore_case names from secrets_known_values_from_env whose values are also
+                                     matched with case ignored (a value of hex digits and "-" always is).
     """
 
     default: str = "block"
@@ -412,6 +419,8 @@ class Policy:
     flows: tuple[FlowRule, ...] = ()
     classify_by_annotations: bool = True
     hide_blocked_tools: bool = False
+    # ---- added in 0.6
+    secrets_known_values_ignore_case: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # A policy can also be built in code, without the loader. An action such
@@ -443,6 +452,9 @@ class Policy:
         # tuple belongs (secrets_canaries="my-canary-1") would be read one
         # character at a time by the code that acts on these settings.
         self.secrets_known_values_from_env = _env_names(_as_list(self.secrets_known_values_from_env))
+        self.secrets_known_values_ignore_case = _ignore_case_names(
+            _as_list(self.secrets_known_values_ignore_case), self.secrets_known_values_from_env
+        )
         self.secrets_canaries = _canaries(_as_list(self.secrets_canaries))
         self.secrets_patterns = _code_secret_patterns(self.secrets_patterns)
         _expect_severity(self.block_severity)
@@ -533,6 +545,7 @@ class Policy:
             flows=_flow_rules(data.get("flows", [])),
             classify_by_annotations=classify,
             hide_blocked_tools=hide,
+            secrets_known_values_ignore_case=secrets.get("known_values_ignore_case", []),
         )
 
     # ---- evaluating ---------------------------------------------------------
@@ -1293,6 +1306,23 @@ def _env_names(specs: Any) -> tuple[str, ...]:
             raise PolicyError(
                 f"{where}[{index}] must be the NAME of an environment variable (letters, digits and '_', not "
                 f"starting with a digit), got {quoted(name)}. Never write the value itself in a policy"
+            )
+        if name in names:
+            raise PolicyError(f"{where}[{index}]: '{name}' is listed twice")
+        names.append(name)
+    return tuple(names)
+
+
+def _ignore_case_names(specs: Any, known: tuple[str, ...]) -> tuple[str, ...]:
+    """Read secrets.known_values_ignore_case: names that secrets.known_values_from_env lists, each once."""
+    where = "secrets.known_values_ignore_case"
+    if not isinstance(specs, list):
+        raise PolicyError(f"{where} must be a list of environment variable names ([ ... ]), got {type_name(specs)}")
+    names: list[str] = []
+    for index, name in enumerate(specs):
+        if not isinstance(name, str) or name not in known:
+            raise PolicyError(
+                f"{where}[{index}] must be one of the names in secrets.known_values_from_env, got {quoted(name)}"
             )
         if name in names:
             raise PolicyError(f"{where}[{index}]: '{name}' is listed twice")
