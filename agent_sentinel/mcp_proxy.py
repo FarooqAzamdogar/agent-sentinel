@@ -203,7 +203,8 @@ Every record is linked into the log's hash chain (audit_chain.py), and with
 --audit-key-file signed (HMAC-SHA256). Three session records say what
 wrote the records between them: session_start before the server is started
 (the version, the policy's SHA-256, monitor mode, the pins file's SHA-256, a
-hash of the server command with secrets masked, the OS user and the host),
+hash of the server command with secrets masked, whether the server is
+contained or sandboxed, the OS user and the host),
 protocol once the handshake is done (the protocol version, the client's and
 the server's name and version; at most MAX_PROTOCOL_RECORDS), and
 session_end when the proxy stops. --audit-required refuses to start when
@@ -3086,17 +3087,22 @@ def main(argv: list[str] | None = None) -> int:
         say(line, limit=1500)
     _report_server_environment(args, environment, added, say)
     started = firewall.provenance(
-        audit_chain.SESSION_START, "the proxy started", _session_details(firewall, args, [executable, *command[1:]])
+        audit_chain.SESSION_START, "the proxy started",
+        _session_details(firewall, args, [executable, *command[1:]], contain),
     )
     if not started and args.audit_required:
         _warn("not starting: the audit log cannot be written, and --audit-required was given")
         return 2
     try:
         # On Windows the proxy joins its job object here, before the server starts (containment.py).
+        # The audit key file is a secret of the proxy's: a sandbox must not show it to the server.
         contained = containment.prepare(contain, _resolve_executable, server_executable=executable,
-                                        control_files=[path for path in (args.policy, args.pins, args.audit) if path])
+                                        control_files=[path for path in (args.policy, args.pins, args.audit) if path],
+                                        secret_files=[args.audit_key_file] if args.audit_key_file else [])
     except containment.ContainmentError as exc:
         _warn(f"cannot contain the server as asked, so it is not started: {exc}", limit=1000)
+        firewall.provenance(audit_chain.SESSION_END, "the server could not be contained as asked, so it was not "
+                                                     "started")
         return 2
     try:
         server = subprocess.Popen(
@@ -3111,8 +3117,10 @@ def main(argv: list[str] | None = None) -> int:
         contained.after_start(server)
     except containment.ContainmentError as exc:
         _warn(f"cannot contain the server as asked, so it was stopped: {exc}", limit=1000)
-        _stop(server, time.monotonic())
+        exit_code = _stop(server, time.monotonic())
         contained.sweep(server)
+        firewall.provenance(audit_chain.SESSION_END, "the server could not be contained as asked, so it was stopped",
+                            {"server_exit_code": exit_code})
         return 2
     assert server.stdin is not None and server.stdout is not None and server.stderr is not None
     if args.monitor:
@@ -3167,8 +3175,15 @@ def main(argv: list[str] | None = None) -> int:
     return exit_code
 
 
-def _session_details(firewall: Firewall, args: argparse.Namespace, server_argv: list[str]) -> dict[str, Any]:
-    """What the session_start record says: what is running, under which policy, for whom (no secret, no path)."""
+def _session_details(firewall: Firewall, args: argparse.Namespace, server_argv: list[str],
+                     contain: containment.Settings | None = None) -> dict[str, Any]:
+    """What the session_start record says: what is running, under which policy, for whom (no secret, no path).
+
+    contain: what the containment options ask for (_containment_settings),
+    recorded as "containment": "none", "contained" or "sandboxed (NAME)"
+    (containment.label). It is what was asked for: when it cannot be set up,
+    a session_end follows at once.
+    """
     return {
         "version": __version__,
         "policy_sha256": firewall.policy_sha256,
@@ -3176,6 +3191,7 @@ def _session_details(firewall: Firewall, args: argparse.Namespace, server_argv: 
         "pins_sha256": audit_chain.file_sha256(args.pins) if args.pins and not args.no_pins else None,
         "server_program": printable(os.path.basename(server_argv[0]), limit=audit_chain.MAX_PROVENANCE_TEXT),
         "server_argv_sha256": audit_chain.argv_sha256(server_argv, firewall.redact),
+        "containment": (containment.label(contain) or "none") if contain is not None else None,
         "signed": firewall.audit_signed,
         "user": audit_chain.os_user(),
         "host": audit_chain.host_name(),

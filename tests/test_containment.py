@@ -308,6 +308,50 @@ class TheSandboxesWords(unittest.TestCase):
         self.assertIn('(deny file-read* file-write* (subpath "/tmp/h/.ssh"))', lines)
         self.assertIn('(deny file-read* file-write* (subpath "/Users/me/.ssh"))', lines)
 
+    def test_sandbox_exec_hides_the_audit_key_file_wherever_it_is(self):
+        # The audit key (--audit-key-file) signs the records: a sandboxed server may neither read nor replace it.
+        # The control files stay readable, only their writing is denied.
+        lines = sandbox_exec_profile(Settings(sandbox="sandbox-exec"), "/Users/me", None, ["/etc/as/policy.json"],
+                                     real=same, secret_files=["/opt/keys/audit.key"]).splitlines()
+        self.assertIn('(deny file-read* file-write* (subpath "/opt/keys/audit.key"))', lines)
+        self.assertIn('(deny file-write* (literal "/opt/keys"))', lines)
+        self.assertIn('(deny file-write* (literal "/etc/as/policy.json"))', lines)
+        self.assertNotIn('(deny file-read* file-write* (subpath "/etc/as/policy.json"))', lines)
+        self.assertEqual(len(lines), len(set(lines)))
+
+    def test_bwrap_refuses_to_show_the_audit_key_file(self):
+        exists, real = a_linux_host("/run")
+        homes = ["/home/me"]
+
+        def problem(key, **folders):
+            return containment._secret_shown_problem(Settings(sandbox="bwrap", **folders), [key], homes,
+                                                     "/srv/as/.agent-sentinel", exists=exists, real=real)
+
+        # Hidden: in the emptied home folder, in /tmp, in the agent-sentinel home (hidden last, even inside a
+        # folder the server may read).
+        self.assertIsNone(problem("/home/me/.agent-sentinel/audit.key"))
+        self.assertIsNone(problem("/home/me/keys/audit.key", read=("/home/me/tools",)))
+        self.assertIsNone(problem("/tmp/audit.key"))
+        self.assertIsNone(problem("/srv/as/.agent-sentinel/audit.key", read=("/srv/as",)))
+        # Shown: inside a folder the server may read or write, or outside every hidden place.
+        self.assertIn("the sandbox shows /home/me/proj, which holds the audit key file",
+                      problem("/home/me/proj/audit.key", read=("/home/me/proj",)))
+        self.assertIn("the sandbox shows /home/me/proj", problem("/home/me/proj/k/audit.key", allow=("/home/me/proj",)))
+        self.assertIn("outside the folders the sandbox hides", problem("/etc/as/audit.key"))
+        self.assertIsNone(containment._secret_shown_problem(Settings(sandbox="bwrap"), [], homes, None,
+                                                            exists=exists, real=real))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "real paths of POSIX folders")
+    def test_the_sandboxes_are_given_the_audit_key_file(self):
+        with mock.patch.object(containment, "_homes", return_value=["/home/me"]), \
+                mock.patch.object(containment, "_agent_home", return_value="/home/me/.agent-sentinel"):
+            words = containment._sandbox_prefix(Settings(sandbox="sandbox-exec"), found, [], None,
+                                                ["/opt/k/audit.key"])
+            self.assertIn('(deny file-read* file-write* (subpath "/opt/k/audit.key"))', words[2])
+            with self.assertRaises(ContainmentError) as caught:
+                containment._sandbox_prefix(Settings(sandbox="bwrap"), found, [], None, ["/opt/k/audit.key"])
+            self.assertIn("audit key file", str(caught.exception))
+
     @unittest.skipUnless(POSIX, "the home folders are POSIX paths")
     def test_the_home_folders_are_homes_and_the_accounts_own(self):
         with tempfile.TemporaryDirectory() as one, tempfile.TemporaryDirectory() as other:
@@ -360,6 +404,87 @@ class SettingUpWithoutAnything(unittest.TestCase):
         refused = Settings(sandbox="bwrap") if WINDOWS else Settings(processes=2)
         with self.assertRaises(ContainmentError):
             containment.prepare(refused, found)
+
+
+class TheAuditTrailOfContainment(unittest.TestCase):
+    """What the proxy's audit records say about containment: session_start, and session_end when it fails.
+
+    The proxy runs in this process up to the point where it would relay
+    messages; containment.prepare is replaced, so nothing is contained here.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.folder = Path(tmp.name)
+        self.audit = self.folder / "audit.jsonl"
+        self.key = self.folder / "audit.key"
+        self.key.write_bytes(b"k" * 32)
+        if POSIX:
+            self.key.chmod(0o600)
+
+    def run_proxy(self, *options, prepare):
+        stderr = io.StringIO()
+        with mock.patch.object(containment, "prepare", prepare), mock.patch("sys.stderr", stderr):
+            code = mcp_proxy.main(["--policy", str(EXAMPLE_POLICY_PATH), "--audit", str(self.audit),
+                                   "--audit-key-file", str(self.key), *options, "--",
+                                   sys.executable, "-c", "import sys; sys.stdin.read()"])
+        return code, stderr.getvalue()
+
+    def sessions(self):
+        records = [json.loads(line) for line in self.audit.read_text(encoding="utf-8").splitlines()]
+        return [record for record in records if record["event"] in ("session_start", "session_end")]
+
+    def verified(self):
+        from agent_sentinel import audit_chain
+        report = audit_chain.check_files([str(self.audit)], key=self.key.read_bytes())
+        return report.state, report.mac_mismatches
+
+    def test_a_containment_that_cannot_be_set_up_is_recorded_and_the_key_file_is_kept_from_the_sandbox(self):
+        asked = []
+
+        def refuse(settings, find, control_files=(), server_executable=None, secret_files=()):
+            asked.append((settings, list(control_files), list(secret_files)))
+            raise ContainmentError("bwrap is not here")
+
+        code, err = self.run_proxy("--sandbox", "bwrap", prepare=refuse)
+        self.assertEqual(code, 2)
+        self.assertIn("cannot contain the server as asked, so it is not started: bwrap is not here", err)
+        (settings, control_files, secret_files), = asked
+        self.assertEqual(settings.sandbox, "bwrap")
+        self.assertIn(str(self.audit), control_files)
+        self.assertEqual(secret_files, [str(self.key)])  # the key is a secret: a sandbox may not show it
+        start, end = self.sessions()
+        self.assertEqual((start["containment"], start["signed"]), ("sandboxed (bwrap)", True))
+        self.assertEqual(end["reason"], "the server could not be contained as asked, so it was not started")
+        self.assertEqual(self.verified(), ("intact", 0))
+
+    def test_a_server_stopped_because_its_containment_failed_is_recorded_with_its_exit_code(self):
+        class FailsAfterStart(containment.Containment):
+            def after_start(self, server):
+                raise ContainmentError("the limits job could not be applied")
+
+        code, err = self.run_proxy("--contain", "--server-cpu-seconds", "60",
+                                   prepare=lambda *args, **kwargs: FailsAfterStart())
+        self.assertEqual(code, 2)
+        self.assertIn("so it was stopped: the limits job could not be applied", err)
+        start, end = self.sessions()
+        self.assertEqual(start["containment"], "contained")
+        self.assertEqual(end["reason"], "the server could not be contained as asked, so it was stopped")
+        self.assertIsInstance(end["server_exit_code"], int)
+        self.assertEqual(self.verified(), ("intact", 0))
+
+    def test_session_start_says_what_containment_was_asked_for(self):
+        from agent_sentinel import Firewall
+        from support import POLICY
+        args = mcp_proxy._argument_parser().parse_args(["--policy", "p.json", "--", "server"])
+        for settings, expected in ((Settings(), "none"), (Settings(contain=True), "contained"),
+                                   (Settings(memory_mb=64), "contained"),
+                                   (Settings(sandbox="sandbox-exec"), "sandboxed (sandbox-exec)")):
+            with self.subTest(expected=expected):
+                details = mcp_proxy._session_details(Firewall(POLICY), args, ["server"], settings)
+                self.assertEqual(details["containment"], expected)
+        self.assertIsNone(containment.label(Settings()))
 
 
 class TheProcessGroupSetup(unittest.TestCase):
@@ -458,6 +583,32 @@ class WrapAndDoctor(DoctorTest):
         self.assertTrue(any("need --sandbox" in finding["text"] for finding in servers["orphan"]["findings"]))
         self.assertEqual(servers["small"]["status"], "broken")
         self.assertTrue(any("--server-memory-mb '1'" in finding["text"] for finding in servers["small"]["findings"]))
+
+    def test_doctor_knows_the_audit_options_beside_the_containment_ones(self):
+        # The audit lane's proxy options, checked by the proxy's own parser, and the --audit they need.
+        key = self.home / "audit.key"
+        path = self.config({
+            "both": self.wrapped("both", "--contain", "--audit-key-file", str(key), "--audit-required",
+                                 "--audit-max-bytes", "65536"),
+            "small": self.wrapped("small", "--audit-max-bytes", "10"),
+            "nolog": self.wrapped("nolog", "--audit-required", "--audit-key-file", str(key), audit=""),
+        })
+        code, servers, _ = self.statuses(path)
+        self.assertEqual(code, 1)
+        self.assertEqual((servers["both"]["status"], servers["both"]["containment"]), ("protected", "contained"))
+        texts = [finding["text"] for finding in servers["both"]["findings"]]
+        self.assertFalse(any("not one this version knows" in text for text in texts), texts)
+        self.assertEqual(servers["small"]["status"], "broken")
+        self.assertTrue(any("--audit-max-bytes '10'" in finding["text"] for finding in servers["small"]["findings"]))
+        self.assertEqual(servers["nolog"]["status"], "broken")
+        self.assertTrue(any("--audit-key-file, --audit-required without --audit" in finding["text"]
+                            for finding in servers["nolog"]["findings"]))
+
+    def test_doctor_warns_of_an_audit_key_file_inside_the_project(self):
+        key = self.project / "keys" / "audit.key"
+        path = self.write("project/.mcp.json", {"mcpServers": {"s": self.wrapped("s", "--audit-key-file", str(key))}})
+        code, out, _ = self.doctor(path)
+        self.assertIn("the audit key file is inside the project folder", out)
 
     def test_the_wrap_command_takes_contain(self):
         from cli_support import run_cli
@@ -665,6 +816,24 @@ class TheRealProxy(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn(b"cannot contain the server as asked, so it is not started", proc.stderr)
         self.assertFalse(marker.exists())
+
+    def test_a_refused_containment_is_in_the_audit_log_between_session_start_and_session_end(self):
+        marker = self.folder / "started"
+        server = self.server("marker.py", f"open({str(marker)!r}, 'w').close()\n")
+        audit = self.folder / "audit.jsonl"
+        refused, asked = (["--sandbox", "bwrap"], "sandboxed (bwrap)") if WINDOWS else (["--server-processes", "2"],
+                                                                                         "contained")
+        proc = subprocess.run(
+            [sys.executable, "-m", "agent_sentinel", "proxy", "--policy", str(EXAMPLE_POLICY_PATH), "--audit", str(audit),
+             "--audit-required", *refused, "--", sys.executable, str(server)],
+            capture_output=True, cwd=self.folder, env=self.environment, timeout=60,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertFalse(marker.exists())
+        records = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([record["event"] for record in records], ["chain_start", "session_start", "session_end"])
+        self.assertEqual(records[1]["containment"], asked)
+        self.assertEqual(records[2]["reason"], "the server could not be contained as asked, so it was not started")
 
     @unittest.skipUnless(WINDOWS, "job objects are a Windows matter")
     def test_on_windows_an_orphaned_grandchild_ends_with_the_proxy_only_when_contained(self):

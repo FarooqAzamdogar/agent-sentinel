@@ -329,6 +329,23 @@ class TheProxysOwnOptions(unittest.TestCase):
         self.assertEqual(args.policy, "p.json")
         self.assertEqual(args.command, ["--", "python", "server.py", "--mon"])  # the server's own words
 
+    def test_every_option_of_the_proxy_is_known_to_wrap_and_doctor(self):
+        # Several lanes add proxy options (the audit options, the containment options): each must be in
+        # VALUE_OPTIONS or FLAG_OPTIONS, as it takes a value or not, or doctor calls it unknown and unwrap
+        # misreads the entry.
+        from agent_sentinel import mcp_proxy
+        for action in mcp_proxy._argument_parser()._actions:
+            for option in action.option_strings:
+                if option in ("-h", "--help"):
+                    continue
+                with self.subTest(option=option):
+                    known = wrapping.FLAG_OPTIONS if action.nargs == 0 else wrapping.VALUE_OPTIONS
+                    self.assertIn(option, known)
+        for option in ("--audit-key-file", "--audit-max-bytes", "--server-memory-mb", "--sandbox"):
+            self.assertIn(option, wrapping.VALUE_OPTIONS)
+        for option in ("--audit-required", "--contain", "--sandbox-network"):
+            self.assertIn(option, wrapping.FLAG_OPTIONS)
+
 
 class StatusFromTheEntryAlone(unittest.TestCase):
     def test_what_clients_counts(self):

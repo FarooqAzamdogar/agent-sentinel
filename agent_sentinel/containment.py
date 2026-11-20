@@ -349,6 +349,33 @@ def _writable_problem(allow: Sequence[str], protected: Iterable[str | None],
     return None
 
 
+def _secret_shown_problem(settings: Settings, secrets: Sequence[str], homes: Sequence[str], agent_home: str | None,
+                          exists: Callable[[str], bool] = os.path.exists,
+                          real: Callable[[str], str] = os.path.realpath) -> str | None:
+    """Why a bwrap sandbox would let the server read a secret file of the proxy's (the audit key), or None.
+
+    secrets: real paths. bwrap shows the whole file system read-only, then
+    hides the home folders, /tmp and the system places, shows the --sandbox-read
+    and --sandbox-allow folders again, and hides the agent-sentinel home last.
+    So a secret is hidden inside the agent-sentinel home, or inside a hidden
+    place and no shown folder; anywhere else the server could read it, and
+    with the audit key sign records of its own.
+    """
+    hidden = [*homes, "/tmp", *_system_places(exists, real)]
+    shown = [folder for folder, _ in _shown_folders(settings, real)]
+    for secret in secrets:
+        if agent_home and _within(secret, agent_home):
+            continue
+        folder = next((one for one in shown if _within(secret, one)), None)
+        if folder is not None:
+            return (f"the sandbox shows {folder}, which holds the audit key file {secret}: the server could read it "
+                    "and sign records of its own; keep the key out of the folders the server may read")
+        if not any(_within(secret, place) for place in hidden):
+            return (f"the audit key file {secret} is outside the folders the sandbox hides (the home folders, /tmp, "
+                    "the agent-sentinel home), so the server could read it; keep the key in the agent-sentinel home")
+    return None
+
+
 def _system_places(exists: Callable[[str], bool] = os.path.exists,
                    real: Callable[[str], str] = os.path.realpath) -> list[str]:
     """The HIDDEN_SYSTEM_PLACES that exist, as real paths, each once and none inside another already listed."""
@@ -437,10 +464,13 @@ def bwrap_arguments(settings: Settings, home: str | Sequence[str], agent_home: s
 
 
 def sandbox_exec_profile(settings: Settings, home: str | Sequence[str], agent_home: str | None,
-                         control_files: Iterable[str] = (), real: Callable[[str], str] = os.path.realpath) -> str:
+                         control_files: Iterable[str] = (), real: Callable[[str], str] = os.path.realpath,
+                         secret_files: Iterable[str] = ()) -> str:
     """The sandbox-exec (SBPL) profile for a sandboxed server. ContainmentError for a path it cannot quote.
 
     home: the home folder, or the home folders ($HOME's and the account's).
+    secret_files: files the server may neither read nor write (the audit key
+    file), wherever they are.
     Later rules win over earlier ones, so everything is allowed first and the
     denials follow. `real` gives a path's real path: the sandbox matches real
     paths (/tmp is /private/tmp), so both spellings are denied. The denials
@@ -460,6 +490,7 @@ def sandbox_exec_profile(settings: Settings, home: str | Sequence[str], agent_ho
     hidden = [posixpath.join(one, credential) for one in homes for credential in CREDENTIAL_PATHS]
     if agent_home:
         hidden.append(agent_home)
+    hidden += [path for path in secret_files if path]
     unwritable = [posixpath.join(one, path) for one in homes for path in PERSISTENCE_PATHS]
     unwritable += SYSTEM_PERSISTENCE_PATHS
     files = list(control_files)
@@ -525,6 +556,13 @@ def describe(settings: Settings, platform: str = sys.platform) -> str:
     return "; ".join(parts)
 
 
+def label(settings: Settings) -> str | None:
+    """A short name for what the server gets: "contained", "sandboxed (NAME)", or None (doctor, session_start)."""
+    if not settings.active:
+        return None
+    return f"sandboxed ({settings.sandbox})" if settings.sandbox else "contained"
+
+
 # ---- setting it up -------------------------------------------------------------------------------------
 
 class Containment:
@@ -552,13 +590,16 @@ class Containment:
 
 
 def prepare(settings: Settings, find: Callable[[str], str | None], control_files: Sequence[str] = (),
-            server_executable: str | None = None) -> Containment:
+            server_executable: str | None = None, secret_files: Sequence[str] = ()) -> Containment:
     """Set up containment for a server about to start; ContainmentError when it cannot be (fail closed).
 
     control_files: the proxy's own files (policy, pins, audit log), which a
                    sandboxed server may not write.
     server_executable: the program the server command starts, which must be
                    visible inside a bwrap sandbox.
+    secret_files:  the proxy's files a sandboxed server may not read either
+                   (the audit key file, --audit-key-file). --contain alone
+                   does not hide them: the server runs as the same user.
     On Windows the proxy joins its job object here, before the server starts.
     """
     if not settings.active:
@@ -570,7 +611,7 @@ def prepare(settings: Settings, find: Callable[[str], str | None], control_files
         return _WindowsJob(settings)
     prefix: list[str] = []
     if settings.sandbox is not None:
-        prefix = _sandbox_prefix(settings, find, control_files, server_executable)
+        prefix = _sandbox_prefix(settings, find, control_files, server_executable, secret_files)
     return _ProcessGroup(settings, prefix)
 
 
@@ -585,19 +626,22 @@ def _agent_home() -> str:
 
 
 def _sandbox_prefix(settings: Settings, find: Callable[[str], str | None], control_files: Sequence[str],
-                    server_executable: str | None) -> list[str]:
+                    server_executable: str | None, secret_files: Sequence[str] = ()) -> list[str]:
     homes = _homes()
     if homes is None:
         raise ContainmentError("the home folder is / or unknown, so the sandbox could not hide it")
     agent_home = _agent_home()
     files = [os.path.realpath(name) for name in control_files if name]
+    secrets = [os.path.realpath(name) for name in secret_files if name]
     if server_executable is not None:
         problem = _credential_program_problem(server_executable, homes)
         if problem is not None:
             raise ContainmentError(problem)
     if settings.sandbox == "sandbox-exec":
-        return [SANDBOX_EXEC, "-p", sandbox_exec_profile(settings, homes, agent_home, files)]
+        return [SANDBOX_EXEC, "-p", sandbox_exec_profile(settings, homes, agent_home, files, secret_files=secrets)]
     problem = _writable_problem(settings.allow, [*files, agent_home])
+    if problem is None:
+        problem = _secret_shown_problem(settings, secrets, homes, agent_home)
     if problem is None and server_executable is not None:
         problem = _hidden_program_problem(server_executable, settings, homes)
     if problem is not None:

@@ -36,7 +36,9 @@ written in the file (names only: a value is never printed). A leading "~" in
 home folder, as the proxy reads it. An entry whose proxy contains the server
 (--contain, a --server-* limit, --sandbox) is reported as contained or
 sandboxed, and is broken when that containment cannot be set up on this
-machine (containment.check).
+machine (containment.check). --audit-key-file, --audit-required and
+--audit-max-bytes need --audit, as the proxy says; the key file is never
+read here.
 
 Nothing is changed and no server is started. A configuration may come from
 someone else (a project's checked-in .mcp.json), so doctor never runs a
@@ -350,7 +352,10 @@ def _check_wrapped(report: ServerReport, proxy: ProxyCommand, entry: dict[str, A
     _check_env_redirects(lines, proxy, entry)
     report.containment = _check_containment(lines, proxy)
     if project is not None:
-        for what, path in (("policy", report.policy), ("pins file", report.pins), ("audit log", report.audit)):
+        key = proxy.value("--audit-key-file")
+        key = os.path.normpath(_option_path(key)) if key else None
+        for what, path in (("policy", report.policy), ("pins file", report.pins), ("audit log", report.audit),
+                           ("audit key file", key)):
             if path and clients.inside_folder(path, project):
                 lines.append(Line("warn", f"the {what} is inside the project folder, where the agent's own tools may "
                                           "be able to change it; keep it in the agent-sentinel home folder"))
@@ -596,6 +601,10 @@ def _check_values(lines: list[Line], proxy: ProxyCommand) -> None:
     if proxy.has("--quiet") and proxy.has("--verbose"):
         lines.append(Line("fail", "--quiet and --verbose are both given, and the proxy takes only one of them, so it "
                                   "will not start"))
+    needing = [option for option in _NEED_AUDIT if proxy.has(option)]
+    if needing and proxy.value("--audit") is None:
+        lines.append(Line("fail", f"{', '.join(needing)} without --audit: the proxy will not start; give the audit "
+                                  "log with --audit FILE"))
 
 
 def _approver_not_looked_up(program: str) -> str | None:
@@ -638,7 +647,10 @@ _VALUE_CHECKS: dict[str, Callable[[str], Any]] = {
     "--server-processes": mcp_proxy._server_processes,
     "--server-cpu-seconds": mcp_proxy._server_cpu_seconds,
     "--sandbox": _sandbox_name,
+    "--audit-max-bytes": mcp_proxy._audit_max_bytes,
 }
+# The options the proxy refuses to start with unless --audit is given too (mcp_proxy.main).
+_NEED_AUDIT = ("--audit-key-file", "--audit-required", "--audit-max-bytes")
 
 
 def _check_server_command(lines: list[Line], server: list[str]) -> None:

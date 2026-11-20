@@ -13,7 +13,9 @@ The unit tests drive a Proxy in memory (test_proxy.Harness); the end-to-end
 test starts the real proxy in front of a small server written for it.
 """
 
+import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -449,6 +451,86 @@ class ServerMetadata(SchemaTest):
         self.assertNotIn("websiteUrl", info)
 
 
+class TheAuditTrailOfTheSchemaChecks(SchemaTest):
+    """The schema checks' records in the hash-chained audit log: the policy hash, and --audit-required."""
+
+    def proxy_from_file(self, policy, monitor=False, **firewall_options):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        path = folder / "policy.json"
+        path.write_text(json.dumps({"default": "allow", **policy}), encoding="utf-8")
+        self.policy_hash = hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+        self.audit = folder / "audit.jsonl"
+        return Harness(firewall=Firewall(Policy.from_file(path), audit_path=self.audit, monitor=monitor,
+                                         **firewall_options))
+
+    def break_the_log(self):
+        """From now on every write fails: the log's name is a folder."""
+        os.replace(self.audit, self.audit.with_name("kept.jsonl"))
+        self.audit.mkdir()
+
+    def test_every_schema_block_carries_the_policy_hash_and_no_note_does(self):
+        h = self.proxy_from_file({"schema_checks": {"arguments": "enforce", "results": "enforce",
+                                                    "remote_refs": "quarantine"}})
+        self.assertEqual(self.listed(h, COUNT_TOOL, REMOTE_TOOL), [COUNT_TOOL])
+        h.from_client(call(1, "count_words", {"path": "a", "limit": 99}))
+        self.assertEqual(h.sent_to_server(), [])
+        h.from_client(call(2, "count_words", {"path": "a"}))
+        h.sent_to_server()
+        h.from_server(reply(2, {"content": [], "structuredContent": {"words": "three"}}))
+        blocks = self.records(action="block")
+        self.assertEqual(sorted(record["rule"] for record in blocks),
+                         ["schema.arguments", "schema.remote_refs", "schema.result"])
+        self.assertEqual({record["policy"] for record in blocks}, {self.policy_hash})
+        monitor = self.proxy_from_file({"schema_checks": {"arguments": "enforce"}}, monitor=True)
+        self.listed(monitor, COUNT_TOOL)
+        monitor.from_client(call(1, "count_words", {"limit": 99}))
+        (would,) = self.records(action="would_block")
+        self.assertEqual((would["rule"], would["policy"]), ("schema.arguments", self.policy_hash))
+        warn = self.proxy_from_file({"schema_checks": {"arguments": "warn", "results": "warn"}})
+        self.listed(warn, COUNT_TOOL, REMOTE_TOOL)
+        warn.from_client(call(1, "count_words", {"limit": 99}))
+        warn.sent_to_server()
+        warn.from_server(reply(1, {"content": [], "structuredContent": {}}))
+        notes = [record for record in self.records(action="note") if record["event"].startswith(("schema", "tool_"))]
+        self.assertEqual(sorted(record["event"] for record in notes),
+                         ["schema_arguments", "schema_result", "tool_remote_ref"])
+        self.assertFalse(any("policy" in record for record in notes))
+
+    def test_audit_required_refuses_a_mismatch_that_monitor_mode_would_let_through_unrecorded(self):
+        h = self.proxy_from_file({"schema_checks": {"arguments": "enforce", "results": "enforce"}}, monitor=True,
+                                 audit_required=True)
+        self.listed(h, COUNT_TOOL)
+        h.from_client(call(1, "count_words", {"path": "a"}))
+        self.assertEqual(len(h.sent_to_server()), 1)
+        self.break_the_log()
+        # The result does not match: monitor mode would deliver it, but its would_block cannot be recorded.
+        h.from_server(reply(1, {"content": [{"type": "text", "text": "3"}], "structuredContent": {"words": "three"}}))
+        (withheld,) = h.sent_to_client()
+        text = withheld["result"]["content"][0]["text"]
+        self.assertIn("the content could not be checked, so it was withheld", text)
+        self.assertNotIn("three", json.dumps(withheld))
+        # Nor are arguments that do not match.
+        h.from_client(call(2, "count_words", {"path": "a", "limit": 99}))
+        self.assertEqual(h.sent_to_server(), [])
+        (refused,) = h.sent_to_client()
+        self.assertIn("the call could not be checked, so it was not made", refused["result"]["content"][0]["text"])
+        self.assertRegex(refused["result"]["content"][0]["text"], REF_SUFFIX)
+        self.assertIn("cannot write audit log", h.warnings.getvalue())
+        # Without --audit-required, monitor mode lets both through, as before.
+        lenient = self.proxy_from_file({"schema_checks": {"arguments": "enforce", "results": "enforce"}},
+                                       monitor=True)
+        self.listed(lenient, COUNT_TOOL)
+        lenient.from_client(call(1, "count_words", {"path": "a"}))
+        lenient.sent_to_server()
+        self.break_the_log()
+        lenient.from_server(reply(1, {"content": [], "structuredContent": {"words": "three"}}))
+        self.assertEqual(lenient.sent_to_client()[0]["result"]["structuredContent"], {"words": "three"})
+        lenient.from_client(call(2, "count_words", {"path": "a", "limit": 99}))
+        self.assertEqual(len(lenient.sent_to_server()), 1)
+
+
 # A server for the end-to-end test: lists a tool with schemas, one with a remote reference, and puts a
 # serverInfo with unsafe icons into every result's _meta.
 SCHEMA_SERVER = r'''
@@ -512,6 +594,54 @@ class ThroughTheRealProxy(unittest.TestCase):
             with self.subTest(msg_id=msg_id):
                 self.assertTrue(replies[msg_id]["result"]["isError"])
                 self.assertIn(expected, replies[msg_id]["result"]["content"][0]["text"])
+
+
+    def test_a_contained_proxy_with_a_signed_log_records_every_schema_block_with_the_policy_hash(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name)
+        tool = {"name": "count_words", "description": "Count words",
+                "inputSchema": {"type": "object", "properties": {"words": {"type": "integer"}},
+                                "additionalProperties": False},
+                "outputSchema": {"type": "object", "properties": {"words": {"type": "integer", "maximum": 100}}}}
+        server = folder / "schema_server.py"
+        server.write_text(SCHEMA_SERVER % json.dumps([tool, REMOTE_TOOL]), encoding="utf-8")
+        policy = folder / "policy.json"
+        policy.write_text(json.dumps({"default": "allow", "schema_checks": {
+            "arguments": "enforce", "results": "enforce", "undeclared_args": "block", "remote_refs": "quarantine"}}),
+            encoding="utf-8")
+        audit, key = folder / "audit.jsonl", folder / "audit.key"
+        key.write_bytes(b"0123456789abcdef0123456789abcdef")
+        if os.name == "posix":
+            key.chmod(0o600)
+        messages = [initialize(0), request(1, "tools/list"), call(2, "count_words", {"words": 5}),
+                    call(3, "count_words", {"words": "five"}), call(4, "count_words", {"words": 500}),
+                    call(5, "fetch_doc", {"q": "x"})]
+        proc = subprocess.run(
+            [sys.executable, "-m", "agent_sentinel", "proxy", "--policy", str(policy), "--audit", str(audit),
+             "--audit-key-file", str(key), "--contain", "--name", "srv", "--", sys.executable, str(server)],
+            input="".join(json.dumps(m) + "\n" for m in messages).encode(), capture_output=True, cwd=ROOT, timeout=60,
+        )
+        stderr = proc.stderr.decode(errors="replace")
+        self.assertEqual(proc.returncode, 0, stderr)
+        self.assertIn("records signed with a key", stderr)
+        self.assertIn("contain   ", stderr)
+        records = read_audit(audit)
+        start = next(record for record in records if record["event"] == "session_start")
+        self.assertEqual((start["containment"], start["signed"]), ("contained", True))
+        protocol = next(record for record in records if record["event"] == "protocol")
+        self.assertEqual(protocol["server_info"], {"name": "srv", "version": "1"})
+        self.assertEqual(records[-1]["event"], "session_end")
+        blocks = [record for record in records if record.get("action") == "block"]
+        self.assertEqual(sorted(record["rule"] for record in blocks),
+                         ["quarantine", "schema.arguments", "schema.remote_refs", "schema.result"])
+        self.assertEqual({record["policy"] for record in blocks}, {hashlib.sha256(policy.read_bytes()).hexdigest()[:12]})
+        verify = subprocess.run(
+            [sys.executable, "-m", "agent_sentinel", "audit", "verify", str(audit), "--key-file", str(key)],
+            capture_output=True, cwd=ROOT, timeout=60,
+        )
+        self.assertEqual(verify.returncode, 0, verify.stdout + verify.stderr)
+        self.assertIn(b"INTACT", verify.stdout)
 
 
 if __name__ == "__main__":
