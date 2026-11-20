@@ -145,6 +145,13 @@ policy says hide_blocked_tools, the tools it blocks outright are hidden from
 the list (never in monitor mode); a call to a hidden tool is still checked
 and refused.
 
+With --pin-server the server itself is pinned too (pins.py, "The server
+itself"): how it is launched, before it starts, and the serverInfo of its
+handshake. A server that differs from its pin is not started, or its
+handshake is refused (--on-server-change refuse, the default); with
+--on-server-change quarantine it runs with every tool, prompt and resource
+template quarantined (quarantine_server). Monitor mode logs the change only.
+
 Requests other than tool calls
 ------------------------------
 The policy's client_requests section may refuse any other method the client
@@ -213,9 +220,10 @@ from .firewall import (
     secret_rule,
 )
 from .jsonutil import finite_float, no_constant
+from .launch import launch_identity
 from .leaks import Found
 from .mcp_protocol import ShapeError
-from .pins import CHANGED, FULL, KIND_WORDS, PINNED_LISTS, ToolPins, definition_of, fingerprint
+from .pins import CHANGED, FULL, KIND_WORDS, NEW, PINNED_LISTS, ToolPins, definition_of, fingerprint, server_info_value
 from .policy import (
     PROMPTS_GET,
     RULE_MALFORMED,
@@ -289,6 +297,11 @@ TOOL_NAMES_STRICT = "strict"  # removed and quarantined
 TOOL_NAMES_WARN = "warn"  # kept, and reported on stderr and in the audit log (the default)
 TOOL_NAMES_OFF = "off"  # neither the naming rules nor look-alikes are checked
 TOOL_NAME_MODES = (TOOL_NAMES_STRICT, TOOL_NAMES_WARN, TOOL_NAMES_OFF)
+
+# proxy --on-server-change, with --pin-server: what happens when the server differs from its pin (pins.py).
+SERVER_CHANGE_REFUSE = "refuse"  # the proxy does not start (a changed launch) or refuses the handshake (serverInfo)
+SERVER_CHANGE_QUARANTINE = "quarantine"  # it starts, with every tool, prompt and resource template quarantined
+SERVER_CHANGE_MODES = (SERVER_CHANGE_REFUSE, SERVER_CHANGE_QUARANTINE)
 
 JsonObject = dict[str, Any]
 
@@ -542,9 +555,14 @@ class Proxy:
         approvers: Sequence[ApprovalBackend] = (),
         approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT,
         report: str = proxy_report.NORMAL,
+        pin_server: bool = False,
+        on_server_change: str = SERVER_CHANGE_REFUSE,
     ) -> None:
         """
         pins:              the pins of this server (pins.ToolPins); default: kept in memory only.
+        pin_server:        compare the serverInfo of each handshake with the server's pin (proxy --pin-server).
+        on_server_change:  when it differs: SERVER_CHANGE_REFUSE refuses the handshake, SERVER_CHANGE_QUARANTINE
+                           lets it through; either way every tool, prompt and template is quarantined.
         tool_names:        what to do with a tool or prompt whose name breaks the MCP naming
                            rules: TOOL_NAMES_STRICT, TOOL_NAMES_WARN (the default) or TOOL_NAMES_OFF.
         elicitation_hosts: the hosts a URL-mode elicitation may send the user to (proxy
@@ -564,6 +582,12 @@ class Proxy:
             raise ValueError(f"approval_timeout must be more than 0 and at most {MAX_APPROVAL_TIMEOUT} seconds")
         if type(max_message_bytes) is not int or not 1 <= max_message_bytes <= MAX_MAX_MESSAGE_BYTES:
             raise ValueError(f"max_message_bytes must be a whole number from 1 to {MAX_MAX_MESSAGE_BYTES}")
+        if on_server_change not in SERVER_CHANGE_MODES:
+            raise ValueError(f"on_server_change must be one of {', '.join(SERVER_CHANGE_MODES)}")
+        self._pin_server = pin_server
+        self._on_server_change = on_server_change
+        # Why the whole server is quarantined (its pin changed: quarantine_server), or None. Guarded by `_state`.
+        self._server_quarantine: str | None = None
         self._firewall = firewall
         self._client_out = client_out
         self._server_in = server_in
@@ -1474,14 +1498,25 @@ class Proxy:
     def _is_quarantined(self, tool: str) -> bool:
         """Whether a call to this tool must be refused because the tool cannot be vouched for."""
         with self._state:
-            # No tool can be vouched for if more were quarantined than can be
-            # remembered, or if the last tool list could not be checked at all.
-            return self._quarantine_overflowed or self._tools_unverified or tool in self._quarantined["tools"]
+            # No tool can be vouched for if more were quarantined than can be remembered, if the last tool
+            # list could not be checked at all, or if the server is no longer the one that was pinned.
+            return (self._quarantine_overflowed or self._tools_unverified or self._server_quarantine is not None
+                    or tool in self._quarantined["tools"])
 
     def _was_quarantined(self, kind: str, name: str) -> bool:
         """Whether this entry of a list (tools, prompts, resourceTemplates) was itself quarantined."""
         with self._state:
-            return self._quarantine_overflowed or name in self._quarantined[kind]
+            return self._quarantine_overflowed or self._server_quarantine is not None or name in self._quarantined[kind]
+
+    def quarantine_server(self, reason: str) -> None:
+        """Quarantine every tool, prompt and resource template of this server, for as long as the proxy runs.
+
+        For a server that differs from its pin (proxy --pin-server): they are
+        left out of every list, and calls and prompts are refused.
+        """
+        with self._state:
+            if self._server_quarantine is None:
+                self._server_quarantine = reason
 
     def _set_tools_unverified(self, unverified: bool) -> None:
         with self._state:
@@ -1828,6 +1863,10 @@ class Proxy:
         if problem is not None:
             return self._unsupported_reply(pending, msg_id, problem, _UNSUPPORTED_VERSION, code=protocol.INVALID_PARAMS)
         meta = result.get("_meta")
+        if self._pin_server:
+            refusal = self._check_server_info(pending, msg_id, result)
+            if refusal is not None:
+                return refusal
         for server_info in (result.get("serverInfo"), meta.get(_SERVER_INFO_KEY) if isinstance(meta, dict) else None):
             if isinstance(server_info, dict) and "icons" in server_info:
                 self._clean_icons_of(server_info, f"the server, in its reply to {pending.method}")
@@ -1839,6 +1878,36 @@ class Proxy:
             elif pending.method == protocol.SERVER_DISCOVER and self._era is None:
                 self._era = _MODERN
         return None
+
+    def _check_server_info(self, pending: _PendingRequest, msg_id: Any, result: JsonObject) -> JsonObject | None:
+        """With --pin-server: compare the serverInfo of a handshake reply with the server's pin; a refusal, or None.
+
+        The first serverInfo is pinned (pins.ToolPins.check_server_info). One
+        that differs quarantines the whole server (quarantine_server), and
+        with --on-server-change refuse (the default) the reply is refused
+        too. In monitor mode the change is logged and nothing happens.
+        """
+        meta = result.get("_meta")
+        server_info = result.get("serverInfo")
+        if not isinstance(server_info, dict) and isinstance(meta, dict):
+            server_info = meta.get(_SERVER_INFO_KEY)
+        server_info = server_info if isinstance(server_info, dict) else {}
+        status, changed = self._pins.check_server_info({"name": server_info_value(server_info.get("name")),
+                                                        "version": server_info_value(server_info.get("version"))})
+        self._save_pins()
+        if status != CHANGED:
+            return None
+        what = f"its serverInfo ({', '.join(changed)}) changed since it was pinned"
+        reason = f"the server is quarantined: {what}. {server_change_advice(self._pins.path)}"
+        decision = self._firewall.block(pending.label, reason, event="server_changed", rule=RULE_QUARANTINE,
+                                        call_id=pending.call_id)
+        if decision.allowed:  # monitor mode: logged as what would have been blocked
+            return None
+        self.quarantine_server(what)
+        self._report_block("quarantined every tool, prompt and resource template of the server", decision)
+        if self._on_server_change == SERVER_CHANGE_QUARANTINE:
+            return None
+        return _rpc_error(msg_id, decision.public_reason)
 
     def _malformed_reply(self, pending: _PendingRequest, msg_id: Any, reason: str) -> JsonObject:
         decision = self._firewall.refuse(
@@ -2123,6 +2192,10 @@ class Proxy:
         pinned = kind in PINNED_LISTS
         if not isinstance(item, dict) or (pinned and label == "?"):
             return "it is not a well-formed entry", None
+        with self._state:
+            server_quarantine = self._server_quarantine
+        if pinned and server_quarantine is not None:
+            return f"the whole server is quarantined: {server_quarantine}", None
         if pinned and self._was_quarantined(kind, item["name"]):
             return "it was quarantined earlier", None  # even if it looks clean now
 
@@ -2475,6 +2548,13 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--approval-timeout", type=_approval_timeout, default=None, metavar="SECONDS",
                         help=f"refuse a call nobody answered within this time (default {DEFAULT_APPROVAL_TIMEOUT}, "
                              f"at most {MAX_APPROVAL_TIMEOUT})")
+    parser.add_argument("--pin-server", action="store_true",
+                        help="also pin the server itself in the --pins file: how it is launched (the program, a "
+                             "runner's package version, the SHA-256 of a local script) and the name and version it "
+                             "reports. A server that differs is refused, see --on-server-change")
+    parser.add_argument("--on-server-change", choices=SERVER_CHANGE_MODES, default=None,
+                        help="with --pin-server, a server that differs from its pin: refuse (the default) does not "
+                             "start it, or refuses its handshake; quarantine starts it with every tool quarantined")
     loudness = parser.add_mutually_exclusive_group()
     loudness.add_argument("--quiet", action="store_true",
                           help="print only errors (the server's own stderr is still passed on)")
@@ -2553,6 +2633,41 @@ def _report_policy_error(path: str, error: Exception) -> None:
         _warn(hint, limit=500)
 
 
+def server_change_advice(pins_path: Any) -> str:
+    """What the operator can do about a server that differs from its pin (proxy --pin-server)."""
+    command = ["agent-sentinel", "pins", "diff", "--server", "--pins", str(pins_path)]
+    return (f"If the change is expected, review it with: {proxy_report.shell_line(command)}; then pins accept "
+            "--server, and restart the proxy")
+
+
+def _check_server_launch(pins: ToolPins, firewall: Firewall, executable: str, command: list[str],
+                         label: str, say: Callable[..., None]) -> str | None:
+    """With --pin-server: compare how the server is about to be launched with its pin (pins.py).
+
+    The first launch is pinned. Returns what changed when it differs and
+    the change is not lifted by monitor mode (the caller then refuses to
+    start, or quarantines the server), else None.
+    """
+    status, changed = pins.check_server_launch(launch_identity(executable, command))
+    try:
+        pins.save()
+    except OSError as exc:
+        _warn(f"cannot save the pins file: {exc}")
+    if status == NEW:
+        say("--pin-server: pinned how the server is launched; it is compared at every later start")
+    if status != CHANGED:
+        return None
+    what = f"its launch ({', '.join(changed)}) changed since it was pinned"
+    decision = firewall.block(label, f"the server differs from its pin: {what}. {server_change_advice(pins.path)}",
+                              event="server_changed", rule=RULE_QUARANTINE)
+    if decision.allowed:  # monitor mode
+        say(f"monitor mode: the server differs from its pin ({what}); it starts as usual")
+        return None
+    _warn(f"the server differs from its pin: {what}. {server_change_advice(pins.path)} "
+          f"{proxy_report.rule_and_ref(decision)}", limit=2000)
+    return what
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _argument_parser()
     args = parser.parse_args(argv)
@@ -2564,6 +2679,12 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("give the MCP server command after '--'")
+    if args.pin_server and (args.pins is None or args.no_pins):
+        parser.error("--pin-server pins the server in the pins file: give --pins FILE, without --no-pins")
+    if args.on_server_change is not None and not args.pin_server:
+        parser.error("--on-server-change says what happens to a server that differs from its pin: it needs "
+                     "--pin-server")
+    on_server_change = args.on_server_change or SERVER_CHANGE_REFUSE
     backends = [approver.describe() for approver in args.approve_with]
     for backend in backends:
         if backends.count(backend) > 1:
@@ -2617,6 +2738,12 @@ def main(argv: list[str] | None = None) -> int:
     for line in proxy_report.startup_lines(start):
         say(line, limit=1500)
     _report_server_environment(args, environment, added, say)
+    server_changed = None
+    if args.pin_server:
+        server_changed = _check_server_launch(pins, firewall, executable, command, args.name or "server", say)
+        if server_changed is not None and on_server_change == SERVER_CHANGE_REFUSE:
+            _warn("refusing to start the server (--on-server-change refuse)")
+            return 2
     try:
         server = subprocess.Popen(
             [executable, *command[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -2633,8 +2760,12 @@ def main(argv: list[str] | None = None) -> int:
     proxy = Proxy(
         firewall, sys.stdout.buffer, server.stdin, pins=pins, max_message_bytes=args.max_message_bytes,
         tool_names=args.tool_names, elicitation_hosts=args.elicitation_host, approvers=args.approve_with,
-        approval_timeout=approval_timeout, report=report,
+        approval_timeout=approval_timeout, report=report, pin_server=args.pin_server,
+        on_server_change=on_server_change,
     )
+    if server_changed is not None:
+        _warn("every tool, prompt and resource template of the server is quarantined (--on-server-change quarantine)")
+        proxy.quarantine_server(server_changed)
 
     # Run one relay per direction. When either side closes, shut down.
     one_side_closed = threading.Event()

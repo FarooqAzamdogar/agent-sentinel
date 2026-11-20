@@ -35,6 +35,28 @@ written in the file (names only: a value is never printed). A leading "~" in
 --policy, --audit, --pins, --env-file and an --approve-with command: is the
 home folder, as the proxy reads it.
 
+How each server is launched (launch_lines, with launch.py): a package of
+advisories.py that is malware fails, one with a known vulnerability warns,
+so does one a letter away from a popular MCP package's name; and so does a
+risky command: inline code (sh -c, cmd /c, powershell -EncodedCommand,
+node -e, python -c), shell operators in arguments, sudo, a download piped to
+a runner, a package from a git repository, a container with --privileged,
+the host's root or home folder mounted, host namespaces or no image digest,
+and an argument that names a credential file, a whole drive or the whole
+home folder. The full command is then printed, never cut short.
+
+The control plane (control_plane.py): whether a server, a policy's
+allow_args root or a policy's write rules let the agent reach
+agent-sentinel's own files (policies, pins, audit logs, the hook's state,
+env files, approver programs); and on POSIX whether other users can read or
+change them. In a project's configuration, an approver program or an env
+file inside the project folder is broken (the agent's own tools could
+rewrite them).
+
+--save-baseline FILE records what the configurations and Claude Code's
+settings hold; --baseline FILE fails on anything added, changed or removed
+since (doctor_baseline.py). Saving the baseline is the only thing doctor writes.
+
 Nothing is changed and no server is started. A configuration may come from
 someone else (a project's checked-in .mcp.json), so doctor never runs a
 program it names: whether a Python can import agent_sentinel is tried only
@@ -48,8 +70,9 @@ that machine with the user's credentials. Neither is a device path
 printed through `printable`.
 
 Exit codes: 0 every stdio server is protected; 1 a server is not protected
-or is broken, a configuration cannot be read, or a policy does not load;
-2 a --config file does not exist.
+or is broken, a configuration cannot be read, a policy does not load, or
+something differs from the --baseline; 2 a --config file does not exist, or
+the --baseline cannot be read.
 """
 
 from __future__ import annotations
@@ -57,20 +80,23 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import __version__, clients, config_file, elicitation, home, mcp_proxy, server_env
+from . import __version__, clients, config_file, control_plane, doctor_baseline, elicitation, home, launch, mcp_proxy
+from . import server_env
 from .approvers import COMMAND_PREFIX
-from .cli_common import EXIT_FAIL, EXIT_OK, CommandError, full_path, shown_command, shown_path
+from .cli_common import EXIT_FAIL, EXIT_OK, CommandError, full_path, shell_line, shown_command, shown_path
 from .clients import CLIENTS
 from .config_file import ConfigError, read_config
+from .control_plane import ControlFile
 from .firewall import SERVER_NAME
-from .leaks import find_secrets
+from .launch import unpinned_package  # noqa: F401  (doctor's own check, kept under its old name too)
+from .leaks import find_secrets, redact
+from .pins import pending_path
 from .policy import Policy, PolicyError
 from .policy_errors import file_error_message
 from .server_env import looks_secret  # the proxy's own test, so that doctor and the proxy agree
@@ -107,21 +133,10 @@ sign-in to that machine.
 examples:
   agent-sentinel doctor
   agent-sentinel doctor --config .mcp.json --format json
+  agent-sentinel doctor --save-baseline ~/.agent-sentinel/baseline.json      later: --baseline FILE
 """
 
 STATUSES = ("protected", "unprotected", "remote", "broken")
-_EXACT_VERSION = re.compile(r"v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?")
-# Where a PyPI package's name ends in a requirement such as "pkg>=1.0" or "pkg[extra]".
-_PYPI_NAME_END = re.compile(r"[=<>~!@ \[]")
-_NPX_VALUE_OPTIONS = frozenset({"-p", "--package", "-c", "--call", "--cache", "--registry", "--userconfig", "-w",
-                                "--workspace", "--node-options"})
-_UVX_VALUE_OPTIONS = frozenset({
-    "--from", "--with", "--with-editable", "--with-requirements", "-p", "--python", "--index", "--index-url",
-    "--extra-index-url", "--default-index", "--find-links", "-f", "--constraint", "-c", "--override",
-    "--python-preference", "--refresh-package", "--reinstall-package", "--upgrade-package", "--cache-dir",
-    "--directory", "--project", "--config-file", "--env-file", "--index-strategy", "--keyring-provider",
-    "--resolution", "--prerelease", "--exclude-newer", "--link-mode", "--compile-bytecode",
-})
 MAX_POLICY_WARNINGS_SHOWN = 20
 # The largest policy or pins file doctor reads (both are small; a configuration could name anything).
 MAX_CHECKED_FILE_BYTES = 16 * 1024 * 1024
@@ -145,6 +160,10 @@ class ServerReport:
     policy: str | None = None  # full path, when the entry names one
     pins: str | None = None
     audit: str | None = None
+    # For the control-plane checks (not printed): the server command, and the env file and approver programs.
+    command: list[str] = field(default_factory=list)
+    env_file: str | None = None
+    approvers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -156,6 +175,7 @@ class ConfigReport:
     error: str | None = None
     servers: list[ServerReport] = field(default_factory=list)
     extensions: list[str] = field(default_factory=list)
+    entries: Any = None  # the servers as the file holds them, for --save-baseline and --baseline (never printed)
 
 
 @dataclass
@@ -164,27 +184,57 @@ class PolicyReport:
     loads: bool
     summary: str
     warnings: list[str] = field(default_factory=list)
+    policy: Policy | None = None  # the loaded policy, for the control-plane checks
+
+
+@dataclass
+class Extras:
+    """What doctor checks beyond each server: the control plane, and the baseline."""
+
+    control_plane: list[Line] = field(default_factory=list)
+    baseline_file: str | None = None  # --baseline
+    drift: list[str] = field(default_factory=list)  # what differs from it (names only)
+    saved_baseline: str | None = None  # --save-baseline
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", action="append", default=[], metavar="FILE",
                         help="check this configuration file (repeat for more; default: every one `clients` finds)")
     parser.add_argument("--format", choices=("text", "json"), default="text", help="output format (default text)")
+    baseline = parser.add_mutually_exclusive_group()
+    baseline.add_argument("--save-baseline", metavar="FILE",
+                          help="record what the configurations and Claude Code's settings hold now (servers, hooks, "
+                               "env overrides), to compare with later; the only file doctor writes")
+    baseline.add_argument("--baseline", metavar="FILE",
+                          help="fail on any server, hook or setting added, changed or removed since --save-baseline "
+                               "wrote FILE (names are shown, never values)")
 
 
 def run(args: argparse.Namespace) -> int:
     _versions.clear()
+    saved = doctor_baseline.load(Path(full_path(args.baseline))) if args.baseline else None
     reports = [check_config(*where) for where in _configs(args.config)]
     policies = check_policies(reports)
     for report in reports:
         for server in report.servers:
             _add_policy_result(server, policies)
     shared = shared_pins(reports)
-    code = exit_code(reports, policies)
+    settings = control_plane.claude_settings()
+    extras = Extras(control_plane=check_control_plane(reports, policies, settings))
+    if saved is not None:
+        extras.baseline_file = full_path(args.baseline)
+        current = baseline_items(reports, settings, saved.key)
+        extras.drift = doctor_baseline.described(doctor_baseline.changes(saved.items, current))
+    if args.save_baseline:
+        target = Path(full_path(args.save_baseline))
+        key = doctor_baseline.new_key()
+        doctor_baseline.save(target, doctor_baseline.Baseline(key, baseline_items(reports, settings, key)))
+        extras.saved_baseline = str(target)
+    code = EXIT_FAIL if extras.drift else exit_code(reports, policies)
     if args.format == "json":
-        print(json.dumps(as_json(reports, policies, shared, code), indent=2, ensure_ascii=True))
+        print(json.dumps(as_json(reports, policies, shared, code, extras), indent=2, ensure_ascii=True))
     else:
-        print_report(reports, policies, shared, code)
+        print_report(reports, policies, shared, code, extras)
     return code
 
 
@@ -256,6 +306,7 @@ def check_config(path: Path, client: str | None, scope: str, note: str) -> Confi
         return report
     key = CLIENTS[client].servers_key if client in CLIENTS else _guess_key(config.document)
     servers = config.document.get(key, {})
+    report.entries = servers
     if not isinstance(servers, dict):
         report.error = f"\"{key}\" is not an object"
         return report
@@ -295,12 +346,12 @@ def check_server(name: str, entry: Any, client: str | None, project: Path | None
     if proxy is None:
         fix = f"agent-sentinel wrap --client {client} --policy POLICY" if client else "agent-sentinel wrap"
         report = ServerReport(shown_name, "unprotected", [
-            Line("fail", f"NOT protected: starts {_shown(words)} directly. To fix: {fix}")])
-        report.lines += _package_lines(words) + _secret_lines(entry)
+            Line("fail", f"NOT protected: starts {_shown(words)} directly. To fix: {fix}")], command=words)
+        report.lines += launch_lines(words) + _secret_lines(entry)
         return report
-    report = ServerReport(shown_name, "protected")
+    report = ServerReport(shown_name, "protected", command=proxy.server)
     _check_wrapped(report, proxy, entry, project)
-    report.lines += _package_lines(proxy.server) + _secret_lines(entry)
+    report.lines += launch_lines(proxy.server) + _secret_lines(entry)
     if any(line.level == "fail" for line in report.lines):
         report.status = "broken"
     elif proxy.has("--monitor"):
@@ -339,15 +390,58 @@ def _check_wrapped(report: ServerReport, proxy: ProxyCommand, entry: dict[str, A
     report.pins = _pins_path(lines, proxy)
     report.audit = _audit_path(lines, proxy.value("--audit"))
     _check_env_file(lines, proxy.value("--env-file"))
+    report.env_file = _local_path(proxy.value("--env-file"))
+    report.approvers = _approver_programs(proxy)
     _check_name(lines, proxy.values("--name"))
     _check_server_command(lines, proxy.server)
     _check_passed_env(lines, proxy, entry)
     _check_env_redirects(lines, proxy, entry)
     if project is not None:
-        for what, path in (("policy", report.policy), ("pins file", report.pins), ("audit log", report.audit)):
-            if path and clients.inside_folder(path, project):
-                lines.append(Line("warn", f"the {what} is inside the project folder, where the agent's own tools may "
-                                          "be able to change it; keep it in the agent-sentinel home folder"))
+        _check_inside_project(report, project)
+
+
+def _check_inside_project(report: ServerReport, project: Path) -> None:
+    """A project's configuration: what of the proxy's own files the project folder holds (DET-9).
+
+    The agent's own tools can often write the project. A policy, pins file
+    or audit log there is a warning; an approver program (it alone can turn
+    every 'ask' into a yes) or an env file (it gives the server variables
+    such as NODE_OPTIONS) there is broken.
+    """
+    for what, path in (("policy", report.policy), ("pins file", report.pins), ("audit log", report.audit)):
+        if path and clients.inside_folder(path, project):
+            report.lines.append(Line("warn", f"the {what} is inside the project folder, where the agent's own tools "
+                                             "may be able to change it; keep it in the agent-sentinel home folder"))
+    for what, path in [("env file", report.env_file), *(("approver program", program) for program in report.approvers)]:
+        if path and clients.inside_folder(path, project):
+            report.lines.append(Line("fail", f"the {what} {printable(path, limit=300)} is inside the project folder, "
+                                             "where the agent's own tools may be able to rewrite it"
+                                             + (" to approve every call" if what == "approver program" else "")
+                                             + "; keep it in the agent-sentinel home folder (or another folder the "
+                                               "agent cannot write)"))
+
+
+def _local_path(path: str | None) -> str | None:
+    """A full path on this machine from a proxy option ("~" expanded), or None (none, relative, or never opened)."""
+    if not path:
+        return None
+    path = _option_path(path)
+    return os.path.normpath(path) if home.is_absolute(path) and not _never_opened(path) else None
+
+
+def _approver_programs(proxy: ProxyCommand) -> list[str]:
+    """The program of each --approve-with command:, as the proxy finds it (a name on PATH, or a full path)."""
+    found = []
+    for value in proxy.values("--approve-with"):
+        if not value.startswith(COMMAND_PREFIX):
+            continue
+        program = _option_path(value[len(COMMAND_PREFIX):])
+        if not program or _approver_not_looked_up(program):
+            continue
+        located = program if home.is_absolute(program) else mcp_proxy._resolve_executable(program)
+        if located:
+            found.append(os.path.normpath(os.path.abspath(located)))
+    return found
 
 
 def _check_launcher(lines: list[Line], proxy: ProxyCommand, project: Path | None) -> None:
@@ -590,6 +684,11 @@ def _check_values(lines: list[Line], proxy: ProxyCommand) -> None:
     if proxy.has("--quiet") and proxy.has("--verbose"):
         lines.append(Line("fail", "--quiet and --verbose are both given, and the proxy takes only one of them, so it "
                                   "will not start"))
+    if proxy.has("--pin-server") and (proxy.value("--pins") is None or proxy.has("--no-pins")):
+        lines.append(Line("fail", "--pin-server pins the server in the pins file, so the proxy will not start without "
+                                  "--pins FILE, or with --no-pins"))
+    if proxy.values("--on-server-change") and not proxy.has("--pin-server"):
+        lines.append(Line("fail", "--on-server-change needs --pin-server, so the proxy will not start"))
 
 
 def _approver_not_looked_up(program: str) -> str | None:
@@ -614,6 +713,12 @@ def _tool_names(value: str) -> str:
     return value
 
 
+def _server_change(value: str) -> str:
+    if value not in mcp_proxy.SERVER_CHANGE_MODES:
+        raise argparse.ArgumentTypeError(f"choose from {', '.join(mcp_proxy.SERVER_CHANGE_MODES)}")
+    return value
+
+
 # The proxy's own check of an option's value: the types and choices of its argument parser. A value for which
 # one raises ArgumentTypeError is one the proxy refuses to start with.
 _VALUE_CHECKS: dict[str, Callable[[str], Any]] = {
@@ -622,6 +727,7 @@ _VALUE_CHECKS: dict[str, Callable[[str], Any]] = {
     "--approve-with": mcp_proxy._approver,
     "--pass-env": mcp_proxy._pass_env_name,
     "--tool-names": _tool_names,
+    "--on-server-change": _server_change,
 }
 
 
@@ -666,77 +772,43 @@ def _check_env_redirects(lines: list[Line], proxy: ProxyCommand, entry: dict[str
                                   "variable to the server alone)"))
 
 
-# ---- packages and secrets ------------------------------------------------------------------------------
+# ---- how a server is launched, and secrets ---------------------------------------------------------------
 
-def unpinned_package(words: list[str]) -> tuple[str, str] | None:
-    """(package, how to pin it) when an npx or uvx command runs a package without an exact version; else None."""
-    program = os.path.basename(words[0].replace("\\", "/")).lower()
-    for ending in (".cmd", ".exe", ".bat", ".ps1"):
-        if program.endswith(ending):
-            program = program[: -len(ending)]
-    if program == "npx":
-        spec = _first_package(words[1:], _NPX_VALUE_OPTIONS, ("-p", "--package"))
-        return (spec, f"{_npm_name(spec)}@1.2.3") if spec and _npm_unpinned(spec) else None
-    if program == "uvx" or (program == "uv" and words[1:3] == ["tool", "run"]):
-        rest = words[1:] if program == "uvx" else words[3:]
-        spec = _first_package(rest, _UVX_VALUE_OPTIONS, ("--from",))
-        if not spec or not _pypi_unpinned(spec):
-            return None
-        return spec, _PYPI_NAME_END.split(spec, maxsplit=1)[0] + "==1.2.3"
-    return None
+def launch_lines(words: list[str]) -> list[Line]:
+    """doctor's launch checks of a server command (launch.py; wrap, clients and inspect say the same).
 
-
-def _first_package(args: list[str], value_options: frozenset[str], package_options: tuple[str, ...]) -> str | None:
-    """The package a runner runs: the value of --package/--from, or else the first word that is not an option."""
-    index = 0
-    while index < len(args):
-        word = args[index]
-        name, equals, value = word.partition("=")
-        if name in package_options:
-            return value if equals else (args[index + 1] if index + 1 < len(args) else None)
-        if word == "--":
-            return args[index + 1] if index + 1 < len(args) else None
-        if equals and name in value_options:
-            pass
-        elif word in value_options:
-            index += 1
-        elif not word.startswith("-"):
-            return word
-        index += 1
-    return None
-
-
-def _npm_name(spec: str) -> str:
-    at = spec.find("@", 1)
-    return spec if at == -1 else spec[:at]
-
-
-def _npm_unpinned(spec: str) -> bool:
-    if spec.startswith((".", "/", "~")) or ":" in spec or ("/" in spec and not spec.startswith("@")):
-        return False  # a path, a URL or a git reference: not a registry package
-    at = spec.find("@", 1)
-    return at == -1 or not _EXACT_VERSION.fullmatch(spec[at + 1:])
-
-
-def _pypi_unpinned(spec: str) -> bool:
-    if spec.startswith((".", "/", "~")) or "://" in spec or spec.startswith("git+"):
-        return False
-    if "==" in spec:
-        return not _EXACT_VERSION.fullmatch(spec.split("==", 1)[1].strip())
-    if "@" in spec:  # uv's "package@1.2.3"
-        return not _EXACT_VERSION.fullmatch(spec.split("@", 1)[1].strip())
-    return True
-
-
-def _package_lines(words: list[str]) -> list[Line]:
+    A package of advisories.py: malware fails, a known vulnerability warns;
+    a name a letter away from a popular MCP package warns; a package without
+    an exact version warns; and so does a risky command, with the full
+    command printed (secrets redacted, never cut short).
+    """
     if not words:
         return []
+    lines = []
+    ref = launch.runner_package(words)
+    if ref is not None:
+        lines += [Line(level, text) for level, text in launch.advisory_findings(ref)]
+        squatted = launch.typosquat_of(ref)
+        if squatted:
+            lines.append(Line("warn", f"the package {printable(ref.spec, limit=120)!r} is named one letter away from "
+                                      f"the popular {squatted!r}: a typosquat runs someone else's code under a "
+                                      "name you meant to trust. Check that it is the package you mean"))
     found = unpinned_package(words)
-    if found is None:
-        return []
-    package, pinned = found
-    return [Line("warn", f"the package {printable(package, limit=80)!r} is not pinned to an exact version: a new "
-                         f"release would run without review. Pin it, for example {printable(pinned, limit=80)}")]
+    if found is not None:
+        package, pinned = found
+        lines.append(Line("warn", f"the package {printable(package, limit=80)!r} is not pinned to an exact version: "
+                                  "a new release would run without review. Pin it, for example "
+                                  f"{printable(pinned, limit=80)}"))
+    risks = launch.launch_risks(words)
+    if risks:
+        lines.append(Line("warn", f"the launch command {'; '.join(risks)}. The full command: {full_command(words)}"))
+    return lines
+
+
+def full_command(words: list[str]) -> str:
+    """A command as one line to print in full: quoted, printable, recognisable secrets redacted, never cut short."""
+    text = redact(shell_line(words))
+    return printable(text, limit=max(1, len(text)))
 
 
 def _secret_lines(entry: Any) -> list[Line]:
@@ -787,7 +859,7 @@ def _load(path: str) -> PolicyReport:
         summary += f", {asks} 'ask' rule(s), refused by the proxy unless it has an approver (--approve-with)"
     if policy.default == "allow":
         summary += "; default allow: every tool without a rule can be called"
-    return PolicyReport(path, True, summary, [printable(text, limit=300) for text in policy.warnings()])
+    return PolicyReport(path, True, summary, [printable(text, limit=300) for text in policy.warnings()], policy)
 
 
 def _add_policy_result(server: ServerReport, policies: dict[str, PolicyReport]) -> None:
@@ -815,6 +887,95 @@ def counts(reports: list[ConfigReport]) -> Counter:
     return Counter(server.status for report in reports for server in report.servers)
 
 
+# ---- the control plane, and the baseline -----------------------------------------------------------------
+
+def control_files(reports: list[ConfigReport], hooks: list[tuple[str, str]]) -> list[ControlFile]:
+    """agent-sentinel's own files: each wrapped server's, the Claude Code hooks', and the home folder's."""
+    found: list[ControlFile] = []
+    for report in reports:
+        for server in report.servers:
+            whose = f"{report.client or report.path.name}: {server.name}"
+            pins = [("pins file", server.pins), ("changes waiting beside the pins file",
+                                                 str(pending_path(server.pins)) if server.pins else None)]
+            for what, path in [("policy", server.policy), *pins, ("audit log", server.audit),
+                               ("env file", server.env_file),
+                               *(("approver program", program) for program in server.approvers)]:
+                if path and not _never_opened(path):
+                    found.append(ControlFile(what, path, whose))
+    for what, path in hooks:
+        if not _never_opened(path):
+            found.append(ControlFile(what, path, "the Claude Code hook", folder=what == "hook state folder"))
+    try:
+        found += control_plane.home_files(home.home_folder())
+    except home.HomeError:
+        pass
+    return found
+
+
+def check_control_plane(reports: list[ConfigReport], policies: dict[str, PolicyReport],
+                        settings: list[control_plane.SettingsFile]) -> list[Line]:
+    """Whether servers, policies or other users can reach agent-sentinel's own files (control_plane.py).
+
+    Lines about one server go into its report; the rest are returned.
+    """
+    hooks = control_plane.hook_paths(settings)
+    files, too_many = control_plane.unique(control_files(reports, hooks))
+    index = control_plane.FolderIndex(files)
+    for report in reports:
+        for server in report.servers:
+            server.lines += [Line("warn", text) for text in control_plane.server_reaches(server.command[1:], index)]
+    lines: list[Line] = []
+    budget = control_plane.Budget()
+    loaded = [(policy.path, policy.policy) for policy in policies.values() if policy.policy is not None]
+    for what, path in hooks:
+        if what == "hook policy" and os.path.normcase(os.path.normpath(path)) not in policies:
+            loaded += _hook_policy(path, lines)
+    for label, policy in dict(loaded).items():
+        lines += [Line("warn", text) for text in control_plane.policy_lines(label, policy, files, budget)]
+    # The audit log's own permissions are the audit log's business (auditlog/firewall), not reported here.
+    lines += [Line("warn", text) for text in control_plane.permission_lines(
+        [found for found in files if found.what not in ("audit log", "hook audit log")])]
+    lines += [Line("warn", text) for text in control_plane.windows_home_lines()]
+    if too_many or budget.exceeded:
+        lines.append(Line("warn", "there are more of agent-sentinel's own files and policies than doctor checks in one "
+                                  f"run ({control_plane.MAX_CONTROL_FILES} files, {control_plane.MAX_DRY_RUNS} "
+                                  "policy checks): not every one was checked"))
+    for settings_file in settings:
+        if settings_file.error:
+            lines.append(Line("warn", f"Claude Code's settings {shown_path(settings_file.path)} cannot be read, so "
+                                      f"its hooks were not checked: {settings_file.error}"))
+    return lines
+
+
+def _hook_policy(path: str, lines: list[Line]) -> list[tuple[str, Policy]]:
+    """The policy a Claude Code hook of agent-sentinel names, loaded for the control-plane checks."""
+    if _never_opened(path) or not home.is_absolute(path) or not os.path.isfile(path) or _too_big(path):
+        lines.append(Line("warn", f"the Claude Code hook's policy {printable(path, limit=300)} is not a policy file "
+                                  "on this machine that doctor reads, so the hook blocks every call"))
+        return []
+    loaded = _load(path)
+    if loaded.policy is None:
+        lines.append(Line("warn", f"the Claude Code hook's policy does not load, so the hook blocks every call: "
+                                  f"{loaded.summary}"))
+        return []
+    return [(path, loaded.policy)]
+
+
+def baseline_items(reports: list[ConfigReport], settings: list[control_plane.SettingsFile],
+                   key: bytes) -> dict[doctor_baseline.Where, str]:
+    """What --save-baseline records and --baseline compares: every configuration's servers, and the settings."""
+    items: dict[doctor_baseline.Where, str] = {}
+    for report in reports:
+        if report.error and report.entries is None:
+            items[("config", str(report.path), "(cannot be read)")] = "0" * 64
+            continue
+        items.update(doctor_baseline.config_items(key, str(report.path), report.entries))
+    for settings_file in settings:
+        items.update(doctor_baseline.settings_items(key, str(settings_file.path), settings_file.document,
+                                                    settings_file.error))
+    return items
+
+
 def exit_code(reports: list[ConfigReport], policies: dict[str, PolicyReport]) -> int:
     found = counts(reports)
     failed = (found["unprotected"] or found["broken"] or any(report.error for report in reports)
@@ -829,7 +990,7 @@ def _mark(level: str) -> str:
 
 
 def print_report(reports: list[ConfigReport], policies: dict[str, PolicyReport],
-                 shared: list[tuple[str, list[str]]], code: int) -> None:
+                 shared: list[tuple[str, list[str]]], code: int, extras: Extras | None = None) -> None:
     print("agent-sentinel doctor: a read-only check; nothing is changed and no server is started.")
     print(f"{_mark('info')}agent-sentinel {__version__}, Python {sys.version.split()[0]}: {shown_path(sys.executable)}")
     try:
@@ -853,6 +1014,8 @@ def print_report(reports: list[ConfigReport], policies: dict[str, PolicyReport],
     for path, names in shared:
         print(f"\n{_mark('warn')}{len(names)} servers share the pins file {shown_path(path)}: "
               f"{', '.join(names)}. Give each server its own (wrap does)")
+    if extras is not None:
+        _print_extras(extras)
     found = counts(reports)
     extensions = sum(len(report.extensions) for report in reports)
     print(f"\nSummary: {found['protected']} protected, {found['unprotected']} NOT protected, {found['remote']} remote "
@@ -860,6 +1023,25 @@ def print_report(reports: list[ConfigReport], policies: dict[str, PolicyReport],
           + (f"; {extensions} Desktop Extension(s), which cannot be wrapped" if extensions else "") + ".")
     if code:
         print("Exit code 1: see the [fail] lines.")
+
+
+def _print_extras(extras: Extras) -> None:
+    """The control plane, and what differs from the --baseline (or where --save-baseline wrote it)."""
+    if extras.control_plane:
+        print("\nControl plane (agent-sentinel's own files: policies, pins, audit logs, hook state, approvers):")
+        for line in extras.control_plane:
+            print(f"  {_mark(line.level)}{line.text}")
+    if extras.baseline_file is not None:
+        print(f"\nBaseline {shown_path(extras.baseline_file)}:")
+        if not extras.drift:
+            print(f"  {_mark('ok')}nothing was added, changed or removed since it was saved")
+        for text in extras.drift:
+            print(f"  {_mark('fail')}{text}")
+        if extras.drift:
+            print(f"  {'':7}If you made these changes, save a new baseline: agent-sentinel doctor --save-baseline FILE")
+    if extras.saved_baseline is not None:
+        print(f"\n{_mark('info')}Saved the baseline to {shown_path(extras.saved_baseline)}; compare with it later: "
+              f"agent-sentinel doctor --baseline {shown_path(extras.saved_baseline)}")
 
 
 def _print_config(report: ConfigReport) -> None:
@@ -882,8 +1064,9 @@ def _print_config(report: ConfigReport) -> None:
 
 
 def as_json(reports: list[ConfigReport], policies: dict[str, PolicyReport],
-            shared: list[tuple[str, list[str]]], code: int) -> dict[str, Any]:
+            shared: list[tuple[str, list[str]]], code: int, extras: Extras | None = None) -> dict[str, Any]:
     """The report as plain data; every text from a file is already printable."""
+    extras = extras or Extras()
     return {
         "version": __version__,
         "python": printable(sys.executable, limit=500),
@@ -905,6 +1088,10 @@ def as_json(reports: list[ConfigReport], policies: dict[str, PolicyReport],
         "policies": [{"path": printable(policy.path, limit=500), "loads": policy.loads, "summary": policy.summary,
                       "warnings": policy.warnings} for policy in policies.values()],
         "shared_pins": [{"path": printable(path, limit=500), "servers": names} for path, names in shared],
+        "control_plane": [{"level": line.level, "text": line.text} for line in extras.control_plane],
+        "baseline": None if extras.baseline_file is None else {
+            "file": printable(extras.baseline_file, limit=500), "changes": extras.drift},
+        "saved_baseline": printable(extras.saved_baseline, limit=500) if extras.saved_baseline else None,
         "summary": {status: counts(reports)[status] for status in STATUSES},
         "exit_code": code,
     }

@@ -70,9 +70,10 @@ from .textutil import printable
 # contract between the proxy and the commands that write or read wrapped entries).
 VALUE_OPTIONS = frozenset({
     "--policy", "--audit", "--pins", "--name", "--pass-env", "--env-file", "--approve-with",
-    "--approval-timeout", "--max-message-bytes", "--tool-names", "--elicitation-host",
+    "--approval-timeout", "--max-message-bytes", "--tool-names", "--elicitation-host", "--on-server-change",
 })
-FLAG_OPTIONS = frozenset({"--no-log-args", "--no-pins", "--monitor", "--clean-env", "--quiet", "--verbose"})
+FLAG_OPTIONS = frozenset({"--no-log-args", "--no-pins", "--monitor", "--clean-env", "--quiet", "--verbose",
+                          "--pin-server"})
 # The shapes of command that start the proxy (read_proxy_command), each followed by "proxy":
 #   agent-sentinel                        the script (agent-sentinel.exe, .cmd, .bat)
 #   PYTHON [-I] -m agent_sentinel         a Python, with only harmless options of its own before -m

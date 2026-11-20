@@ -302,7 +302,8 @@ class ReadingTheProxyCommand(unittest.TestCase):
         self.assertEqual(wrapping.shortened_option("--mon"), ["--monitor"])
         self.assertEqual(wrapping.shortened_option("--polic"), ["--policy"])
         self.assertEqual(wrapping.shortened_option("--polic=weak.json"), ["--policy"])
-        self.assertEqual(wrapping.shortened_option("--p"), ["--pass-env", "--pins", "--policy"])
+        self.assertEqual(wrapping.shortened_option("--p"), ["--pass-env", "--pin-server", "--pins", "--policy"])
+        self.assertEqual(wrapping.shortened_option("--on-server"), ["--on-server-change"])
         for word in ("--monitor", "--policy=x", "--frobnicate", "-m", "--", "weak.json", "-"):
             with self.subTest(word=word):
                 self.assertEqual(wrapping.shortened_option(word), [])

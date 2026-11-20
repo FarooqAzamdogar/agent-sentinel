@@ -20,6 +20,13 @@ not redirected that way.
 Nothing here is found implicitly. The proxy never looks in this folder by
 itself: `wrap` writes the full path of every file into each wrapped entry,
 and every command that writes here prints the full path it used.
+
+Permissions. The folders agent-sentinel creates here (the home folder, pins,
+hook-state, backups) are its owner's only: mode 0700 on POSIX
+(make_private_folder), and `init` writes the policy with 0600. On Windows,
+Python 3.13 and later give a folder made that way an owner-only access list;
+earlier versions leave it to the user profile's inherited permissions, which
+is why `doctor` warns about a home folder outside the profile.
 """
 
 from __future__ import annotations
@@ -38,6 +45,12 @@ POLICY_FILE = "policy.json"
 AUDIT_FILE = "audit.jsonl"
 PINS_FOLDER = "pins"
 HOOK_STATE_FOLDER = "hook-state"
+BACKUPS_FOLDER = "backups"
+# Owner-only: the folders agent-sentinel creates, and the policy `init` writes (see "Permissions" above).
+PRIVATE_FOLDER_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+# How many missing folders above the one asked for make_private_folder creates at most.
+MAX_FOLDERS_CREATED = 64
 
 
 class HomeError(CommandError):
@@ -123,13 +136,36 @@ def hook_state_folder(home: Path) -> Path:
     return home / HOOK_STATE_FOLDER
 
 
+def make_private_folder(folder: str | Path) -> list[Path]:
+    """Create a folder, and each missing folder above it, readable by its owner only. Returns those created.
+
+    Mode 0700 on POSIX, whatever the umask leaves (it only takes bits away).
+    A folder that exists is left as it is. Raises OSError.
+    """
+    missing: list[Path] = []
+    current = Path(folder)
+    while not current.is_dir() and current.parent != current and len(missing) < MAX_FOLDERS_CREATED:
+        missing.append(current)
+        current = current.parent
+    created = []
+    for path in reversed(missing):
+        try:
+            path.mkdir(mode=PRIVATE_FOLDER_MODE)
+        except FileExistsError:
+            if not path.is_dir():
+                raise
+            continue
+        created.append(path)
+    return created
+
+
 def make_folders(home: Path) -> list[Path]:
-    """Create the home folder and its pins folder if they are missing; return the folders that were created."""
+    """Create the home folder and its pins folder (owner-only) if they are missing; return those created."""
     created = []
     for folder in (home, pins_folder(home)):
         if not folder.is_dir():
             try:
-                folder.mkdir(parents=True, exist_ok=True)
+                make_private_folder(folder)
             except OSError as exc:
                 raise HomeError(f"cannot create the folder {folder}: {exc.strerror or exc}") from exc
             created.append(folder)

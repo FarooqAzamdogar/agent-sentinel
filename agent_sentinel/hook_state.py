@@ -83,7 +83,7 @@ class FileRateLimiter:
             return None  # nothing to count: the file is not even opened
         second = int(self._clock())
         try:
-            self.directory.mkdir(parents=True, exist_ok=True)
+            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)  # owner-only (home.PRIVATE_FOLDER_MODE)
             with self._thread_lock, locked(self._lock_path):
                 buckets = _recent(self._read(), second)
                 full = next(

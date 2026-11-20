@@ -283,7 +283,7 @@ class FileSessionStore(SessionStore):
         Raises SessionStateError if the folder or the file cannot be written.
         """
         try:
-            self.directory.mkdir(parents=True, exist_ok=True)
+            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)  # owner-only (home.PRIVATE_FOLDER_MODE)
             with self._exclusive():
                 if not self.path.exists():
                     self._started = _now()
