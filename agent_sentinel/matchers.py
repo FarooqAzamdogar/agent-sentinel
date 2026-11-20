@@ -283,12 +283,19 @@ _WINDOWS_ALIASES = (
 # The real Start Menu, Recent, SendTo and Templates folders are in a
 # Microsoft\Windows folder: a name there is the folder itself, not an alias
 # (and reading it as one would never end, as the target holds the name again).
+# Each is (the alias, a pattern for it outside Microsoft\Windows, the target).
+# The pattern looks back from the end of the alias, so that it starts with the
+# alias's own text, which the regex engine searches for quickly.
 _WINDOWS_ALIAS_PATTERNS = tuple(
-    (re.compile(r"(?<!\\microsoft\\windows)" + re.escape(alias)), target) for alias, target in _WINDOWS_ALIASES
+    (alias, re.compile(re.escape(alias) + "(?<!" + re.escape("\\microsoft\\windows" + alias) + ")"), target)
+    for alias, target in _WINDOWS_ALIASES
 )
-# How many alias readings one value may have. A real path goes through a few
-# aliases at most; a value that needs more is denied rather than read in part.
+# How many alias readings one value may have, and how many characters its
+# readings may have in all (each reading is searched for every alias). A real
+# path has a few readings of a few hundred characters at most; a value that
+# needs more is denied rather than read in part.
 _MAX_ALIAS_READINGS = 64
+_MAX_ALIAS_CHARS = 16 * 1024
 # On Linux, /proc/<process>/root, cwd, fd ... lead into another process's view of
 # the files (/dev/fd is /proc/self/fd), where a root can be reached by any name.
 # A path through them cannot be read with certainty.
@@ -324,7 +331,8 @@ class PathMatcher(Matcher):
     device name (CON, NUL, COM1...), a name ending in a dot or a space,
     wildcards, control characters, "~user", a path through /proc/<process>/root,
     cwd or fd or through /dev/fd, or more than MAX_PATH_CHARS characters.
-    deny_args also denies a value with more alias readings than _MAX_ALIAS_READINGS.
+    deny_args also denies a value with more alias readings than _MAX_ALIAS_READINGS,
+    or with readings longer than _MAX_ALIAS_CHARS characters in all.
 
     Readings. A value starting with "~/" is read as the home folder, as most
     tools read it; deny_args also checks it as a folder named "~". A "file:"
@@ -509,6 +517,8 @@ class PathMatcher(Matcher):
 
         For deny_args: "C:\\Documents and Settings\\me\\.ssh" is "C:\\Users\\me\\.ssh",
         and on macOS "/private/etc" is "/etc". Extra readings can only add blocks.
+        The work is bounded: past _MAX_ALIAS_READINGS readings, or
+        _MAX_ALIAS_CHARS characters of readings searched, the value is _Unreadable.
         """
         if not self._windows:
             parts = path.split("/")
@@ -518,13 +528,25 @@ class PathMatcher(Matcher):
                 return [path, "/private" + path]
             return [path]
         names = [path]
+        seen = {path}
+        searched = 0
         for name in names:  # grows as it goes: an alias reached through another is read too
-            for alias, target in _WINDOWS_ALIAS_PATTERNS:
-                other = ntpath.normpath(alias.sub(lambda _: target, name + "\\"))
-                if other not in names:
+            searched += len(name)
+            if searched > _MAX_ALIAS_CHARS:
+                raise _Unreadable("it is too long to read through all of the system's folder aliases")
+            padded = name + "\\"
+            for alias, pattern, target in _WINDOWS_ALIAS_PATTERNS:
+                if alias not in padded:
+                    continue
+                changed = pattern.sub(lambda _: target, padded)
+                if changed == padded:  # the name is only there as the real folder, in Microsoft\Windows
+                    continue
+                other = ntpath.normpath(changed)
+                if other not in seen:
                     if len(names) >= _MAX_ALIAS_READINGS:
                         raise _Unreadable("it goes through more of the system's folder aliases than are followed")
                     names.append(other)
+                    seen.add(other)
         return names
 
     def _allow_key(self, path: str) -> str:
