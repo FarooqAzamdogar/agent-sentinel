@@ -746,6 +746,20 @@ class Policy:
             return self.default
         return max((rule.action for rule in rules), key=lambda action: _STRICTNESS[action])
 
+    def may_ask(self) -> bool:
+        """True if some call can be sent to a person: the default or a rule says "ask", a deny_args entry
+        has "action": "ask", a command section asks (ask_classes, or "unreadable": "ask" when it judges
+        any class), or a flow rule asks. For the notes of `hook install` and `wrap`."""
+        if self.default == "ask" or any(entry.action == "ask" for entry in self.deny_args):
+            return True
+        for rule in self.tools:
+            if rule.action == "ask" or any(entry.action == "ask" for entry in rule.deny_args):
+                return True
+            section = rule.command
+            if section is not None and (section.ask_classes or section.judges and section.unreadable == "ask"):
+                return True
+        return any(flow.action == "ask" for flow in self.flows)
+
     def tool_labels(self, tool: str) -> frozenset[str]:
         """The flow labels the policy gives `tool`: those of EVERY rule that matches it.
 

@@ -322,7 +322,7 @@ def _print_header(config: ConfigFile, client: str, settings: ProxySettings, poli
     warnings = policy.warnings()
     note = f"; {len(warnings)} warning(s): agent-sentinel validate {shown_path(policy_path)}" if warnings else ""
     print(f"Policy: {shown_path(policy_path)} (default {policy.default}, {len(policy.tools)} tool rule(s){note})")
-    if any(rule.action == "ask" for rule in policy.tools) or policy.default == "ask":
+    if policy.may_ask():
         print("  Its 'ask' rules are refused by the proxy unless it is started with an approver (--approve-with).")
     print(f"Each wrapped server logs to {shown_path(settings.audit)}")
     print(f"and keeps its tool pins in its own file in {shown_path(settings.pins_folder)}")

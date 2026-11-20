@@ -30,6 +30,13 @@ says which of these classes the command line falls into:
 PowerShell reads the typographic quotes (‘ ’ ‚ ‛ “ ” „) as quotes and the en
 dash, em dash and horizontal bar as "-"; so does this reader.
 
+Command texts kept for later are read as commands too: the text trap runs
+(trap 'curl x' EXIT runs at the end of the call), compgen -C and complete -C,
+and what an alias set in the same line stands for (Set-Alias x iwr; x ...,
+alias x='curl -s'), both where it is set and where it is used. A word with a
+Windows short name in it (CLAUDE~1, MCP~1.JSO) counts as a protected file when a
+command writes to it or changes into it.
+
 A command that cannot be read with certainty is "unreadable": an unclosed
 quote or $( ), a heredoc or here-string, ANSI-C quoting ($'...'), a program
 chosen at run time ($c args, PowerShell's & $c, & (...) and . (...)), a program
@@ -39,8 +46,8 @@ MAX_COMMAND_CHARS characters, deeper nesting than MAX_DEPTH, or a control
 character. The policy decides what happens to it (see CommandRule).
 
 This raises the bar; it is not a boundary. A shell can reach the same ends in
-ways no text reading follows: variables and aliases set earlier (c=curl in an
-earlier call), functions, scripts, python -c, node -e, Invoke-Expression of a
+ways no text reading follows: variables, aliases and functions set in an
+earlier call (c=curl), scripts, python -c, node -e, Invoke-Expression of a
 string built at run time, globs in arguments (cat .e*), and programs this list
 does not name. Nothing here runs anything or touches the file system or the network.
 """
@@ -154,6 +161,8 @@ class _Budget:
     def __init__(self) -> None:
         self.segments = 0
         self.pipelines = 0  # pipelines numbered so far: each gets its own number, nested ones too
+        # Aliases this command line sets, by (shell, lowercased name): what each stands for (Bash: a text).
+        self.aliases: dict[tuple[str, str], str] = {}
 
     def spend(self) -> None:
         self.segments += 1
@@ -256,8 +265,9 @@ class _Splitter:
         return not self.current or self.current[-1][-1:].isspace()
 
     def ends_with_redirection(self) -> bool:
-        """True if the current command's text ends with ">" (so a "&" next is part of >& or 2>&1)."""
-        return bool(self.current) and self.current[-1].endswith(">")
+        """True if the current command's text ends with a ">" operator (so a "&" next is part of >& or 2>&1,
+        and a "|" next of >|). An escaped "\\>" is a piece of its own, so it does not count."""
+        return bool(self.current) and self.current[-1] == ">"
 
     def nested(self, body: str, shell: str) -> None:
         """A command inside this one ($( ), backticks ...): its pipelines are read as pipelines of their own."""
@@ -334,6 +344,9 @@ class _BashSplitter(_Splitter):
                 i = n if end < 0 else end
             elif c in ";\n":
                 self.end_pipeline()
+                i += 1
+            elif c == "|" and self.ends_with_redirection():
+                self.push(c)  # >| (and 2>|) writes the file even under noclobber: a redirection, not a pipe
                 i += 1
             elif c == "|":
                 if nxt == "|":
@@ -549,6 +562,9 @@ class _PowerShellSplitter(_Splitter):
             elif c in ";\n":
                 self.end_pipeline()
                 i += 1
+            elif c == "|" and self.ends_with_redirection():
+                self.push(c)  # ">|" is not PowerShell's, which refuses the line; read as Bash's, it is a write
+                i += 1
             elif c == "|":
                 if nxt == "|":
                     self.end_pipeline()
@@ -724,6 +740,11 @@ def _redirections(tokens: list[str], attached: bool) -> tuple[list[str], list[st
 
 def _powershell_words(segment: str) -> tuple[list[str], list[str]]:
     """The words of one PowerShell simple command (quotes and backtick escapes removed), and its targets."""
+    return _redirections(_powershell_word_list(segment), attached=True)
+
+
+def _powershell_word_list(segment: str) -> list[str]:
+    """The words of a PowerShell text, quotes and backtick escapes removed (redirection operators kept)."""
     words: list[str] = []
     current: list[str] = []
     started = False
@@ -759,15 +780,18 @@ def _powershell_words(segment: str) -> tuple[list[str], list[str]]:
             i += 1
     if started:
         words.append("".join(current))
-    return _redirections(words, attached=True)
+    return words
 
 
 # ---- simple commands -----------------------------------------------------------------------
 
-# Words that start a Bash compound command or a group, and come before its first program.
-# ("time" is a wrapper below, so that its option -p is not taken for the program.)
+# Words that start a Bash compound command or a group, and come before its first program; also after a
+# wrapper ("time { curl x; }", "time ! curl x"). "time" is a wrapper below, so that its -p is not taken for
+# the program. "function" is followed by the function's name, and "coproc" by the coprocess's name when a
+# compound command follows (coproc NAME { curl x; }): neither name is the program.
 _KEYWORDS = frozenset({"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "{", "}", "!",
                        "coproc", "[[", "]]", "function"})
+_COMPOUND_STARTS = frozenset({"{", "while", "until", "if", "for", "select", "case", "[["})
 # Commands whose words are not a program to run: a loop header lists values.
 _HEADERS = frozenset({"for", "select", "case", "in", "esac"})
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=")
@@ -809,7 +833,19 @@ _WRAPPERS: dict[str, frozenset[str]] = {
     "wsl": frozenset({"-d", "--distribution", "-u", "--user", "--cd", "--shell-type", "--distribution-id"}),
     "conhost": frozenset({"--width", "--height", "--signal", "--server", "--feature", "--vtmode"}),
     "winpty": frozenset(),
+    # Programs that run another one through a proxy, as another user or as a service.
+    "torsocks": frozenset({"-u", "-p", "-a", "-P", "--user", "--pass", "--address", "--port"}),
+    "proxychains": frozenset({"-f"}),
+    "proxychains4": frozenset({"-f"}),
+    "pkexec": frozenset({"--user"}),
+    "systemd-run": frozenset({
+        "-u", "--unit", "-p", "--property", "-E", "--setenv", "-M", "--machine", "-H", "--host", "--uid", "--gid",
+        "--nice", "--slice", "--description", "--working-directory", "--path-property", "--socket-property",
+        "--timer-property", "--service-type", "--on-active", "--on-boot", "--on-startup", "--on-unit-active",
+        "--on-unit-inactive", "--on-calendar"}),
 }
+# PowerShell's Start-Process (and saps, start): read by _start_process, which knows its parameters.
+_LAUNCHERS = frozenset({"start-process", "saps"})
 # Wrappers followed by one word that is not the program: timeout's duration, chroot's root, flock's lock file.
 _WRAPPERS_WITH_A_VALUE = frozenset({"timeout", "chroot", "flock"})
 # Wrappers whose options start with "/" (cmd's start, runas).
@@ -819,7 +855,7 @@ _SLASH_OPTION_WRAPPERS = frozenset({"start", "runas"})
 _CHDIR_OPTIONS = {
     "env": ("-C", "--chdir"), "sudo": ("-D", "--chdir"), "wsl": ("--cd",), "git": ("-C",),
     "make": ("-C", "--directory"), "start": ("/d",), "start-process": ("-workingdirectory",),
-    "saps": ("-workingdirectory",),
+    "saps": ("-workingdirectory",), "systemd-run": ("--working-directory",),
 }
 _CASELESS_OPTIONS = frozenset({"start", "start-process", "saps"})
 _STRIPPED_EXTENSIONS = (".exe", ".cmd", ".bat", ".ps1")
@@ -876,10 +912,7 @@ def _simple_commands(words: list[str], targets: list[str], shell: str, pipeline:
     rest = list(words)
     if shell == "powershell":
         rest = _powershell_statement(rest)
-    while rest and (_ASSIGNMENT.match(rest[0]) and shell == "bash" or rest[0] in _KEYWORDS):
-        rest.pop(0)
-        if shell == "powershell" and rest and rest[0] == _GROUP:
-            rest.pop(0)  # the condition of if ( ... ) or while ( ... ), read as commands of its own
+    rest = _strip_keywords(rest, shell)
 
     chdir: list[str] = []
     fed: str | None = None
@@ -891,11 +924,11 @@ def _simple_commands(words: list[str], targets: list[str], shell: str, pipeline:
 
     if not rest:
         return [command("", [])] if targets or groups else []
-    if rest[0] in _HEADERS:
-        return [command("", rest[1:])]
     peeled = 0
     while rest:
         word = rest[0]
+        if word in _HEADERS:
+            return [command("", rest[1:])]
         if shell == "powershell" and peeled == 0 and (word[:1] in ("$", "[", "@") or word == _GROUP):
             # An expression ($x.Method(), [Type]::Call(), (...).Length), not a program to run.
             return [command("", rest)]
@@ -905,7 +938,7 @@ def _simple_commands(words: list[str], targets: list[str], shell: str, pipeline:
             name = "start-process"  # in PowerShell, start is Start-Process
         if name not in _WRAPPERS or peeled >= _MAX_WRAPPERS or (name == "." and shell != "powershell"):
             break
-        found = _after_wrapper(name, rest[1:])
+        found = _start_process(rest[1:]) if name in _LAUNCHERS else _after_wrapper(name, rest[1:])
         if found is None:  # "env" alone, "command -v curl": the wrapper is the program
             break
         rest, options = found
@@ -914,6 +947,7 @@ def _simple_commands(words: list[str], targets: list[str], shell: str, pipeline:
             fed = _placeholder(name, options)
         relined = relined or name == "wsl" and not any(option.lower() in ("-e", "--exec") for option in options)
         peeled += 1
+        rest = _strip_keywords(rest, shell, after_wrapper=True)  # time { curl x; }, time ! curl x
     if not rest:
         return []
     program = _program_name(rest[0])
@@ -922,6 +956,25 @@ def _simple_commands(words: list[str], targets: list[str], shell: str, pipeline:
     elif program == "make":
         chdir.extend(_chdir_values(program, rest[1:]))
     return [command(program, rest[1:], rest[0])]
+
+
+def _strip_keywords(rest: list[str], shell: str, after_wrapper: bool = False) -> list[str]:
+    """Drop the keywords, assignments and names before a command's program: "! time { curl x" runs curl, and
+    so do "function f { curl x" and "coproc NAME { curl x" (when f or NAME runs).
+
+    After a wrapper, an assignment with a space in it is kept: it is a quoted
+    command text (watch 'A=1 curl x', env -S 'A=1 curl x'), read as a command line.
+    """
+    while rest and (rest[0] in _KEYWORDS or shell == "bash" and _ASSIGNMENT.match(rest[0]) and not (
+            after_wrapper and any(ch.isspace() for ch in rest[0]))):
+        keyword = rest.pop(0)
+        if keyword == "function" and rest:
+            rest.pop(0)  # the function's name
+        elif keyword == "coproc" and len(rest) > 1 and rest[1] in _COMPOUND_STARTS:
+            rest.pop(0)  # the coprocess's name
+        if shell == "powershell" and rest and rest[0] == _GROUP:
+            rest.pop(0)  # the condition of if ( ... ) or while ( ... ), read as commands of its own
+    return rest
 
 
 def _leading_options(words: list[str], with_value: frozenset[str]) -> list[str]:
@@ -987,8 +1040,8 @@ def _after_wrapper(name: str, words: list[str]) -> tuple[list[str], list[str]] |
     while i < len(words):
         word = words[i]
         lowered = word.lower()
-        if name == "env" and _ASSIGNMENT.match(word):
-            i += 1
+        if name in ("env", "sudo") and _ASSIGNMENT.match(word):
+            i += 1  # env A=1 curl, sudo A='x y' curl: settings for the program
         elif name == "env" and (word in ("-S", "--split-string") or word.startswith(("-S", "--split-string="))):
             # env -S 'curl x' splits the text into the program and its words.
             if word in ("-S", "--split-string"):
@@ -1010,16 +1063,110 @@ def _after_wrapper(name: str, words: list[str]) -> tuple[list[str], list[str]] |
     return (words[i:], words[:i]) if words[i:] else None
 
 
+# PowerShell cmdlets whose parameters the reader needs: those that take a value and the switches. PowerShell
+# also takes any unambiguous start of a name (-Arg, -Wo) and an alias (-Args); and every cmdlet has the
+# common parameters.
+_START_PROCESS_PARAMETERS = (
+    frozenset({"filepath", "argumentlist", "credential", "workingdirectory", "verb", "windowstyle",
+               "redirectstandardoutput", "redirectstandardinput", "redirectstandarderror", "environment"}),
+    frozenset({"loaduserprofile", "nonewwindow", "passthru", "wait", "usenewenvironment"}),
+)
+_SET_ALIAS_PARAMETERS = (frozenset({"name", "value", "description", "option", "scope"}),
+                         frozenset({"passthru", "force"}))
+_CMDLET_PARAMETERS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
+    "start-process": _START_PROCESS_PARAMETERS, "saps": _START_PROCESS_PARAMETERS,
+    "set-alias": _SET_ALIAS_PARAMETERS, "sal": _SET_ALIAS_PARAMETERS, "new-alias": _SET_ALIAS_PARAMETERS,
+    "nal": _SET_ALIAS_PARAMETERS,
+}
+_COMMON_VALUES = frozenset({"erroraction", "warningaction", "informationaction", "errorvariable", "warningvariable",
+                            "informationvariable", "outvariable", "outbuffer", "pipelinevariable", "progressaction"})
+_COMMON_SWITCHES = frozenset({"verbose", "debug", "whatif", "confirm"})
+_PARAMETER_ALIASES = {
+    "path": "filepath", "pspath": "filepath", "args": "argumentlist", "rso": "redirectstandardoutput",
+    "rsi": "redirectstandardinput", "rse": "redirectstandarderror", "lup": "loaduserprofile", "nnw": "nonewwindow",
+    "ea": "erroraction", "wa": "warningaction", "infa": "informationaction", "ev": "errorvariable",
+    "wv": "warningvariable", "iv": "informationvariable", "ov": "outvariable", "ob": "outbuffer",
+    "pv": "pipelinevariable", "proga": "progressaction", "vb": "verbose", "db": "debug", "wi": "whatif",
+    "cf": "confirm",
+}
+# A word PowerShell reads as a parameter: -Name, or -Name:value. A quoted "-c iwr x" has a space and a
+# quoted list '-c','iwr' a comma, so they are values.
+_PARAMETER = re.compile(r"-([A-Za-z]\w*)(:.*)?", re.DOTALL)
+
+
+def _cmdlet_arguments(cmdlet: str, words: list[str]) -> tuple[dict[str, list[str]], list[str]]:
+    """A PowerShell cmdlet's named values, by full parameter name (switches left out), and its positional words.
+    A parameter it does not have, or the start of two names (-W), makes the command unreadable."""
+    values, switches = _CMDLET_PARAMETERS[cmdlet]
+    values, switches = values | _COMMON_VALUES, switches | _COMMON_SWITCHES
+    named: dict[str, list[str]] = {}
+    positional: list[str] = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        i += 1
+        found = _PARAMETER.fullmatch(word)
+        if found is None:
+            positional.append(word)
+            continue
+        parameter = _parameter_name(cmdlet, found.group(1).lower(), values | switches)
+        if parameter in switches:
+            continue
+        if found.group(2) is not None:
+            value = found.group(2)[1:]
+        elif i < len(words):
+            value, i = words[i], i + 1
+        else:
+            value = ""  # PowerShell refuses a parameter without its value
+        named.setdefault(parameter, []).append(value)
+    return named, positional
+
+
+def _parameter_name(cmdlet: str, name: str, known: frozenset[str]) -> str:
+    if name in known:
+        return name
+    if _PARAMETER_ALIASES.get(name) in known:
+        return _PARAMETER_ALIASES[name]
+    matches = [full for full in known if full.startswith(name)]
+    if len(matches) != 1:
+        raise Unreadable(f"{cmdlet} is given a parameter that cannot be placed with certainty (-{name[:40]})")
+    return matches[0]
+
+
+def _start_process(words: list[str]) -> tuple[list[str], list[str]] | None:
+    """Start-Process's program, with the words it hands that program, and its -WorkingDirectory (as options).
+
+    The program's words are its -ArgumentList values and the positional words
+    after the program, joined with spaces as Start-Process joins them (a list
+    'a','b' too) and split again, as the started program splits its command
+    line: so "Start-Process pwsh -ArgumentList '-c iwr x'" runs "pwsh -c iwr x".
+    None when it names no program.
+    """
+    named, positional = _cmdlet_arguments("start-process", words)
+    program = named["filepath"][-1] if "filepath" in named else positional.pop(0) if positional else ""
+    if not program:
+        return None
+    arguments = [*positional, *named.get("argumentlist", [])]
+    split = _powershell_word_list(" ".join(arguments).replace(",", " ")) if arguments else []
+    folders = [part for folder in named.get("workingdirectory", []) for part in ("-workingdirectory", folder)]
+    return [program, *split], folders
+
+
 def _inner_commands(command: _Command, budget: _Budget, depth: int) -> Iterator[_Command]:
     """Commands that this one runs from its words: bash -c, pwsh -Command, cmd /c, find -exec, a quoted program,
-    the words wsl hands to its Linux shell, git settings that are commands, parallel ::: 'command'."""
+    the words wsl hands to its Linux shell, git settings that are commands, parallel ::: 'command', the text
+    trap keeps; and the aliases this command line sets: what an alias stands for, and where it is used."""
     program, words = command.program, list(command.words)
     quoted_text = any(ch.isspace() for ch in command.written)
     call = _shell_call(program, words)
     texts = [text for text, _ in call.texts] if call else []
     git_texts = _git_command_texts(words) if program == "git" else []
+    kept = _kept_texts(command)
+    definitions = _alias_definitions(command)
+    expansion = budget.aliases.get((command.shell, program)) if program else None
     if depth + 1 > MAX_DEPTH:
-        if texts or git_texts or program in ("find", ":::") or quoted_text or command.relined:
+        if (texts or git_texts or kept or definitions or expansion is not None or program in ("find", ":::")
+                or quoted_text or command.relined):
             raise Unreadable("it nests commands more deeply than is followed")
         return
     for text, shell in call.texts if call else ():
@@ -1029,6 +1176,24 @@ def _inner_commands(command: _Command, budget: _Budget, depth: int) -> Iterator[
             yield from _read(text, shell, budget, depth + 1)
     for text in git_texts:
         yield from _read(text, "bash", budget, depth + 1)
+    for text in kept:
+        if _SUBST not in text:  # trap "$(curl ...)" EXIT is obfuscation, as sh -c "$(...)" is
+            yield from _read(text, "bash", budget, depth + 1)
+    if expansion is not None:
+        # x https://y after Set-Alias x iwr (or Bash's alias x=curl): read as what the alias stands for, with
+        # the same words. The command as written is kept too (Bash expands an alias only when told to). As in
+        # the shells, an alias is not expanded again inside its own text (alias ls='ls --color').
+        key = (command.shell, program)
+        del budget.aliases[key]
+        try:
+            yield from _read(_alias_line(expansion, words, command.shell), command.shell, budget, depth + 1)
+        finally:
+            budget.aliases[key] = expansion
+    for name, value in definitions:
+        # What the alias stands for counts at once, whether or not the line uses it.
+        budget.aliases[(command.shell, name.lower())] = value
+        yield from _read(value if command.shell == "bash" else _alias_line(value, [], "powershell"),
+                         command.shell, budget, depth + 1)
     if program == ":::":  # parallel ::: 'curl x' 'wget y' runs each word as a command line
         for word in words:
             yield from _read(word, "bash", budget, depth + 1)
@@ -1059,6 +1224,82 @@ def _quoted(word: str, shell: str) -> str:
     if shell == "powershell":
         return "'" + word.replace("'", "''") + "'"
     return "'" + word.replace("'", "'\\''") + "'"
+
+
+def _alias_line(expansion: str, words: list[str], shell: str) -> str:
+    """The command line an alias use stands for: a Bash alias is text put in place of its name; a PowerShell
+    alias names a command, called here with the call operator (& 'iwr' 'https://x')."""
+    quoted = [_quoted(word, shell) for word in words]
+    if shell == "bash":
+        return " ".join([expansion, *quoted])
+    return " ".join(["&", _quoted(expansion, shell), *quoted])
+
+
+# Bash builtins that keep a command text and run it later: trap runs its text when the signal comes (EXIT: when
+# the shell ends, at the end of every call); compgen -C runs its text at once, complete -C at a completion.
+_COMPLETERS = frozenset({"complete", "compgen"})
+_COMPLETE_VALUE_LETTERS = "oAGWFXPSC"  # their options that take a value; -C's is a command text
+_ALIAS_SETTERS = frozenset({"set-alias", "sal", "new-alias", "nal"})
+_ITEM_SETTERS = frozenset({"set-item", "si", "new-item", "ni"})
+
+
+def _kept_texts(command: _Command) -> list[str]:
+    """The command texts a Bash builtin keeps to run later: trap 'curl x' EXIT, complete -C 'curl x' y."""
+    if command.shell != "bash":
+        return []
+    words = list(command.words)
+    if command.program == "trap":
+        i = 0
+        while i < len(words) and words[i][:1] == "-" and words[i] != "-":
+            i += 1
+            if words[i - 1] == "--":
+                break
+        # The first word left is the text (trap - EXIT and trap '' INT set none); the rest name signals.
+        return [words[i]] if i < len(words) and words[i] not in ("", "-") else []
+    if command.program not in _COMPLETERS:
+        return []
+    texts = []
+    i = 0
+    while i < len(words) and words[i][:1] == "-" and words[i] not in ("-", "--"):
+        word = words[i]
+        i += 1
+        for at, letter in enumerate(word[1:]):
+            if letter in _COMPLETE_VALUE_LETTERS:
+                value = word[2 + at:]
+                if not value and i < len(words):
+                    value, i = words[i], i + 1
+                if letter == "C" and value:
+                    texts.append(value)
+                break
+    return texts
+
+
+def _alias_definitions(command: _Command) -> list[tuple[str, str]]:
+    """The aliases a command sets, as (name, what it stands for): Bash's alias x='curl -s', PowerShell's Set-Alias
+    x iwr (also sal, New-Alias, nal, with -Name and -Value). PowerShell uses an alias at once, even later in the
+    same line. An alias set to a program chosen when the command runs, or through the alias: drive, makes the
+    command unreadable."""
+    program, words = command.program, list(command.words)
+    if command.shell == "bash":
+        if program != "alias":
+            return []
+        found = []
+        for word in words:
+            name, equals, value = word.partition("=")
+            if equals and name and not name.startswith("-"):
+                found.append((name, value))
+        return found
+    if program in _ITEM_SETTERS and any("alias:" in word.lower() for word in (*words, *command.groups)):
+        raise Unreadable("an alias is set through PowerShell's alias: drive")
+    if program not in _ALIAS_SETTERS:
+        return []
+    named, positional = _cmdlet_arguments(program, words)
+    name = named["name"][-1] if "name" in named else positional.pop(0) if positional else ""
+    value = named["value"][-1] if "value" in named else positional.pop(0) if positional else ""
+    if not name or not value:
+        return []
+    _check_program_word(value, "powershell")  # Set-Alias x $c: chosen when the command runs
+    return [(name, value)]
 
 
 _BASH_FAMILY = frozenset({"bash", "sh", "rbash"})
@@ -1308,6 +1549,18 @@ _NETWORK_PROGRAMS = frozenset({
     "resolve-dnsname", "test-netconnection", "tnc", "iwr", "irm", "invoke-webrequest", "invoke-restmethod",
     "start-bitstransfer", "bitsadmin", "send-mailmessage", "gh", "http", "https", "xh",
 })
+# Programs that open what they are given in a browser or a mail client: given a URL, they send a request
+# that carries whatever its path and query hold (explorer https://x/?q=<secret>).
+_URL_OPENERS = frozenset({
+    "invoke-item", "ii", "explorer", "xdg-open", "open", "wslview", "sensible-browser", "x-www-browser",
+    "www-browser", "gio", "kde-open", "gnome-open", "rundll32", "msedge", "chrome", "firefox", "brave", "iexplore",
+})
+_URL_WORD = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://|mailto:)", re.IGNORECASE)
+
+
+def _opens_url(word: str) -> bool:
+    """True for a URL a browser or mail client sends a request for (not a file: URL)."""
+    return bool(_URL_WORD.match(word)) and not word.lower().startswith("file:")
 # Programs that download, for "a download piped to a shell".
 _DOWNLOADERS = frozenset({"curl", "wget", "wget2", "aria2c", "iwr", "irm", "invoke-webrequest", "invoke-restmethod",
                           "http", "https", "xh", "certutil", "bitsadmin"})
@@ -1416,6 +1669,11 @@ _PROTECTED_TARGET = re.compile(
     r"(^|[\s\\/:@='\"`<>|;&(,{])\.(claude|cursor|codeium|gemini|codex|agent-sentinel)([\\/]|$)",
     re.IGNORECASE,
 )
+# A part of a path that is a Windows short (8.3) name: CLAUDE~1, SETTIN~1.JSO, MCP~1.JSO, GIT~1. Windows
+# opens the long name it stands for (.claude, settings.json ...), which the patterns cannot see, so a write
+# to one, or a change into one, counts as protected (the path matcher refuses such names for the same
+# reason). Only the words a command writes to or changes into are looked at: git log HEAD~1 is not.
+_SHORT_NAME = re.compile(r"(^|[\\/:])[^\\/:.~\s]{1,8}~[0-9]{1,6}(\.[^\\/:.~\s]{1,3})?([\\/]|$)")
 
 # The host part of a URL, and a word that is a host name (with a user, a port or an scp path).
 _URL_HOST = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://(?:[^/?#@\s]*@)?([^/?#:\s]*)")
@@ -1545,12 +1803,19 @@ def _network(command: _Command, earlier: list[_Command]) -> str | None:
         return f"program '{program}'"
     if program == "certutil" and any(word.lstrip("-/").lower() in ("urlcache", "verifyctl") for word in words):
         return "program 'certutil' with -urlcache"
+    if _opens_url(command.written):
+        return f"it opens '{command.written}'"  # PowerShell's start https://x, cmd's start https://x
+    if program in _URL_OPENERS and any(_opens_url(word) for word in words):
+        return f"program '{program}' opens a URL"
     if program == "git":
         positional = _positional(words, _GIT_OPTIONS_WITH_VALUE)
         if positional and positional[0].lower() in _GIT_NETWORK:
             return f"'git {positional[0].lower()}'"
-        if positional[:2] in (["remote", "update"], ["submodule", "update"]):
+        if positional[:2] in (["remote", "update"], ["submodule", "update"], ["submodule", "add"]) or (
+                positional[:1] == ["lfs"] and positional[1:2] in (["push"], ["pull"], ["fetch"], ["clone"])):
             return f"'git {' '.join(positional[:2])}'"
+        if positional[:1] == ["archive"] and any(word.startswith("--remote") for word in words):
+            return "'git archive --remote'"
     if program in ("npm", "pnpm", "yarn") and _subcommand(words) in ("publish", "unpublish"):
         return f"'{program} {_subcommand(words)}'"
     for word in (*words, *command.targets):
@@ -1608,6 +1873,9 @@ def _install(command: _Command, earlier: list[_Command]) -> str | None:
         positional = [word.lower() for word in _positional(words)]
         if positional[:2] in (["pip", "install"], ["tool", "install"], ["tool", "run"]) or positional[:1] == ["add"]:
             return f"'uv {' '.join(positional[:2])}'"
+        if positional[:1] == ["run"] and any(word == "--with" or word.startswith(("--with=", "--with-"))
+                                             for word in words):
+            return "'uv run --with'"  # installs the packages it names before running
     if program in _INTERPRETERS and any(other.program in _DOWNLOADERS for other in earlier):
         return f"a download piped to '{program}'"
     return None
@@ -1657,9 +1925,14 @@ def _secret_read(command: _Command, earlier: list[_Command]) -> str | None:
 
 
 def _protected(word: str) -> bool:
-    """True if a word a command writes to names an agent's configuration, a credential file or $PROFILE."""
-    return any(_PROTECTED_TARGET.search(spelling) or _PROFILE_VARIABLE.match(spelling)
+    """True if a word a command writes to (or changes into) names an agent's configuration, a credential file
+    or $PROFILE, or has a Windows short name in it, which may stand for any of them."""
+    return any(_PROTECTED_TARGET.search(spelling) or _PROFILE_VARIABLE.match(spelling) or _SHORT_NAME.search(spelling)
                for spelling in _spellings(word))
+
+
+def _short_note(word: str) -> str:
+    return " (a Windows short name, which may stand for any file)" if _SHORT_NAME.search(word) else ""
 
 
 def _write_targets(words: Iterable[str]) -> Iterator[str]:
@@ -1677,7 +1950,7 @@ def _write_targets(words: Iterable[str]) -> Iterator[str]:
 def _config_write(command: _Command, earlier: list[_Command]) -> str | None:
     for target in command.targets:
         if _protected(target):
-            return f"a redirection to '{target}'"
+            return f"a redirection to '{target}'{_short_note(target)}"
     program, words = command.program, command.words
     writes = program in _PROGRAM_WRITERS or (
         program in _IN_PLACE_EDITORS and any(word.startswith(("-i", "--in-place", "-pi")) for word in words)) or (
@@ -1686,7 +1959,7 @@ def _config_write(command: _Command, earlier: list[_Command]) -> str | None:
     if writes:
         for word in (*_write_targets(words), *command.groups):
             if _protected(word):
-                return f"program '{program or command.written}' with '{word}'"
+                return f"program '{program or command.written}' with '{word}'{_short_note(word)}"
     return None
 
 
@@ -1706,10 +1979,15 @@ def _obfuscation(command: _Command, earlier: list[_Command]) -> str | None:
         if any(_SUBST in text for text in texts) or program in _POSIX_SHELLS and any(
                 "$(" in text or "`" in text for text in texts):
             return f"program '{program}' with a command substitution in the command it runs"
+        if any(_GROUP in text for text in texts):
+            # pwsh -c ('iw'+'r x'), Start-Process pwsh -ArgumentList ('-c ...'): a text built when it runs.
+            return f"program '{program}' runs a text built by a PowerShell expression"
         if call.stdin and command.position > 0:
             return f"text piped into '{program}', which runs it"
         if command.fed is not None and (call.missing or command.fed and any(command.fed in text for text in texts)):
             return f"text from its input run by '{program}' (xargs or parallel)"
+    if any(_SUBST in text for text in _kept_texts(command)):
+        return f"program '{program}' keeps a command's output to run later"
     if command.position > 0 and (_language_reads_input(command) or program == "parallel"):
         return f"text piped into '{program}', which runs it"
     if _script_of(command) == _SUBST:

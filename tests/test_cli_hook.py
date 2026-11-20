@@ -125,6 +125,17 @@ class PrintingTheSnippet(InstallTest):
         self.assertIn("the policy blocks Claude Code's own tools Glob, Grep, Edit, Write", out)
         self.assertIn("Its 'ask' rules show Claude Code's own permission prompt", out)
 
+    def test_the_ask_note_counts_asks_from_command_checks(self):
+        # Every rule allows, but the Bash command section asks: bypassPermissions still refuses those calls.
+        self.policy.write_text(json.dumps({"tools": {"Bash": {"action": "allow",
+                                                              "command": {"ask_classes": ["network"]}}}}),
+                               encoding="utf-8")
+        _, out, _ = self.install()
+        self.assertIn("Its 'ask' rules show Claude Code's own permission prompt", out)
+        self.policy.write_text(json.dumps({"tools": {"Bash": "allow"}}), encoding="utf-8")
+        _, out, _ = self.install()
+        self.assertNotIn("Its 'ask' rules", out)
+
     def test_a_policy_that_does_not_load_stops_it(self):
         self.policy.write_text('{"default": "deny"}', encoding="utf-8")
         code, out, err = self.install()

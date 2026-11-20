@@ -114,8 +114,13 @@ SECRET_ROOTS = ("~/.ssh", "~/.aws", "~/.agent-sentinel")
 #     environment variable names without case;
 #   * Windows' own ways of setting a variable, where case never matters: setx,
 #     $env:NAME = ..., PowerShell's env: drive (Set-Item env:NAME) and
-#     [Environment]::SetEnvironmentVariable('NAME', ...).
+#     [Environment]::SetEnvironmentVariable('NAME', ...);
+#   * a name with a plain letter, digit, "_" or "." written as an escape that
+#     the program reading the file decodes (JSON's, and YAML's and TOML's,
+#     _ or \U0000005f), right before ":" or "=": "chat.tools.autoApprove":
+#     and NODE_OPTIONS=. Ordinary files have no reason to escape those.
 _ANY_CASE_SETTING = r"\w*_base_url|node_options"
+_ESCAPED_PLAIN = r"\\(u00|U000000)"  # then two hex digits
 CONTROL_SETTING_PATTERN = (
     r"(?<![\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\w*_base_url|node_options"
     r"|chat\.tools\.(global\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)"
@@ -124,6 +129,8 @@ CONTROL_SETTING_PATTERN = (
     r"|\$\{?env:(" + _ANY_CASE_SETTING + r")\}?\s*\+?="
     r"|(?<![\w$:{])env:[\\/]?(" + _ANY_CASE_SETTING + r")\b"
     r"|SetEnvironmentVariable\s*\(\s*" + _QUOTE + r"?(" + _ANY_CASE_SETTING + r")\b"
+    r"|" + _ESCAPED_PLAIN + r"(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])"
+    r"([\w.]|" + _ESCAPED_PLAIN + r"[0-9a-f]{2}){0,80}" + _QUOTE + r"?\s*[:=]"
 )
 
 # A value that starts with "-" can be read as an option by a program the tool
