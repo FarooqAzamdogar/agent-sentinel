@@ -71,6 +71,8 @@ from .policy_errors import (
     unknown_keys_message,
 )
 from .session import BUILTIN_LABELS, SINK, UNTRUSTED, SessionMarks, is_label
+from .session import MAX_COUNTERS as SESSION_MAX_COUNTERS
+from .session import MAX_DISTINCT_VALUES as SESSION_MAX_VALUES
 from .textutil import printable, texts_in
 
 ACTIONS = ("allow", "ask", "block")
@@ -920,6 +922,7 @@ class Policy:
         found.extend(_missing_root_warnings(self))
         found.extend(_flow_warnings(self))
         found.extend(_injection_warnings(self))
+        found.extend(_session_limit_warnings(self))
         found.extend(_client_request_warnings(self))
         found.extend(known_value_warnings(self))
         return found
@@ -1392,6 +1395,34 @@ def _injection_warnings(policy: Policy) -> list[str]:
     for where, label in marks:
         if label not in used:
             found.append(f"{where}: no flow rule has '{label}' in its 'after', so this mark changes nothing")
+    return found
+
+
+def _session_limit_warnings(policy: Policy) -> list[str]:
+    """Warn about session limits a session cannot keep counting: past the bounds of session.py, calls are refused.
+
+    A max_distinct set never holds more than its "max" (the call that would
+    pass it is refused and not counted), and each rule id has one counter or
+    set (a wildcard rule shares one), so these sums are what a session can
+    come to hold at most.
+    """
+    distinct = [*policy.max_distinct, *(entry for rule in policy.tools for entry in rule.max_distinct)]
+    counters = [policy.max_calls_per_session, policy.max_sink_bytes_per_session]
+    counters += [rule.max_calls_per_session for rule in policy.tools]
+    found = []
+    values = sum(entry.max for entry in distinct)
+    if values > SESSION_MAX_VALUES:
+        found.append(
+            f"the max_distinct limits add up to {values} values, more than the {SESSION_MAX_VALUES} a session can "
+            "keep: once it holds that many, every call they count is refused (rule 'session') before its own limit "
+            "is reached; lower their 'max'"
+        )
+    used = sum(1 for limit in counters if limit is not None)
+    if used > SESSION_MAX_COUNTERS or len(distinct) > SESSION_MAX_COUNTERS:
+        found.append(
+            f"the policy has more session limits than the {SESSION_MAX_COUNTERS} counters (and sets of values) a "
+            "session can keep: once they are all in use, every call they count is refused (rule 'session')"
+        )
     return found
 
 

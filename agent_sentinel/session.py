@@ -33,10 +33,16 @@ agent nothing.
 Other session state
 -------------------
 A session also keeps (`SessionState`): the end of the text last delivered on
-each channel (the "tail", at most TAIL_CHARS characters, which the next
-result is read together with, see tail_scan.py), the counts of the policy's
-session limits, and the asks a person refused (approval memory). Values and
-calls are kept as hashes, never as text. Everything has a fixed bound.
+each channel (the "tail", which the next result is read together with, see
+tail_scan.py), the counts of the policy's session limits, and the asks a
+person refused (approval memory). The values and calls the limits and the
+approval memory count are kept as hashes, never as text. The tail is TEXT:
+up to TAIL_TEXTS ends of TAIL_CHARS characters each, cut from what the
+agent read (with the secrets the firewall's guard knows replaced). So in
+hook mode the session file holds the end of the last tool output in clear
+text; like every file agent-sentinel writes, it can be read by its owner
+only on POSIX (0600), and on Windows it has the permissions of its folder.
+Everything has a fixed bound.
 
 Stores
 ------
@@ -65,7 +71,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Iterable, Iterator, Mapping, TypeVar
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, TypeVar
 
 from . import jsonutil
 from .filelock import locked, replace_file
@@ -87,8 +93,10 @@ MAX_CAUSE_TEXT_CHARS = 100  # the server and the channel of a mark's cause
 MAX_SESSION_ID_CHARS = 256
 MAX_STATE_FILE_BYTES = 1024 * 1024
 
-# The tail: how much of the end of the text last delivered is kept, per channel.
+# The tail: how much of the end of the text last delivered is kept, per channel: up to TAIL_TEXTS texts
+# (tail_scan.py keeps one for each kind of the detector's matching views) of TAIL_CHARS characters each.
 TAIL_CHARS = 512
+TAIL_TEXTS = 8
 TAIL_CHANNELS = ("result", "notification")
 # Bounds on the rest of the session state (SessionState). Past the first three the
 # session limits refuse the call (they cannot count it); the last two forget the oldest.
@@ -98,6 +106,9 @@ MAX_COUNT = 10**15  # the largest count (calls or bytes)
 MAX_IDENTICAL_KEYS = 2_000  # different calls counted for max_identical_calls
 MAX_REFUSALS = 1_000  # refused asks remembered
 _HASH = re.compile(r"[0-9a-f]{32}")
+
+# A tail as Decision.tail and add_marks pass it: (channel, the texts kept for it).
+ChannelTail = tuple[str, Sequence[str]]
 
 FILE_FORMAT = "agent-sentinel-session"
 FILE_VERSION = 2
@@ -251,8 +262,9 @@ class SessionMarks:
 class SessionState:
     """What a session keeps besides its marks. Plain data; a store hands out copies.
 
-    tails:     channel ("result" or "notification") -> at most TAIL_CHARS characters: the
-               end of the text the model read on it, runs of blanks as one (see tail_scan.py).
+    tails:     channel ("result" or "notification") -> a list of at most TAIL_TEXTS texts of
+               at most TAIL_CHARS characters: the end of the text the model read on it, in
+               each kind of the detector's views (see tail_scan.py).
     counts:    counter of a session limit (a hash of its name) -> calls or bytes counted.
     distinct:  set of a max_distinct limit (a hash of its name) -> hashes of the values seen.
     identical: hash of a call (tool and arguments) -> how many times it was made;
@@ -261,7 +273,7 @@ class SessionState:
                ask a person refused, oldest first.
     """
 
-    tails: dict[str, str] = field(default_factory=dict)
+    tails: dict[str, list[str]] = field(default_factory=dict)
     counts: dict[str, int] = field(default_factory=dict)
     distinct: dict[str, list[str]] = field(default_factory=dict)
     identical: dict[str, int] = field(default_factory=dict)
@@ -269,15 +281,17 @@ class SessionState:
 
     def copy(self) -> "SessionState":
         return SessionState(
-            dict(self.tails), dict(self.counts), {key: list(values) for key, values in self.distinct.items()},
-            dict(self.identical), [list(entry) for entry in self.refusals],
+            {channel: list(texts) for channel, texts in self.tails.items()}, dict(self.counts),
+            {key: list(values) for key, values in self.distinct.items()}, dict(self.identical),
+            [list(entry) for entry in self.refusals],
         )
 
     def as_json(self) -> dict[str, Any]:
         """The state as the session file holds it."""
         return {
-            "tails": dict(self.tails), "counts": dict(self.counts), "distinct": dict(self.distinct),
-            "identical": dict(self.identical), "refusals": [list(entry) for entry in self.refusals],
+            "tails": {channel: list(texts) for channel, texts in self.tails.items()}, "counts": dict(self.counts),
+            "distinct": dict(self.distinct), "identical": dict(self.identical),
+            "refusals": [list(entry) for entry in self.refusals],
         }
 
     @classmethod
@@ -293,9 +307,8 @@ class SessionState:
         tails, counts, distinct, identical, refusals = (
             self.tails, self.counts, self.distinct, self.identical, self.refusals
         )
-        if not isinstance(tails, dict) or any(
-            channel not in TAIL_CHANNELS or not isinstance(text, str) or len(text) > TAIL_CHARS
-            for channel, text in tails.items()
+        if not isinstance(tails, dict) or not all(
+            channel in TAIL_CHANNELS and _valid_tail(texts) for channel, texts in tails.items()
         ):
             return "a tail is malformed"
         if not _counter_map(counts, MAX_COUNTERS, lowest=0):
@@ -322,6 +335,12 @@ class SessionState:
 
 def _is_hash(value: Any) -> bool:
     return isinstance(value, str) and _HASH.fullmatch(value) is not None
+
+
+def _valid_tail(texts: Any) -> bool:
+    return isinstance(texts, list) and len(texts) <= TAIL_TEXTS and all(
+        isinstance(text, str) and len(text) <= TAIL_CHARS for text in texts
+    )
 
 
 def _whole(value: Any) -> bool:
@@ -369,8 +388,8 @@ class SessionStore:
     def add(self, labels: Iterable[str], tool: str) -> SessionMarks:
         raise NotImplementedError
 
-    def add_marks(self, marks: Iterable[Mark], tail: tuple[str, str] | None = None) -> SessionMarks:
-        """Record marks, each with its own cause, and (channel, text) as that channel's tail."""
+    def add_marks(self, marks: Iterable[Mark], tail: ChannelTail | None = None) -> SessionMarks:
+        """Record marks, each with its own cause, and (channel, texts) as that channel's tail."""
         by_cause: dict[str, list[str]] = {}
         for mark in _checked_marks(marks):
             by_cause.setdefault(mark.tool, []).append(mark.label)
@@ -386,13 +405,17 @@ class SessionStore:
         raise SessionStateError("this session store keeps no session state")
 
 
-def _checked_tail(tail: tuple[str, str] | None) -> tuple[str, str] | None:
+def _checked_tail(tail: ChannelTail | None) -> tuple[str, list[str]] | None:
+    """(channel, texts) as a store keeps it, each text cut to its last TAIL_CHARS characters; ValueError if not."""
     if tail is None:
         return None
-    channel, text = tail
-    if channel not in TAIL_CHANNELS or not isinstance(text, str):
-        raise ValueError(f"not a tail: {tail!r}")
-    return channel, text[-TAIL_CHARS:]
+    channel, texts = tail
+    if (
+        channel not in TAIL_CHANNELS or not isinstance(texts, (list, tuple)) or len(texts) > TAIL_TEXTS
+        or not all(isinstance(text, str) for text in texts)
+    ):
+        raise ValueError("not a tail: (channel, at most TAIL_TEXTS texts) was expected")
+    return channel, [text[-TAIL_CHARS:] for text in texts]
 
 
 def _changed_state(state: SessionState, change: Callable[[SessionState], _T]) -> tuple[_T, SessionState]:
@@ -422,7 +445,7 @@ class MemorySessionStore(SessionStore):
         marks = [Mark(label, tool, _now(), server, channel) for label in _checked_labels(labels)]
         return self._record(_checked_marks(marks), None)
 
-    def add_marks(self, marks: Iterable[Mark], tail: tuple[str, str] | None = None) -> SessionMarks:
+    def add_marks(self, marks: Iterable[Mark], tail: ChannelTail | None = None) -> SessionMarks:
         wanted, kept = _checked_marks(marks), _checked_tail(tail)
         if _add_replaced(self, MemorySessionStore):
             # A subclass (or a test double) that records marks its own way keeps doing so; the tail is kept here.
@@ -439,7 +462,7 @@ class MemorySessionStore(SessionStore):
             answer, self._state = _changed_state(self._state, change)
             return answer
 
-    def _record(self, marks: list[Mark], tail: tuple[str, str] | None) -> SessionMarks:
+    def _record(self, marks: list[Mark], tail: tuple[str, list[str]] | None) -> SessionMarks:
         with self._lock:
             for mark in marks:
                 if mark.label in self._marks:
@@ -528,7 +551,7 @@ class FileSessionStore(SessionStore):
         marks = [Mark(label, tool, _now(), server, channel) for label in _checked_labels(labels)]
         return self._record(_checked_marks(marks), None)
 
-    def add_marks(self, marks: Iterable[Mark], tail: tuple[str, str] | None = None) -> SessionMarks:
+    def add_marks(self, marks: Iterable[Mark], tail: ChannelTail | None = None) -> SessionMarks:
         wanted, kept = _checked_marks(marks), _checked_tail(tail)
         if _add_replaced(self, FileSessionStore):
             current = super().add_marks(wanted)
@@ -555,7 +578,7 @@ class FileSessionStore(SessionStore):
 
     # ---- internals --------------------------------------------------------------
 
-    def _record(self, wanted: list[Mark], tail: tuple[str, str] | None) -> SessionMarks:
+    def _record(self, wanted: list[Mark], tail: tuple[str, list[str]] | None) -> SessionMarks:
         try:
             with self._exclusive():
                 current, state = self._load_unlocked()

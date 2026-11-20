@@ -117,6 +117,7 @@ from .policy import (
 from .session import (
     MAX_SESSION_ID_CHARS,
     SINK,
+    ChannelTail,
     Mark,
     MemorySessionStore,
     SessionMarks,
@@ -277,7 +278,9 @@ class Decision:
     injection.warn_severity (NOTICE and " (ref <ref>)"; `ref` is set too).
     `marks` are the marks the content gives the session once delivered
     (injection.mark_at), and `tail` is the end of its text that the next
-    result is read with; mark_delivered(..., decision=) records both.
+    result is read with (in each kind of view, with its secrets replaced;
+    None for content refused for a secret); mark_delivered(..., decision=)
+    records both.
     """
 
     allowed: bool
@@ -294,7 +297,7 @@ class Decision:
     would_block: bool = False  # monitor mode let through a call or result that would have been blocked
     notice: str | None = None  # an allowed result at or above injection.warn_severity: the text to put before it
     marks: frozenset[str] = frozenset()  # injection.mark_at: the marks the content sets once it is delivered
-    tail: tuple[str, str] | None = field(default=None, repr=False, compare=False)  # (channel, the end of the text)
+    tail: ChannelTail | None = field(default=None, repr=False, compare=False)  # (channel, the ends of the text)
 
     def __post_init__(self) -> None:
         if self.pending and self.allowed:
@@ -589,7 +592,9 @@ class Firewall:
                    TAIL_CHANNELS): read the text the model reads of the
                    content together with the end of the text last delivered on
                    its channel (tail_scan.py), and put its own end in
-                   decision.tail. False for content the
+                   decision.tail (with the secrets the guard knows replaced,
+                   whatever secrets.in_results says; none for content
+                   refused for a secret). False for content the
                    model does not read next to a result (the proxy: a tool list
                    or the reply to initialize).
 
@@ -1197,20 +1202,24 @@ class Firewall:
         tail = None
         channel = TAIL_CHANNELS.get(event) if cross_message else None
         if channel is not None:
-            joined, kept = tail_scan.read_with_tail(self._kept_tail(channel), _reading_text(content, event), findings)
+            # The tail is kept as text (in hook mode, in the session file), so its secrets are replaced first,
+            # whatever secrets.in_results says, and content refused for a secret keeps none.
+            joined, kept = tail_scan.read_with_tail(
+                self._kept_tail(channel), _reading_text(content, event), findings, redact=self._secret_guard().redact
+            )
             findings = merge_findings(findings, joined)
-            tail = (channel, kept)
+            tail = (channel, kept) if secret_problem is None else None
         decision = self._result_decision(findings, redacted, secret_problem, call_id, event, tail)
         logged = bool(findings) or bool(redacted) or secret_problem is not None or log_clean
         decision = self._finish(event, tool, decision, log=logged)
         return CheckedResult(decision, content if decision.allowed else None)
 
-    def _kept_tail(self, channel: str) -> str:
-        """The end of the text last delivered on this channel; "" when there is none or it cannot be read."""
+    def _kept_tail(self, channel: str) -> tuple[str, ...]:
+        """The tail of this channel (tail_scan.Tail); () when there is none or it cannot be read."""
         try:
-            return self.session_store.read_state().tails.get(channel, "")
+            return tuple(self.session_store.read_state().tails.get(channel, ()))
         except SessionStateError:
-            return ""  # a session whose state cannot be read is read without a tail
+            return ()  # a session whose state cannot be read is read without a tail
 
     def _secrets_in_result(
         self, content: Any, views: list[str], can_replace: bool
@@ -1266,7 +1275,7 @@ class Firewall:
 
     def _result_decision(
         self, findings: list[Finding], redacted: tuple[str, ...], secret_problem: str | None, call_id: str | None,
-        event: str = "result", tail: tuple[str, str] | None = None,
+        event: str = "result", tail: ChannelTail | None = None,
     ) -> Decision:
         """The Decision on a result, from the detector's findings and the secret step.
 

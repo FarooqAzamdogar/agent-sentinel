@@ -233,6 +233,32 @@ class SessionLimitSettings(unittest.TestCase):
         self.assertIsNone(Policy.from_dict({}).describe_rule("limits.max_calls_per_session"))
         self.assertIsNone(loaded.describe_rule("limits.max_distinct[1]"))
 
+    def test_validate_warns_when_the_limits_can_outgrow_what_a_session_keeps(self):
+        # CORE2-3: maxima that add up past MAX_DISTINCT_VALUES loaded silently; calls were then refused with rule
+        # "session" before any limit was reached.
+        def distinct(count, most):
+            return [{"arg": f"a{n}", "max": most} for n in range(count)]
+
+        def bound_warnings(loaded):
+            return [warning for warning in loaded.warnings() if "a session can" in warning]
+
+        over = policy(limits={"max_distinct": distinct(4, 1000)}, tools={"send": {"action": "allow",
+                                                                                   "max_distinct": distinct(1, 97)}})
+        self.assertEqual(len(bound_warnings(over)), 1)
+        self.assertIn(f"add up to 4097 values, more than the {MAX_DISTINCT_VALUES}", bound_warnings(over)[0])
+        at_the_bound = policy(limits={"max_distinct": distinct(4, 1000)},
+                              tools={"send": {"action": "allow", "max_distinct": distinct(1, 96)}})
+        self.assertEqual(bound_warnings(at_the_bound), [])
+        many = policy(tools={f"t{n}": {"action": "allow", "max_distinct": distinct(20, 1)} for n in range(51)})
+        self.assertTrue(any("counters" in warning for warning in bound_warnings(many)))
+        self.assertEqual(bound_warnings(policy(limits={"max_calls_per_session": 5})), [])
+
+        firewall = Firewall(policy(limits={"max_distinct": distinct(5, 1000)}))  # what the warning is about
+        refused = next(decision for decision in (
+            firewall.check_call("t", {f"a{n}": f"v{call}" for n in range(5)}) for call in range(1000)
+        ) if not decision.allowed)
+        self.assertEqual(refused.rule, "session")
+
 
 class SessionLimits(unittest.TestCase):
     def test_calls_per_session_for_all_tools_and_per_rule(self):

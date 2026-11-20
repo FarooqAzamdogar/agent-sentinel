@@ -123,7 +123,8 @@ class TheHook(EndToEndTest):
         (session_file,) = self.state.glob("session-*.json")
         document = json.loads(session_file.read_text(encoding="ascii"))
         self.assertEqual(document["version"], 2)
-        self.assertTrue(document["tails"]["result"].endswith(PARTS[0]))  # the withheld part is not kept
+        # The withheld part is not kept.
+        self.assertTrue(all(tail.endswith(PARTS[0]) for tail in document["tails"]["result"]))
         self.assertEqual(sorted(document["counts"].values()), [2])
         self.assertNotIn("npm test", session_file.read_text(encoding="ascii"))  # calls are kept as hashes
 
@@ -133,6 +134,29 @@ class TheHook(EndToEndTest):
         self.assertIsNone(self.hook("post_tool_use_mcp.json", tool_response=padded))
         split = self.hook("post_tool_use_mcp.json", tool_response=[{"type": "text", "text": PARTS[1]}])
         self.assertEqual(split["decision"], "block")
+
+    def test_the_session_file_never_holds_a_secret_the_guard_knows(self):
+        # CORE2-2: the tail is kept as text in the session file; 0.6 before review kept the end of a tool output
+        # as it was, a token included, and kept it even for an output the guard withheld for that token.
+        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        output = {"result": f"GITHUB_TOKEN={token}\nsee the docs", "code": 200, "url": "https://x.example/"}
+        for in_results in ("off", "redact", "block"):
+            with self.subTest(in_results=in_results):
+                self.policy = self.write(f"policy-{in_results}.json", {
+                    "default": "allow", "secrets": {"in_results": in_results}})
+                self.state = self.folder / f"state-{in_results}"
+                self.assertIsNone(self.hook("session_start.json"))
+                answer = self.hook("post_tool_use_webfetch.json", tool_response=output)
+                if in_results == "block":
+                    self.assertIs(answer["continue"], False)
+                (session_file,) = self.state.glob("session-*.json")
+                text = session_file.read_text(encoding="ascii")
+                self.assertNotIn(token[4:], text)
+                tails = json.loads(text)["tails"]
+                if in_results == "block":
+                    self.assertEqual(tails, {})  # an output withheld for a secret keeps no tail
+                else:
+                    self.assertTrue(all("[redacted GitHub token]" in tail for tail in tails["result"]))
 
     def test_a_session_file_that_cannot_be_used_refuses_the_calls_the_limits_count(self):
         self.assertIsNone(self.hook("session_start.json"))
