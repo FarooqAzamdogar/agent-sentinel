@@ -1,10 +1,12 @@
 """What a server's launch command runs, and what is risky about it. Functions of the command's words.
 
-    commands_run       the commands a launch runs, looked at behind wrappers: cmd /c X,
-                       env NAME=VALUE X, sh -c "X && Y", powershell -Command X (or
-                       -EncodedCommand), sudo X, wsl X, exec X
+    commands_run       the commands a launch runs, looked at behind wrappers: cmd /c X
+                       (also cmd /d/s/c X, and cmd's start), env NAME=VALUE X, sh -c
+                       "X && Y", powershell -Command X (or -EncodedCommand, iex), sudo X,
+                       wsl X, exec X, timeout N X, nice X, corepack X
     runner_packages    the packages runners (npx, bunx, pnpm dlx, yarn dlx, npm exec, uvx,
-                       uv tool run, pipx run) fetch and run, behind such wrappers too
+                       uv tool run, pipx run) fetch and run, behind such wrappers too:
+                       every npx -p, and the requirements of uvx --with
     runner_package     the first of them
     unpinned_package   such a package run without an exact version
     advisory_findings  a package of advisories.py: malware (fail) or a known vulnerability (warn)
@@ -12,7 +14,8 @@
     launch_risks       what is risky in the command itself: inline code (sh -c, powershell
                        -EncodedCommand, node -e, python -c), shell operators in arguments, sudo,
                        a download piped to a runner, a package from a git repository, a container
-                       with host privileges or mounts or without an image digest, and arguments
+                       with host privileges, the host's root or its container engine's socket
+                       mounted, or without an image digest, and arguments
                        that name credential files, a whole drive or the whole home folder
     launch_identity    what proxy --pin-server pins of a launch (pins.py): the program, the runners'
                        packages as written, and the SHA-256 of the local script it starts
@@ -86,16 +89,32 @@ MAX_WRAPPERS = 4  # wrappers in a row that are looked behind: cmd /c env bash -c
 MAX_LOOKED_BEHIND = 16  # wrappers looked behind in one launch, in all
 MAX_COMMANDS = 16  # commands one launch is taken to run, at most
 MAX_COMMAND_STRING_CHARS = 8192  # of a command string (sh -c "..."); the rest of it is not looked at
+# Windows starts no program with a longer command line (CreateProcess), so cmd never reads further than this.
+MAX_CMD_LINE_CHARS = 32_768
 _OPERATOR_WORDS = frozenset({"&&", "||", ";", "|", "&"})
 _OPERATORS_IN_TEXT = re.compile(r"&&|\|\||[;&|\r\n]")
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _SPACE = re.compile(r"\s")
+# cmd reads each "/" and the character after it as a switch; /C, /K or /R gives the command (also "/d/s/c").
+_CMD_SWITCH = re.compile(r"/(.)", re.DOTALL)
 _ENV_VALUE_OPTIONS = frozenset({"-u", "--unset", "-C", "--chdir"})
 _ELEVATE_VALUE_OPTIONS = frozenset({"-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-p",
                                     "--prompt", "-R", "--chroot", "-T", "--command-timeout", "-U", "--other-user",
                                     "-r", "--role", "-t", "--type"})
 _GSUDO_VALUE_OPTIONS = frozenset({"-i", "--integrity", "-u", "--user"})
 _WSL_VALUE_OPTIONS = frozenset({"-d", "--distribution", "-u", "--user", "--cd", "--distribution-id", "--shell-type"})
+_START_VALUE_OPTIONS = frozenset({"/d", "/node", "/affinity"})
+# Wrappers that run the rest of their words as one command: (their options that take a value, how many plain
+# words they take before the command). timeout takes a duration first; corepack runs a package manager.
+_SIMPLE_WRAPPERS: dict[str, tuple[frozenset[str], int]] = {
+    "call": (frozenset(), 0),
+    "nohup": (frozenset(), 0),
+    "setsid": (frozenset(), 0),
+    "nice": (frozenset({"-n", "--adjustment"}), 0),
+    "stdbuf": (frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}), 0),
+    "timeout": (frozenset({"-k", "--kill-after", "-s", "--signal"}), 1),
+    "corepack": (frozenset(), 0),
+}
 
 
 def commands_run(words: list[str]) -> list[list[str]]:
@@ -103,9 +122,10 @@ def commands_run(words: list[str]) -> list[list[str]]:
 
     `cmd /c "npx -y x"`, `env A=1 npx -y x`, `bash -c "cd /srv && exec npx -y x"`,
     `powershell -Command npx -y x` (or -EncodedCommand), `sudo npx -y x`,
-    `wsl npx -y x`: each gives the npx command (and `cd /srv` for the third). A
-    command string is split at shell operators and into words roughly as a
-    shell would. At most MAX_COMMANDS commands, MAX_WRAPPERS wrappers deep.
+    `wsl npx -y x`, `timeout 60 npx -y x`: each gives the npx command (and
+    `cd /srv` for the third). A command string is split at shell operators
+    and into words roughly as a shell would. At most MAX_COMMANDS commands,
+    MAX_WRAPPERS wrappers deep.
     """
     found: list[list[str]] = []
     queue: list[tuple[list[str], int]] = [(words[:MAX_WORDS_LINTED], 0)]
@@ -152,18 +172,90 @@ def _behind(words: list[str]) -> list[list[str]] | None:
     if program == "exec":
         index = _after_options(args, frozenset({"-a"}))
         return [args[index:]] if index < len(args) else []
-    if program in ("call", "nohup"):
-        return [args] if args else []
+    if program == "start":
+        return _behind_start(args)
+    if program in ("iex", "invoke-expression"):  # PowerShell's own `sh -c`
+        return _split_text(_joined(args[1:] if args[:1] and args[0].startswith("-") else args))
+    if program in _SIMPLE_WRAPPERS:
+        value_options, plain_words = _SIMPLE_WRAPPERS[program]
+        index = _after_options(args, value_options) + plain_words
+        if index >= len(args):
+            return []
+        if program == "corepack":  # corepack pnpm@9.0.0 dlx ...: the package manager, at a version
+            return [[args[index].split("@", 1)[0], *args[index + 1:]]]
+        return [args[index:]]
     return None
 
 
 def _behind_cmd(args: list[str]) -> list[list[str]] | None:
-    """cmd /c (or /k, /r) and what follows it, which cmd reads as one command line."""
-    index = _option_index(args[:MAX_OPTIONS_SCANNED], _is_cmd_run, prefixes=("/",))
-    if index is None:
+    """cmd /c (or /k, /r) and what follows it, which cmd reads as one command line.
+
+    cmd looks through its whole command line for the switch, so it is found
+    after other text too (`cmd foo /c x`) and run together with other
+    switches (`cmd /d/s/c x`, `cmd /cx`). A caret is cmd's escape: `n^px` is npx.
+    """
+    found = _cmd_run_at(args)
+    if found is None:
         return None  # an interactive cmd
-    rest = ([args[index][2:]] if len(args[index]) > 2 else []) + args[index + 1:]
-    return _split_text(_joined(rest))
+    index, start = found
+    piece, rest = args[index][start:start + MAX_COMMAND_STRING_CHARS], args[index + 1:]
+    if not piece.strip():
+        text = _joined(rest)
+    elif not rest:
+        text = piece
+    else:
+        text = piece + " " + _quoted_words(rest)
+    return _split_text(_without_carets(text))
+
+
+def _cmd_run_at(args: list[str], switches_only: bool = False) -> tuple[int, int] | None:
+    """Where cmd's /C, /K or /R is: (the index of its word, where the command starts in that word); else None.
+
+    As cmd itself does: the first "/" followed by C, K or R anywhere in the
+    command line, inside quotes too; the character after any other "/" is
+    that switch's ("/t:0a/c" is /c, "//c" is none). `switches_only`: stop at
+    the first word that is no switch (for a word "cmd" among other arguments).
+    """
+    left = MAX_CMD_LINE_CHARS
+    for index, word in enumerate(args[:MAX_WORDS_LINTED]):
+        if left <= 0 or (switches_only and not word.startswith("/")):
+            return None
+        for match in _CMD_SWITCH.finditer(word, 0, left):
+            if match.group(1) in "cCkKrR":
+                return index, match.end()
+        left -= len(word) + 1
+    return None
+
+
+def _without_carets(text: str) -> str:
+    """A cmd command line with its escapes taken away: outside double quotes, "^" makes the next character plain."""
+    if "^" not in text:
+        return text
+    kept, quoted, index = [], False, 0
+    while index < len(text):
+        char = text[index]
+        if char == "^" and not quoted:
+            index += 1
+            char = text[index] if index < len(text) else ""
+        elif char == '"':
+            quoted = not quoted
+        kept.append(char)
+        index += 1
+    return "".join(kept)
+
+
+def _behind_start(args: list[str]) -> list[list[str]]:
+    """cmd's start ["title"] [/options] COMMAND. Its quotes are gone by now, so a first plain word may be the title
+    or the program: both readings are given (`start "" npx -y x`, `start /b /wait npx -y x`)."""
+    found: list[list[str]] = []
+    readings = (1,) if args[:1] == [""] else (0, 1) if args and not args[0].startswith("/") else (0,)
+    for skip in readings:
+        index = skip
+        while index < min(len(args), MAX_OPTIONS_SCANNED) and args[index].startswith("/"):
+            index += 2 if args[index].lower() in _START_VALUE_OPTIONS else 1
+        if index < len(args) and args[index:] not in found:
+            found.append(args[index:])
+    return found
 
 
 def _behind_env(args: list[str]) -> list[list[str]]:
@@ -269,6 +361,11 @@ def _joined(words: list[str]) -> str:
     """
     if len(words) == 1:
         return words[0][:MAX_COMMAND_STRING_CHARS]
+    return _quoted_words(words)
+
+
+def _quoted_words(words: list[str]) -> str:
+    """Words as one command line, a word with a space quoted (at most about MAX_COMMAND_STRING_CHARS)."""
     pieces, length = [], 0
     for word in words:
         if length > MAX_COMMAND_STRING_CHARS:
@@ -284,10 +381,20 @@ def _split_text(text: str) -> list[list[str]]:
     """The commands of a command string: split at shell operators, each into words (roughly as a shell would)."""
     commands = []
     for part in _OPERATORS_IN_TEXT.split(text[:MAX_COMMAND_STRING_CHARS], maxsplit=MAX_COMMANDS):
-        words = shell_words(part)
+        words = shell_words(_ungrouped(part))
         if words:
             commands.append(words)
     return commands[:MAX_COMMANDS]
+
+
+def _ungrouped(part: str) -> str:
+    """One command of a command string without the grouping around it: "{ npx -y x" (of "{ npx -y x; }"),
+    "(npx -y x)", PowerShell's "& {npx -y x}" (split at "&" already) and ". {npx -y x}" (dot-sourcing)."""
+    text = part.lstrip()
+    if text[:2] in (". ", ".\t"):  # sh's `. FILE` and PowerShell's dot-sourcing
+        text = text[1:].lstrip()
+    opened = text.lstrip("({ \t")
+    return opened.rstrip(")} \t") if len(opened) != len(text) else text
 
 
 def shell_words(text: str) -> list[str]:
@@ -321,7 +428,7 @@ _PYPI_NAME_END = re.compile(r"[=<>~!@ \[;]")
 _NPX_VALUE_OPTIONS = frozenset({"-p", "--package", "-c", "--call", "--cache", "--registry", "--userconfig", "-w",
                                 "--workspace", "--node-options"})
 _UVX_VALUE_OPTIONS = frozenset({
-    "--from", "--with", "--with-editable", "--with-requirements", "-p", "--python", "--index", "--index-url",
+    "--from", "--with", "-w", "--with-editable", "--with-requirements", "-p", "--python", "--index", "--index-url",
     "--extra-index-url", "--default-index", "--find-links", "-f", "--constraint", "-c", "--override",
     "--python-preference", "--refresh-package", "--reinstall-package", "--upgrade-package", "--cache-dir",
     "--directory", "--project", "--config-file", "--env-file", "--index-strategy", "--keyring-provider",
@@ -333,6 +440,20 @@ _UV_VALUE_OPTIONS = _UVX_VALUE_OPTIONS | frozenset({
 })
 _PIPX_VALUE_OPTIONS = frozenset({"--spec", "--python", "--index-url", "-i", "--pip-args", "--suffix"})
 _GIT_SOURCES = ("git+", "git:", "github:", "gitlab:", "bitbucket:", "gist:")
+# A git address in scp's form, which npm takes for a repository: "git@github.com:user/repo.git".
+_SCP_ADDRESS = re.compile(r"[A-Za-z0-9._~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+:")
+_PACKAGE_OPTIONS = ("-p", "--package")  # npx, npm exec, pnpm dlx, yarn dlx: each one names a package to fetch
+_WITH_OPTIONS = ("--with", "-w")  # uvx, uv tool run: requirements installed beside the package
+_A_VERSION_NEXT = re.compile(r"\s*[!=<>~]")  # after a comma in "pkg>=1,<2": the version goes on
+# The package managers whose subcommand runs a package: (its names, the runner it is, its ecosystem).
+# "exe" is npm's own abbreviation of exec (npm 11 still takes it).
+_SUBCOMMAND_RUNNERS: dict[str, tuple[tuple[str, ...], str, str]] = {
+    "npm": (("exec", "exe", "x"), "npm exec", NPM),
+    "pnpm": (("dlx",), "pnpm dlx", NPM),
+    "yarn": (("dlx",), "yarn dlx", NPM),
+    "bun": (("x",), "bunx", NPM),
+    "pipx": (("run",), "pipx run", PYPI),
+}
 
 
 @dataclass(frozen=True)
@@ -345,20 +466,25 @@ class PackageRef:
     name: str  # npm: lowercase; PyPI: normalised (PEP 503); "" when it is no registry package
     version: str | None  # the exact version the spec pins, if it pins one
     source: str  # "registry", "git", "url" or "path"
+    role: str = "run"  # "run": a package the runner runs; "with": a requirement beside it (uvx --with)
 
     @property
     def written(self) -> str:
-        """The runner and the spec, as one text: "npx mcp-remote@0.1.16"."""
-        return f"{self.runner} {self.spec}"
+        """The runner and the spec, as one text: "npx mcp-remote@0.1.16" ("uvx --with x==1.0" for a requirement)."""
+        return f"{self.runner} --with {self.spec}" if self.role == "with" else f"{self.runner} {self.spec}"
 
 
 def runner_packages(words: list[str]) -> list[PackageRef]:
-    """The packages the runners of a launch fetch and run (commands_run: behind wrappers too); each once."""
+    """The packages the runners of a launch fetch and run (commands_run: behind wrappers too); each once.
+
+    Every package a runner is given counts: each `npx -p`, and the
+    requirements of `uvx --with` (role "with").
+    """
     found: list[PackageRef] = []
     for command in commands_run(words):
-        ref = _direct_package(command)
-        if ref is not None and ref not in found:
-            found.append(ref)
+        for ref in _direct_packages(command):
+            if ref not in found:
+                found.append(ref)
     return found
 
 
@@ -369,62 +495,111 @@ def runner_package(words: list[str]) -> PackageRef | None:
 
 
 def _runner_of(words: list[str]) -> tuple[str, str, int] | None:
-    """(runner, ecosystem, where its own arguments start) when `words` start a package runner; else None."""
+    """(runner, ecosystem, where its own arguments start) when `words` start a package runner; else None.
+
+    The subcommand is found after the program's own options too:
+    `npm --yes exec`, `pnpm --silent dlx`, `uv --quiet tool run`.
+    """
     program = program_name(words[0])
-    second = words[1:2]
     if program in ("npx", "bunx"):
         return program, NPM, 1
     if program == "pnpx":
         return "pnpm dlx", NPM, 1
-    if program == "bun" and second == ["x"]:
-        return "bunx", NPM, 2
-    if program == "npm" and second in (["exec"], ["x"]):
-        return "npm exec", NPM, 2
-    if program in ("pnpm", "yarn") and second == ["dlx"]:
-        return f"{program} dlx", NPM, 2
     if program == "uvx":
         return "uvx", PYPI, 1
-    if program == "uv" and words[1:3] == ["tool", "run"]:
-        return "uv tool run", PYPI, 3
-    if program == "pipx" and second == ["run"]:
-        return "pipx run", PYPI, 2
+    if program in _SUBCOMMAND_RUNNERS:
+        names, runner, ecosystem = _SUBCOMMAND_RUNNERS[program]
+        at = _subcommand_at(words, 1, names)
+        return (runner, ecosystem, at + 1) if at is not None else None
+    if program == "uv":
+        at = _subcommand_at(words, 1, ("tool",))
+        at = _subcommand_at(words, at + 1, ("run", "uvx")) if at is not None else None
+        return ("uv tool run", PYPI, at + 1) if at is not None else None
     return None
 
 
-def _direct_package(words: list[str]) -> PackageRef | None:
-    """The package of a runner that is the command's own program (not behind a wrapper)."""
-    found = _runner_of(words) if words else None
-    if found is None:
-        return None
-    runner, ecosystem, start = found
-    if ecosystem == NPM:
-        spec = _first_package(words[start:], _NPX_VALUE_OPTIONS, ("-p", "--package"))
-        return _npm_ref(runner, spec) if spec else None
-    if runner == "pipx run":
-        spec = _first_package(words[start:], _PIPX_VALUE_OPTIONS, ("--spec",))
-    else:
-        spec = _first_package(words[start:], _UVX_VALUE_OPTIONS, ("--from",))
-    return _pypi_ref(runner, spec) if spec else None
+def _subcommand_at(words: list[str], start: int, names: tuple[str, ...]) -> int | None:
+    """Where a program's subcommand is (one of `names`), after the program's own options; None for another one.
 
-
-def _first_package(args: list[str], value_options: frozenset[str], package_options: tuple[str, ...]) -> str | None:
-    """The package a runner runs: the value of --package/--from, or else the first word that is not an option."""
-    index = 0
-    while index < len(args):
-        word = args[index]
-        name, equals, value = word.partition("=")
-        if name in package_options:
-            return value if equals else (args[index + 1] if index + 1 < len(args) else None)
+    An option's value cannot always be told from a flag here (`npm --prefix
+    /x exec`, but `npm --yes exec`), so a plain word right after an option is
+    passed over as its possible value.
+    """
+    index, value_possible = start, False
+    while index < min(len(words), start + MAX_OPTIONS_SCANNED):
+        word = words[index]
+        if word in names:
+            return index
         if word == "--":
-            return args[index + 1] if index + 1 < len(args) else None
-        if equals and name in value_options:
-            pass
-        elif word in value_options:
-            index += 1
-        elif not word.startswith("-"):
-            return word
+            return index + 1 if words[index + 1:index + 2] and words[index + 1] in names else None
+        if word.startswith("-") and word != "-":
+            value_possible = "=" not in word
+        elif value_possible:
+            value_possible = False
+        else:
+            return None
         index += 1
     return None
+
+
+def _direct_packages(words: list[str]) -> list[PackageRef]:
+    """The packages of a runner that is the command's own program (not behind a wrapper)."""
+    found = _runner_of(words) if words else None
+    if found is None:
+        return []
+    runner, ecosystem, start = found
+    args = words[start:MAX_WORDS_LINTED]
+    if ecosystem == NPM:
+        return [_npm_ref(runner, spec) for spec in _runner_specs(args, _NPX_VALUE_OPTIONS, _PACKAGE_OPTIONS)]
+    if runner == "pipx run":
+        return [_pypi_ref(runner, spec) for spec in _runner_specs(args, _PIPX_VALUE_OPTIONS, ("--spec",))]
+    refs = [_pypi_ref(runner, spec) for spec in _runner_specs(args, _UVX_VALUE_OPTIONS, ("--from",))]
+    for value in _option_values(args, _UVX_VALUE_OPTIONS, _WITH_OPTIONS):
+        refs += [_pypi_ref(runner, spec, role="with") for spec in _requirements(value)]
+    return refs
+
+
+def _runner_specs(args: list[str], value_options: frozenset[str], package_options: tuple[str, ...]) -> list[str]:
+    """The packages a runner runs: every value of its --package (--from, --spec), or else its first plain word."""
+    named = _option_values(args, value_options, package_options)
+    if named:
+        return named
+    index = _first_plain_index(args, value_options | frozenset(package_options))
+    return [args[index]] if index is not None else []
+
+
+def _option_values(args: list[str], value_options: frozenset[str], wanted: tuple[str, ...]) -> list[str]:
+    """Every value given to the `wanted` options among a runner's own options (before its first plain word)."""
+    found, index = [], 0
+    while index < len(args) and len(found) < MAX_COMMANDS:
+        word = args[index]
+        name, equals, value = word.partition("=")
+        if word == "--" or not word.startswith("-") or word == "-":
+            break
+        if name in wanted:
+            if equals:
+                found.append(value)
+            elif index + 1 < len(args):
+                found.append(args[index + 1])
+        index += 2 if not equals and (word in value_options or word in wanted) else 1
+    return [value for value in found if value]
+
+
+def _requirements(value: str) -> list[str]:
+    """The requirements of one --with value, as uv splits it: at commas outside brackets that start no version
+    ("a,b[x,y]>=1,<2" is "a" and "b[x,y]>=1,<2")."""
+    found, depth, start = [], 0, 0
+    text = value[:MAX_COMMAND_STRING_CHARS]
+    for index, char in enumerate(text):
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth = max(depth - 1, 0)
+        elif char == "," and depth == 0 and not _A_VERSION_NEXT.match(text, index + 1):
+            found.append(text[start:index].strip())
+            start = index + 1
+    found.append(text[start:].strip())
+    return [requirement for requirement in found if requirement][:MAX_COMMANDS]
 
 
 def _first_plain_index(args: list[str], value_options: frozenset[str]) -> int | None:
@@ -450,34 +625,36 @@ def _npm_ref(runner: str, spec: str) -> PackageRef:
         if at != -1 and lowered[at + 1:].startswith("npm:"):
             spec = spec[at + 5:]
     lowered = spec.lower()
-    if lowered.startswith(_GIT_SOURCES) or ("/" in spec and not spec.startswith("@") and ":" not in spec
-                                            and not spec.startswith((".", "/", "~"))):
+    at = spec.find("@", 1)
+    wanted = lowered[at + 1:] if at != -1 else ""  # "name@github:user/repo" names a repository too
+    if (lowered.startswith(_GIT_SOURCES) or wanted.startswith(_GIT_SOURCES) or _SCP_ADDRESS.match(spec)
+            or ("/" in spec and not spec.startswith("@") and ":" not in spec
+                and not spec.startswith((".", "/", "~")))):
         return PackageRef(runner, NPM, written, "", None, "git")  # "user/repo" is a GitHub repository to npm
-    if lowered.startswith(("http:", "https:")):
+    if lowered.startswith(("http:", "https:")) or "://" in spec:
         return PackageRef(runner, NPM, written, "", None, "url")
     if spec.startswith((".", "/", "~")) or ":" in spec or "\\" in spec:
         return PackageRef(runner, NPM, written, "", None, "path")
-    at = spec.find("@", 1)
     name = (spec if at == -1 else spec[:at]).lower()
     version = spec[at + 1:] if at != -1 and _EXACT_VERSION.fullmatch(spec[at + 1:]) else None
     return PackageRef(runner, NPM, written, name, version, "registry")
 
 
-def _pypi_ref(runner: str, spec: str) -> PackageRef:
+def _pypi_ref(runner: str, spec: str, role: str = "run") -> PackageRef:
     lowered = spec.lower()
     if lowered.startswith("git+") or " @ git+" in lowered or "@git+" in lowered:
-        return PackageRef(runner, PYPI, spec, "", None, "git")
+        return PackageRef(runner, PYPI, spec, "", None, "git", role)
     if "://" in spec:
-        return PackageRef(runner, PYPI, spec, "", None, "url")
+        return PackageRef(runner, PYPI, spec, "", None, "url", role)
     if spec.startswith((".", "/", "~")) or "\\" in spec:
-        return PackageRef(runner, PYPI, spec, "", None, "path")
+        return PackageRef(runner, PYPI, spec, "", None, "path", role)
     name = pypi_name(_PYPI_NAME_END.split(spec, maxsplit=1)[0])
     version = None
     if "==" in spec and _EXACT_VERSION.fullmatch(spec.split("==", 1)[1].strip()):
         version = spec.split("==", 1)[1].strip()
     elif "==" not in spec and "@" in spec and _EXACT_VERSION.fullmatch(spec.split("@", 1)[1].strip()):
         version = spec.split("@", 1)[1].strip()  # uv's "package@1.2.3"
-    return PackageRef(runner, PYPI, spec, name, version, "registry")
+    return PackageRef(runner, PYPI, spec, name, version, "registry", role)
 
 
 def pypi_name(name: str) -> str:
@@ -495,8 +672,12 @@ def unpinned_package(words: list[str]) -> tuple[str, str] | None:
 
 
 def unpinned_spec(ref: PackageRef) -> tuple[str, str] | None:
-    """(package, how to pin it) when a registry package is run without an exact version; else None."""
-    if ref.source != "registry" or ref.version is not None:
+    """(package, how to pin it) when a registry package is run without an exact version; else None.
+
+    A requirement installed beside it (uvx --with) is left to the advisories,
+    as the package's own dependencies are.
+    """
+    if ref.source != "registry" or ref.version is not None or ref.role != "run":
         return None
     if ref.ecosystem == NPM:
         at = ref.spec.find("@", 1)
@@ -642,6 +823,13 @@ _CONTAINER_GLOBAL_VALUE_OPTIONS = frozenset({
     "--data-root", "--host-gateway-ip", "--hosts-dir",
 })
 _A_NUMBER = re.compile(r"[0-9][0-9.]*[A-Za-z%]{0,3}")
+MAX_MOUNTS_CHECKED = 64  # mounts of one container checked for the host's root, home folder or engine socket
+# A container engine's socket (or Windows pipe), and the folders that hold one: a container given it can start
+# containers of its own on the host, privileged and with the host's root mounted.
+_ENGINE_SOCKETS = frozenset({"docker.sock", "podman.sock", "containerd.sock", "docker_engine"})
+_ENGINE_SOCKET_FOLDERS = frozenset({"/run", "/var/run", "/run/docker", "/var/run/docker", "/run/podman",
+                                    "/var/run/podman", "/run/containerd", "/var/run/containerd"})
+_ENGINE_CONTROL = "it can control the host's containers, which in effect is root on the host"
 
 
 def launch_risks(words: list[str], user_home: str | None = None) -> list[str]:
@@ -687,16 +875,24 @@ def _read_part(words: list[str]) -> tuple[list[str], bool]:
 
 
 def _inline_code(words: list[str]) -> list[str]:
-    """Interpreters given code on the command line: sh -c, cmd /c, powershell -Command, node -e, python -c."""
+    """Interpreters given code on the command line: sh -c, cmd /c, powershell -Command, node -e, python -c.
+
+    cmd as the program is read as cmd reads its command line (`cmd foo /c x`,
+    `cmd /d/s/c x`); a word "cmd" among the arguments only with switches
+    right after it, at most MAX_LOOKED_BEHIND times.
+    """
     found = []
+    cmd_scans = 0
     for index, word in enumerate(words):
         program = program_name(word)
         options = words[index + 1:index + 1 + MAX_OPTIONS_SCANNED]
         flag = None
         if program in _SHELLS:
             flag = _first_option(options, _is_c_cluster, prefixes=("-", "+"), takes_value=_shell_takes_value)
-        elif program == "cmd":
-            flag = _first_option(options, _is_cmd_run, prefixes=("/",))
+        elif program == "cmd" and cmd_scans < MAX_LOOKED_BEHIND:
+            cmd_scans += 1
+            run_at = _cmd_run_at(words[index + 1:], switches_only=index > 0)
+            flag = words[index + 1 + run_at[0]] if run_at is not None else None
         elif program in _POWERSHELL:
             command = _powershell_command(program, options)
             flag = options[command[0]] if command is not None else None
@@ -722,10 +918,6 @@ def _shell_takes_value(option: str) -> bool:
     """A shell option that takes the next word: --rcfile, --init-file, and -o, -O, +o, +O (also ending a cluster)."""
     return option in ("--rcfile", "--init-file") or (
         not option.startswith("--") and len(option) >= 2 and option[1:].isalpha() and option[-1] in "oO")
-
-
-def _is_cmd_run(option: str) -> bool:
-    return option[:2].lower() in ("/c", "/k", "/r")
 
 
 _NODE_EVAL_CLUSTER = re.compile(r"-[cehipv]*[ep][cehipv]*")
@@ -830,8 +1022,8 @@ def _piped_download(text: str) -> bool:
 
 def _package_from_git(commands: list[list[str]]) -> list[str]:
     for command in commands:
-        ref = _direct_package(command)
-        if ref is not None and ref.source in ("git", "url"):
+        ref = next((ref for ref in _direct_packages(command) if ref.source in ("git", "url")), None)
+        if ref is not None:
             return [f"runs a package straight from a git repository or a web address, unreviewed and unpinned "
                     f"({printable(ref.written, limit=120)})"]
         if program_name(command[0]) in ("uvx", "uv", "pipx") and any(
@@ -863,7 +1055,7 @@ def _after_container_options(args: list[str]) -> list[str]:
 
 
 def _run_options(args: list[str], user_home: str | None) -> list[str]:
-    risks, index, image = [], 0, None
+    risks, index, image, mounts = [], 0, None, 0
     while index < len(args):
         word = args[index]
         if not word.startswith("-") or word == "--":
@@ -883,12 +1075,22 @@ def _run_options(args: list[str], user_home: str | None) -> list[str]:
             risks.append("runs a container with --privileged (it has the run of the host)")
         elif name in ("--network", "--net", "--pid", "--ipc", "--uts", "--userns") and value.lower() == "host":
             risks.append(f"shares the host's {name.lstrip('-')} with the container ({name} host)")
+        elif name == "--use-api-socket" and value.lower() not in ("false", "0"):
+            risks.append(f"gives the container the Docker engine's socket (--use-api-socket): {_ENGINE_CONTROL}")
         elif name in ("-v", "--volume", "--mount"):
+            mounts += 1
+            if mounts > MAX_MOUNTS_CHECKED:
+                continue
             source = _mount_source(value) if name == "--mount" else _volume_source(value)
             what = _whole_folder(source, user_home) if source else None
+            shown = f"({printable(name, limit=20)} {printable(value, limit=120)})"
             if what:
-                risks.append(f"mounts {what} into the container ({printable(name, limit=20)} "
-                             f"{printable(value, limit=120)})")
+                risks.append(f"mounts {what} into the container {shown}")
+            elif source and _engine_socket(source):
+                risks.append(f"mounts the container engine's socket into the container {shown}: {_ENGINE_CONTROL}")
+    if mounts > MAX_MOUNTS_CHECKED:
+        risks.append(f"mounts {mounts} folders or files into the container, more than any real one needs, so only the "
+                     f"first {MAX_MOUNTS_CHECKED} were checked")
     if image is not None and "@sha256:" not in image.lower():
         risks.append(f"runs the image {printable(image, limit=120)} by a tag, not pinned by digest (@sha256:...): a "
                      "new image can be pushed under the same tag")
@@ -908,6 +1110,16 @@ def _volume_source(value: str) -> str:
         cut = rest.find(":")
         return value if cut == -1 else value[: 2 + cut]
     return value.split(":", 1)[0]
+
+
+def _engine_socket(source: str) -> bool:
+    """Whether a mount's host side is a container engine's socket, Windows pipe or the folder that holds one:
+    /var/run/docker.sock, podman.sock, containerd.sock, //./pipe/docker_engine, /var/run, /run/podman."""
+    text = source.strip().strip("\"'").replace("\\", "/").lower()
+    if not text or len(text) > MAX_PATH_CHARS:
+        return False
+    normal = posixpath.normpath(text)
+    return normal.rstrip("/").rsplit("/", 1)[-1] in _ENGINE_SOCKETS or normal in _ENGINE_SOCKET_FOLDERS
 
 
 def _mount_source(value: str) -> str:
@@ -1038,7 +1250,8 @@ def _target_of(executable: str | None, words: list[str], cwd: str | None) -> str
 
 def _runner_script(words: list[str]) -> str | None:
     """The local script a runner's package starts: npx -y tsx@4 server.ts -> "server.ts"; else None."""
-    ref = _direct_package(words)
+    refs = _direct_packages(words)
+    ref = refs[0] if refs else None
     runner = _runner_of(words)
     if ref is None or runner is None or ref.source != "registry" or ref.name not in _SCRIPT_RUNNER_PACKAGES:
         return None

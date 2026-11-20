@@ -84,11 +84,34 @@ class LaunchChecks(DoctorTest):
             "yarn": self.wrapped("yarn", server=["yarn", "dlx", "postmark-mcp"]),
             "alias": self.wrapped("alias", server=["npx", "-y", "mail@npm:postmark-mcp@1.0.16"]),
             "remote": self.wrapped("remote", server=["cmd", "/c", "npx", "-y", "mcp-remote@0.1.15", "https://x/m"]),
+            # switches run together, text before /c, cmd's caret escape, cmd's start
+            "s-c": self.wrapped("s-c", server=["cmd", "/s/c", "npx -y postmark-mcp@1.0.16"]),
+            "d-q-c": self.wrapped("d-q-c", server=["cmd", "/d/q/c", "npx", "-y", "postmark-mcp"]),
+            "text": self.wrapped("text", server=["cmd", "anything", "/c", "npx -y postmark-mcp"]),
+            "caret": self.wrapped("caret", server=["cmd", "/c", "n^px -y postmark-mcp"]),
+            "start": self.wrapped("start", server=["cmd", "/c", "start", "", "/wait", "npx", "-y", "postmark-mcp"]),
+            # a second -p, a runner's own options before its subcommand, other wrappers
+            "two-p": self.wrapped("two-p", server=["npx", "-y", "-p", "left-pad@1.3.0", "-p", "postmark-mcp@1.0.16",
+                                                   "postmark-mcp"]),
+            "npm-yes": self.wrapped("npm-yes", server=["npm", "--yes", "exec", "postmark-mcp@1.0.16"]),
+            "npm-dash": self.wrapped("npm-dash", server=["npm", "-y", "exec", "--", "postmark-mcp@1.0.16"]),
+            "pnpm-silent": self.wrapped("pnpm-silent", server=["pnpm", "--silent", "dlx", "postmark-mcp"]),
+            "yarn-silent": self.wrapped("yarn-silent", server=["yarn", "--silent", "dlx", "postmark-mcp"]),
+            "call-op": self.wrapped("call-op", server=["powershell", "-Command", "& {npx -y postmark-mcp}"]),
+            "timeout": self.wrapped("timeout", server=["timeout", "100", "npx", "-y", "postmark-mcp"]),
+            "git": self.wrapped("git", server=["uv", "--quiet", "tool", "run", "mcp-server-git==2025.1.1"]),
+            "with": self.wrapped("with", server=["uvx", "--with", "mcp-server-git==2025.1.1", "x-server==1.0.0"]),
         }
         code, found, _ = self.statuses(self.config(servers))
         self.assertEqual(code, 1)
+        for name in ("git", "with"):  # a known vulnerability warns, behind the runner's own options too
+            with self.subTest(name=name):
+                levels = {finding["level"] for finding in found[name]["findings"]
+                          if "mcp-server-git==2025.1.1 has a known vulnerability, fixed in" in finding["text"]}
+                self.assertEqual(levels, {"warn"}, texts(found[name]))
+        self.assertIn("uvx --with mcp-server-git==2025.1.1 has a known vulnerability", texts(found["with"]))
         for name in servers:
-            if name == "remote":
+            if name in ("remote", "git", "with"):
                 continue
             with self.subTest(name=name):
                 self.assertEqual(found[name]["status"], "broken", texts(found[name]))
@@ -323,6 +346,31 @@ class Permissions(unittest.TestCase):
         lines = windows_home_lines(dict(profile, AGENT_SENTINEL_HOME="C:\\agent-sentinel"), "win32")
         self.assertIn("AGENT_SENTINEL_HOME is C:\\agent-sentinel, outside your user profile", lines[0])
         self.assertEqual(windows_home_lines(dict(profile, AGENT_SENTINEL_HOME="/srv/x"), "linux"), [])
+        self.assertTrue(windows_home_lines(dict(profile, AGENT_SENTINEL_HOME="C:\\Users\\me\\..\\Public\\x"), "win32"))
+        self.assertTrue(windows_home_lines(dict(profile, AGENT_SENTINEL_HOME="\\\\server\\share\\me"), "win32"))
+
+    @unittest.skipUnless(sys.platform == "win32", "short names and junctions are Windows matters")
+    def test_windows_resolves_the_home_and_the_profile(self):
+        """DOC2-2: the profile's short (8.3) spelling is inside it; a junction from it to elsewhere is not."""
+        import _winapi
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            profile = Path(folder) / "a long profile name"
+            outside = Path(folder) / "shared"
+            profile.mkdir()
+            outside.mkdir()
+            environ = {"USERPROFILE": str(profile)}
+            short = _short_name(profile)
+            if short is not None and os.path.normcase(short) != os.path.normcase(str(profile)):
+                home_folder = str(Path(short) / ".agent-sentinel")
+                self.assertEqual(windows_home_lines(dict(environ, AGENT_SENTINEL_HOME=home_folder), "win32"), [])
+            _winapi.CreateJunction(str(outside), str(profile / "linked"))
+            try:
+                home_folder = str(profile / "linked" / ".agent-sentinel")
+                lines = windows_home_lines(dict(environ, AGENT_SENTINEL_HOME=home_folder), "win32")
+                self.assertIn("outside your user profile", lines[0])
+            finally:
+                os.rmdir(profile / "linked")  # the junction itself, not the folder it leads to
 
 
 class Baseline(DoctorTest):
@@ -554,7 +602,9 @@ class ClientsAndInspect(IsolatedHomeTest):
         self.assertEqual(code, 2)
         self.assertIn("the server was not started: npx postmark-mcp@1.0.16 is a malicious version", err)
         for words in (("cmd", "/c", "npx", "-y", "postmark-mcp"), ("pnpm", "dlx", "postmark-mcp"),
-                      ("bash", "-c", "npx -y postmark-mcp@1.0.16")):
+                      ("bash", "-c", "npx -y postmark-mcp@1.0.16"), ("cmd", "/s/c", "npx -y postmark-mcp"),
+                      ("npm", "--yes", "exec", "postmark-mcp"),
+                      ("npx", "-p", "a-b-c@1.0.0", "-p", "postmark-mcp", "x")):
             with self.subTest(words=words), mock.patch("agent_sentinel.server_probe.probe") as probe:
                 code, _, err = run_cli("inspect", "--", *words)
                 self.assertEqual(code, 2)

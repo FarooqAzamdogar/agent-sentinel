@@ -435,7 +435,7 @@ def inside_project(path: str, project: Path) -> bool:
     """Whether a file is inside the project folder: as written, or as the system resolves both paths.
 
     The second catches another spelling of the same place: a Windows short
-    (8.3) name such as C:\\Users\\FAROOQ~1, a link or a junction. Nothing on
+    (8.3) name such as C:\\Users\\JOHNSM~1, a link or a junction. Nothing on
     another machine is looked at (_never_opened).
     """
     if clients.inside_folder(path, project):

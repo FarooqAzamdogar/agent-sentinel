@@ -291,6 +291,147 @@ class BehindWrappers(unittest.TestCase):
         self.assertEqual(runner_package(long_string).name, "x")  # the start of a long string is still read
 
 
+class OtherSpellings(unittest.TestCase):
+    """Spellings of wrappers, runners and packages that slipped past the checks in review round 2 (DOC2-1, 3, 4)."""
+
+    npx = ["npx", "-y", "x@1.0.0"]
+
+    def test_cmd_finds_its_switch_as_cmd_does(self):
+        # cmd reads the first "/" followed by C, K or R anywhere in its command line (checked against cmd.exe).
+        for args in (["/d/c"], ["/s/c"], ["/q/c"], ["/D/S/C"], ["/d/q/k"], ["/s/r"], ["foo", "/c"], ["/T:0a/c"],
+                     ["/E:ON/c"], ["/d", "/s", "/c"]):
+            with self.subTest(args=args):
+                self.assertEqual(launch.commands_run(["cmd", *args, "npx -y x@1.0.0"]), [self.npx])
+                self.assertEqual(launch.commands_run(["cmd.exe", *args, *self.npx]), [self.npx])
+                flag = next(arg for arg in args if arg[-2:].lower() in ("/c", "/k", "/r"))
+                self.assertIn(f"runs code written on the command line (cmd {flag})", risks("cmd", *args, "x"))
+        self.assertEqual(launch.commands_run(["cmd", "/cnpx", "-y", "x@1.0.0"]), [self.npx])
+        self.assertEqual(launch.commands_run(["cmd", "/d/cnpx -y x@1.0.0"]), [self.npx])
+        self.assertEqual(launch.commands_run(["cmd", "/c", "n^px -y ^x@1.0.0"]), [self.npx])  # cmd's escape
+        self.assertEqual(launch.commands_run(["cmd", "/c", '"n^px" -y x@1.0.0']), [["n^px", "-y", "x@1.0.0"]])
+        for args in (["//c", "x"], ["/d", "x"], []):  # "//c" is no /c to cmd: an interactive cmd
+            with self.subTest(args=args):
+                self.assertEqual(launch.commands_run(["cmd", *args]), [["cmd", *args]])
+                self.assertEqual([risk for risk in risks("cmd", *args) if "code written" in risk], [])
+        # A word "cmd" among the arguments is read only with switches right after it.
+        self.assertEqual(risks("server", "--shell", "C:/Windows/System32/cmd.exe", "--root", "C:/code"), [])
+        self.assertTrue(any("(cmd /s/c)" in risk for risk in risks("server", "--run", "cmd", "/s/c", "x")))
+
+    def test_cmd_start_and_other_wrappers(self):
+        for words in (["cmd", "/c", "start", "", "/wait", *self.npx],
+                      ["cmd", "/c", "start /b /wait npx -y x@1.0.0"],
+                      ["cmd", "/c", 'start "a title" /d C:\\srv npx -y x@1.0.0'],
+                      ["timeout", "60", *self.npx], ["timeout", "-k", "5", "60", *self.npx],
+                      ["nice", "-n", "5", *self.npx], ["setsid", *self.npx], ["stdbuf", "-o", "L", *self.npx],
+                      ["powershell", "-Command", "iex 'npx -y x@1.0.0'"], ["pwsh", "-c", "& {npx -y x@1.0.0}"],
+                      ["pwsh", "-c", ". { npx -y x@1.0.0 }"], ["bash", "-c", "{ npx -y x@1.0.0; }"],
+                      ["bash", "-c", "(npx -y x@1.0.0)"], ["bash", "-c", "cd /srv && (exec npx -y x@1.0.0)"]):
+            with self.subTest(words=words):
+                self.assertEqual([ref.written for ref in launch.runner_packages(words)], ["npx x@1.0.0"])
+        self.assertEqual(launch.commands_run(["corepack", "pnpm@9.0.0", "dlx", "x@1.0.0"]),
+                         [["pnpm", "dlx", "x@1.0.0"]])
+        self.assertEqual(launch.commands_run(["bash", "-c", "node \"$(pwd)/s.js\""]), [["node", "$(pwd)/s.js"]])
+
+    def test_a_runner_after_its_own_options(self):
+        for words, runner in (
+            (["npm", "--yes", "exec", "x@1.0.0"], "npm exec"),
+            (["npm", "-y", "exec", "--", "x@1.0.0"], "npm exec"),
+            (["npm", "--prefix", "/srv/x", "--loglevel", "silent", "x", "x@1.0.0"], "npm exec"),
+            (["npm", "exe", "x@1.0.0"], "npm exec"),  # npm's own abbreviation
+            (["npm", "--", "exec", "x@1.0.0"], "npm exec"),
+            (["pnpm", "--silent", "dlx", "x@1.0.0"], "pnpm dlx"),
+            (["pnpm", "-C", "/srv", "dlx", "x@1.0.0"], "pnpm dlx"),
+            (["yarn", "--silent", "dlx", "x@1.0.0"], "yarn dlx"),
+            (["bun", "--bun", "x", "x@1.0.0"], "bunx"),
+            (["pipx", "--verbose", "run", "x==1.0.0"], "pipx run"),
+            (["uv", "--quiet", "tool", "run", "x==1.0.0"], "uv tool run"),
+            (["uv", "tool", "--quiet", "run", "x==1.0.0"], "uv tool run"),
+            (["uv", "--directory", "/srv", "tool", "uvx", "x==1.0.0"], "uv tool run"),
+        ):
+            with self.subTest(words=words):
+                ref = runner_package(words)
+                self.assertEqual((ref.runner, ref.name, ref.version), (runner, "x", "1.0.0"))
+        for words in (["npm", "start"], ["npm", "run", "exec"], ["npm", "install", "x"], ["pnpm", "exec", "x"],
+                      ["yarn", "x"], ["bun", "run", "x"], ["uv", "run", "tool", "run"], ["uv", "tool", "install", "x"],
+                      ["pipx", "install", "x"], ["npm", "Exec", "x"]):
+            with self.subTest(words=words):
+                self.assertIsNone(runner_package(words))
+        self.assertEqual(launch.unpinned_package(["npm", "--yes", "exec", "some-mcp"]), ("some-mcp", "some-mcp@1.2.3"))
+
+    def test_every_package_a_runner_is_given(self):
+        words = ["npx", "-y", "-p", "left-pad@1.3.0", "--package=postmark-mcp@1.0.16", "-p", "b-c-d", "postmark-mcp"]
+        found = launch.runner_packages(words)
+        self.assertEqual([ref.written for ref in found], ["npx left-pad@1.3.0", "npx postmark-mcp@1.0.16", "npx b-c-d"])
+        self.assertEqual([level for level, _ in advisory_findings(found[1])], ["fail"])
+        self.assertEqual(launch_identity("C:/x/npx.cmd", words)["package"],
+                         "npx left-pad@1.3.0; npx postmark-mcp@1.0.16; npx b-c-d")
+        self.assertEqual(launch.unpinned_spec(found[2]), ("b-c-d", "b-c-d@1.2.3"))
+        pnpm = launch.runner_packages(["pnpm", "dlx", "-p", "a@1.0.0", "-p", "b", "run-it"])
+        self.assertEqual([ref.written for ref in pnpm], ["pnpm dlx a@1.0.0", "pnpm dlx b"])
+        self.assertEqual(len(launch.runner_packages(["npx"] + ["-p", "a-b-c"] * 2000 + ["x"])), 1)  # each once
+
+    def test_the_requirements_of_uvx_with(self):
+        found = launch.runner_packages(["uvx", "--with", "mcp-server-git==2025.1.1", "-w", "b", "x-server==1.0.0"])
+        self.assertEqual([(ref.written, ref.role) for ref in found],
+                         [("uvx x-server==1.0.0", "run"), ("uvx --with mcp-server-git==2025.1.1", "with"),
+                          ("uvx --with b", "with")])
+        self.assertEqual([level for level, _ in advisory_findings(found[1])], ["warn"])
+        self.assertIsNone(launch.unpinned_spec(found[2]))  # a requirement is not asked to be pinned
+        self.assertEqual([ref.spec for ref in launch.runner_packages(["uv", "tool", "run", "--with=a,b[x,y]>=1,<2 , c",
+                                                                      "s==1.0.0"])][1:], ["a", "b[x,y]>=1,<2", "c"])
+        self.assertEqual(typosquat_of(launch.runner_packages(["uvx", "--with", "mcp-server-gti", "s==1.0.0"])[1]),
+                         "mcp-server-git")
+        self.assertTrue(any("straight from a git repository" in risk
+                            for risk in risks("uvx", "--with=git+https://x/p", "s==1.0.0")))
+
+    def test_other_spellings_of_a_git_package(self):
+        for spec, source in (("git@github.com:evil/pkg.git", "git"), ("user@host.example.org:r.git", "git"),
+                             ("pkg@github:evil/pkg", "git"), ("pkg@git+https://x/y.git", "git"),
+                             ("ssh://git@github.com/x/y.git", "url"), ("pkg@file:../x", "path"),
+                             ("@scope/pkg@1.0.0", "registry"), ("x@1.0.0", "registry")):
+            with self.subTest(spec=spec):
+                self.assertEqual(runner_package(["npx", "-y", spec]).source, source)
+        self.assertTrue(any("straight from a git repository" in risk
+                            for risk in risks("npx", "-y", "git@github.com:evil/pkg.git")))
+
+    def test_a_container_given_its_engine(self):
+        digest = "img@sha256:" + "d" * 64
+        for mount in (["-v", "/var/run/docker.sock:/var/run/docker.sock"], ["-v", "//var/run/docker.sock:/s"],
+                      ["--volume=/run/user/1000/podman/podman.sock:/s"], ["-v", "/var/run:/var/run"],
+                      ["-v", "//./pipe/docker_engine://./pipe/docker_engine"], ["-v", "\\\\.\\pipe\\docker_engine:/p"],
+                      ["--mount", "type=bind,src=/run/containerd/containerd.sock,dst=/c"], ["--use-api-socket"]):
+            with self.subTest(mount=mount):
+                found = risks("docker", "run", *mount, digest)
+                self.assertTrue(any("in effect is root on the host" in risk for risk in found), found)
+        for mount in (["-v", "/srv/data:/data"], ["-v", "/var/run/app.pid:/p"], ["--use-api-socket=false"]):
+            with self.subTest(mount=mount):
+                self.assertEqual(risks("docker", "run", *mount, digest), [])
+
+    def test_mounts_beyond_the_ones_checked_are_said_to_be(self):
+        digest = "img@sha256:" + "e" * 64
+        many = ["-v", "/srv/a:/a"] * launch.MAX_MOUNTS_CHECKED + ["-v", "/var/run/docker.sock:/s"]
+        found = risks("docker", "run", *many, digest)
+        checked = launch.MAX_MOUNTS_CHECKED
+        self.assertEqual(found, [f"mounts {checked + 1} folders or files into the container, more than any real one "
+                                 f"needs, so only the first {checked} were checked"])
+        self.assertEqual(risks("docker", "run", *many[2:], digest)[0].split(" (")[0],
+                         "mounts the container engine's socket into the container")
+
+    def test_hostile_spellings_stay_fast(self):
+        for words in (["cmd"] * 4096, ["cmd"] + ["x" * 1000] * 4095, ["cmd", "/" * 4_000_000],
+                      ["cmd", "/c" + "^" * 4_000_000], ["server"] + ["cmd", "/d"] * 2048, ["npm"] + ["--x"] * 4096,
+                      ["npx"] + ["-p", "a"] * 2048 + ["x"], ["uvx", "--with", "a," * 2_000_000, "x"],
+                      ["uvx", "--with", "a" + ",>=1" * 1_000_000, "x"], ["uvx"] + ["--python", "3"] * 2048 + ["x"],
+                      ["bash", "-c", "(" * 1_000_000 + "npx x" + ")" * 1_000_000],
+                      ["cmd", "/c", "start " + "/x " * 3000 + "npx -y x"],
+                      ["docker", "run"] + ["-v", "/." * 2000 + "run:/h"] * 2000 + ["img"]):
+            started = time.perf_counter()
+            launch_risks(words, user_home=HOME)
+            launch.runner_packages(words)
+            launch_identity("C:/x/" + words[0], words)
+            self.assertLess(time.perf_counter() - started, 2)
+
+
 class Packages(unittest.TestCase):
     def test_the_package_a_runner_runs(self):
         for words, expected in (
@@ -416,10 +557,15 @@ class WhatAServerPinHolds(unittest.TestCase):
     def test_behind_a_wrapper_the_package_or_script_is_pinned(self):
         identity = launch_identity("C:/Windows/System32/cmd.exe", ["cmd", "/c", "npx", "-y", "mcp-remote@0.1.16"])
         self.assertEqual(identity["package"], "npx mcp-remote@0.1.16")  # so a new version is seen at the start
+        for words in (["cmd", "/s/c", "npx -y mcp-remote@0.1.16"], ["npm", "--yes", "exec", "mcp-remote@0.1.16"],
+                      ["uv", "--quiet", "tool", "run", "mcp-remote==0.1.16"]):
+            with self.subTest(words=words):  # DOC2-1: these pinned no package at all
+                self.assertIsNotNone(launch_identity("C:/x/" + words[0], words)["package"])
         script = self.folder / "server.js"
         script.write_bytes(b"console.log(2)")
         for words in (["cmd", "/c", "node", "server.js"], ["env", "NODE_ENV=production", "node", "server.js"],
-                      ["bash", "-c", "exec node server.js"]):
+                      ["bash", "-c", "exec node server.js"], ["cmd", "/s/c", "node server.js"],  # DOC2-1
+                      ["cmd", "/d/q/c", "node", "server.js"], ["timeout", "600", "node", "server.js"]):
             with self.subTest(words=words):
                 identity = launch_identity("C:/x/" + words[0], words, cwd=str(self.folder))
                 self.assertEqual((identity["script"], identity["script_sha256"]),
