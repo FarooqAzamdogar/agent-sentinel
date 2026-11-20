@@ -43,6 +43,8 @@ MAX_RULE_ID_CHARS = 600
 # A position as rule ids write it (policy.RULE_INDEX): "[3]", no leading zeros, at most nine digits.
 _INDEX = RULE_INDEX
 _TOOL_PART = re.compile(rf"tools\.(.+)\.(deny_args{_INDEX}|allow_args{_INDEX}|other_args|max_calls_per_minute)")
+# A tool rule's command section: tools.Bash.command.network, tools.Bash.command.unreadable.
+_TOOL_COMMAND = re.compile(r"tools\.(.+)\.command\.([a-z_]{1,20})")
 
 # The fixed rule ids (policy.RULE_*) and the kind of hint each gets.
 _FIXED_KINDS = {
@@ -71,7 +73,7 @@ _PART_KINDS = {"other_args": "other_args", "max_calls_per_minute": "limit_tool"}
 # policy. `suggest` never proposes to loosen them; `report` says so next to them.
 PROTECTIVE_KINDS = frozenset({
     "deny_global", "deny_tool", "secrets", "secrets_results", "canary", "known_value", "secret_pattern",
-    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "hook_failed",
+    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "hook_failed", "command",
 })
 
 
@@ -101,6 +103,9 @@ def classify(rule: Any) -> RuleId:
     for section, kind in (("server_requests.", "server_request"), ("client_requests.", "client_request")):
         if rule.startswith(section) and len(rule) > len(section):
             return RuleId(kind, text, name=rule[len(section):])
+    command = _TOOL_COMMAND.fullmatch(rule)
+    if command:
+        return RuleId("command", text, tool_rule=command.group(1), name=command.group(2))
     part = _TOOL_PART.fullmatch(rule)
     if part:
         tool_rule, which = part.group(1), part.group(2)
@@ -195,7 +200,24 @@ def fix_hint(
         )
     if kind == "flow":
         return _flow_hint(rule_id.text, rule, policy)
+    if kind == "command":
+        return _command_hint(rule_id)
     return _FIXED_HINTS.get(kind, _FIXED_HINTS["unknown"])
+
+
+def _command_hint(rule_id: RuleId) -> str:
+    rule = _name(rule_id.tool_rule)
+    if rule_id.name == "unreadable":
+        return (
+            f"The command section of the tool rule {rule} could not read the command with certainty (an unclosed "
+            "quote, a heredoc, a program chosen at run time, a very long or deeply nested command). Write the "
+            'command more plainly; "unreadable": "ask" in that section sends such commands to a person instead.'
+        )
+    return (
+        f"The command section of the tool rule {rule} found a command in the class {_name(rule_id.name)}. If it is "
+        "harmless, move the class from deny_classes to ask_classes, or (for network and install only) add the "
+        'program to allow_programs, such as "git push"; if not, the block is doing its job.'
+    )
 
 
 def _default_hint(tool: Any) -> str:

@@ -7,6 +7,7 @@ Module map:
     leaks.py          recognises secrets in calls, results and logs  (uses textutil)
     policy.py         decides allow / ask / block for a call    (uses detector for severities)
     matchers.py       the ways a policy judges one argument's value (pattern, one_of, path, url, ...)
+    commands.py       what a Bash or PowerShell command line does, in classes (network, install, ...)
     policy_errors.py  error messages that help fix a policy file
     session.py        what the agent has read this session, for flow rules (memory or file store)
     filelock.py       operating-system file locks (audit log, session files)

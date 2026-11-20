@@ -1276,8 +1276,6 @@ class TheProxyInA2026Session(EndToEndTest):
         self.assertEqual(discovered["capabilities"]["extensions"], {})  # tasks removed
         tools = [tool["name"] for tool in proxy.request(2, "tools/list", modern=True)["result"]["tools"]]
         self.assertEqual(tools, ["read_file", "fetch_page", "search_with_approval", "search_with_summary"])
-        allowed = proxy.call(3, "read_file", {"path": "a.txt"}, modern=True)["result"]
-        self.assertEqual((allowed["content"][0]["text"], allowed["resultType"]), ("contents of a.txt", "complete"))
         refused = proxy.call(4, "delete_file", {"path": "a.txt"}, modern=True)["result"]
         self.assertEqual((refused["isError"], refused["resultType"]), (True, "complete"))
 
@@ -1294,6 +1292,12 @@ class TheProxyInA2026Session(EndToEndTest):
         self.assertIn("looks like a secret", text_of(leaked))
         sampling = proxy.call(8, "search_with_summary", {"query": "soup"}, modern=True)
         self.assertIn("the server asked for input that is not permitted", text_of(sampling))
+        # Read after the searches: since 0.6 the example labels search_* a sink, so once a private file has
+        # been read too, the flow rule refuses them.
+        allowed = proxy.call(3, "read_file", {"path": "a.txt"}, modern=True)["result"]
+        self.assertEqual((allowed["content"][0]["text"], allowed["resultType"]), ("contents of a.txt", "complete"))
+        after = proxy.call(18, "search_with_approval", {"query": "soup"}, modern=True)
+        self.assertIn("not permitted by the policy", text_of(after))
 
         unknown = proxy.request(9, "tools/list", {"_meta": {VERSION_KEY: "2099-01-01"}})
         self.assertEqual(unknown["error"], {"code": -32022, "message": "Unsupported protocol version",

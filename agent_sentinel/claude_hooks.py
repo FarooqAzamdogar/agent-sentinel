@@ -362,7 +362,7 @@ def _pre_tool_use(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
                 decision, False, f"the hook: permission mode {shown} would not show the prompt", asked=False
             )
     if decision.allowed or decision.pending:
-        decision = _marked_before_the_call(firewall, tool, decision)
+        decision = _marked_before_the_call(firewall, tool, decision, event["tool_input"])
     if decision.allowed:
         return HookAnswer()  # nothing: Claude Code's own permission rules decide the rest
     if decision.pending:
@@ -370,7 +370,7 @@ def _pre_tool_use(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
     return HookAnswer(_pre_tool_use_output("deny", blocked_text(decision.public_reason)))
 
 
-def _marked_before_the_call(firewall: Firewall, tool: str, decision: Decision) -> Decision:
+def _marked_before_the_call(firewall: Firewall, tool: str, decision: Decision, args: Any = None) -> Decision:
     """Set now the flow marks of a call whose output the PostToolUse hooks may never see; refuse it if they cannot be.
 
     By default the PostToolUse hooks run only for web and MCP tools
@@ -379,12 +379,13 @@ def _marked_before_the_call(firewall: Firewall, tool: str, decision: Decision) -
     never apply. Setting the marks before the call runs is the safe side: at
     worst a call that then fails, or that the user refuses in Claude Code's
     prompt, counts as read. Tools the default matcher covers keep their marks
-    for when their output is actually delivered.
+    for when their output is actually delivered. A command section's labels_by_class adds labels by what
+    the call's command does (`args`, the tool input).
     """
     if covered_by_results_hooks(tool):
         return decision
     try:
-        firewall.mark_delivered(tool)
+        firewall.mark_delivered(tool, args=args)
     except SessionStateError as exc:
         reason = f"the call was refused: its flow marks could not be recorded: {exc}"
         if decision.pending:

@@ -32,6 +32,7 @@ in the policy file:
     tools.read_file.deny_args[1]         a tool rule's deny rule
     tools.send_email.allow_args[0]       a tool rule's allow rule
     tools.send_email.other_args          an argument no allow rule names
+    tools.Bash.command.network           a tool rule's command section, by class (or "unreadable")
     tools.send_email.max_calls_per_minute, limits.max_calls_per_minute   rate limits
     server_requests.sampling/createMessage
     client_requests.completion/complete
@@ -51,7 +52,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence, TypeVar
 
-from . import jsonutil, matchers
+from . import commands, jsonutil, matchers
+from .commands import CommandRule
 from .detector import SEVERITY_ORDER
 from .matchers import Matcher, PathMatcher, PatternMatcher, decoded_spellings
 from .policy_errors import (
@@ -65,7 +67,7 @@ from .policy_errors import (
     unicode_error_message,
     unknown_keys_message,
 )
-from .session import BUILTIN_LABELS, SINK, UNTRUSTED, SessionMarks, is_label
+from .session import BUILTIN_LABELS, PRIVATE, SINK, UNTRUSTED, SessionMarks, is_label
 from .textutil import printable, texts_in
 
 ACTIONS = ("allow", "ask", "block")
@@ -152,8 +154,18 @@ _STRICTNESS = {"allow": 0, "ask": 1, "block": 2}
 # The keys a policy file may have, at the top and in "secrets".
 _TOP_LEVEL_KEYS = (
     "default", "deny_args", "tools", "server_requests", "client_requests", "injection", "secrets", "limits",
-    "flows", "classify_by_annotations", "hide_blocked_tools",
+    "flows", "classify_by_annotations", "hide_blocked_tools", "require_labels",
 )
+# The keys of a tool rule, and of its "command" section.
+_TOOL_RULE_KEYS = ("action", "deny_args", "allow_args", "other_args", "max_calls_per_minute", "labels", "command")
+_COMMAND_KEYS = ("arg", "shell", "deny_classes", "ask_classes", "allow_programs", "labels_by_class", "unreadable")
+MAX_ALLOW_PROGRAMS = 100
+
+# Tool names that suggest a tool sends something out (a request, a search query, a post): such a
+# tool should be labelled "sink" once flow rules exist (a warning, see _sink_label_warnings).
+_SENDS_OUT_NAME = re.compile(r"fetch|http|request|search|browse|webhook|post|upload", re.IGNORECASE)
+# The most tool names a warning lists.
+_NAMES_LISTED = 5
 _SECRETS_KEYS = ("in_arguments", "in_results", "known_values_from_env", "canaries", "patterns")
 
 
@@ -240,12 +252,19 @@ def _deciding_rules(rules: Sequence[_Rule], name: str) -> list[_Rule]:
 
 @dataclass(frozen=True)
 class ArgRule:
-    """One entry of deny_args or allow_args: an argument name and the matcher that judges its value."""
+    """One entry of deny_args or allow_args: an argument name and the matcher that judges its value.
+
+    A named entry of deny_args checks every top-level argument whose name is
+    the same ignoring case ("Command" for "command"), because some servers
+    read argument names that way.
+    """
 
     arg: str
     matcher: Matcher
     # allow_args only: the argument may be left out, but a value that is given must be acceptable.
     optional: bool = False
+    # deny_args only: "block" (the default) refuses a call the entry matches; "ask" sends it to a person.
+    action: str = "block"
 
     def __post_init__(self) -> None:
         # Code written before matchers existed passed a compiled pattern here.
@@ -255,7 +274,8 @@ class ArgRule:
     def describe(self) -> str:
         """What this entry checks, for the operator."""
         which = "every argument" if self.arg == ANY_ARG else f"argument {quoted(self.arg)}"
-        return f"{which}: {self.matcher.describe()}" + (", or left out" if self.optional else "")
+        asks = ", sent to a person for approval" if self.action == "ask" else ""
+        return f"{which}: {self.matcher.describe()}" + (", or left out" if self.optional else "") + asks
 
 
 @dataclass(frozen=True)
@@ -268,6 +288,16 @@ class ToolRule(_NamedRule):
     max_calls_per_minute: int | None = None
     # Flow labels of the tools this rule matches, such as ("untrusted",) or ("private", "sink").
     labels: tuple[str, ...] = ()
+    # The "command" section: how the classes of a shell command argument are treated (commands.py).
+    command: CommandRule | None = None
+    # True when the policy file has "labels" for this rule, even an empty list: "labels": [] says the
+    # tool has no flow label on purpose (see Policy.require_labels and the warnings).
+    labels_given: bool = False
+
+    @property
+    def labelled(self) -> bool:
+        """True if the rule has labels, or says it has none on purpose."""
+        return self.labels_given or bool(self.labels)
 
 
 @dataclass(frozen=True)
@@ -389,6 +419,12 @@ class Policy:
     hide_blocked_tools               whether the proxy hides tools that tool_level_action says "block"
                                      from tools/list (default false). Hiding is not enforcement:
                                      a call to a hidden tool is still checked and refused.
+
+    Added in 0.6:
+
+    require_labels                   true: every rule that allows or asks must say its flow labels
+                                     ("labels", an empty list when it has none on purpose), or the
+                                     policy does not load (default false: a warning when flows exist).
     """
 
     default: str = "block"
@@ -412,6 +448,8 @@ class Policy:
     flows: tuple[FlowRule, ...] = ()
     classify_by_annotations: bool = True
     hide_blocked_tools: bool = False
+    # ---- added in 0.6
+    require_labels: bool = False
 
     def __post_init__(self) -> None:
         # A policy can also be built in code, without the loader. An action such
@@ -447,8 +485,17 @@ class Policy:
         self.secrets_patterns = _code_secret_patterns(self.secrets_patterns)
         _expect_severity(self.block_severity)
         for name, value in (("classify_by_annotations", self.classify_by_annotations),
-                            ("hide_blocked_tools", self.hide_blocked_tools)):
+                            ("hide_blocked_tools", self.hide_blocked_tools),
+                            ("require_labels", self.require_labels)):
             _expect_bool(value, name)
+        for rule in self.tools:
+            if rule.command is not None and not isinstance(rule.command, CommandRule):
+                raise PolicyError(f"tools.{rule.name}.command must be a CommandRule")
+            if self.require_labels and rule.action != "block" and not _labels_said(self.tools, rule):
+                raise PolicyError(
+                    f'tools.{rule.name}: "require_labels" is true, so a rule that allows or asks must say its flow '
+                    'labels: add "labels" (["untrusted"], ["private"], ["sink"] ..., or [] for none)'
+                )
 
     # ---- loading ------------------------------------------------------------
 
@@ -512,6 +559,8 @@ class Policy:
         _expect_bool(classify, "classify_by_annotations")
         hide = data.get("hide_blocked_tools", False)
         _expect_bool(hide, "hide_blocked_tools")
+        require_labels = data.get("require_labels", False)
+        _expect_bool(require_labels, "require_labels")
 
         client_requests = None
         if "client_requests" in data:
@@ -533,6 +582,7 @@ class Policy:
             flows=_flow_rules(data.get("flows", [])),
             classify_by_annotations=classify,
             hide_blocked_tools=hide,
+            require_labels=require_labels,
         )
 
     # ---- evaluating ---------------------------------------------------------
@@ -546,10 +596,14 @@ class Policy:
     ) -> Verdict:
         """Decide what should happen to a call of `tool` with `args`.
 
-        In order: the policy-wide deny_args, which hold for every call; then
-        the rule with exactly this name; otherwise every wildcard rule that
-        matches, each checked in full, and the strictest result wins. With no
-        rule at all, the default.
+        In order: a call whose argument names differ only in case is refused;
+        then the policy-wide deny_args, which hold for every call; then the
+        deny_args and command sections of every wildcard rule that matches
+        (an exact rule does not lift them); then the rule with exactly this
+        name, or otherwise every wildcard rule that matches, each checked in
+        full, and the strictest result wins. With no rule at all, the default.
+        A deny_args entry with "action": "ask" makes the call ask, unless
+        something refuses it.
 
         marks:        what the session has read (a SessionMarks, or plain labels
                       such as {"untrusted"} to ask "what if"). When given, the
@@ -557,11 +611,13 @@ class Policy:
                       verdicts wins (see flow_verdict). None leaves flows out.
         extra_labels: labels the tool has besides those the policy gives it
                       (the firewall passes the ones its MCP annotations imply).
+                      The labels its command sections give this call
+                      (labels_by_class) are added here.
         """
         verdict = self._verdict_without_flows(tool, args)
         if marks is None or verdict.action == "block":
             return verdict
-        flow = self.flow_verdict(tool, marks, extra_labels)
+        flow = self.flow_verdict(tool, marks, frozenset(extra_labels) | self.command_labels(tool, args))
         # A flow that is at least as strict wins a tie: its reason says more (what was read, and where from).
         if flow is not None and _STRICTNESS[flow.action] >= _STRICTNESS[verdict.action]:
             return flow
@@ -586,20 +642,32 @@ class Policy:
 
     def _argument_and_rule_verdict(self, tool: str, args: dict[str, Any]) -> Verdict:
         """The policy-wide deny_args first; then the tool rules that decide for `tool`, or the default."""
-        denied = _denied_argument(self.deny_args, args, "deny_args")
+        clash = _case_clash(args)
+        if clash is not None:
+            return clash
+        asks: list[Verdict] = []
+        denied = _denied_argument(self.deny_args, args, "deny_args", asks)
         if denied is not None:
             return denied
 
         rules = _deciding_rules(self.tools, tool)
+        for rule in self.tools:
+            if rule.is_glob and rule.matches(tool) and not any(rule is chosen for chosen in rules):
+                # An exact rule decides for this tool, but a wildcard's restrictions still hold, as its
+                # labels and rate limit do: deny rules only ever add blocks.
+                denied = _restrictions(rule, args, asks)
+                if denied is not None:
+                    return denied
         if not rules:
             reason = f"no rule for '{printable(tool, limit=80)}', default is {self.default}"
-            return _rule_verdict(self.default, reason, RULE_DEFAULT)
+            return max([*asks, _rule_verdict(self.default, reason, RULE_DEFAULT)], key=_strictness)
 
         # Strictest wins, so a block holds whatever else matches and the order of
         # the rules in the file does not matter. max() returns the first of equals,
-        # which keeps file order between verdicts that are equally strict.
-        verdicts = [_apply_rule(rule, args) for rule in rules]
-        return max(verdicts, key=lambda verdict: _STRICTNESS[verdict.action])
+        # which keeps file order between verdicts that are equally strict, and puts
+        # an "ask" of an argument rule (which says why) before a rule's own "ask".
+        verdicts = [*asks, *(_apply_rule(rule, args) for rule in rules)]
+        return max(verdicts, key=_strictness)
 
     def server_request_verdict(self, method: str) -> Verdict:
         """Decide whether the server may send the client a request or notification with this method.
@@ -690,6 +758,22 @@ class Policy:
             return frozenset()
         return frozenset(label for rule in self.tools if rule.labels and rule.matches(tool) for label in rule.labels)
 
+    def command_labels(self, tool: str, args: Any) -> frozenset[str]:
+        """The flow labels one call gets from the labels_by_class of the command sections that match `tool`.
+
+        Like tool labels, they add up over every rule that matches. A command
+        that cannot be read gets every label its sections could give.
+        """
+        if not isinstance(tool, str) or args is None:
+            return frozenset()
+        return frozenset(label for rule in self.tools
+                         if rule.command is not None and rule.command.labels_by_class and rule.matches(tool)
+                         for label in rule.command.labels(args))
+
+    def call_labels(self, tool: str, args: Any) -> frozenset[str]:
+        """Every flow label the policy gives this call: the tool's labels and its command's (for explain, check)."""
+        return self.tool_labels(tool) | self.command_labels(tool, args)
+
     def flow_verdict(
         self, tool: str, marks: SessionMarks | Iterable[str], extra_labels: Iterable[str] = ()
     ) -> Verdict | None:
@@ -748,8 +832,11 @@ class Policy:
         for rule in self.tools:
             found.extend(_empty_match_warnings(f"tools.{rule.name}", rule.deny_args, rule.allow_args))
         found.extend(_overridden_glob_warnings(self.tools))
+        found.extend(_shadowed_glob_warnings(self.tools))
         found.extend(_missing_root_warnings(self))
         found.extend(_flow_warnings(self))
+        found.extend(_label_warnings(self))
+        found.extend(_rule_of_two_warnings(self))
         found.extend(_client_request_warnings(self))
         found.extend(known_value_warnings(self))
         return found
@@ -867,12 +954,28 @@ def _flow_reason(index: int, flow: FlowRule, tool: str, marks: SessionMarks) -> 
     )
 
 
+def _strictness(verdict: Verdict) -> int:
+    return _STRICTNESS[verdict.action]
+
+
 def _apply_rule(rule: ToolRule, args: dict[str, Any]) -> Verdict:
-    """Check a call against one rule: its deny_args, its allow_args, its other_args, then its action."""
+    """Check a call against one rule: its deny_args and command section, its allow_args, its other_args, then
+    its action."""
     where = f"tools.{rule.name}"
-    denied = _denied_argument(rule.deny_args, args, f"{where}.deny_args")
+    asks: list[Verdict] = []
+    denied = _restrictions(rule, args, asks)
     if denied is not None:
         return denied
+
+    allow_names = {allow.arg for allow in rule.allow_args}
+    if allow_names:
+        # A server that reads names ignoring case (Go's encoding/json does) would take "Path" for "path":
+        # a name that is an allow_args name in another case is not accepted, even with other_args "allow".
+        folded = {allow.arg.casefold(): index for index, allow in reversed(list(enumerate(rule.allow_args)))}
+        for name in args:
+            if isinstance(name, str) and name not in allow_names and name.casefold() in folded:
+                reason = f"argument '{printable(name, limit=60)}' is not accepted by the policy"
+                return _argument_block(reason, f"{where}.allow_args[{folded[name.casefold()]}]", _bounded_name(name))
 
     for index, allow in enumerate(rule.allow_args):
         rule_id = f"{where}.allow_args[{index}]"
@@ -886,50 +989,140 @@ def _apply_rule(rule: ToolRule, args: dict[str, Any]) -> Verdict:
     if rule.other_args == "block":
         # Top level only. An allowed argument cannot carry more arguments inside
         # it, because _is_allowed refuses objects.
-        named = {allow.arg for allow in rule.allow_args}
         for name in args:
-            if name not in named:
+            if name not in allow_names:
                 # The name is chosen by the agent: shorten and escape it before repeating it.
                 reason = f"argument '{printable(name, limit=60)}' is not accepted by the policy"
                 return _argument_block(reason, f"{where}.other_args", _bounded_name(name))
 
-    return _rule_verdict(rule.action, f"rule '{rule.name}' says {rule.action}", where)
+    action = _rule_verdict(rule.action, f"rule '{rule.name}' says {rule.action}", where)
+    return max([*asks, action], key=_strictness)
 
 
-def _denied_argument(rules: tuple[ArgRule, ...], args: dict[str, Any], where: str) -> Verdict | None:
+def _restrictions(rule: ToolRule, args: dict[str, Any], asks: list[Verdict]) -> Verdict | None:
+    """A rule's checks that only ever add restrictions: its deny_args and its command section.
+
+    Returns a block, or None; an "ask" is added to `asks`.
+    """
+    where = f"tools.{rule.name}"
+    denied = _denied_argument(rule.deny_args, args, f"{where}.deny_args", asks)
+    if denied is not None:
+        return denied
+    command = _command_verdict(rule, args, where)
+    if command is not None:
+        if command.action == "block":
+            return command
+        asks.append(command)
+    return None
+
+
+def _command_verdict(rule: ToolRule, args: dict[str, Any], where: str) -> Verdict | None:
+    """The verdict of a rule's command section: a block or an ask, or None when it lets the command through."""
+    section = rule.command
+    if section is None or not section.judges:
+        return None
+    reading = section.reading(args)
+    rule_id = f"{where}.command"
+    if reading.unreadable is not None:
+        does = "sent to a person for approval" if section.unreadable == "ask" else "refused"
+        reason = f"the command cannot be read with certainty ({reading.unreadable}), so it is {does}"
+        return _command_result(section, section.unreadable, reason, f"{rule_id}.{commands.UNREADABLE}")
+    found = section.found(reading)
+    for action, listed_classes in (("block", section.deny_classes), ("ask", section.ask_classes)):
+        for kind in commands.CLASSES:
+            if kind in found and kind in listed_classes:
+                does = "refused" if action == "block" else "sent to a person for approval"
+                reason = (f"the command {found[kind].evidence}: class '{kind}' ({commands.CLASS_TEXT[kind]}), "
+                          f"so it is {does}")
+                return _command_result(section, action, reason, f"{rule_id}.{kind}")
+    return None
+
+
+def _command_result(section: CommandRule, action: str, reason: str, rule_id: str) -> Verdict:
+    if action == "block":
+        # Worded like any refused value, so the agent cannot tell a command rule from a deny rule.
+        return Verdict("block", reason, VALUE_NOT_PERMITTED.format(section.arg), rule_id, section.arg)
+    return Verdict("ask", reason, NOT_PERMITTED, rule_id, section.arg)
+
+
+def _case_clash(args: dict[str, Any]) -> Verdict | None:
+    """A block when two top-level argument names differ only in case ("to" and "To"), or None.
+
+    A server that matches names ignoring case would read one of them in place
+    of the other, and which one is up to the server.
+    """
+    seen: dict[str, str] = {}
+    for name in args:
+        if not isinstance(name, str):
+            continue
+        first = seen.setdefault(name.casefold(), name)
+        if first != name:
+            reason = (f"the argument names '{printable(first, limit=60)}' and '{printable(name, limit=60)}' differ "
+                      "only in case")
+            return Verdict("block", reason, NOT_PERMITTED, RULE_MALFORMED, _bounded_name(name))
+    return None
+
+
+def _denied_argument(
+    rules: tuple[ArgRule, ...], args: dict[str, Any], where: str, asks: list[Verdict] | None = None
+) -> Verdict | None:
     """Return a block for the first deny rule that matches, or None.
 
     The wording is VALUE_NOT_PERMITTED, as for an allow list, and names the
     argument also for a "*" entry, so the agent cannot tell which list
-    refused it; `rule` tells the operator.
+    refused it; `rule` tells the operator. An entry with "action": "ask" that
+    matches adds an "ask" to `asks` (the first one only) and the checks go on;
+    without `asks` it refuses like any other entry.
     """
+    folded = _folded_names(args) if any(rule.arg != ANY_ARG for rule in rules) else {}
+    asked = False
     for index, rule in enumerate(rules):
-        matched = _denied_in(rule, args)
-        if matched is not None:
-            # For "*" the name is the agent's: shorten and escape it before repeating it.
-            shown = printable(matched, limit=60) if rule.arg == ANY_ARG else rule.arg
-            return _argument_block(VALUE_NOT_PERMITTED.format(shown), f"{where}[{index}]", matched)
+        if rule.action == "ask" and asks is not None and asked:
+            continue  # one ask from this list says enough
+        matched = _denied_in(rule, args, folded)
+        if matched is None:
+            continue
+        # For "*" the name is the agent's: shorten and escape it before repeating it.
+        shown = printable(matched, limit=60) if rule.arg == ANY_ARG else rule.arg
+        if rule.action == "ask" and asks is not None:
+            reason = f"argument '{shown}' has a value the policy sends to a person for approval"
+            asks.append(Verdict("ask", reason, NOT_PERMITTED, f"{where}[{index}]", matched))
+            asked = True
+            continue
+        return _argument_block(VALUE_NOT_PERMITTED.format(shown), f"{where}[{index}]", matched)
     return None
 
 
-def _denied_in(rule: ArgRule, args: dict[str, Any]) -> str | None:
+def _folded_names(args: dict[str, Any]) -> dict[str, list[Any]]:
+    """The argument names by their casefolded spelling (a name that is not text keeps its own spelling)."""
+    folded: dict[str, list[Any]] = {}
+    for name in args:
+        folded.setdefault(name.casefold() if isinstance(name, str) else name, []).append(name)
+    return folded
+
+
+def _denied_in(rule: ArgRule, args: dict[str, Any], folded: dict[str, list[Any]] | None = None) -> str | None:
     """The name of the argument in which the deny rule matches, or None.
 
     Looks inside nested lists and objects, including object keys, so a denied
     value cannot be hidden one level down. For "*", the name of an argument
-    is itself one of the texts checked.
+    is itself one of the texts checked. A named entry checks every top-level
+    argument whose name is the same ignoring case (str.casefold).
     """
     if rule.arg == ANY_ARG:
         for name, value in args.items():
             if _found_in_any(rule.matcher, texts_in({name: value}, keys=True, scalars=True)):
                 return _bounded_name(name)
         return None
-    if rule.arg not in args:
-        return None
-    # An empty list or object holds no text, but the argument is there: check
-    # it as empty text, so that a pattern meant to forbid the argument still does.
-    texts = texts_in(args[rule.arg], keys=True, scalars=True) or [""]
-    return rule.arg if _found_in_any(rule.matcher, texts) else None
+    if folded is None:
+        folded = _folded_names(args)
+    for name in folded.get(rule.arg.casefold(), ()):
+        # An empty list or object holds no text, but the argument is there: check
+        # it as empty text, so that a pattern meant to forbid the argument still does.
+        texts = texts_in(args[name], keys=True, scalars=True) or [""]
+        if _found_in_any(rule.matcher, texts):
+            return rule.arg if name == rule.arg else _bounded_name(name)
+    return None
 
 
 def _found_in_any(matcher: Matcher, texts: list[str]) -> bool:
@@ -1012,6 +1205,18 @@ def _describe_tool_rule_part(rule: ToolRule, rule_id: str) -> str | None:
         return f"tool rule '{rule.name}' accepts only the arguments its allow_args name ({named})"
     if part == "max_calls_per_minute" and rule.max_calls_per_minute is not None:
         return f"tool rule '{rule.name}': at most {rule.max_calls_per_minute} call(s) per minute"
+    section = rule.command
+    if section is not None and part.startswith("command."):
+        kind = part[len("command."):]
+        if kind == commands.UNREADABLE and section.judges:
+            does = "sent to a person for approval" if section.unreadable == "ask" else "refused"
+            return (f"tool rule '{rule.name}': a {section.shell} command that cannot be read with certainty "
+                    f"(an unclosed quote, a heredoc, a program chosen at run time ...) is {does}")
+        for action, listed_classes in (("refused", section.deny_classes), ("sent to a person for approval",
+                                                                             section.ask_classes)):
+            if kind in listed_classes:
+                return (f"tool rule '{rule.name}': a {section.shell} command in the class '{kind}' "
+                        f"({commands.CLASS_TEXT[kind]}) is {action}")
     indexed = re.fullmatch(rf"(deny_args|allow_args){_INDEX}", part)
     if indexed:
         entries = rule.deny_args if indexed.group(1) == "deny_args" else rule.allow_args
@@ -1080,27 +1285,143 @@ def _overridden_glob_warnings(tools: list[ToolRule]) -> list[str]:
     return found
 
 
-def _missing_root_warnings(policy: Policy) -> list[str]:
-    """Warn about a path root that is not a folder on this machine: probably a typo, or the wrong machine."""
-    lists = [("deny_args", policy.deny_args)]
-    for rule in policy.tools:
-        lists += [(f"tools.{rule.name}.deny_args", rule.deny_args), (f"tools.{rule.name}.allow_args", rule.allow_args)]
+def _shadowed_glob_warnings(tools: list[ToolRule]) -> list[str]:
+    """Warn when an exact rule replaces the allow_args (or the closed list) of a wildcard rule that matches it.
+
+    The exact rule decides the action and the allowed arguments; the
+    wildcard's deny_args, command section, labels and rate limit still apply.
+    """
     found = []
-    for where, entries in lists:
+    for rule in tools:
+        if rule.is_glob:
+            continue
+        for glob in tools:
+            if glob.is_glob and glob.matches(rule.name) and (glob.allow_args or glob.other_args == "block"):
+                found.append(
+                    f"tools.{rule.name}: this exact rule replaces the allow_args of the wildcard rule '{glob.name}', "
+                    f"so they do not apply to '{rule.name}' (its deny_args, labels and rate limit still do); "
+                    "copy the allow_args you need into the exact rule"
+                )
+    return found
+
+
+def _missing_root_warnings(policy: Policy) -> list[str]:
+    """Warn about a path root that is not a folder on this machine: probably a typo, or the wrong machine.
+
+    A deny root is reported only when the folder that would hold it is missing
+    too: a deny rule for a folder that does not exist yet (~/.codex on a
+    machine without Codex) protects it once it does.
+    """
+    lists = [("deny_args", policy.deny_args, True)]
+    for rule in policy.tools:
+        lists += [(f"tools.{rule.name}.deny_args", rule.deny_args, True),
+                  (f"tools.{rule.name}.allow_args", rule.allow_args, False)]
+    found = []
+    for where, entries, deny in lists:
         for index, entry in enumerate(entries):
             if isinstance(entry.matcher, PathMatcher):
                 found.extend(
                     f"{where}[{index}]: the root '{root}' is not a folder on this machine"
-                    for root in entry.matcher.roots if not os.path.isdir(root)
+                    for root in entry.matcher.roots
+                    if not os.path.isdir(os.path.dirname(root) if deny else root)
                 )
     return found
+
+
+def _labels_said(tools: Sequence[ToolRule], rule: ToolRule) -> bool:
+    """True if the rule says its flow labels (maybe none), or, for an exact rule, a matching wildcard does."""
+    if rule.labelled:
+        return True
+    return not rule.is_glob and any(other.is_glob and other.labelled and other.matches(rule.name) for other in tools)
+
+
+def _possible_labels(policy: Policy, rule: ToolRule) -> frozenset[str]:
+    """The labels a call to the tools of this rule can have: its own (with a matching wildcard's), and its
+    command section's labels_by_class."""
+    labels = set(rule.labels if rule.is_glob else policy.tool_labels(rule.name))
+    if rule.command is not None:
+        labels.update(label for _, given in rule.command.labels_by_class for label in given)
+    return frozenset(labels)
+
+
+def _some_names(names: list[str]) -> str:
+    shown = ", ".join(printable(name, limit=60) for name in names[:_NAMES_LISTED])
+    return shown + (f" and {len(names) - _NAMES_LISTED} more" if len(names) > _NAMES_LISTED else "")
+
+
+def _label_warnings(policy: Policy) -> list[str]:
+    """Warn about tools the flow rules cannot see: allowed with no labels, or likely to send data out unlabelled.
+
+    Only when flow rules exist. A tool also labelled "private" is not asked to
+    be a sink: it is a source of private data, and a block flow would lock it.
+    """
+    if not policy.flows:
+        return []
+    found = []
+    for rule in policy.tools:
+        if rule.action == "block":
+            continue
+        if not _labels_said(policy.tools, rule):
+            found.append(
+                f"tools.{rule.name}: it is allowed but has no flow labels, so the flow rules cannot see what it "
+                'reads or sends; add "labels" (["untrusted"], ["private"], ["sink"] ..., or [] if it has none)'
+            )
+            continue
+        labels = _possible_labels(policy, rule)
+        if SINK in labels or PRIVATE in labels:
+            continue
+        if UNTRUSTED in labels:
+            found.append(
+                f"tools.{rule.name}: it is labelled 'untrusted' but not 'sink'. A tool that fetches content sends "
+                "something too (a URL, a query), which can carry private data out; add 'sink'"
+            )
+        elif _SENDS_OUT_NAME.search(rule.name):
+            found.append(
+                f"tools.{rule.name}: its name says it fetches, searches or posts, but it is not labelled 'sink', so "
+                "a flow rule does not stop it from carrying data out; add 'sink' if it sends anything"
+            )
+    return found
+
+
+def _rule_of_two_warnings(policy: Policy) -> list[str]:
+    """Warn when one session can reach untrusted content, private data and a sink, and no flow rule covers it.
+
+    The agents' "Rule of Two": an agent should not have all three at once. A
+    tool counts when a rule allows it or asks for it; with
+    classify_by_annotations, MCP annotations can make any server tool
+    untrusted and a sink. A flow covers the combination when its "after" holds
+    only 'untrusted' and 'private' and its "then" is 'sink'.
+    """
+    reachable = {UNTRUSTED: [], PRIVATE: [], SINK: []}
+    for rule in policy.tools:
+        if rule.action == "block":
+            continue
+        labels = _possible_labels(policy, rule)
+        for label, names in reachable.items():
+            if label in labels:
+                names.append(rule.name)
+    if not reachable[PRIVATE]:
+        return []
+    if policy.classify_by_annotations:
+        for label in (UNTRUSTED, SINK):
+            reachable[label].append("any server tool its MCP annotations mark")
+    if not reachable[UNTRUSTED] or not reachable[SINK]:
+        return []
+    if any(flow.then == SINK and set(flow.after) <= {UNTRUSTED, PRIVATE} for flow in policy.flows):
+        return []
+    return [
+        f"one session can reach untrusted content ({_some_names(reachable[UNTRUSTED])}), private data "
+        f"({_some_names(reachable[PRIVATE])}) and a tool that sends data out ({_some_names(reachable[SINK])}), and "
+        'no flow rule blocks or asks for that: add {"after": ["untrusted", "private"], "then": "sink", '
+        '"action": "block"} to "flows"'
+    ]
 
 
 def _flow_warnings(policy: Policy) -> list[str]:
     """Warn about flow rules that can never apply, labels nothing uses, and tools a flow will lock after one use."""
     if not policy.flows:
         return []
-    given = {label for rule in policy.tools for label in rule.labels}
+    given = {label for rule in policy.tools for label in _possible_labels(policy, rule)}
     from_annotations = {UNTRUSTED, SINK} if policy.classify_by_annotations else set()
     used = {label for flow in policy.flows for label in (*flow.after, flow.then)}
     found = []
@@ -1115,7 +1436,9 @@ def _flow_warnings(policy: Policy) -> list[str]:
             )
     for rule in policy.tools:
         for label in rule.labels:
-            if label not in used:
+            # A built-in label is never a typo, and it describes the tool for the Rule of Two check
+            # even when no flow names it.
+            if label not in used and label not in BUILTIN_LABELS:
                 hint = did_you_mean(label, sorted(used))
                 found.append(
                     f"tools.{rule.name}.labels: no flow rule uses the label '{label}'"
@@ -1174,9 +1497,7 @@ def _tool_rule(name: Any, spec: Any) -> ToolRule:
         spec = {"action": spec}
     elif not isinstance(spec, dict):
         raise PolicyError(f"{where} must be an action ({listed(ACTIONS)}) or an object, got {type_name(spec)}")
-    _expect_object(
-        spec, where, allowed_keys=("action", "deny_args", "allow_args", "other_args", "max_calls_per_minute", "labels")
-    )
+    _expect_object(spec, where, allowed_keys=_TOOL_RULE_KEYS)
     if "action" not in spec:
         # No default on purpose: a rule left without an action while editing must not come to mean allow.
         raise PolicyError(f"{where} needs an 'action', one of {list(ACTIONS)}")
@@ -1191,7 +1512,63 @@ def _tool_rule(name: Any, spec: Any) -> ToolRule:
         other_args=other_args,
         max_calls_per_minute=_calls_per_minute(spec, where),
         labels=_labels(spec.get("labels", []), f"{where}.labels", allow_sink=True),
+        command=_command_rule(spec["command"], f"{where}.command") if "command" in spec else None,
+        labels_given="labels" in spec,
     )
+
+
+def _command_rule(spec: Any, where: str) -> CommandRule:
+    """Read a tool rule's "command" section (see commands.CommandRule)."""
+    _expect_object(spec, where, allowed_keys=_COMMAND_KEYS)
+    arg = spec.get("arg", "command")
+    if not isinstance(arg, str) or arg == ANY_ARG:
+        raise PolicyError(f"{where}.arg must be the name of the argument that holds the command, got {quoted(arg)}")
+    _expect_name(arg, f"{where}.arg")
+    shell = matchers.command_shell(spec.get("shell", "bash"), f"{where}.shell")
+    deny = matchers.command_classes(spec.get("deny_classes", []), f"{where}.deny_classes", allow_empty=True)
+    ask = matchers.command_classes(spec.get("ask_classes", []), f"{where}.ask_classes", allow_empty=True)
+    both = sorted(deny & ask)
+    if both:
+        raise PolicyError(f"{where}: the class {quoted(both[0])} is in both deny_classes and ask_classes; "
+                          "keep it in one")
+    unreadable = spec.get("unreadable", "ask")
+    _expect_choice(unreadable, f"{where}.unreadable", ("ask", "block"))
+    return CommandRule(
+        arg=arg,
+        shell=shell,
+        deny_classes=tuple(kind for kind in commands.CLASSES if kind in deny),
+        ask_classes=tuple(kind for kind in commands.CLASSES if kind in ask),
+        allow_programs=_allow_programs(spec.get("allow_programs", []), f"{where}.allow_programs"),
+        labels_by_class=_labels_by_class(spec.get("labels_by_class", {}), f"{where}.labels_by_class"),
+        unreadable=unreadable,
+    )
+
+
+def _allow_programs(specs: Any, where: str) -> tuple[tuple[str, ...], ...]:
+    if not isinstance(specs, list):
+        raise PolicyError(f"{where} must be a list of programs such as [\"git push\", \"curl\"], got "
+                          f"{type_name(specs)}")
+    if len(specs) > MAX_ALLOW_PROGRAMS:
+        raise PolicyError(f"{where} can name at most {MAX_ALLOW_PROGRAMS} programs")
+    entries = []
+    for index, spec in enumerate(specs):
+        entry = commands.allow_program_entry(spec) if isinstance(spec, str) else None
+        if entry is None:
+            raise PolicyError(
+                f"{where}[{index}] must be a program name, maybe with its first words (\"git push\"): at most 8 "
+                f"words, without quotes, '$' or shell operators, got {quoted(spec)}"
+            )
+        entries.append(entry)
+    return tuple(entries)
+
+
+def _labels_by_class(specs: Any, where: str) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    _expect_object(specs, where)
+    pairs = []
+    for kind, labels in specs.items():
+        matchers.command_classes([kind], f"{where}: key")
+        pairs.append((kind, _labels(labels, f"{where}.{kind}", allow_sink=True)))
+    return tuple(pairs)
 
 
 def _labels(specs: Any, where: str, allow_sink: bool) -> tuple[str, ...]:
@@ -1420,7 +1797,12 @@ def _arg_rules(specs: Any, where: str, deny: bool) -> tuple[ArgRule, ...]:
         optional = spec.get("optional", False)
         if not isinstance(optional, bool):
             raise PolicyError(f"{entry}: 'optional' must be true or false, got {quoted(optional)}")
-        rules.append(ArgRule(arg, matchers.build(spec, entry, deny=deny, any_arg=arg == ANY_ARG), optional))
+        if not deny and "action" in spec:
+            raise PolicyError(f"{entry}: 'action' is only used in deny_args (\"ask\" sends a matching call to a "
+                              "person instead of refusing it)")
+        action = spec.get("action", "block")
+        _expect_choice(action, f"{entry}.action", ("block", "ask"))
+        rules.append(ArgRule(arg, matchers.build(spec, entry, deny=deny, any_arg=arg == ANY_ARG), optional, action))
     return tuple(rules)
 
 
@@ -1462,6 +1844,8 @@ def _check_code_arg_rules(rules: Sequence[ArgRule], where: str, deny: bool) -> N
             raise PolicyError(f"{where}[{index}]: 'optional' must be true or false, got {quoted(rule.optional)}")
         if deny and rule.optional:
             raise PolicyError(f"{where}[{index}]: 'optional' is only used in allow_args")
+        # A typo such as "Ask" or "allow" must not quietly turn a deny entry into something else.
+        _expect_choice(rule.action, f"{where}[{index}].action", ("block", "ask") if deny else ("block",))
 
 
 def _expect_object(value: Any, where: str, allowed_keys: tuple[str, ...] | None = None) -> None:

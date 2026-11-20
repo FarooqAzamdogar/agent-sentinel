@@ -6,8 +6,8 @@
   ],
   "tools": {
     "read_file": { "action": "allow", "labels": ["private"] },
-    "fetch_page": { "action": "allow", "labels": ["untrusted"] },
-    "search_*": "allow",
+    "fetch_page": { "action": "allow", "labels": ["untrusted", "sink"] },
+    "search_*": { "action": "allow", "labels": ["untrusted", "sink"] },
     "send_email": {
       "action": "ask",
       "labels": ["sink"],
@@ -23,7 +23,7 @@
     },
     "delete_*": "block",
     "run_shell": "block",
-    "resources/read": "allow"
+    "resources/read": { "action": "allow", "labels": ["untrusted", "private"] }
   },
   "flows": [
     { "after": ["untrusted", "private"], "then": "sink", "action": "block" }

@@ -125,7 +125,7 @@ def run(args: argparse.Namespace) -> int:
     _print_decision(policy, args.tool, arguments, decision, outcome, as_proxy=args.proxy)
     _print_session_note(policy, marks)
     if args.show_rules:
-        _print_rules(policy, firewall, args.tool, decision)
+        _print_rules(policy, firewall, args.tool, arguments, decision)
 
     result_blocked = False
     if result is not None:
@@ -287,7 +287,7 @@ def _print_result(firewall: Firewall, tool: str, scanned: Decision, source: str,
 
 # ---- --show-rules ---------------------------------------------------------------------
 
-def _print_rules(policy: Policy, firewall: Firewall, tool: str, decision: Decision) -> None:
+def _print_rules(policy: Policy, firewall: Firewall, tool: str, arguments: dict[str, Any], decision: Decision) -> None:
     """Every part of the policy that applies to a call of `tool`, and which one decided this call.
 
     For the operator: it names rules and patterns.
@@ -300,7 +300,8 @@ def _print_rules(policy: Policy, firewall: Firewall, tool: str, decision: Decisi
     for index, deny in enumerate(policy.deny_args):
         print(f"  deny_args[{index}]  policy-wide, for every tool: {printable(deny.describe(), limit=300)}")
     _print_tool_rules(policy, tool)
-    labels = firewall.tool_labels(tool)
+    # A command section's labels_by_class adds labels by what this call's command does.
+    labels = firewall.tool_labels(tool) | policy.command_labels(tool, arguments)
     for index, flow in enumerate(policy.flows):
         if flow.then in labels:
             applies = "applies to this tool"
@@ -336,14 +337,17 @@ def _print_tool_rules(policy: Policy, tool: str) -> None:
         if not rule.is_glob:
             role = "exact rule: decides (an exact rule beats every wildcard)"
         elif exact is not None:
-            role = "wildcard: not used, because the exact rule decides"
+            role = ("wildcard: the exact rule decides, so only its deny rules and command checks apply "
+                    "(and its labels and rate limit)")
         else:
             role = "wildcard: checked; when several match, the strictest answer wins"
         print(f"  tools.{name}  action {rule.action}; {role}")
-        if rule.is_glob and exact is not None:
-            continue
         for index, deny in enumerate(rule.deny_args):
             print(f"    tools.{name}.deny_args[{index}]  {printable(deny.describe(), limit=300)}")
+        if rule.command is not None:
+            print(f"    tools.{name}.command  {printable(rule.command.describe(), limit=400)}")
+        if rule.is_glob and exact is not None:
+            continue
         for index, allow in enumerate(rule.allow_args):
             print(f"    tools.{name}.allow_args[{index}]  {printable(allow.describe(), limit=300)}")
         if rule.other_args == "block":
