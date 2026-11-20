@@ -130,6 +130,46 @@ class TheJsonCopy(unittest.TestCase):
         with self.assertRaises(UnscannableError):
             normalised_arguments({"x": Broken()})
 
+    def test_a_container_whose_own_reading_fails_is_refused_not_raised(self):
+        from collections.abc import Mapping
+
+        class BrokenMapping(Mapping):
+            def __getitem__(self, key):
+                raise KeyError(key)
+
+            def __len__(self):
+                return 1
+
+            def __iter__(self):
+                raise RuntimeError("boom")
+
+        class BrokenList(list):
+            def __iter__(self):
+                raise RuntimeError("boom")
+
+        @dataclasses.dataclass
+        class BrokenField:
+            name: str = "x"
+
+            def __getattribute__(self, attribute):
+                if attribute == "name":
+                    raise RuntimeError("boom")
+                return object.__getattribute__(self, attribute)
+
+        class BrokenEnum(enum.Enum):
+            ONE = 1
+
+            @property
+            def value(self):
+                raise RuntimeError("boom")
+
+        for value in (BrokenMapping(), deque_of_broken(), BrokenField(), BrokenEnum.ONE, BrokenList([1])):
+            with self.subTest(value=type(value).__name__):
+                with self.assertRaises(UnscannableError):
+                    normalised_arguments({"x": value})
+        decision = firewall().check_call("t", {"x": BrokenMapping()})
+        self.assertEqual((decision.allowed, decision.rule), (False, "unscannable"))
+
     def test_a_value_that_holds_itself_is_refused(self):
         loop = {}
         loop["again"] = loop
@@ -161,10 +201,31 @@ class TheJsonCopy(unittest.TestCase):
         self.assertLess(time.perf_counter() - started, 5)
 
 
+def deque_of_broken():
+    class BrokenDeque(deque):
+        def __iter__(self):
+            raise RuntimeError("boom")
+
+    return BrokenDeque([1])
+
+
 class NumbersAreRead(unittest.TestCase):
     def test_numbers_in_finds_ints_and_floats_but_never_booleans(self):
         self.assertEqual(sorted(numbers_in({"a": [1, 2.5, True, False, None, "3"], "b": {"c": -4}})),
                          ["-4", "1", "2.5"])
+
+    def test_numbers_are_written_as_json_writes_them(self):
+        numbers = [0, -1, 7, 10 ** 40, -(10 ** 4000), 0.1, -0.0, 1e300, 1e-300, 2.5e-7, 123456789.125,
+                   float("inf"), float("-inf"), float("nan"), Level.HIGH]
+        for number in numbers:
+            with self.subTest(number=repr(number)[:20]):
+                self.assertEqual(textutil.number_text(number), json.dumps(number))
+
+    def test_a_million_numbers_are_checked_quickly(self):
+        guarded = firewall()  # a known value of digits: every number is looked at
+        started = time.perf_counter()
+        self.assertTrue(guarded.check_call("t", {"values": list(range(1_000_000))}).allowed)
+        self.assertLess(time.perf_counter() - started, 10)
 
     def test_a_numeric_known_value_or_canary_is_found_in_a_number(self):
         guard = SecretGuard(known_values={"PIN": PIN}, canaries=[ACCOUNT_CANARY])

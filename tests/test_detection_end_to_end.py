@@ -56,7 +56,13 @@ for line in sys.stdin:
     elif method == "tools/list":
         result = {"tools": [TOOL]}
     elif method == "tools/call":
-        result = ANSWERS[message["params"]["arguments"]["mode"]]
+        mode = message["params"]["arguments"]["mode"]
+        if mode.startswith("log_"):  # a log notification first, then a plain result
+            notice = {"level": "warning", "data": ATPA.format(name=mode[4:])}
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/message", "params": notice}) + "\n")
+            result = text("done")
+        else:
+            result = ANSWERS[mode]
     else:
         result = {}
     sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": result}) + "\n")
@@ -93,6 +99,18 @@ class TheProxyReadsOutputAsTheClientWill(EndToEndTest):
         rules = [[finding["rule"] for finding in record.get("findings", [])] for record in records.values()]
         self.assertIn(["parameter_smuggling"], rules)
         self.assertIn(["parameter_request"], rules)
+
+    def test_server_notifications_are_read_with_the_servers_parameter_names_too(self):
+        proxy = self.start()
+        self.assertEqual(text_of(self.answer(proxy, 2, "log_sidenote")), "done")
+        self.assertEqual(text_of(self.answer(proxy, 3, "log_notes")), "done")
+        proxy.stop()
+        forwarded = [message for message in proxy.unsolicited if isinstance(message, dict)
+                     and message.get("method") == "notifications/message"]
+        self.assertEqual([message["params"]["data"] for message in forwarded], [ATPA.format(name="notes")])
+        records = [record for record in self.records(self.audit) if record["event"] == "server_request"]
+        rules = sorted(finding["rule"] for record in records for finding in record.get("findings", []))
+        self.assertEqual(rules, ["parameter_request", "parameter_smuggling"])
 
     def test_invisible_payloads_are_withheld_and_ordinary_emoji_pass_unchanged(self):
         proxy = self.start()

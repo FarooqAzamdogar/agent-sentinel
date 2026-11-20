@@ -13,7 +13,7 @@ Also here, because the detector and the secret guard both need them:
     (`decode_invisible`), and `clean_for_forwarding`, which removes escapes,
     tags and other hiding characters from text that is passed on to a client;
   * `folded_text`, one spelling of a text with compatibility forms folded and
-    format characters removed;
+    the characters that draw nothing removed (`INVISIBLE_OUTSIDE_FORMAT`);
   * `tool_parameters` and `media_blocks`, which pick parts out of MCP
     messages for the detector;
   * `EncodedRuns`, the bounded decoder of base64 and hex runs (`DecodedRun`).
@@ -204,6 +204,9 @@ def _walk(
         item, group = stack.pop()
         if group is _LEAVE:
             inside.discard(item)
+        elif type(item) in _PLAIN_NUMBERS:  # first, by exact type: arguments can hold millions of numbers
+            if scalars:
+                yield group, number_text(item)
         elif isinstance(item, str):
             yield group, item
         elif isinstance(item, UserString):
@@ -242,6 +245,9 @@ def _walk(
                         stack.append((key, _KEY))
 
 
+_PLAIN_NUMBERS = frozenset([int, float])
+
+
 def _members(item: Any) -> tuple[list[tuple[Any, Any]], list[Any]] | None:
     """What a container holds, as (named children, listed children); None if `item` is not a container.
 
@@ -277,7 +283,9 @@ def _members(item: Any) -> tuple[list[tuple[Any, Any]], list[Any]] | None:
 # recurses, and a value that holds itself must end somewhere.
 MAX_ARGUMENT_DEPTH = 256
 # How many parts (objects, arrays, strings, numbers...) the arguments of one
-# call may have in all. A message of 16 MB of JSON has fewer.
+# call may have in all. Real calls have far fewer; arguments with more (a
+# message of 16 MB of one-digit numbers holds 8 million) are refused, not
+# checked for seconds on end.
 MAX_ARGUMENT_PARTS = 4_000_000
 # An integer longer than this many bits (about 4,200 digits) is refused: Python
 # will not write a longer one as text, and JSON read by this package has none.
@@ -309,8 +317,10 @@ def normalised_arguments(value: Any) -> Any:
 
     Raises UnscannableError for anything else (a generator, a file, an object
     of unknown kind), for a value nested more than MAX_ARGUMENT_DEPTH deep or
-    with more than MAX_ARGUMENT_PARTS parts, and for an integer too long to
-    write: the call is then refused, never checked with parts left out.
+    with more than MAX_ARGUMENT_PARTS parts, for an integer too long to
+    write, and for an object whose own code raises while it is read (its
+    model_dump, items(), iteration, a property): the call is then refused,
+    never checked with parts left out.
     Iterative, so a deep value cannot exhaust Python's recursion limit.
     """
     holder: list[Any] = [None]
@@ -330,9 +340,15 @@ def normalised_arguments(value: Any) -> Any:
         if type(item) in _JSON_LEAVES:
             parent[key] = _checked_number(item) if type(item) is int else item
             continue
-        converted = _CONTAINER if type(item) in (dict, list, tuple) else _converted(item)
+        try:
+            converted = _CONTAINER if type(item) in (dict, list, tuple) else _converted(item)
+            if converted is _CONTAINER:
+                parts += _copy_container(item, parent, key, depth, stack, inside)
+        except UnscannableError:
+            raise
+        except Exception as exc:  # the object's own code failed (its items(), iteration, a property)
+            raise UnscannableError(f"an argument of type {type(item).__name__} could not be read") from exc
         if converted is _CONTAINER:
-            parts += _copy_container(item, parent, key, depth, stack, inside)
             if parts > MAX_ARGUMENT_PARTS:
                 raise UnscannableError("the arguments have too many parts to check")
         elif type(converted) is _Leaf:
@@ -362,9 +378,23 @@ def _checked_number(number: int | float) -> int | float:
 
 
 def number_text(number: int | float) -> str:
-    """A number as JSON writes it ("12", "1.5", "-3e+20"), for the texts a check reads."""
-    _checked_number(number)
-    return json.dumps(number)
+    """A number as JSON writes it ("12", "1.5", "-3e+20", "NaN"), for the texts a check reads.
+
+    What json.dumps writes, without its cost per call: int and float's own
+    repr, except for the three floats JSON spells its own way.
+    """
+    if isinstance(number, int):
+        if number.bit_length() > _MAX_INT_BITS:
+            raise UnscannableError("an argument holds a number too long to check")
+        return int.__repr__(number)
+    if number != number:
+        return "NaN"
+    if number in (_INFINITY, -_INFINITY):
+        return "Infinity" if number > 0 else "-Infinity"
+    return float.__repr__(number)
+
+
+_INFINITY = float("inf")
 
 
 def _converted(item: Any) -> Any:
@@ -491,7 +521,7 @@ def numbers_in(value: Any) -> list[str]:
     opened = 0
     while waiting:
         item = waiting.pop()
-        if isinstance(item, (int, float)) and not isinstance(item, bool):
+        if type(item) in _PLAIN_NUMBERS or (isinstance(item, (int, float)) and not isinstance(item, bool)):
             found.append(number_text(item))
         elif item is None or isinstance(item, (bool, str, bytes, bytearray, memoryview, UserString)):
             continue
@@ -655,9 +685,9 @@ def decode_invisible(text: str) -> Unhidden | None:
     A run of two or more variation selectors is read one byte per selector,
     and a run of 64 or more characters of one invisible pair one bit per
     character, the first character of the pair as 0 (or, if that is not text,
-    as 1). What a run spells counts only if it is UTF-8 and mostly printable,
-    as for base64. At most _MAX_CARRIER_RUNS runs and _MAX_CARRIER_CHARS
-    characters are read, so hostile text stays quick; a payload past them is
+    as 1). What a run spells counts only if it is mostly printable UTF-8, or
+    starts with enough of it, as for base64. At most _MAX_CARRIER_RUNS runs
+    and _MAX_CARRIER_CHARS characters are read, so hostile text stays quick; a payload past them is
     not decoded (it is still an invisible_characters finding).
     """
     if _TWO_CARRIERS.search(text) is None:
@@ -687,7 +717,10 @@ def decode_invisible(text: str) -> Unhidden | None:
     pieces: list[str] = []
     position = 0
     for start, end, spelled in found:
-        pieces += [text[position:start], spelled]
+        # Kept apart from a word it touches ("Nice" + hidden "Ignore ..."), so that each is read as a word.
+        before = " " if start and text[start - 1].isalnum() and spelled[0].isalnum() else ""
+        after = " " if end < len(text) and text[end].isalnum() and spelled[-1].isalnum() else ""
+        pieces += [text[position:start], before, spelled, after]
         position = end
     pieces.append(text[position:])
     return Unhidden("".join(pieces), " ".join(spelled for _, _, spelled in found))
@@ -729,11 +762,23 @@ _CONTROLS_AND_BIDI = {
         *range(0x202A, 0x202F), *range(0x2061, 0x2065), *range(0x2066, 0x206A),
     ]
 }
-# Variation selectors that clean_for_forwarding reduces: a run of two or more,
-# and any one of U+E0100..U+E01EF (the ideographic ones).
-_SELECTORS_TO_REDUCE = re.compile(f"[{_SELECTORS}]{{2,}}|[\U000e0100-\U000e01ef]")
+# A run of eight or more zero-width spaces, joiners, word joiners or byte
+# order marks: no text needs one (each has its use alone, between visible
+# characters), and eight of them are a byte of hidden bits. Removed whole.
+_ZERO_WIDTH_RUN = re.compile("[\\u200b-\\u200d\\u2060\\ufeff]{8,}")
+# Variation selectors that clean_for_forwarding reduces: every run of them,
+# one or more long (a single one is kept only where it belongs).
+_SELECTORS_TO_REDUCE = re.compile(f"[{_SELECTORS}]+")
 # CJK ideographs: the characters an ideographic variation selector belongs after.
 _CJK_IDEOGRAPHS = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF), (0x20000, 0x323AF))
+# U+FE0E (text style) and U+FE0F (emoji style) belong after a character that
+# can be drawn as an emoji: a symbol (So, Sm), a pictograph from U+1F000 on,
+# the keycap bases, and the few emoji filed as punctuation or a letter.
+_TEXT_OR_EMOJI_STYLE = "\ufe0e\ufe0f"
+_EMOJI_BASES_ELSEWHERE = frozenset("#*0123456789\u203c\u2049\u2139\u3030\u303d")
+# U+FE00..U+FE0D pick a standardized variant of a symbol (mathematics) or of a
+# CJK compatibility ideograph.
+_SYMBOLS = ("So", "Sm")
 # A carriage return that does not end a line moves the cursor back to the
 # start of it, so text written after it is drawn over text written before. It
 # becomes a line break, which shows both parts and, like the detector (which
@@ -751,11 +796,15 @@ def clean_for_forwarding(text: str) -> str:
         return stays before a line feed, and becomes a line feed elsewhere);
       * Unicode tag characters, except inside a subdivision flag such as England's;
       * the bidirectional embedding, override and isolate controls;
-      * the invisible operators U+2061 to U+2064;
+      * the invisible operators U+2061 to U+2064, and runs of eight or more
+        zero-width spaces, joiners, word joiners and byte order marks;
       * all but the first of a run of variation selectors, and that one too
-        unless it is U+FE00..U+FE0F after a character, or an ideographic
-        variation selector after a CJK ideograph. An emoji keeps its one
-        VS15 or VS16, and a name written with an ideographic variant keeps it.
+        unless it belongs after the character before it: VS15 or VS16 after
+        a character that can be drawn as an emoji, U+FE00..U+FE0D after a
+        symbol or a CJK ideograph, an ideographic variation selector after a
+        CJK ideograph. An emoji keeps its one VS15 or VS16, and a name
+        written with an ideographic variant keeps it; a selector after a
+        letter goes (one after each letter could carry four hidden bits).
 
     Ordinary text, including Arabic, Hebrew, CJK and emoji, is unchanged. Removing a
     character joins the text on either side of it. The detector's matching
@@ -770,22 +819,28 @@ def clean_for_forwarding(text: str) -> str:
         text = _LONE_CARRIAGE_RETURN.sub("\n", text)
     if TAG_CHARACTERS.search(text):
         text = _FLAG_OR_TAGS.sub(lambda match: match.group() if match.group("flag") else "", text)
+    if _ZERO_WIDTH_RUN.search(text):
+        text = _ZERO_WIDTH_RUN.sub("", text)
     if _SELECTORS_TO_REDUCE.search(text):
         text = _SELECTORS_TO_REDUCE.sub(_one_selector_at_most, text)
     return text
 
 
 def _one_selector_at_most(match: re.Match[str]) -> str:
-    """What is kept of a run of variation selectors: its first one, where it may belong, or nothing."""
+    """What is kept of a run of variation selectors: its first one, if it belongs after the character before it."""
     first = match.group()[0]
     start = match.start()
-    base = match.string[start - 1] if start else ""
-    if not base or base.isspace() or "︀" <= base <= "️" or "\U000e0100" <= base <= "\U000e01ef":
+    if not start:
         return ""
-    if first <= "️":
-        return first
+    base = match.string[start - 1]
     code = ord(base)
-    return first if any(low <= code <= high for low, high in _CJK_IDEOGRAPHS) else ""
+    cjk = any(low <= code <= high for low, high in _CJK_IDEOGRAPHS)
+    if first in _TEXT_OR_EMOJI_STYLE:
+        emoji = code >= 0x1F000 or base in _EMOJI_BASES_ELSEWHERE or unicodedata.category(base) in _SYMBOLS
+        return first if emoji else ""
+    if first <= "\ufe0d":  # U+FE00..U+FE0D
+        return first if cjk or unicodedata.category(base) in _SYMBOLS else ""
+    return first if cjk else ""  # an ideographic variation selector
 
 
 # --------------------------------------------------------------------------
@@ -793,16 +848,43 @@ def _one_selector_at_most(match: re.Match[str]) -> str:
 # --------------------------------------------------------------------------
 
 
-class _WithoutFormat(dict):  # type: ignore[type-arg]
-    """A str.translate table that removes format characters (category Cf), filled in as characters are met."""
+# Characters that draw nothing although Unicode files them under letters,
+# marks or unassigned rather than as format characters (Cf): the grapheme
+# joiner, Hangul and Khmer fillers, Mongolian separators, variation selectors,
+# and the reserved "ignorable" code points, which include the whole block of
+# tag characters. The detector deletes them from its matching views too.
+INVISIBLE_OUTSIDE_FORMAT = frozenset([
+    0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, *range(0x180B, 0x1810), 0x2065, 0x3164, 0xFFA0,
+    *range(0xFE00, 0xFE10), *range(0xFFF0, 0xFFF9), *range(0xE0000, 0xE1000),
+])
+
+
+class _WithoutInvisible(dict):  # type: ignore[type-arg]
+    """A str.translate table that removes the characters that draw nothing, filled in as characters are met.
+
+    Those are the format characters (category Cf) and INVISIBLE_OUTSIDE_FORMAT.
+    """
 
     def __missing__(self, code: int) -> int | None:
-        kept = None if unicodedata.category(chr(code)) == "Cf" else code
+        kept = None if code in INVISIBLE_OUTSIDE_FORMAT or unicodedata.category(chr(code)) == "Cf" else code
         self[code] = kept
         return kept
 
 
-_WITHOUT_FORMAT = _WithoutFormat()
+# The table every text shares, which remembers the characters it has met. A
+# text that could take it past _MAX_REMEMBERED characters gets a table of its
+# own instead, which goes with it: one hostile text holding every character
+# of Unicode would otherwise leave a table of tens of megabytes behind.
+_WITHOUT_INVISIBLE = _WithoutInvisible()
+_MAX_REMEMBERED = 16_384
+
+
+def _without_invisible(text: str) -> str:
+    """`text` without the characters that draw nothing (see _WithoutInvisible)."""
+    shared = len(_WITHOUT_INVISIBLE) + len(text) <= _MAX_REMEMBERED
+    return text.translate(_WITHOUT_INVISIBLE if shared else _WithoutInvisible())
+
+
 # Characters normalized in one call, and how many times longer a slice may get
 # (see detector._decompose for why long texts are normalized in slices).
 _FOLD_SLICE = 256
@@ -810,10 +892,12 @@ _MAX_FOLD_EXPANSION = 4
 
 
 def folded_text(text: str) -> str:
-    """`text` without format characters (zero-width spaces and joiners, tags, bidi controls), in NFKC form.
+    """`text` without the characters that draw nothing, in NFKC form.
 
-    NFKC turns compatibility forms into plain ones: full-width letters,
-    ligatures, circled and superscript digits. For comparing exact values,
+    Removed: format characters (zero-width spaces and joiners, tags, bidi
+    controls), variation selectors, the grapheme joiner, fillers
+    (INVISIBLE_OUTSIDE_FORMAT). NFKC turns compatibility forms into plain
+    ones: full-width letters, ligatures, circled and superscript digits. For comparing exact values,
     which a hijacked agent can spell that way at no cost. ASCII text is
     returned as it is. Normalized in slices, never cut between a character
     and the marks that combine with it, and a slice that would grow more than
@@ -822,7 +906,7 @@ def folded_text(text: str) -> str:
     """
     if text.isascii():
         return text
-    text = text.translate(_WITHOUT_FORMAT)
+    text = _without_invisible(text)
     pieces: list[str] = []
     start = 0
     while start < len(text):
@@ -952,38 +1036,48 @@ def _schema_text(schema: Any) -> str:
 
 # The content blocks whose "data" holds encoded media, not text for the model.
 _MEDIA_TYPES = ("image", "audio")
-# The members through which a client reaches the content blocks it renders: a
-# result's "content", and the "content" of each of the "messages" of a prompt
-# or a sampling request (under "params" or "result" when a whole request or
-# reply is read). Nothing under "_meta" or "structuredContent" is rendered.
-_RENDERED_PATH = ("content", "messages", "params", "result")
+# Where a whole request or reply keeps what is read for content blocks: its
+# "result" (a tool's result, a prompt) or its "params" (a sampling request).
+_MESSAGE_PARTS = ("result", "params")
 
 
 def media_blocks(value: Any) -> frozenset[int]:
     """The id() of each image and audio content block in a JSON-like value that a client renders as media.
 
-    A block counts where a client renders content: the value itself or an
-    item of it (a tool's output given as blocks), and what is reached through
-    "content", "messages", "params" and "result" only, ending in "content" or
-    one of its items. An image-shaped object anywhere else (_meta,
-    structuredContent, a field of the server's own) is not one: it would be
-    shown as text, if at all. Only the exact "data" member of these blocks is
-    read as media (see text_views); a copy of the same text elsewhere is not.
-    The walk is iterative and reads at most MAX_CONTAINERS objects and arrays.
+    Only the places where MCP puts the content a client renders count:
+
+      * an item of the "content" array of a result;
+      * the "content" of one of the "messages" of a prompt or a sampling
+        request: a single block, or an item of an array of blocks;
+      * an item of the value itself, when it is an array (a tool's output
+        given as its blocks).
+
+    A result, prompt or request may also be read whole, with these under its
+    "result" or "params". An image-shaped object anywhere else (_meta,
+    structuredContent, a block nested in a block, an array in an array, the
+    value itself) is not one: it would be shown as text, if at all. Only the
+    exact "data" member of these blocks is read as media (see text_views); a
+    copy of the same text elsewhere is not. At most MAX_CONTAINERS blocks are
+    looked at.
     """
+    holders = [value]
+    if isinstance(value, dict):
+        holders += [value[part] for part in _MESSAGE_PARTS if isinstance(value.get(part), dict)]
+    blocks: list[Iterable[Any]] = [value] if isinstance(value, list) else []
+    for holder in holders:
+        if not isinstance(holder, dict):
+            continue
+        if isinstance(holder.get("content"), list):
+            blocks.append(holder["content"])
+        messages = holder.get("messages")
+        if isinstance(messages, list):
+            for message in itertools.islice(messages, MAX_CONTAINERS):
+                content = message.get("content") if isinstance(message, dict) else None
+                blocks.append(content if isinstance(content, list) else [content])
     found: set[int] = set()
-    waiting: list[tuple[Any, bool]] = [(value, True)]  # (part, whether a client renders it as a block)
-    opened = 0
-    while waiting and opened < MAX_CONTAINERS:
-        item, rendered = waiting.pop()
-        if isinstance(item, dict):
-            opened += 1
-            if rendered and item.get("type") in _MEDIA_TYPES and isinstance(item.get("data"), str):
-                found.add(id(item))
-            waiting.extend((item[key], key == "content") for key in _RENDERED_PATH if key in item)
-        elif isinstance(item, (list, tuple)):
-            opened += 1
-            waiting.extend((child, rendered) for child in item)
+    for block in itertools.islice(itertools.chain.from_iterable(blocks), MAX_CONTAINERS):
+        if isinstance(block, dict) and block.get("type") in _MEDIA_TYPES and isinstance(block.get("data"), str):
+            found.add(id(block))
     return frozenset(found)
 
 
@@ -996,6 +1090,7 @@ MIN_HEX_CHARS = 48  # 24 bytes: a SHA-1 (40) or a short id is not decoded
 _HEX_DIGITS = re.compile(r"[0-9A-Fa-f]+")
 _UPPER = re.compile(r"[A-Z]")
 _LOWER = re.compile(r"[a-z]")
+_SLASHES = re.compile(r"/+")
 # Share of the decoded characters that must be printable (or tab, newline,
 # return) for a run to be read as text. Random bytes almost never pass.
 _PRINTABLE_SHARE = 0.85
@@ -1024,11 +1119,13 @@ class EncodedRuns:
 
     One instance serves one check: the limits are shared by every text it is
     given, and a run met again (in another view of the same value) is not
-    decoded again. A run counts as decoded text only if it is valid UTF-8 and
-    at least 85% printable once up to 16 leading bytes (a file's magic bytes,
-    a few NULs) are passed over; whether it is, is decided on its first
-    256 bytes, so a long binary run costs little. Every run that looks
-    encoded costs an attempt, binary or not.
+    decoded again. A run counts as decoded text if it is at least 85%
+    printable UTF-8 (a byte that is not UTF-8 counts as unprintable) once up
+    to 16 leading bytes (a file's magic bytes, a few NULs) are passed over;
+    whether it is, is decided on its first 256 bytes, so a long binary run
+    costs little. Text followed by binary data counts too: its first
+    characters, if 16 or more of them are mostly printable. Every run that
+    looks encoded costs an attempt, binary or not.
 
     The limits make the work bounded on hostile input, and they can be used to
     hide a payload: runs placed before it use up the attempts or the bytes, and
@@ -1044,7 +1141,8 @@ class EncodedRuns:
     min_base64_chars, min_hex_chars: the shortest run of each kind that is decoded.
     binary:        also return each run that is binary data, its first
                    MAX_BINARY_BYTES bytes read as Latin-1 (DecodedRun.binary),
-                   for a caller that looks for tokens inside binary data.
+                   for a caller that looks for tokens inside binary data. A run
+                   of text followed by binary data is returned that way too.
     """
 
     def __init__(
@@ -1087,12 +1185,16 @@ class EncodedRuns:
             self._seen.add(run)
             compact = "".join(run.split()) if "\n" in run else run
             results = [self._attempt(compact, run)]
-            if (results[0] is None or results[0].binary) and "/" in compact:
+            if "/" in compact and _not_clean_text(results[0]):
                 # In a URL the path before a run is part of it ("example/Z2hw..."): try what follows the last "/".
                 tail = compact.rpartition("/")[2]
                 if tail not in self._seen:
                     self._seen.add(tail)
-                    results.append(self._attempt(tail, tail))
+                    from_tail = self._attempt(tail, tail)
+                    if _is_text(results[0]) and _is_text(from_tail):
+                        results = [from_tail]  # the text, without the path read as bytes in front of it
+                    else:
+                        results.append(from_tail)
             for result in results:
                 if result is not None and self.kept_left > 0:
                     self.kept_left -= 1
@@ -1117,8 +1219,10 @@ class EncodedRuns:
         if len(run) < self._min_base64_chars:
             return None
         # Base64 of text has capitals and small letters, and rarely a "/": a
-        # run without both, or full of slashes, is a word, a path or an id.
-        if not (_UPPER.search(run) and _LOWER.search(run)) or run.count("/") * 16 > len(run):
+        # run without both, or full of path separators, is a word, a path or an
+        # id. A run of slashes counts once: it is how bytes 0xFF are written
+        # ("////"), and a payload must not escape decoding by ending in them.
+        if not (_UPPER.search(run) and _LOWER.search(run)) or len(_SLASHES.findall(run)) * 16 > len(run):
             return None
         if ("+" in run or "/" in run) and ("-" in run or "_" in run):
             return None  # both alphabets at once: not base64
@@ -1132,19 +1236,45 @@ class EncodedRuns:
         if sample is None:
             return None  # not valid base64 or hex
         whole = sample_cut >= len(bare)  # the sample is the whole run
-        start = _start_of_text(sample, truncated=not whole)
-        if start is None:  # binary data
-            raw = sample
-            if self._binary and not whole:
-                raw = _raw_bytes(bare, kind, min(limit, MAX_BINARY_BYTES))[0] or sample
-            self.bytes_left -= len(raw)
-            return DecodedRun(kind, raw.decode("latin-1"), run, binary=True) if self._binary else None
-        raw, cut = (sample, sample_cut) if whole else _raw_bytes(bare, kind, limit)
+        found = _start_of_text(sample, truncated=not whole)
+        if found is None:  # binary data
+            return self._binary_run(bare, kind, run, sample, whole, limit)
+        start, all_text = found
+        # The sample holds all the text there is when it is the whole run, or when binary data follows the text in it.
+        raw, cut = (sample, sample_cut) if whole or not all_text else _raw_bytes(bare, kind, limit)
         if raw is None:
             return None
+        found_text = _text_of(raw[start:], truncated=cut < len(bare))
+        if found_text is None:
+            self.bytes_left -= len(raw)
+            return None
+        text, all_text = found_text
+        if not all_text and self._binary:
+            # Text, then binary data: read it all as Latin-1, as binary runs are, so nothing after it is missed.
+            return self._binary_run(bare, kind, run, raw, cut >= len(bare), limit)
         self.bytes_left -= len(raw)
-        text = _as_text(raw[start:], truncated=cut < len(bare))
-        return None if text is None else DecodedRun(kind, text, run)
+        return DecodedRun(kind, text, run)
+
+    def _binary_run(self, bare: str, kind: str, run: str, raw: bytes, whole: bool, limit: int) -> DecodedRun | None:
+        """A run of binary data: its first MAX_BINARY_BYTES bytes as Latin-1 if they are asked for, else None."""
+        if self._binary and not whole and len(raw) < min(limit, MAX_BINARY_BYTES):
+            raw = _raw_bytes(bare, kind, min(limit, MAX_BINARY_BYTES))[0] or raw
+        self.bytes_left -= len(raw)
+        return DecodedRun(kind, raw[:MAX_BINARY_BYTES].decode("latin-1"), run, binary=True) if self._binary else None
+
+
+def _is_text(found: DecodedRun | None) -> bool:
+    """Whether a run was decoded, to text."""
+    return found is not None and not found.binary
+
+
+def _not_clean_text(found: DecodedRun | None) -> bool:
+    """Whether a decoded run is not plain text from its first characters on: nothing, binary data, or text with
+    an unprintable character among its first ones, as when the path before a run in a URL is decoded with it."""
+    if found is None or found.binary:
+        return True
+    start = found.text[:_MIN_TEXT_CHARS]
+    return any(ch == _REPLACEMENT or not ch.isprintable() for ch in _NOT_PLAIN_ASCII.findall(start))
 
 
 def _raw_bytes(bare: str, kind: str, limit: int) -> tuple[bytes | None, int]:
@@ -1165,24 +1295,56 @@ def _raw_bytes(bare: str, kind: str, limit: int) -> tuple[bytes | None, int]:
         return None, 0
 
 
-def _start_of_text(sample: bytes, truncated: bool) -> int | None:
-    """Where text starts in the first bytes of a run: 0 to _MAX_SKIPPED_BYTES, or None if it is binary data."""
+def _start_of_text(sample: bytes, truncated: bool) -> tuple[int, bool] | None:
+    """Where text starts in the first bytes of a run (0 to _MAX_SKIPPED_BYTES), and whether all of the sample
+    after it is text; None if it is binary data."""
     for start in range(min(_MAX_SKIPPED_BYTES, max(0, len(sample) - 1)) + 1):
-        if _as_text(sample[start:start + _SAMPLE_BYTES], truncated or start + _SAMPLE_BYTES < len(sample)):
-            return start
+        found = _text_of(sample[start:start + _SAMPLE_BYTES], truncated or start + _SAMPLE_BYTES < len(sample))
+        if found is not None:
+            return start, found[1]
     return None
 
 
+# Characters that may not be printable: all but printable ASCII, tab, line feed and carriage return.
+_NOT_PLAIN_ASCII = re.compile(r"[^\t\n\r -~]")
+# What bytes that are not UTF-8 become ("\xff" is one).
+_REPLACEMENT = "\ufffd"
+# Text followed by binary data: its first characters, if this many or more are mostly printable, are read.
+_MIN_TEXT_CHARS = 16
+
+
 def _as_text(raw: bytes, truncated: bool) -> str | None:
-    """`raw` as text, if it is UTF-8 and mostly printable; otherwise None."""
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as error:
-        # A run decoded only in part can end inside a character.
-        if not truncated or error.start < len(raw) - 3:
-            return None
-        text = raw[: error.start].decode("utf-8")
+    """`raw` as text, if it is mostly printable UTF-8 or starts with enough of it; otherwise None (see `_text_of`)."""
+    found = _text_of(raw, truncated)
+    return None if found is None else found[0]
+
+
+def _text_of(raw: bytes, truncated: bool) -> tuple[str, bool] | None:
+    """(text, whole): `raw` read as UTF-8, if at least 85% of it is printable; else its longest start that is,
+    if that has _MIN_TEXT_CHARS characters or more (whole is then False); None if it is not text.
+
+    A byte that is not UTF-8 is read as U+FFFD and counts as unprintable: one
+    stray byte, before, inside or after a payload, costs an attacker nothing
+    and must not make the whole run binary data. For the same reason binary
+    data after text does not hide the text. truncated: the run was decoded
+    only in part, so it may end inside a character, which is then left out.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    if truncated and text.endswith(_REPLACEMENT):
+        text = text[:-1]
     if not text:
         return None
-    printable_count = sum(1 for ch in text if ch.isprintable() or ch in "\t\n\r")
-    return text if printable_count >= _PRINTABLE_SHARE * len(text) else None
+    unprintable = [
+        match.start() for match in _NOT_PLAIN_ASCII.finditer(text)
+        if match.group() == _REPLACEMENT or not match.group().isprintable()
+    ]
+    if len(text) - len(unprintable) >= _PRINTABLE_SHARE * len(text):
+        return text, True
+    # Text followed by binary data must be mostly printable from its first characters on: binary data with
+    # some text after its first bytes (the bytes 0 to 255 in order) is not text.
+    allowed = int((1 - _PRINTABLE_SHARE) * _MIN_TEXT_CHARS)
+    if len(unprintable) > allowed and unprintable[allowed] < _MIN_TEXT_CHARS:
+        return None
+    # The text before the n-th unprintable character holds n of them: the longest such start that is mostly printable.
+    end = max((at for count, at in enumerate(unprintable) if at - count >= _PRINTABLE_SHARE * at), default=0)
+    return (text[:end], False) if end >= _MIN_TEXT_CHARS else None

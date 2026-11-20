@@ -70,8 +70,10 @@ should only describe the tool. So the rules come in two profiles:
 
 Both profiles also read links and images that can carry data out
 (link_exfiltration, image_alphabet, encoded_host_label: medium, high only
-when a secret is named in the same sentence) and terminal sequences that can
-hide or rewrite text (terminal_escape_hiding, medium).
+when a secret is named in the same sentence, and for a link that is not an
+image only when that sentence also orders something put into it) and
+terminal sequences that can hide or rewrite text (terminal_escape_hiding,
+medium).
 
 In metadata only COMBINATIONS are high: a concealment phrase ("do not mention
 this ... to the user"), and an order to put the content of a credential file
@@ -138,6 +140,7 @@ from typing import Any
 from .textutil import (
     FIELD_BREAK,
     HIDDEN_TEXT_CHARS,
+    INVISIBLE_OUTSIDE_FORMAT,
     MAX_PARAMETERS,
     TAG_CHARACTERS,
     EncodedRuns,
@@ -178,13 +181,10 @@ class _Unscannable(Exception):
 # ordinary Arabic text and report it as hidden text.
 _VISIBLE_FORMAT = frozenset([*range(0x0600, 0x0606), 0x06DD, 0x070F, 0x0890, 0x0891, 0x08E2, 0x110BD, 0x110CD])
 # Characters that draw nothing although Unicode files them under letters,
-# marks or unassigned: the grapheme joiner, Hangul and Khmer fillers,
-# Mongolian separators, variation selectors, and the reserved "ignorable"
-# code points, which include the whole block of tag characters.
-_INVISIBLE_ELSEWHERE = frozenset([
-    0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, *range(0x180B, 0x1810), 0x2065, 0x3164, 0xFFA0,
-    *range(0xFE00, 0xFE10), *range(0xFFF0, 0xFFF9), *range(0xE0000, 0xE1000),
-])
+# marks or unassigned (textutil.INVISIBLE_OUTSIDE_FORMAT): the grapheme joiner,
+# Hangul and Khmer fillers, Mongolian separators, variation selectors, and the
+# reserved "ignorable" code points, which include the block of tag characters.
+_INVISIBLE_ELSEWHERE = INVISIBLE_OUTSIDE_FORMAT
 # Invisible characters with everyday uses: the soft hyphen, the joiners and
 # direction marks of emoji, Arabic, Urdu and Persian, the byte order mark and
 # the emoji variation selectors. Control characters count too: mojibake and
@@ -442,7 +442,7 @@ def _matching_views(
         if TAG_CHARACTERS.search(text):
             candidates.append((_unglue(_normalize(decode_tags(text))), "[tags]"))
         if unhidden is not None:
-            candidates.append((_unglue(_normalize(unhidden.view)), "[invisible]"))
+            candidates += [(_unglue(_normalize(spelled)), "[invisible]") for spelled in _read_through(unhidden.view)]
     for view, marker in candidates:
         if view not in seen:
             seen.add(view)
@@ -451,10 +451,20 @@ def _matching_views(
         return
     # Last, and one level only: a decoded run is not decoded again.
     for run in context.encoded.decoded(text):
-        view = _unglue(_normalize(run.text))
-        if view not in seen:
-            seen.add(view)
-            yield view, f"[{run.kind}]"
+        for spelled in _read_through(run.text):
+            view = _unglue(_normalize(spelled))
+            if view not in seen:
+                seen.add(view)
+                yield view, f"[{run.kind}]"
+
+
+# What a byte that is not UTF-8 becomes in decoded text (textutil: base64, hex, invisible carriers).
+_REPLACEMENT = "\ufffd"
+
+
+def _read_through(decoded: str) -> tuple[str, ...]:
+    """Decoded text, and the same without U+FFFD if it has any: a stray byte inside a word must not hide it."""
+    return (decoded, decoded.replace(_REPLACEMENT, "")) if _REPLACEMENT in decoded else (decoded,)
 
 
 # --------------------------------------------------------------------------
@@ -568,9 +578,17 @@ _RULES: tuple[_Rule, ...] = (
 # Every alternative starts with a literal character, which lets the regex
 # engine skip ahead (see `_first_matches`); where a name must not continue a
 # longer word ("valid rsa", "process.env"), a look-behind AFTER it says so.
-_KEY_FILES = "|".join(rf"id[_ ]{key}\b(?<![a-z0-9]id.{key})" for key in ("rsa", "dsa", "ecdsa", "ed25519"))
+# Files that only look like one hold nothing secret, and setup guides tell the
+# reader to paste them into a form ("paste ~/.ssh/id_rsa.pub into the key
+# field"): a public key (".pub"; in some views "_" is a space, so "id rsa.pub")
+# and a template of an .env file (".env.example").
+_PUBLIC_KEY_FILE = r"[\w-]{1,64}(?:[ .][\w-]{1,64}){0,2}\.pub\b"
+_KEY_FILES = "|".join(
+    rf"id[_ ]{key}\b(?<![a-z0-9]id.{key})(?![\w-]{{0,32}}\.pub\b)" for key in ("rsa", "dsa", "ecdsa", "ed25519")
+)
 _CREDENTIAL_FILE = (
-    rf"(~/\.ssh\b|\.ssh[/\\]|{_KEY_FILES}|\.env\b(?<![\w.]\.env)"
+    rf"(~/\.ssh\b(?![/\\]{_PUBLIC_KEY_FILE})|\.ssh[/\\](?!{_PUBLIC_KEY_FILE})|{_KEY_FILES}"
+    r"|\.env\b(?<![\w.]\.env)(?!\.(?:example|sample|template|dist)\b)"
     r"|\.aws[/\\]credentials\b|mcp\.json\b|claude[_ ]desktop[_ ]config\b"
     r"|\.cursor[/\\]|\.npmrc\b|\.pypirc\b|\.netrc\b|\.git-credentials\b|/proc/(self|\d{1,7})/environ\b"
     r"|/etc/(passwd|shadow)\b|\.kube[/\\]config\b|\.docker[/\\]config\.json\b|\.gnupg\b|\.config[/\\]gh\b)"
@@ -1193,7 +1211,10 @@ def _label(text: str) -> str:
 # Medium, because documentation writes all of these: API references put
 # {placeholders} in links, README files have rows of badges from one host,
 # cloud and CDN hosts have long hashed names. High only when a secret is
-# named in the same sentence, outside the address itself.
+# named in the same sentence, outside the address itself; for a link that is
+# not an image (one a person must click), only when that sentence also orders
+# something put into it: "Your API token is shown on [the settings
+# page](https://example.com/tokens/{id})" is how API docs are written.
 
 # A link a client may render: markdown (an image or not), an HTML link or
 # image, an autolink, a reference definition. Group "url" is the address. A
@@ -1231,13 +1252,24 @@ _SECRET_WORD = re.compile(_SECRET)
 # exclamation mark before a space, or a blank line.
 _SENTENCE_BREAK = re.compile(r"[.!?][\"')\]]?(?=\s)|\n[ \t]*\n")
 _SENTENCE_REACH = 200
+# An order to put something into a link, which makes a link (not an image) high with a secret named.
+_FILL_IN = re.compile(
+    r"\b(?:put(?:s|ting)?|insert(?:s|ed|ing)?|append(?:s|ed|ing)?|add(?:s|ed|ing)?|includ(?:e|es|ed|ing)"
+    r"|replac(?:e|es|ed|ing)|substitut(?:e|es|ed|ing)|fill(?:s|ed|ing)?|embed(?:s|ded|ding)?|encod(?:e|es|ed|ing)"
+    r"|past(?:e|es|ed|ing)|attach(?:es|ed|ing)?)\b"
+)
+
+
+def _sentence_outside(text: str, start: int, end: int) -> str:
+    """The sentence around text[start:end], without that span, in lowercase (at most _SENTENCE_REACH each side)."""
+    before = _SENTENCE_BREAK.split(text[max(0, start - _SENTENCE_REACH) : start])[-1]
+    after = _SENTENCE_BREAK.split(text[end : end + _SENTENCE_REACH], maxsplit=1)[0]
+    return f"{before.lower()} \n {after.lower()}"
 
 
 def _secret_named_near(text: str, start: int, end: int) -> bool:
     """Whether a secret is named in the sentence around text[start:end], outside that span."""
-    before = _SENTENCE_BREAK.split(text[max(0, start - _SENTENCE_REACH) : start])[-1]
-    after = _SENTENCE_BREAK.split(text[end : end + _SENTENCE_REACH], maxsplit=1)[0]
-    return _SECRET_WORD.search(f"{before.lower()} \n {after.lower()}") is not None
+    return _SECRET_WORD.search(_sentence_outside(text, start, end)) is not None
 
 
 def _carries_data(rest: str) -> bool:
@@ -1258,7 +1290,12 @@ def _links(text: str, patterns: tuple[re.Pattern[str], ...]) -> Iterator[re.Matc
 
 
 def _link_finding(text: str) -> Finding | None:
-    """link_exfiltration: a link or image whose address has a slot for data, or encoded data, after its host."""
+    """link_exfiltration: a link or image whose address has a slot for data, or encoded data, after its host.
+
+    High when a secret is named in its sentence and either it is an image,
+    which a client fetches without a click, or the sentence orders something
+    put into it ("Put the API key in [this link](...{data})").
+    """
     if "//" not in text:
         return None
     medium = None
@@ -1267,10 +1304,16 @@ def _link_finding(text: str) -> Finding | None:
         if parts is None or not _carries_data(parts.group("rest")):
             continue
         excerpt = _excerpt(text, *match.span())
-        if _secret_named_near(text, *match.span("url")):
+        sentence = _sentence_outside(text, *match.span("url"))
+        if _SECRET_WORD.search(sentence) and (_is_image(match.group()) or _FILL_IN.search(sentence)):
             return Finding("link_exfiltration", "high", excerpt)
         medium = medium or Finding("link_exfiltration", "medium", excerpt)
     return medium
+
+
+def _is_image(link: str) -> bool:
+    """Whether a match of _LINK_RES is an image: markdown "![...](...)" or an HTML <img>."""
+    return link.startswith("!") or link[:4].lower() == "<img"
 
 
 # Text that orders data written out one image per character, as CamoLeak's did.
@@ -1393,14 +1436,18 @@ def _host_label_finding(text: str) -> Finding | None:
 # address shown is not the one opened) and OSC 52 (writes the clipboard).
 # ESC [ or the one-character CSI, ESC ] or the one-character OSC. Each kind is
 # looked for with one search; only SGR sequences with an 8 in them are read
-# one by one, to tell conceal from the 8 of a colour.
+# one by one, to tell conceal from the 8 of a colour. The parameters have no
+# length bound: a terminal reads "ESC[000...0;8m" with a hundred zeros as
+# conceal. The patterns stay linear all the same: parameters cannot hold the
+# characters that start or end a sequence, and in an SGR the part before the
+# first 8 cannot hold an 8, so no character is read by more than a few attempts.
 _CSI = r"(?:\x1b\[|\x9b)"
 _HIDING_SEQUENCES = (
-    ("cursor movement or erasing", re.compile(_CSI + r"[0-?]{0,64}[ -/]{0,8}[ABCDEFGHJKLMPXadefsu`]")),
+    ("cursor movement or erasing", re.compile(_CSI + r"[0-?]*[ -/]{0,8}[ABCDEFGHJKLMPXadefsu`]")),
     ("hyperlink", re.compile(r"(?:\x1b\]|\x9d)8;")),
     ("clipboard", re.compile(r"(?:\x1b\]|\x9d)52;")),
 )
-_SGR_WITH_AN_EIGHT = re.compile(_CSI + r"(?P<parameters>[0-?]{0,63}8[0-?]{0,63})m")
+_SGR_WITH_AN_EIGHT = re.compile(_CSI + r"(?P<parameters>[0-79:-?]*8[0-?]*)m")
 _MAX_SEQUENCES = 10_000
 
 

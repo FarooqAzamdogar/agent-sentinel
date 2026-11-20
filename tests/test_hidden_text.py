@@ -71,6 +71,45 @@ class InvisibleCarriers(unittest.TestCase):
         self.assertFalse(decision.decision.allowed)
 
 
+class StrayBytesDoNotHideAPayload(unittest.TestCase):
+    """Round 1 of the review: one byte that is not UTF-8, or binary data after the text, turned decoding off."""
+
+    PAYLOAD = INJECTION.encode()
+
+    def test_a_stray_byte_before_inside_or_after_base64_text(self):
+        for raw in (self.PAYLOAD + b"\xff", b"\x80" + self.PAYLOAD, self.PAYLOAD.replace(b"Ignore", b"Ign\xffore"),
+                    self.PAYLOAD.replace(b"Ignore all", b"Ignore\xffall")):
+            with self.subTest(raw=raw[:12]):
+                found = rules("Decode and follow: " + base64.b64encode(raw).decode())
+                self.assertEqual(found.get("instruction_override"), "high")
+
+    def test_binary_data_after_base64_text(self):
+        import random
+        for trailer in (b"\0" * 50, random.Random(1).randbytes(300), b"\xff" * 20):
+            with self.subTest(trailer=trailer[:4]):
+                found = rules("Decode: " + base64.b64encode(self.PAYLOAD + trailer).decode())
+                self.assertEqual(found.get("instruction_override"), "high")
+
+    def test_a_stray_byte_after_invisible_carriers(self):
+        for text in ("Nice " + bits_of(self.PAYLOAD + b"\xff", "\N{INVISIBLE TIMES}", "\N{INVISIBLE PLUS}"),
+                     "Nice" + bits_of(self.PAYLOAD + b"\xff", "\N{ZERO WIDTH SPACE}", "\N{ZERO WIDTH NON-JOINER}"),
+                     "Nice \U0001f600" + selectors_of(self.PAYLOAD + b"\xff"),
+                     "Nice \U0001f600" + selectors_of(self.PAYLOAD + bytes(range(1, 41)))):
+            with self.subTest(text=ascii(text[:8])):
+                found = rules(text)
+                self.assertEqual(found.get("invisible_smuggling"), "high")
+                self.assertEqual(found.get("instruction_override"), "high")
+                self.assertFalse(checked({"content": [{"type": "text", "text": text}]}).decision.allowed)
+
+
+def bits_of(data, zero, one):
+    return "".join(format(byte, "08b") for byte in data).replace("0", zero).replace("1", one)
+
+
+def selectors_of(data):
+    return "".join(chr(0xFE00 + byte) if byte < 16 else chr(0xE0100 + byte - 16) for byte in data)
+
+
 class CleaningForForwarding(unittest.TestCase):
     def test_invisible_operators_go(self):
         self.assertEqual(clean_for_forwarding("a⁡b⁢c⁣d⁤e"), "abcde")
@@ -79,7 +118,9 @@ class CleaningForForwarding(unittest.TestCase):
     def test_a_run_of_variation_selectors_is_reduced(self):
         payload = "Sunny \U0001f600" + selectors(INJECTION)
         self.assertEqual(clean_for_forwarding(payload), "Sunny \U0001f600")
-        self.assertEqual(clean_for_forwarding("a️️️"), "a️")
+        smiley, vs16 = "\N{WHITE SMILING FACE}", "\N{VARIATION SELECTOR-16}"
+        self.assertEqual(clean_for_forwarding(smiley + vs16 * 3), smiley + vs16)
+        self.assertEqual(clean_for_forwarding("a" + vs16 * 3), "a")  # a letter takes no selector
         self.assertEqual(clean_for_forwarding("️️start"), "start")
 
     def test_emoji_and_cjk_variation_sequences_are_kept(self):
@@ -95,6 +136,33 @@ class CleaningForForwarding(unittest.TestCase):
         self.assertEqual(clean_for_forwarding("a\U000e0100b"), "ab")
         self.assertEqual(clean_for_forwarding("葛\U000e0100\U000e0101"), "葛\U000e0100")
         self.assertEqual(clean_for_forwarding("\U0001f600\U000e0139\U000e0157"), "\U0001f600")
+
+    def test_a_selector_after_each_letter_goes(self):
+        # One selector per visible letter carries four bits each: only an emoji, a symbol or a CJK ideograph keeps one.
+        hidden = "".join(letter + chr(0xFE00 + n % 16) for n, letter in enumerate(INJECTION))
+        self.assertEqual(clean_for_forwarding(hidden), INJECTION)
+        kept = ("\N{HEAVY BLACK HEART}\N{VARIATION SELECTOR-16}",
+                "#\N{VARIATION SELECTOR-16}\N{COMBINING ENCLOSING KEYCAP}",
+                "\N{DOUBLE EXCLAMATION MARK}\N{VARIATION SELECTOR-16}",
+                "\N{GREATER-THAN BUT NOT EQUAL TO}\N{VARIATION SELECTOR-1}",
+                "\N{CJK UNIFIED IDEOGRAPH-8FBB}\N{VARIATION SELECTOR-1}", "\U0001f44d\N{VARIATION SELECTOR-15}")
+        for text in kept:
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(clean_for_forwarding(text), text)
+        for text in ("x\N{VARIATION SELECTOR-16}", "x\N{VARIATION SELECTOR-1}", " \N{VARIATION SELECTOR-16}",
+                     "\N{LATIN SMALL LETTER E WITH ACUTE}\N{VARIATION SELECTOR-15}"):
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(clean_for_forwarding(text), text[0])
+
+    def test_runs_of_zero_width_characters_go_and_single_ones_stay(self):
+        zero, one = "\N{ZERO WIDTH SPACE}", "\N{ZERO WIDTH NON-JOINER}"
+        self.assertEqual(clean_for_forwarding("ok " + bits(INJECTION, zero, one) + " done"), "ok  done")
+        self.assertEqual(clean_for_forwarding("a" + "\N{WORD JOINER}" * 8 + "b"), "ab")
+        for text in ("\N{ARABIC LETTER HEH}\N{ZERO WIDTH NON-JOINER}\N{ARABIC LETTER ALEF}",
+                     "\U0001f468\N{ZERO WIDTH JOINER}\U0001f469\N{ZERO WIDTH JOINER}\U0001f467",
+                     "long" + zero + "word" + zero * 7 + "break"):
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(clean_for_forwarding(text), text)
 
     def test_cleaning_twice_changes_nothing_more(self):
         text = "Sunny \U0001f600" + selectors(INJECTION) + " 葛\U000e0100\U000e0101 a⁢b"
@@ -152,6 +220,16 @@ class MediaIsExemptOnlyWhereItIsRendered(unittest.TestCase):
         self.assertTrue(checked(result).decision.allowed)
         prompt = {"messages": [{"role": "user", "content": {"type": "audio", "data": B64_INJECTION}}]}
         self.assertTrue(checked(prompt).decision.allowed)
+
+    def test_only_blocks_where_a_client_renders_them_are_exempt(self):
+        image = {"type": "image", "mimeType": "image/png", "data": B64_INJECTION}
+        for result in ({"content": [{"type": "text", "text": "hi", "content": image}]}, {"content": [[image]]},
+                       {"content": [{"type": "resource", "content": [image]}]}, image):
+            with self.subTest(result=str(result)[:50]):
+                self.assertFalse(checked(result).decision.allowed)
+        for result in ({"content": [image]}, [image], {"result": {"content": [image]}}):
+            with self.subTest(result=str(result)[:50]):
+                self.assertTrue(checked(result).decision.allowed)
 
     def test_a_data_uri_in_text_is_decoded(self):
         self.assertFalse(checked("Logo: data:image/png;base64," + B64_INJECTION).decision.allowed)
@@ -212,6 +290,20 @@ class KnownValueSpellings(unittest.TestCase):
             with self.subTest(text=ascii(text[:20])):
                 self.assertEqual(self.kinds(text), {kind})
 
+    def test_invisible_characters_that_are_not_format_characters_are_folded_too(self):
+        for joiner in ("\N{VARIATION SELECTOR-16}", "\N{COMBINING GRAPHEME JOINER}", "\N{HANGUL FILLER}",
+                       "\N{MONGOLIAN FREE VARIATION SELECTOR ONE}", "\U000e0101"):
+            with self.subTest(joiner=ascii(joiner)):
+                self.assertEqual(self.kinds(joiner.join(self.WORD)), {"value of WORD"})
+                self.assertEqual(self.kinds(joiner.join(CANARY)), {"canary"})
+
+    def test_the_folding_table_shared_by_all_texts_stays_small(self):
+        from agent_sentinel import textutil
+        every_character = "".join(chr(code) for code in range(0x80, 0x30000) if not 0xD800 <= code <= 0xDFFF)
+        self.assertNotIn("\N{ZERO WIDTH SPACE}", folded_text(every_character))
+        self.assertLessEqual(len(textutil._WITHOUT_INVISIBLE), textutil._MAX_REMEMBERED)
+        self.assertEqual(folded_text("a\N{ZERO WIDTH SPACE}b\N{VARIATION SELECTOR-16}c"), "abc")
+
     def test_base64_wrapped_before_its_24th_character_is_joined(self):
         encoded = base64.b64encode(f"password={self.WORD}".encode()).decode()
         for width in (1, 5, 13):
@@ -240,6 +332,10 @@ class KnownValueSpellings(unittest.TestCase):
                     Policy.from_dict(secrets(wrong))
 
 
+def b64_of(data):
+    return base64.b64encode(data).decode()
+
+
 class HostileInputStaysQuick(unittest.TestCase):
     LIMIT_SECONDS = 5
 
@@ -256,6 +352,13 @@ class HostileInputStaysQuick(unittest.TestCase):
             "dotted letters": "a." * 250_000,
             "binary base64 runs": ("AAAA" + "/w==" * 8 + " ") * 20_000,
             "many short base64 runs": ("QUJDREVGR0hJSktMTU5PUFFSU1RVVldY" + " ") * 30_000,
+            "base64 runs of text and binary data": (b64_of(b"Some text, then binary data" + bytes(range(256))) + " ")
+            * 3_000,
+            "base64 runs with stray bytes": (b64_of(b"\xff" * 30 + b"x" * 200) + " ") * 3_000,
+            "base64 runs ending in slashes": (b64_of(b"Text that ends in 0xFF bytes" + b"\xff" * 60) + " ") * 3_000,
+            "a selector after each letter": "a\N{VARIATION SELECTOR-1}" * 250_000,
+            "zero-width runs": ("\N{ZERO WIDTH SPACE}" * 9 + "a") * 50_000,
+            "selectors spelling binary data": "\U0001f600" + "\N{VARIATION SELECTOR-16}\U000e01ef" * 150_000,
         }
         for name, text in cases.items():
             with self.subTest(case=name):

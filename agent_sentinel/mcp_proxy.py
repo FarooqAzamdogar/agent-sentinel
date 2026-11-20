@@ -1577,7 +1577,9 @@ class Proxy:
         elif method == elicitation.ELICITATION_CREATE:
             decision = self._elicitation_refusal(label, message.get("params"))
         if decision is None:
-            decision = self._firewall.scan_result(label, message, event="server_request", log_clean=False)
+            decision = self._firewall.scan_result(
+                label, message, event="server_request", log_clean=False, parameter_names=self._known_parameters()
+            )
         if decision.allowed:
             if is_request:
                 self._expect_client_reply(msg_id, method)
@@ -1736,7 +1738,8 @@ class Proxy:
             decision = self._elicitation_refusal(label, entry.get("params"), pending.call_id)
         if decision is None:
             decision = self._firewall.scan_result(
-                label, entry, event="server_request", log_clean=False, call_id=pending.call_id
+                label, entry, event="server_request", log_clean=False, call_id=pending.call_id,
+                parameter_names=self._known_parameters(),
             )
         if not decision.allowed:
             self._report_block(
@@ -1863,6 +1866,11 @@ class Proxy:
         self._report(f"blocked a reply to {pending.method}: {reason} {proxy_report.rule_and_ref(decision)}")
         return _rpc_error(msg_id, decision.public_reason, code=code)
 
+    def _known_parameters(self) -> frozenset[str]:
+        """The parameter names of the server's tools let through so far, for the output-poisoning rules."""
+        with self._state:
+            return frozenset(self._parameter_names)
+
     def _deliver_or_block(
         self, pending: _PendingRequest, msg_id: Any, member: str, value: Any, log_clean: bool = True
     ) -> JsonObject:
@@ -1874,10 +1882,8 @@ class Proxy:
         The reply holds that checked copy, never `value` itself. The flow
         marks of the request are set just before the reply is returned.
         """
-        with self._state:
-            parameter_names = frozenset(self._parameter_names)
         checked = self._checked_for_forwarding(
-            pending.label, value, "result", log_clean, pending.call_id, parameter_names=parameter_names
+            pending.label, value, "result", log_clean, pending.call_id, parameter_names=self._known_parameters()
         )
         decision = checked.decision
         if not decision.allowed:
