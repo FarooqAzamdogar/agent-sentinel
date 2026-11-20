@@ -37,14 +37,14 @@ class TheAuditTrailOfAProxy(EndToEndTest):
 
     def test_a_signed_rotated_log_with_session_records_verifies_and_an_edit_is_found(self):
         proxy = self.proxy("--policy", EXAMPLE_POLICY, "--audit", self.audit, "--audit-key-file", self.key,
-                           "--audit-max-bytes", "4096", "--name", "files")
+                           "--audit-max-bytes", "65536", "--name", "files")
         proxy.initialize()
         self.assertEqual(text_of(proxy.call(1, "read_file", {"path": "notes.txt"})), "contents of notes.txt")
-        for msg_id in range(2, 14):
-            self.assertRegex(text_of(proxy.call(msg_id, "delete_file", {"path": f"f{msg_id}"})),
+        for msg_id in range(2, 14):  # records of about 12 kB each: the log is rotated twice or more
+            self.assertRegex(text_of(proxy.call(msg_id, "delete_file", {"path": f"f{msg_id}" + "x" * 12000})),
                              r"\ABlocked by agent-sentinel: .* " + REF + r"\Z")
         self.assertEqual(proxy.stop(), 0)
-        self.assertIn("records signed with a key; rotated past 4096 bytes", proxy.stderr)
+        self.assertIn("records signed with a key; rotated past 65536 bytes", proxy.stderr)
 
         files = self.rotated_files()
         self.assertGreater(len(files), 2)

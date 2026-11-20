@@ -121,7 +121,8 @@ def _add_paths(parser: argparse.ArgumentParser) -> None:
                         help="block every call whose audit record cannot be written")
     parser.add_argument("--audit-max-bytes", type=_audit_max_bytes, metavar="BYTES",
                         help="past about this size, move the audit log to FILE.1 (then FILE.2, ...) and start it "
-                             "again, its chain continuing; nothing is deleted")
+                             "again, its chain continuing; nothing is deleted "
+                             f"({audit_chain.MIN_MAX_BYTES} to {audit_chain.MAX_MAX_BYTES})")
 
 
 def _audit_max_bytes(text: str) -> int:

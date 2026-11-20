@@ -23,8 +23,13 @@ A chain starts with a "chain_start" record ("start" says why):
            it continues the chain of the file that was moved aside (FILE.1,
            FILE.2, ...), whose name it gives in "previous_file";
   restart  the last line of the log could not be linked to (damaged, cut
-           short, or written by agent-sentinel 0.5 or earlier): a new chain
-           starts after it, rather than failing every call.
+           short, or written by agent-sentinel 0.5 or earlier), or this
+           process may append to the log but not read it: a new chain starts
+           after it, rather than failing every call. It names the last
+           chained record found in the end of the log ("after_seq" and
+           "after_hash", or null when there is none in the "scanned" bytes;
+           "scanned" is 0 when the log could not be read), so that records
+           removed before it are still found.
 
 What the chain can and cannot show (also in SECURITY.md):
 
@@ -32,7 +37,10 @@ What the chain can and cannot show (also in SECURITY.md):
     file can work out every hash again;
   * a key detects any change, but only if the agent's tools cannot read it;
   * records cut from the end of the log are not detected by either: keep
-    the last seq and hash somewhere else (`audit verify` prints them).
+    the last seq and hash somewhere else (`audit verify` prints them);
+  * lines without chain fields at the start of a log (agent-sentinel 0.5 or
+    earlier wrote them, or they replace records that were removed) cannot
+    be checked: a log that has them is only "partly" checked.
 
 `append_chained` writes; `ChainChecker` checks (`agent-sentinel audit verify`,
 and the one-line state that `report` and `explain` print). Provenance helpers
@@ -50,6 +58,7 @@ import re
 import socket
 import stat
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Sequence
@@ -67,13 +76,26 @@ CHAIN_FIELDS = frozenset({"seq", "prev", "hash", "mac"})  # added to a line when
 # How much of the end of the log is read to find the last record's chain fields. The fields
 # are the last ~300 bytes of a line, so this is plenty; the read never goes past it.
 TAIL_BYTES = 4096
+# When a chain restarts, how much of the end of the log is searched for the last chained record (the
+# restart names it, so that records removed before the restart are still found).
+RESTART_SCAN_BYTES = 64 * 1024
 # The size of a chunk when a log is copied aside on rotation.
 COPY_CHUNK_BYTES = 1024 * 1024
-# --audit-max-bytes: the smallest and largest size a log may grow to before it is rotated.
-MIN_MAX_BYTES = 1024
-MAX_MAX_BYTES = 1 << 40
+# --audit-max-bytes: the smallest and largest size a log may grow to before it is rotated. The smallest
+# holds about a hundred records; the largest bounds the copy made under the lock at each rotation (other
+# writers wait for it: on Windows they give up after filelock.LOCK_TIMEOUT_SECONDS).
+MIN_MAX_BYTES = 64 * 1024
+MAX_MAX_BYTES = 256 * 1024 * 1024
 # Rotated files are FILE.1, FILE.2, ... up to this number. Past it, the log is not rotated (it keeps growing).
 MAX_ROTATED_FILES = 10_000
+# A rotation lists the log's folder once to find the highest FILE.N; in a folder with more entries than
+# this, the log is not rotated.
+MAX_LISTED_ENTRIES = 100_000
+# How many numbers after the highest one a rotation tries (each is created with O_EXCL) before giving up.
+ROTATE_ATTEMPTS = 8
+# After a rotation fails, or no number is free, this process appends without rotating for this long.
+ROTATION_RETRY_SECONDS = 60.0
+_MAX_PAUSED_LOGS = 64
 # A key file: 16 bytes at the least (128 bits), and small.
 MIN_KEY_BYTES = 16
 MAX_KEY_FILE_BYTES = 1024
@@ -103,12 +125,17 @@ def read_key_file(path: str | Path) -> bytes:
     `openssl rand -hex 32 > key` works), and must be 16 to 1024 bytes. On
     POSIX the file must be readable and writable by its owner only (0600 or
     0400): a key others can read lets them sign records too.
+
+    Anything but a regular file is refused before it is opened, and the open
+    does not wait (O_NONBLOCK): a named pipe in its place cannot hang the start.
     """
     try:
-        handle = open(path, "rb")
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            raise AuditKeyError("the audit key file is not a regular file")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
     except OSError as exc:
         raise AuditKeyError(f"the audit key file cannot be opened ({exc.strerror or type(exc).__name__})") from None
-    with handle:
+    with open(descriptor, "rb") as handle:
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode):
             raise AuditKeyError("the audit key file is not a regular file")
@@ -181,16 +208,21 @@ def append_chained(
     handle that reads the end and appends: on Windows a locked byte cannot be
     read through another handle. A new log is created readable by its owner
     only (0600 on POSIX).
+
+    A log this process may append to but not read (an append-only ACL, mode
+    0200) is still written, as before 0.6: each record then starts a chain of
+    its own (a restart that says the log could not be read), and the log is
+    not rotated.
     """
-    handle = _open_log(path)
+    handle, readable = _open_log(path)
     with handle:
         lock_file(handle)
         try:
             size = handle.seek(0, os.SEEK_END)
-            tail = _read_tail(handle, size)
+            tail = _read_tail(handle, size) if readable else _UNREAD if size else _Tail()
             start: dict[str, Any] | None = None
             estimate = len(line) + 400
-            if max_bytes is not None and size > 0 and size + estimate > max_bytes:
+            if readable and max_bytes is not None and size > 0 and size + estimate > max_bytes:
                 rotated = _rotate(handle, path, size)
                 if rotated is not None:
                     size = 0
@@ -199,7 +231,8 @@ def append_chained(
             if start is None and size == 0:
                 start = {"start": NEW, "reason": "a new audit log"}
             elif start is None and tail.problem is not None:
-                start = {"start": RESTART, "reason": f"a new chain starts: {tail.problem}"}
+                start = {"start": RESTART, "reason": f"a new chain starts: {tail.problem}",
+                         **(_last_link(handle, size) if readable else _NO_LINK)}
             # An incomplete last line is ended first, so that the records after it start lines of their own.
             pieces = [b"\n"] if size > 0 and tail.unterminated else []
             if start is None:
@@ -233,15 +266,49 @@ def chained_line(line: str, seq: int, prev: str, key: bytes | None) -> tuple[byt
     return body[:-1] + trailer.encode("ascii") + b"}\n", digest
 
 
-def _open_log(path: Path) -> BinaryIO:
-    """The log, opened to read and append, created if missing with owner-only permissions (0600 on POSIX)."""
-    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
-    descriptor = os.open(path, flags, 0o600)
+def _open_log(path: Path) -> tuple[BinaryIO, bool]:
+    """The log, opened to append, and whether it can be read too. Created if missing, owner-only (0600 on POSIX).
+
+    When reading is refused (PermissionError), the log is opened to append
+    only, as agent-sentinel 0.5 did: the record is written, unlinked.
+    """
+    common = os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0)
     try:
-        return open(descriptor, "a+b", buffering=0)  # unbuffered: reads and writes go straight to the file
+        descriptor, readable = os.open(path, os.O_RDWR | common, 0o600), True
+    except PermissionError:
+        descriptor, readable = os.open(path, os.O_WRONLY | common, 0o600), False
+    try:
+        # Unbuffered: reads and writes go straight to the file.
+        return open(descriptor, "a+b" if readable else "ab", buffering=0), readable
     except BaseException:
         os.close(descriptor)
         raise
+
+
+# The end of a log this process cannot read, and the restart that follows it.
+_UNREAD = _Tail(problem="this process may append to the log but not read it (an append-only log), so it cannot "
+                        "link to the record before")
+_NO_LINK: dict[str, Any] = {"after_seq": None, "after_hash": None, "scanned": 0}
+
+
+def _last_link(handle: BinaryIO, size: int) -> dict[str, Any]:
+    """For a restart: the last chained record in the last RESTART_SCAN_BYTES of the log, and how much was searched.
+
+    Only whole lines are searched (an incomplete last line is left out). A
+    record found there must be the last chained record before the restart
+    when the log is checked, so a cut of the records before the restart is
+    found even though the restart does not link to them.
+    """
+    begin = max(0, size - RESTART_SCAN_BYTES)
+    handle.seek(begin)
+    data = _read_exactly(handle, size - begin)
+    end = data.rfind(b"\n")
+    if end >= 0:
+        for line in reversed(data[:end].split(b"\n")):
+            found = parse_trailer(line)
+            if found is not None:
+                return {"after_seq": found.seq, "after_hash": found.digest, "scanned": len(data)}
+    return {"after_seq": None, "after_hash": None, "scanned": len(data)}
 
 
 def _read_tail(handle: BinaryIO, size: int) -> _Tail:
@@ -281,36 +348,101 @@ def _write_all(handle: BinaryIO, data: bytes) -> None:
         view = view[written:]
 
 
+# Logs this process does not try to rotate for a while (see ROTATION_RETRY_SECONDS): path -> time.monotonic() deadline.
+_rotation_paused: dict[str, float] = {}
+
+
 def _rotate(handle: BinaryIO, path: Path, size: int) -> str | None:
-    """Copy the log to the next free FILE.N, then empty it; the name of the copy, or None when none is free.
+    """Copy the log to a new FILE.N, then empty it; the name of the copy, or None when it was not rotated.
 
     Copied, not renamed: another process may hold the log open (Windows
     refuses to rename it then, and on POSIX that process would go on writing
     to the renamed file). Nothing is ever deleted: the copy is complete and
     on disk before the log is emptied, under the lock.
+
+    When no number is free or anything fails, the log is not rotated (it
+    grows), and this process does not try again for ROTATION_RETRY_SECONDS:
+    a failed rotation is never paid on every append, and never fails one.
     """
-    for number in range(1, MAX_ROTATED_FILES + 1):
+    paused = os.path.normcase(os.path.abspath(path))
+    now = time.monotonic()
+    if _rotation_paused.get(paused, 0.0) > now:
+        return None
+    rotated = _rotate_now(handle, path, size)
+    if rotated is None:
+        if len(_rotation_paused) >= _MAX_PAUSED_LOGS:
+            _rotation_paused.clear()
+        _rotation_paused[paused] = now + ROTATION_RETRY_SECONDS
+    return rotated
+
+
+def _rotate_now(handle: BinaryIO, path: Path, size: int) -> str | None:
+    """Copy the log to the first number after the highest FILE.N there is; its name, or None."""
+    first = _next_rotated_number(path)
+    if first is None:
+        return None
+    for number in range(first, min(first + ROTATE_ATTEMPTS, MAX_ROTATED_FILES + 1)):
         target = path.with_name(f"{path.name}.{number}")
         try:
             descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
-        except FileExistsError:
+        except OSError:  # it exists, it is a folder, it is being deleted, it may not be created: not free
             continue
-        break
-    else:
+        return target.name if _copy_aside(handle, descriptor, target, size) else None
+    return None
+
+
+def _next_rotated_number(path: Path) -> int | None:
+    """One more than the highest N of the FILE.N beside the log (1 if none), or None when none can be used.
+
+    One listing of the folder, not one attempt per number: the cost does not
+    grow with the files already rotated. New numbers keep growing even when
+    older rotated files were deleted, so the numbers stay in the order the
+    files were written.
+    """
+    prefix = os.path.normcase(f"{path.name}.")
+    highest = 0
+    try:
+        with os.scandir(path.parent) as entries:
+            for count, entry in enumerate(entries):
+                if count >= MAX_LISTED_ENTRIES:
+                    return None
+                name = os.path.normcase(entry.name)
+                if not name.startswith(prefix):
+                    continue
+                number = name[len(prefix):]
+                if number.isascii() and number.isdigit() and len(number) <= 5 and int(number) <= MAX_ROTATED_FILES:
+                    highest = max(highest, int(number))
+    except OSError:
         return None
-    with open(descriptor, "wb") as copy:
-        handle.seek(0)
-        left = size
-        while left > 0:
-            chunk = handle.read(min(COPY_CHUNK_BYTES, left))
-            if not chunk:
-                break
-            copy.write(chunk)
-            left -= len(chunk)
-        copy.flush()
-        os.fsync(copy.fileno())
-    handle.truncate(0)
-    return target.name
+    return highest + 1 if highest < MAX_ROTATED_FILES else None
+
+
+def _copy_aside(handle: BinaryIO, descriptor: int, target: Path, size: int) -> bool:
+    """Copy the log's `size` bytes to the new file `target` (open as `descriptor`), on disk, then empty the log.
+
+    If anything fails, the copy is removed (every record is still in the
+    log, which was not emptied) and False is returned.
+    """
+    try:
+        with open(descriptor, "wb") as copy:
+            handle.seek(0)
+            left = size
+            while left > 0:
+                chunk = handle.read(min(COPY_CHUNK_BYTES, left))
+                if not chunk:
+                    break
+                copy.write(chunk)
+                left -= len(chunk)
+            copy.flush()
+            os.fsync(copy.fileno())
+        handle.truncate(0)
+        return True
+    except OSError:
+        try:
+            os.remove(target)
+        except OSError:
+            pass
+        return False
 
 
 # ---- reading the chain fields ------------------------------------------------------------------------
@@ -344,16 +476,24 @@ def parse_trailer(line: bytes) -> Trailer | None:
 
 # ---- checking a log ------------------------------------------------------------------------------------
 
-INTACT, BROKEN, UNCHAINED, EMPTY = "intact", "broken", "unchained", "empty"
+INTACT, PARTIAL, BROKEN, UNCHAINED, EMPTY = "intact", "partial", "broken", "unchained", "empty"
+_HEX64_TEXT = re.compile(r"[0-9a-f]{64}")
 
 
 @dataclass
 class ChainReport:
-    """What a check of one log (or of several, in order) found."""
+    """What a check of one log (or of several, in order) found.
+
+    state is "partial" when the chain is intact where it can be checked, but
+    some lines cannot be linked to it: lines without chain fields at the start
+    (`unchained_prefix`), or restarts written by a process that could not read
+    the log (`unlinked`). Records removed there would not be detected.
+    """
 
     lines: int = 0
     chained: int = 0
     unchained_prefix: int = 0  # lines without chain fields before the first chained record
+    unlinked: int = 0  # restarts after an intact record, by a writer that could not read the log
     first_seq: int | None = None
     last_seq: int | None = None
     last_hash: str | None = None
@@ -372,7 +512,20 @@ class ChainReport:
             return BROKEN
         if self.chained == 0:
             return UNCHAINED
+        if self.unchained_prefix or self.unlinked:
+            return PARTIAL
         return INTACT
+
+    def unchecked(self) -> str:
+        """What a "partial" check could not link to the chain, in words."""
+        parts = []
+        if self.unchained_prefix:
+            parts.append(f"the first {self.unchained_prefix} line(s) have no chain fields (agent-sentinel 0.5 or "
+                         "earlier wrote them, or they replace records that were removed)")
+        if self.unlinked:
+            parts.append(f"{self.unlinked} restart(s) were written by a process that could not read the log, so "
+                         "they do not link to the record before")
+        return "; ".join(parts)
 
     def one_line(self, command: str) -> str:
         """The state in one short line, for `report` and `explain`. `command` is how to run `audit verify` on the log."""
@@ -385,14 +538,16 @@ class ChainReport:
             first = self.problems[0] if self.problems else "a problem"
             more = f" (and {self.problem_count - 1} more)" if self.problem_count > 1 else ""
             return f"Integrity: BROKEN at {first}{more}. Details: {command}"
+        if state == PARTIAL:
+            return (f"Integrity: PARTLY CHECKED: hash chain intact, seq {self.first_seq} to {self.last_seq}, but "
+                    f"{self.unchecked()}. Details: {command}")
         if self.key_given:
             macs = "every MAC matches the key"
         elif self.macs_present:
             macs = "MACs not checked here (audit verify --key-file checks them)"
         else:
             macs = "no MACs (written without a key)"
-        older = f"; {self.unchained_prefix} older line(s) before it" if self.unchained_prefix else ""
-        return f"Integrity: hash chain intact, seq {self.first_seq} to {self.last_seq}{older}; {macs}."
+        return f"Integrity: hash chain intact, seq {self.first_seq} to {self.last_seq}; {macs}."
 
 
 class ChainChecker:
@@ -408,6 +563,8 @@ class ChainChecker:
         self._key_id = key_id(key) if key is not None else None
         self.report = ChainReport(key_given=key is not None)
         self._previous: Any = None  # None (nothing yet), "unchained", "bad", or (seq, hash) of the last record
+        # (seq, hash) of the last line with chain fields, however many lines ago: what a restart names.
+        self._last_chained: tuple[int, str] | None = None
         self._seen_chain = False
         self._label = ""
         self._line = 0
@@ -441,12 +598,13 @@ class ChainChecker:
             return
         record = self._parsed(content)
         if record is None:
+            self._last_chained = (trailer.seq, trailer.digest)  # as the writer saw it when it looked for a link
             return
         if carriage_return:  # the record is intact, but the file is not as it was written
             self._problem("it ends with a carriage return: a program changed the file's line ends")
         self._check_hash_and_mac(trailer, record)
         self._check_link(trailer, record, at_start)
-        self._previous = (trailer.seq, trailer.digest)
+        self._previous = self._last_chained = (trailer.seq, trailer.digest)
         self._seen_chain = True
         report = self.report
         report.chained += 1
@@ -565,15 +723,48 @@ class ChainChecker:
                     "first, to check the link"
                 )
         elif start == RESTART:
-            if at_start:
+            if not fresh:
+                self._problem("a restarted chain must start at seq 0 with no previous hash")
+            elif at_start:
                 self._problem("the file starts with a chain restart: the line before it is missing")
             elif isinstance(previous, tuple):
-                self._problem("a new chain starts although the record before it is intact: records may have been "
-                              "removed here")
-            elif not fresh:
-                self._problem("a restarted chain must start at seq 0 with no previous hash")
+                if _could_not_read(record):  # a writer that may only append: it did not know the record before
+                    self.report.unlinked += 1
+                else:
+                    self._problem("a new chain starts although the record before it is intact: records may have "
+                                  "been removed here")
+            else:
+                self._check_restart_follows(record)
         else:
             self._problem("it is a chain_start record of an unknown kind")
+
+    def _check_restart_follows(self, record: dict[str, Any]) -> None:
+        """A restart after a damaged or unchained line names the last chained record its writer found before it
+        (after_seq, after_hash), or null when there was none in what it searched: that record must be here."""
+        if "after_hash" not in record or "after_seq" not in record:
+            self._problem("a restart must name the record before it (after_seq and after_hash)")
+            return
+        after_seq, after_hash = record["after_seq"], record["after_hash"]
+        if after_hash is None and after_seq is None:
+            return  # no chained record in the end of the log its writer searched (a log from 0.5, or a long line)
+        if (type(after_seq) is not int or not 0 <= after_seq < 10**18 or not isinstance(after_hash, str)
+                or not _HEX64_TEXT.fullmatch(after_hash)):
+            self._problem("a restart must name the record before it (after_seq and after_hash)")
+            return
+        last = self._last_chained
+        if last is None:
+            self._problem(f"the chain before it is missing: it follows seq {after_seq}, which is not in the log "
+                          "(records before it were removed)")
+        elif last != (after_seq, after_hash):
+            self._problem(f"it follows seq {after_seq}, but the last chained record before it is seq {last[0]}: "
+                          "records before it were removed or changed")
+
+
+def _could_not_read(record: dict[str, Any]) -> bool:
+    """Whether a restart says its writer could not read the log (scanned 0 bytes, and so names no record)."""
+    scanned = record.get("scanned")
+    return (type(scanned) is int and scanned == 0 and record.get("after_hash", "") is None
+            and record.get("after_seq", "") is None)
 
 
 def check_files(paths: Sequence[str], key: bytes | None = None) -> ChainReport:

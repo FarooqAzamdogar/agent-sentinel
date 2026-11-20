@@ -2516,7 +2516,8 @@ def _argument_parser() -> argparse.ArgumentParser:
                              "cannot be written")
     parser.add_argument("--audit-max-bytes", type=_audit_max_bytes, default=None, metavar="BYTES",
                         help="past about this size, move the audit log to FILE.1 (then FILE.2, ...) and start it "
-                             f"again, its chain continuing; nothing is deleted (at least {audit_chain.MIN_MAX_BYTES})")
+                             "again, its chain continuing; nothing is deleted "
+                             f"({audit_chain.MIN_MAX_BYTES} to {audit_chain.MAX_MAX_BYTES})")
     parser.add_argument("--name", type=_server_name, default=None, metavar="NAME",
                         help="a short name for the server (letters, digits, '_', '-', '.'; at most 64), written into "
                              "every audit record and at the start of every line the proxy prints")

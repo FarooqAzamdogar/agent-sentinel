@@ -13,7 +13,9 @@ counts the other problems and the MAC mismatches.
 What it cannot see: without --key-file, someone who could write the file can
 have worked out every hash again; and records cut from the END of the log
 leave no trace. The last seq and hash it prints are what to keep elsewhere to
-catch that later.
+catch that later. Lines without chain fields at the START of a log (from
+agent-sentinel 0.5 or earlier) cannot be checked either: such a log is only
+"partly checked", which exits 1 unless --allow-unchecked is given.
 """
 
 from __future__ import annotations
@@ -21,7 +23,17 @@ from __future__ import annotations
 import argparse
 import os
 
-from .audit_chain import BROKEN, EMPTY, INTACT, MAX_PROBLEMS_KEPT, AuditKeyError, ChainReport, check_files, read_key_file
+from .audit_chain import (
+    BROKEN,
+    EMPTY,
+    INTACT,
+    MAX_PROBLEMS_KEPT,
+    PARTIAL,
+    AuditKeyError,
+    ChainReport,
+    check_files,
+    read_key_file,
+)
 from .cli_common import EXIT_FAIL, EXIT_OK, CommandError, full_path, shown_path
 from .textutil import printable
 
@@ -37,10 +49,14 @@ examples:
   agent-sentinel audit verify audit.jsonl.1 audit.jsonl.2 audit.jsonl   (rotated files, oldest first)
 
 exit codes:
-  0  intact (or empty)    1  broken, or not chained at all    2  a usage error, or a file that cannot be read
+  0  intact (or empty)    1  broken, not chained at all, or only partly checked (see --allow-unchecked)
+  2  a usage error, or a file that cannot be read
 
 Without --key-file, the chain detects naive edits only: anyone who can write the log can work out every hash
 again. Records cut from the end of the log are not detected: keep the last seq and hash somewhere else.
+A log is only partly checked when lines at its start have no chain fields (agent-sentinel 0.5 or earlier
+wrote them, or they replace records that were removed), or when a process that could not read the log
+(an append-only log) wrote records that do not link to the ones before.
 """
 # How many problems are listed after the first.
 SHOWN_PROBLEMS = 10
@@ -57,6 +73,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     verify.add_argument("--key-file", metavar="K",
                         help="the audit key file the log was written with (proxy or hook --audit-key-file): "
                              "check every record's MAC too")
+    verify.add_argument("--allow-unchecked", action="store_true",
+                        help="exit 0 for a partly checked log (lines from agent-sentinel 0.5 or earlier at its "
+                             "start, or records from a process that could not read it): records removed where the "
+                             "chain cannot reach are then not detected")
 
 
 def run(args: argparse.Namespace) -> int:
@@ -75,11 +95,12 @@ def run(args: argparse.Namespace) -> int:
     except OSError as exc:
         raise CommandError(f"cannot read {shown_path(exc.filename or '')}: {exc.strerror or type(exc).__name__}"
                            ) from exc
-    print_report(report, [printable(path, limit=300) for path in args.files])
-    return EXIT_OK if report.state in (INTACT, EMPTY) else EXIT_FAIL
+    allowed = (INTACT, EMPTY, PARTIAL) if args.allow_unchecked else (INTACT, EMPTY)
+    print_report(report, [printable(path, limit=300) for path in args.files], args.allow_unchecked)
+    return EXIT_OK if report.state in allowed else EXIT_FAIL
 
 
-def print_report(report: ChainReport, names: list[str]) -> None:
+def print_report(report: ChainReport, names: list[str], allow_unchecked: bool = False) -> None:
     """What the check found, in a few lines; the verdict (INTACT, BROKEN, ...) starts its own line."""
     shown = ", ".join(names)
     if report.state == EMPTY:
@@ -87,14 +108,17 @@ def print_report(report: ChainReport, names: list[str]) -> None:
         return
     span = f"seq {report.first_seq} to {report.last_seq}" if report.chained else "none chained"
     print(f"Checked {shown}: {report.lines} line(s), {report.chained} chained record(s) ({span}).")
-    if report.unchained_prefix:
-        print(f"  The first {report.unchained_prefix} line(s) have no chain fields: agent-sentinel 0.5 or earlier "
-              "wrote them, so they cannot be checked.")
     print(f"  MACs: {_mac_state(report)}")
     for note in report.notes:
         print(f"  Note: {note}")
     if report.state == INTACT:
         print("INTACT: every record is as it was written and follows the one before it.")
+    elif report.state == PARTIAL:
+        print(f"PARTLY CHECKED: the chain is intact, but {report.unchecked()}. Records removed there would not be "
+              "detected.")
+        if not allow_unchecked:
+            print("  This exits 1; give --allow-unchecked to accept it (for a log that agent-sentinel 0.5 or "
+                  "earlier wrote first, or that this user may only append to).")
     elif report.state == BROKEN:
         print(f"BROKEN: {report.problems[0]}")
         others = report.problems[1:1 + SHOWN_PROBLEMS]

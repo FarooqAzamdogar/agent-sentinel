@@ -35,6 +35,8 @@ from agent_sentinel.audit_chain import (
 
 KEY = bytes(range(32))
 OTHER_KEY = bytes(range(1, 33))
+ROTATE_AT = audit_chain.MIN_MAX_BYTES  # the smallest --audit-max-bytes
+PAD = 3000  # characters of padding in each call's arguments, so that a few dozen calls fill ROTATE_AT
 _CHAIN_FIELDS = re.compile(rb', "seq": [0-9]+, "prev": "[0-9a-f]{64}", "hash": "[0-9a-f]{64}"(, "mac": "[0-9a-f]{64}")?\}$')
 
 
@@ -73,14 +75,17 @@ class LogTest(TempFolderTest):
         self.key_file.write_bytes(KEY)
         if sys.platform != "win32":
             self.key_file.chmod(0o600)
+        self.addCleanup(audit_chain._rotation_paused.clear)  # a failed rotation pauses rotation in this process
 
     def firewall(self, policy=POLICY, **options):
         return Firewall(policy, audit_path=self.audit, **options)
 
-    def write_calls(self, count, firewall=None, **options):
+    def write_calls(self, count, firewall=None, pad=0, **options):
+        """`count` calls, half of them blocked; `pad` characters of padding in each one's arguments."""
         firewall = firewall or self.firewall(**options)
         for number in range(count):
-            firewall.check_call("read_file" if number % 2 else "delete_file", {"path": f"f{number}"})
+            args = {"path": f"f{number}", "note": "p" * pad} if pad else {"path": f"f{number}"}
+            firewall.check_call("read_file" if number % 2 else "delete_file", args)
         return firewall
 
     def check(self, *paths, key=None):
@@ -138,16 +143,76 @@ class Writing(LogTest):
                 continue
         return found
 
-    def test_a_log_written_before_the_chain_gets_a_restart_and_checks_as_intact(self):
+    def test_a_log_written_before_the_chain_gets_a_restart_and_is_only_partly_checked(self):
         old = {"time": "2026-11-18T10:00:00+00:00", "session": "s", "event": "call", "tool": "t", "action": "allow",
                "reason": "r"}
         self.audit.write_bytes((json.dumps(old) + "\n").encode() * 3)
+        size = self.audit.stat().st_size
         self.write_calls(2)
         records = all_records(self.audit)
-        self.assertEqual((records[3]["event"], records[3]["start"]), ("chain_start", "restart"))
-        self.assertIn("no chain fields", records[3]["reason"])
+        restart = records[3]
+        self.assertEqual((restart["event"], restart["start"]), ("chain_start", "restart"))
+        self.assertIn("no chain fields", restart["reason"])
+        self.assertEqual((restart["after_seq"], restart["after_hash"], restart["scanned"]), (None, None, size))
         report = self.check()
-        self.assertEqual((report.state, report.unchained_prefix, report.chained), ("intact", 3, 3))
+        self.assertEqual((report.state, report.unchained_prefix, report.chained), ("partial", 3, 3))
+        self.assertIn("the first 3 line(s) have no chain fields", report.unchecked())
+
+    def test_a_restart_names_the_last_chained_record_before_it(self):
+        self.write_calls(3)
+        last = all_records(self.audit)[-1]
+        with open(self.audit, "ab") as handle:
+            handle.write(b'{"note": "not a record"}\n')
+        self.write_calls(1)
+        restart = all_records(self.audit)[-2]
+        self.assertEqual((restart["start"], restart["after_seq"], restart["after_hash"]),
+                         ("restart", last["seq"], last["hash"]))
+        self.assertEqual(restart["scanned"], self.audit.stat().st_size - len(raw_lines(self.audit)[-1])
+                         - len(raw_lines(self.audit)[-2]))
+        report = self.check()
+        self.assertEqual(report.problem_count, 1)  # only the inserted line: the restart follows the record it names
+        self.assertIn("line 5: it has no chain fields", report.problems[0])
+
+    def test_a_restart_searches_a_bounded_end_of_the_log(self):
+        self.write_calls(1)
+        with open(self.audit, "ab") as handle:
+            handle.write((b"x" * 1000 + b"\n") * 100)  # 100 kB of lines that are not records
+        reads = []
+        real_read = audit_chain._read_exactly
+
+        def counting(handle, count):
+            reads.append(count)
+            return real_read(handle, count)
+
+        with mock.patch.object(audit_chain, "_read_exactly", counting):
+            self.write_calls(1)
+        self.assertEqual(reads, [audit_chain.TAIL_BYTES, audit_chain.RESTART_SCAN_BYTES])
+        restart = json.loads(raw_lines(self.audit)[-2])
+        self.assertEqual((restart["after_seq"], restart["after_hash"], restart["scanned"]),
+                         (None, None, audit_chain.RESTART_SCAN_BYTES))
+
+    def test_a_log_this_process_may_append_to_but_not_read_still_gets_every_record(self):
+        self.write_calls(2)
+        real_open = os.open
+
+        def append_only(path, flags, *args, **kwargs):
+            if Path(path) == self.audit and flags & os.O_RDWR:
+                raise PermissionError(13, "Permission denied")
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(audit_chain.os, "open", append_only):
+            self.write_calls(3, pad=PAD, audit_max_bytes=ROTATE_AT)  # past the size, but it cannot be copied
+            self.write_calls(30, pad=PAD, audit_max_bytes=ROTATE_AT)
+        self.assertEqual(list(self.folder.glob("audit.jsonl.*")), [])
+        records = all_records(self.audit)
+        self.assertEqual(len(audit_records(self.audit)), 35)
+        restarts = [record for record in records if record.get("start") == "restart"]
+        self.assertEqual(len(restarts), 33)  # one before each record written without reading
+        self.assertEqual({(r["after_seq"], r["after_hash"], r["scanned"]) for r in restarts}, {(None, None, 0)})
+        self.assertIn("may append to the log but not read it", restarts[0]["reason"])
+        report = self.check()
+        self.assertEqual((report.state, report.problem_count, report.unlinked), ("partial", 0, 33))
+        self.assertIn("33 restart(s) were written by a process that could not read the log", report.unchecked())
 
     def test_a_record_far_longer_than_the_end_that_is_read_is_still_linked(self):
         firewall = self.firewall(Policy.from_dict({"default": "allow"}))
@@ -171,7 +236,8 @@ class Writing(LogTest):
         with mock.patch.object(audit_chain, "_read_exactly", counting):
             self.assertTrue(self.firewall().check_call("read_file", {"path": "a"}).allowed)
         self.assertLess(time.perf_counter() - started, 2)
-        self.assertEqual(reads, [audit_chain.TAIL_BYTES])
+        # Its end, and as its last line is not a record, the end a restart searches for the record before it.
+        self.assertEqual(reads, [audit_chain.TAIL_BYTES, audit_chain.RESTART_SCAN_BYTES])
         tail = raw_lines(self.audit)[-2:]
         self.assertEqual(json.loads(tail[0])["start"], "restart")
 
@@ -217,7 +283,7 @@ class FilePermissions(LogTest):
             return real_open(path, flags, mode, *args, **kwargs)
 
         with mock.patch("agent_sentinel.audit_chain.os.open", recording):
-            self.write_calls(30, audit_max_bytes=4096)
+            self.write_calls(30, pad=PAD, audit_max_bytes=ROTATE_AT)
         self.assertEqual(modes["audit.jsonl"], 0o600)
         self.assertEqual(modes["audit.jsonl.1"], 0o600)
 
@@ -225,11 +291,47 @@ class FilePermissions(LogTest):
     def test_on_posix_the_files_are_0600(self):
         old = os.umask(0o022)
         try:
-            self.write_calls(30, audit_max_bytes=4096)
+            self.write_calls(30, pad=PAD, audit_max_bytes=ROTATE_AT)
         finally:
             os.umask(old)
         for path in (self.audit, self.folder / "audit.jsonl.1"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_a_log_the_user_may_append_to_but_not_read_still_gets_its_records(self):
+        self.write_calls(1)
+        self.deny_reading(self.audit)
+        decision = self.firewall().check_call("read_file", {"path": "a"})
+        self.assertTrue(decision.allowed)
+        self.allow_reading(self.audit)
+        records = all_records(self.audit)
+        self.assertEqual([record["event"] for record in records], ["chain_start", "call", "chain_start", "call"])
+        self.assertEqual((records[2]["start"], records[2]["scanned"]), ("restart", 0))
+        self.assertEqual(self.check().state, "partial")
+
+    def deny_reading(self, path):
+        """Let this user append to the file but not read it (an append-only ACL; mode 0200 on POSIX)."""
+        if sys.platform == "win32":
+            import getpass
+
+            done = subprocess.run(["icacls", str(path), "/deny", f"{getpass.getuser()}:(RD)"], capture_output=True)
+            if done.returncode != 0:
+                self.skipTest("icacls could not deny reading")
+            self.addCleanup(self.allow_reading, path)
+        else:
+            if os.geteuid() == 0:
+                self.skipTest("root reads any file")
+            path.chmod(0o200)
+            self.addCleanup(path.chmod, 0o600)
+        with self.assertRaises(PermissionError):
+            path.read_bytes()
+
+    def allow_reading(self, path):
+        if sys.platform == "win32":
+            import getpass
+
+            subprocess.run(["icacls", str(path), "/remove:d", getpass.getuser()], capture_output=True)
+        else:
+            path.chmod(0o600)
 
 
 # ---- checking --------------------------------------------------------------------------------------------
@@ -333,6 +435,67 @@ class Verifying(LogTest):
         report, _ = self.tampered(self.lines + [forged])
         self.assertIn("a new chain starts although the record before it is intact", report.problems[0])
 
+    def force_a_restart(self, junk=b'{"note": "x"}\n'):
+        """What someone who may write the log but has no key can do: add a line that is not a record, so that
+        the next record restarts the chain. The lines of the log afterwards, and the index of the restart."""
+        with open(self.audit, "ab") as handle:
+            handle.write(junk)
+        self.write_calls(3, audit_key_file=self.key_file)
+        lines = raw_lines(self.audit)
+        return lines, next(index for index, line in enumerate(lines) if b'"start": "restart"' in line)
+
+    def test_records_cut_before_a_forced_restart_are_found(self):
+        lines, at = self.force_a_restart()
+        old = json.dumps({"time": "2020-01-01T00:00:00+00:00", "event": "call", "tool": "read_file",
+                          "action": "allow", "reason": "r"}).encode() + b"\n"  # looks like a line from 0.5
+        cases = {
+            "the whole head": ([old] + lines[at:], "line 2: the chain before it is missing: it follows seq 8, "
+                                                   "which is not in the log"),
+            "the records just before": (lines[:7] + lines[9:], "it follows seq 8, but the last chained record "
+                                                               "before it is seq 6"),
+        }
+        for name, (tampered, words) in cases.items():
+            with self.subTest(name=name):
+                plain, keyed = self.tampered(tampered)
+                for report in (plain, keyed):
+                    self.assertEqual(report.state, "broken")
+                    self.assertTrue(any(words in problem for problem in report.problems), report.problems)
+                self.assertEqual(keyed.mac_mismatches, 0)  # every signed record left is genuine
+                code, out, _ = run_cli("audit", "verify", self.audit, "--key-file", self.key_file,
+                                       "--allow-unchecked")
+                self.assertEqual(code, 1, out)
+
+    def test_after_a_restart_that_names_no_record_a_cut_head_is_only_partly_checked(self):
+        # The limit: past what a restart searches (RESTART_SCAN_BYTES), it cannot name the record before it.
+        count = audit_chain.RESTART_SCAN_BYTES // 1000 + 5
+        lines, at = self.force_a_restart((b'{"note": "' + b"x" * 1000 + b'"}\n') * count)
+        self.assertIsNone(json.loads(lines[at])["after_hash"])
+        _, keyed = self.tampered(lines[len(self.lines):])  # every signed record before the attacker's lines cut
+        self.assertEqual((keyed.state, keyed.unchained_prefix, keyed.mac_mismatches), ("partial", count, 0))
+        code, out, _ = run_cli("audit", "verify", self.audit, "--key-file", self.key_file)
+        self.assertEqual(code, 1)
+        self.assertIn(f"PARTLY CHECKED: the chain is intact, but the first {count} line(s) have no chain fields", out)
+        self.assertIn("--allow-unchecked", out)
+        code, out, _ = run_cli("audit", "verify", self.audit, "--key-file", self.key_file, "--allow-unchecked")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("This exits 1", out)
+
+    def test_a_restart_that_does_not_name_the_record_before_it_is_reported(self):
+        start = json.loads(self.lines[0])
+        start.update(start="restart", reason="forged")
+        for name in ("seq", "prev", "hash", "mac", "key_id"):
+            start.pop(name)
+        forged = chained_line(json.dumps(start), 0, GENESIS, None)[0]
+        for extra, words in (({}, "a restart must name the record before it"),
+                             ({"after_seq": "8", "after_hash": "z"}, "a restart must name the record before it"),
+                             ({"after_seq": 10**30, "after_hash": "a" * 64}, "a restart must name the record before"),
+                             ({"after_seq": 3, "after_hash": "a" * 64}, "it follows seq 3, but the last chained "
+                                                                       "record before it is seq 8")):
+            line = forged if not extra else chained_line(json.dumps({**start, **extra}), 0, GENESIS, None)[0]
+            with self.subTest(extra=extra):
+                report, _ = self.tampered(self.lines + [b'{"note": "x"}\n', line])
+                self.assertTrue(any(words in problem for problem in report.problems), report.problems)
+
     def test_problems_are_counted_but_only_the_first_few_kept(self):
         lines = [line.replace(b'"action"', b'"action" ') for line in self.lines]  # every hash now wrong
         self.write_calls(40, audit_key_file=self.key_file)
@@ -366,13 +529,13 @@ class Rotation(LogTest):
         return [*numbered, self.audit]
 
     def test_the_log_is_moved_aside_and_its_chain_goes_on_in_the_next_file(self):
-        self.write_calls(40, audit_key_file=self.key_file, audit_max_bytes=4096)
+        self.write_calls(80, pad=PAD, audit_key_file=self.key_file, audit_max_bytes=ROTATE_AT)
         files = self.rotated()
         self.assertGreater(len(files), 3)
         for path in files:
-            self.assertLessEqual(path.stat().st_size, 4096 + 2000)
+            self.assertLessEqual(path.stat().st_size, ROTATE_AT)
         calls = sum(len(audit_records(path)) for path in files)
-        self.assertEqual(calls, 40)  # nothing was deleted
+        self.assertEqual(calls, 80)  # nothing was deleted
         first = all_records(files[1])[0]
         self.assertEqual((first["event"], first["start"], first["previous_file"]),
                          ("chain_start", "rotated", "audit.jsonl.1"))
@@ -384,7 +547,7 @@ class Rotation(LogTest):
         self.assertIn("give the older files first", alone.notes[0])
 
     def test_files_given_out_of_order_or_with_one_missing_are_broken(self):
-        self.write_calls(40, audit_max_bytes=4096)
+        self.write_calls(80, pad=PAD, audit_max_bytes=ROTATE_AT)
         files = self.rotated()
         for order in ([files[1], files[0], *files[2:]], [files[0], *files[2:]]):
             with self.subTest(order=[path.name for path in order]):
@@ -392,19 +555,115 @@ class Rotation(LogTest):
                 self.assertEqual(report.state, "broken")
                 self.assertIn("does not continue the file before it", " ".join(report.problems))
 
+    def fill(self, count=30):
+        """Enough calls to take the log past ROTATE_AT at least once, with rotation on."""
+        return self.write_calls(count, pad=PAD, audit_max_bytes=ROTATE_AT)
+
+    def calls_kept(self):
+        """Every call recorded, in the log and in every rotated file (that is a file)."""
+        return sum(len(audit_records(path)) for path in self.rotated() if path.is_file())
+
     def test_a_file_already_at_a_rotated_name_is_never_overwritten(self):
         taken = self.folder / "audit.jsonl.1"
         taken.write_bytes(b"someone else's file\n")
-        self.write_calls(20, audit_max_bytes=4096)
+        self.fill()
         self.assertEqual(taken.read_bytes(), b"someone else's file\n")
         self.assertTrue((self.folder / "audit.jsonl.2").exists())
 
+    def test_a_folder_at_a_rotated_name_is_passed_over(self):
+        (self.folder / "audit.jsonl.1").mkdir()  # os.open(O_EXCL) on it fails with PermissionError on Windows
+        self.fill()
+        self.assertTrue((self.folder / "audit.jsonl.2").is_file())
+        self.assertEqual(self.calls_kept(), 30)
+        files = [path for path in self.rotated() if path.is_file()]
+        self.assertEqual(self.check(*files).state, "intact")
+
+    def test_new_numbers_follow_the_highest_one_even_after_older_files_are_deleted(self):
+        (self.folder / "audit.jsonl.7").write_bytes(b"")
+        (self.folder / "AUDIT.JSONL.9" if sys.platform == "win32" else self.folder / "audit.jsonl.9").write_bytes(b"")
+        (self.folder / "audit.jsonl.99999").write_bytes(b"")  # past MAX_ROTATED_FILES: not one of ours
+        self.fill()
+        self.assertTrue((self.folder / "audit.jsonl.10").is_file())
+        self.assertFalse((self.folder / "audit.jsonl.1").exists())
+
+    def test_a_rotation_lists_the_folder_once_and_makes_one_file_however_many_were_rotated(self):
+        for number in range(1, 501):
+            (self.folder / f"audit.jsonl.{number}").write_bytes(b"")
+        firewall = self.write_calls(1, pad=ROTATE_AT, audit_max_bytes=ROTATE_AT)  # a new log: not rotated yet
+        exclusive, listings = [], []
+        real_open, real_scandir = os.open, os.scandir
+
+        def recording_open(path, flags, *args, **kwargs):
+            if flags & os.O_EXCL:
+                exclusive.append(Path(path).name)
+            return real_open(path, flags, *args, **kwargs)
+
+        def recording_scandir(*args, **kwargs):
+            listings.append(args)
+            return real_scandir(*args, **kwargs)
+
+        with mock.patch.object(audit_chain.os, "open", recording_open), \
+                mock.patch.object(audit_chain.os, "scandir", recording_scandir):
+            self.write_calls(1, firewall=firewall)
+        self.assertEqual((exclusive, len(listings)), (["audit.jsonl.501"], 1))
+
+    def test_when_no_number_is_free_the_log_grows_and_is_not_listed_on_every_call(self):
+        listings = []
+        real_scandir = os.scandir
+
+        def recording_scandir(*args, **kwargs):
+            listings.append(args)
+            return real_scandir(*args, **kwargs)
+
+        with mock.patch.object(audit_chain, "MAX_ROTATED_FILES", 3):
+            for number in range(1, 4):
+                (self.folder / f"audit.jsonl.{number}").write_bytes(b"taken\n")
+            with mock.patch.object(audit_chain.os, "scandir", recording_scandir):
+                self.fill(40)
+        self.assertEqual(len(listings), 1)  # then rotation pauses for ROTATION_RETRY_SECONDS
+        self.assertEqual(len(audit_records(self.audit)), 40)
+        self.assertGreater(self.audit.stat().st_size, ROTATE_AT)
+        self.assertEqual(self.check().state, "intact")
+
+    def test_a_rotation_that_fails_never_fails_the_call_and_leaves_no_partial_copy(self):
+        failures = {
+            "every number refused": ("open", PermissionError(13, "Permission denied")),
+            "the disk is full": ("fsync", OSError(28, "No space left on device")),
+            "the folder cannot be listed": ("scandir", PermissionError(13, "Permission denied")),
+        }
+        for name, (function, error) in failures.items():
+            with self.subTest(name=name):
+                audit_chain._rotation_paused.clear()
+                if self.audit.exists():
+                    self.audit.unlink()
+                real = getattr(os, function)
+
+                def failing(*args, _real=real, _function=function, _error=error, **kwargs):
+                    if _function != "open" or args[1] & os.O_EXCL:
+                        raise _error
+                    return _real(*args, **kwargs)
+
+                with mock.patch.object(audit_chain.os, function, failing), \
+                        contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    firewall = self.fill()
+                    self.assertTrue(firewall.check_call("read_file", {"path": "a"}).allowed)
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(list(self.folder.glob("audit.jsonl.*")), [])
+                self.assertEqual(len(audit_records(self.audit)), 31)
+                self.assertEqual(self.check().state, "intact")
+        audit_chain._rotation_paused.clear()
+        self.fill(1)  # the cause gone and the pause over: rotated again
+        self.assertTrue((self.folder / "audit.jsonl.1").is_file())
+
     def test_the_size_must_be_a_whole_number_in_range(self):
         self.assertEqual(parse_max_bytes("1048576"), 1048576)
-        for text in ("0", "100", "1023", "abc", "-5", "1e6", "9" * 20, " 2048", ""):
+        self.assertEqual(parse_max_bytes(str(ROTATE_AT)), ROTATE_AT)
+        self.assertEqual(parse_max_bytes(str(audit_chain.MAX_MAX_BYTES)), 256 * 1024 * 1024)
+        for text in ("0", "100", "1023", "4096", str(ROTATE_AT - 1), str(audit_chain.MAX_MAX_BYTES + 1),
+                     "abc", "-5", "1e6", "9" * 20, " 2048", ""):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 parse_max_bytes(text)
-        for value in (100, True, 2.5e6, "4096"):
+        for value in (100, 4096, True, 2.5e6, "65536", 1 << 40):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 Firewall(POLICY, audit_path=self.audit, audit_max_bytes=value)
 
@@ -427,6 +686,44 @@ class Keys(LogTest):
                 read_key_file(path)
             self.assertNotIn(str(self.folder), str(caught.exception))
 
+    def test_anything_but_a_regular_file_is_refused_before_it_is_opened(self):
+        opened = []
+        real_open = os.open
+
+        def recording(path, flags, *args, **kwargs):
+            opened.append((Path(path).name, flags))
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(audit_chain.os, "open", recording):
+            with self.assertRaisesRegex(AuditKeyError, "not a regular file"):
+                read_key_file(self.folder)
+            self.assertEqual(opened, [])
+            self.assertEqual(read_key_file(self.key_file), KEY)
+        (name, flags), = opened
+        self.assertEqual(name, "audit.key")
+        self.assertEqual(flags & getattr(os, "O_NONBLOCK", 0), getattr(os, "O_NONBLOCK", 0))  # never waits
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes (POSIX)")
+    def test_a_named_pipe_in_place_of_the_key_is_refused_without_waiting(self):
+        pipe = self.folder / "pipe.key"
+        os.mkfifo(pipe, 0o600)
+        outcome = []
+
+        def read():
+            try:
+                read_key_file(pipe)
+            except AuditKeyError as exc:
+                outcome.append(str(exc))
+
+        thread = threading.Thread(target=read, daemon=True)
+        thread.start()
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "reading the key waited for a writer")
+        self.assertEqual(outcome, ["the audit key file is not a regular file"])
+        with mock.patch.object(audit_chain.os, "stat", return_value=os.stat(self.key_file)):  # swapped after stat
+            with self.assertRaisesRegex(AuditKeyError, "not a regular file"):
+                read_key_file(pipe)
+
     @unittest.skipIf(sys.platform == "win32", "POSIX permissions")
     def test_on_posix_a_key_others_can_read_or_write_is_refused(self):
         for mode in (0o640, 0o604, 0o620, 0o666):
@@ -444,7 +741,7 @@ class Keys(LogTest):
         self.assertNotIn(str(self.key_file).encode(), log)
         self.assertEqual(all_records(self.audit)[0]["key_id"], audit_chain.key_id(KEY))
         self.assertNotEqual(audit_chain.key_id(KEY), audit_chain.key_id(OTHER_KEY))
-        for options in ({"audit_key_file": self.key_file}, {"audit_required": True}, {"audit_max_bytes": 4096}):
+        for options in ({"audit_key_file": self.key_file}, {"audit_required": True}, {"audit_max_bytes": ROTATE_AT}):
             with self.subTest(options=options), self.assertRaisesRegex(ValueError, "need an audit_path"):
                 Firewall(POLICY, **options)
 
@@ -594,6 +891,19 @@ class Readers(LogTest):
             with self.subTest(command=command):
                 self.assertIn("Integrity: no hash chain", run_cli(command, old)[1])
 
+    def test_report_and_explain_say_when_the_chain_is_only_partly_checked(self):
+        self.write_log("audit.jsonl", [{"event": "call", "tool": "t", "action": "block", "reason": "r"}] * 2)
+        self.write_calls(3)
+        for command in ("report", "explain"):
+            with self.subTest(command=command):
+                out = run_cli(command, self.audit)[1]
+                self.assertIn("Integrity: PARTLY CHECKED: hash chain intact, seq 0 to 3, but the first 2 line(s) "
+                              "have no chain fields", out)
+                self.assertIn("Details: agent-sentinel audit verify", out)
+        integrity = json.loads(run_cli("report", self.audit, "--format", "json")[1])["integrity"]
+        self.assertEqual((integrity["state"], integrity["unchained_prefix"], integrity["unlinked_restarts"]),
+                         ("partial", 2, 0))
+
     def test_suggest_and_explain_read_a_log_with_every_kind_of_record(self):
         policy_file = self.write("policy.json", {"default": "block"})
         firewall = self.firewall(Policy.from_file(policy_file), monitor=True)
@@ -650,7 +960,7 @@ class TheCommand(LogTest):
         self.assertIn("MAC mismatches: 3", out)
 
     def test_rotated_files_are_checked_in_the_order_given(self):
-        self.write_calls(30, audit_max_bytes=4096)
+        self.write_calls(60, pad=PAD, audit_max_bytes=ROTATE_AT)
         numbered = sorted(self.folder.glob("audit.jsonl.*"), key=lambda path: int(path.suffix[1:]))
         self.assertEqual(self.verify(*numbered, self.audit)[0], 0)
         self.assertEqual(self.verify(*reversed(numbered), self.audit)[0], 1)
@@ -666,7 +976,23 @@ class TheCommand(LogTest):
                 self.assertNotIn("Traceback", err)
         _, out, _ = run_cli("audit", "verify", "--help")
         self.assertIn("0  intact (or empty)", out)
+        self.assertIn("1  broken, not chained at all, or only partly checked (see --allow-unchecked)", out)
         self.assertIn("2  a usage error", out)
+
+    def test_a_partly_checked_log_exits_1_unless_it_is_allowed(self):
+        self.write_log("audit.jsonl", [{"event": "call", "tool": "t", "action": "allow", "reason": "r"}])
+        self.write_calls(2, audit_key_file=self.key_file)
+        code, out, _ = self.verify(self.audit, "--key-file", self.key_file)
+        self.assertEqual(code, 1)
+        self.assertIn("PARTLY CHECKED: the chain is intact, but the first 1 line(s) have no chain fields", out)
+        self.assertNotIn("INTACT:", out)
+        code, out, _ = self.verify(self.audit, "--key-file", self.key_file, "--allow-unchecked")
+        self.assertEqual(code, 0)
+        self.assertIn("PARTLY CHECKED", out)
+        self.write_calls(2, audit_key_file=self.key_file)  # --allow-unchecked never lets a broken log through
+        lines = raw_lines(self.audit)
+        self.audit.write_bytes(b"".join(lines[:3] + lines[4:]))
+        self.assertEqual(self.verify(self.audit, "--allow-unchecked")[0], 1)
 
     def test_hostile_text_in_a_log_is_printed_safely(self):
         self.write_calls(2)

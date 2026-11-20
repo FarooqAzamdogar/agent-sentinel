@@ -389,14 +389,15 @@ def _as_json(summary: Summary, show_args: bool) -> dict[str, Any]:
 
 
 def _integrity_json(summary: Summary) -> dict[str, Any] | None:
-    """The hash chain's state: intact, broken, unchained or empty, with the line `report` prints."""
+    """The hash chain's state: intact, partial, broken, unchained or empty, with the line `report` prints."""
     report = summary.integrity
     if report is None:
         return None
     return {
         "state": report.state, "text": printable(integrity_line(summary.path, report), limit=1000),
         "chained_records": report.chained, "first_seq": report.first_seq, "last_seq": report.last_seq,
-        "problems": report.problem_count, "chain_and_session_records": summary.meta,
+        "problems": report.problem_count, "unchained_prefix": report.unchained_prefix,
+        "unlinked_restarts": report.unlinked, "chain_and_session_records": summary.meta,
     }
 
 
