@@ -17,6 +17,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -199,6 +200,49 @@ class TheResults(SchemaTest):
         (note,) = self.records(action="note", event="schema_result")
         self.assertIn("structuredContent.words is a number, not integer", note["reason"])
         self.assertTrue(note.get("call_id"))
+
+    def test_a_result_that_is_not_an_object_has_no_structured_content(self):
+        h = self.proxy({"schema_checks": {"results": "enforce"}})
+        self.listed(h, COUNT_TOOL, PLAIN_TOOL)
+        for msg_id, result in enumerate(([{"words": "x"}], "hello", None, 3), start=1):
+            with self.subTest(result=result):
+                delivered = self.call_and_answer(h, msg_id, result)
+                self.assertTrue(delivered["result"]["isError"])
+                self.assertIn("does not match the tool's output schema", delivered["result"]["content"][0]["text"])
+        reasons = [record["reason"] for record in self.records(action="block", rule="schema.result")]
+        self.assertEqual(len(reasons), 4)
+        self.assertIn("the result is not an object", reasons[0])
+        warn = self.proxy({"schema_checks": {"results": "warn"}})
+        self.listed(warn, COUNT_TOOL)
+        self.call_and_answer(warn, 1, "hello")
+        self.assertIn("not an object", self.records(action="note", event="schema_result")[0]["reason"])
+
+    def test_an_error_result_is_checked_for_what_structured_content_it_has(self):
+        h = self.proxy({"schema_checks": {"results": "enforce"}})
+        self.listed(h, COUNT_TOOL)
+        good = {"isError": True, "content": [{"type": "text", "text": "partly done"}],
+                "structuredContent": {"words": 2}}
+        self.assertEqual(self.call_and_answer(h, 1, good)["result"], good)
+        bad = {"isError": True, "content": [], "structuredContent": {"words": "x"}}
+        delivered = self.call_and_answer(h, 2, bad)
+        self.assertNotIn("structuredContent", delivered["result"])
+        self.assertIn("does not match the tool's output schema", delivered["result"]["content"][0]["text"])
+        (record,) = self.records(action="block", rule="schema.result")
+        self.assertIn("structuredContent.words is text, not integer", record["reason"])
+
+    def test_a_long_type_list_in_the_output_schema_does_not_hold_up_the_server_relay(self):
+        slow = {"name": "slow", "description": "Numbers", "inputSchema": {"type": "object"},
+                "outputSchema": {"type": "object", "properties": {"v": {"type": "array", "items": {
+                    "type": ["null"] * 25_000 + ["integer"]}}}}}
+        h = self.proxy({"schema_checks": {"results": "enforce"}})
+        self.listed(h, slow)
+        started = time.perf_counter()
+        delivered = self.call_and_answer(h, 1, {"content": [], "structuredContent": {"v": list(range(50_000))}},
+                                         tool="slow")
+        self.assertLess(time.perf_counter() - started, 3.0)
+        self.assertTrue(delivered["result"]["isError"])
+        (record,) = self.records(action="block", rule="schema.result")
+        self.assertIn("too large to check", record["reason"])
 
 
 class RemoteReferencesInSchemas(SchemaTest):

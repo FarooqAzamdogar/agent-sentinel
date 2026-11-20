@@ -123,6 +123,34 @@ class TheValidator(unittest.TestCase):
                 self.assertLessEqual(len(problems), schema_check.MAX_PROBLEMS)
         self.assertIn("too large to check", " ".join(validate([0] * 1_000_000, cases[0][1])))
 
+    def test_work_that_grows_with_the_schema_is_paid_for_on_every_part_of_the_value(self):
+        # Each case once cost the size of the schema for every part of the value, outside the budget.
+        long_types = {"type": "array", "items": {"type": ["null"] * 25_000 + ["integer"]}}
+        many_keys = {f"k{i}": 1 for i in range(25_000)}
+        deep_schema, deep_value = many_keys, list(range(5_000))
+        for _ in range(schema_check.MAX_DEPTH + 1):
+            deep_schema = {"items": deep_schema}
+        for _ in range(schema_check.MAX_DEPTH):
+            deep_value = [deep_value]
+        same_keys = {f"k{i}": 0 for i in range(1_000)}
+        other_keys = {f"k{i}": 0 for i in range(999)}
+        other_keys["k-last"] = 0  # as many keys, and only the last one differs
+        key_walks = {"items": {"enum": [other_keys] * 29 + [same_keys]}}  # each item matches the last choice
+        cases = (
+            ("a long type list", list(range(200_000)), long_types, True),
+            ("a schema with many keys past the depth cap", deep_value, deep_schema, False),
+            ("objects compared key by key", [same_keys] * 5_000, key_walks, True),
+        )
+        for label, value, schema, problem in cases:
+            with self.subTest(label):
+                started = time.perf_counter()
+                problems = validate(value, schema)
+                self.assertLess(time.perf_counter() - started, 2.0)
+                self.assertEqual(bool(problems), problem, problems)
+        # A short list is read as before, and costs nothing extra.
+        self.assertEqual(validate(list(range(100_000)), {"items": {"type": ["integer", "null"]}}), [])
+        self.assertTrue(validate(["x"], {"items": {"type": ["integer", "integer", "null"]}}))
+
 
 class RemoteReferences(unittest.TestCase):
     def test_references_outside_the_schema_are_found(self):
@@ -154,6 +182,36 @@ class RemoteReferences(unittest.TestCase):
                          '$schema "https://json-schema.org/draft/2020-12/schema/x"')
         self.assertEqual(remote_refs({"inputSchema": {"$ref": "file:///etc/passwd"}}), ['$ref "file:///etc/passwd"'])
         self.assertEqual(remote_refs("not a tool"), [])
+
+    def test_spellings_a_url_parser_reads_as_an_address_are_found(self):
+        # WHATWG URL parsers (browsers, Node) add the slashes to "https:host", drop controls and spaces at the
+        # ends and tabs and newlines inside, and read a backslash as a slash.
+        for key, value in (("$schema", "https:evil.example/meta"), ("$schema", " https://evil.example/meta"),
+                           ("$schema", "https:\\\\evil.example\\meta"), ("$schema", "file:/etc/passwd"),
+                           ("$schema", "evil.example/meta"), ("$schema", "http://json-schema.org/draft-07/schema# "),
+                           ("$id", "https:evil.example/a.json"), ("$id", "\thttps://evil.example/a.json"),
+                           ("$id", "ht\ntps://evil.example/a.json"), ("$id", "\x00//evil.example/a.json"),
+                           ("$id", "\\\\evil.example\\a.json"), ("$id", "/\\evil.example/a.json"),
+                           ("$id", "file:/etc/passwd"), ("$id", "C:/schemas/a.json")):
+            with self.subTest(key=key, value=value):
+                found = remote_refs({"name": "t", "inputSchema": {"type": "object", key: value}})
+                self.assertEqual(len(found), 1, found)
+                self.assertTrue(found[0].startswith(f"{key} "))
+        for value in ("urn:uuid:6e8bc430-9c3a-11d9-9669-0800200c9a66", "URN:example:x", "#anchor", "item.json", ""):
+            with self.subTest(value=value):
+                self.assertEqual(remote_refs({"inputSchema": {"$id": value}}), [])
+
+    def test_draft_04_id_counts_only_in_a_draft_04_or_03_schema(self):
+        for meta in ("http://json-schema.org/draft-04/schema#", "https://json-schema.org/draft-03/schema"):
+            tool = {"inputSchema": {"$schema": meta, "id": "https://evil.example/d4.json",
+                                    "properties": {"a": {"id": "https:evil.example/x"}, "id": {"type": "string"}}}}
+            with self.subTest(meta=meta):
+                found = remote_refs(tool)
+                self.assertEqual(sorted(found), sorted(['id "https:evil.example/x"',
+                                                        'id "https://evil.example/d4.json"']))
+        later = {"inputSchema": {"$schema": "http://json-schema.org/draft-07/schema#",
+                                 "default": {"id": "https://example.com/items/1"}}}
+        self.assertEqual(remote_refs(later), [])  # "id" is only data there
 
     def test_a_schema_too_large_to_look_through_is_reported_quickly(self):
         schema = {"items": [{"a": [{}] * 10} for _ in range(20_000)]}

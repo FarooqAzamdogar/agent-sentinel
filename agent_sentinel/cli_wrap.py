@@ -109,8 +109,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--monitor", action="store_true",
                         help="start the proxies in monitor mode: log what would be blocked, block nothing")
     parser.add_argument("--contain", action="store_true",
-                        help="start the proxies with --contain: each server, and everything it starts, ends with its "
-                             "proxy (it still runs as you: this does not keep it from reading your files)")
+                        help="start the proxies with --contain: each server, and the processes it starts, end with "
+                             "its proxy (cleanup, not isolation: it still runs as you and can read your files)")
     parser.add_argument("--name", metavar="NAME", help="with a server command after '--': the server's name")
     parser.add_argument("--apply", action="store_true",
                         help="write the change (after a backup); without it, only show it")
@@ -340,7 +340,8 @@ def _print_header(config: ConfigFile, client: str, settings: ProxySettings, poli
     if settings.monitor:
         print("Monitor mode: the proxies will log what they would block, and block NOTHING.")
     if settings.contain:
-        print("Contained: each server, and everything it starts, ends with its proxy (--contain).")
+        print("Contained: each server, and the processes it starts, end with its proxy (--contain; cleanup, "
+              "not isolation).")
 
 
 def print_plan(plan: list[Step]) -> None:

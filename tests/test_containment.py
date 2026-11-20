@@ -10,6 +10,7 @@ process stops it, and waits have time limits.
 """
 
 import ctypes
+import io
 import json
 import os
 import signal
@@ -126,6 +127,36 @@ class WhetherItCanWorkHere(unittest.TestCase):
             self.assertIn("credentials", problem(os.path.join(home, ".config")))
             self.assertIn("does not exist", problem(os.path.join(home, "nope")))
             self.assertIn("not a full path", problem("work"))
+            # PB-5: a folder may not show the host's sockets again.
+            if os.path.isdir("/run"):
+                self.assertIn("where the host's services have their sockets", problem("/run"))
+            # PB-7: nor hold the proxy's own files, whether they exist yet or not.
+            work = os.path.join(home, "work")
+            refused = check(Settings(sandbox="bwrap", allow=(work,)), found, "linux", user_home=home,
+                            control_files=[os.path.join(work, "logs", "audit.jsonl")])
+            self.assertIn("could then change or replace", refused)
+            self.assertIsNone(check(Settings(sandbox="bwrap", read=(work,)), found, "linux", user_home=home,
+                                    control_files=[os.path.join(work, "policy.json")]))
+
+
+def same(path):
+    return path
+
+
+def a_linux_host(*present, links=None):
+    """exists and real for a Linux host with these paths (and every home folder named below), and these links."""
+    links = links or {}
+
+    def real(path):
+        for link, target in links.items():
+            if containment._within(path, link):
+                return target + path[len(link):]
+        return path
+
+    def exists(path):
+        return path in present or real(path) in present or path.startswith(("/home/", "/srv/"))
+
+    return exists, real
 
 
 class TheSandboxesWords(unittest.TestCase):
@@ -133,26 +164,75 @@ class TheSandboxesWords(unittest.TestCase):
 
     def test_bwrap_shows_the_file_system_read_only_and_hides_the_home_folder(self):
         settings = Settings(sandbox="bwrap", allow=("/home/me/work",), read=("/home/me/work/docs", "/home/me/.nvm"))
-        words = bwrap_arguments(settings, self.HOME, "/home/me/.agent-sentinel",
-                                ["/home/me/work/policy.json", "/etc/policy.json", "/home/me/.agent-sentinel/p.json"],
-                                exists=lambda path: True)
+        exists, real = a_linux_host("/run", "/var/run", "/run/user", links={"/var/run": "/run"})
+        words = bwrap_arguments(settings, self.HOME, "/home/me/.agent-sentinel", exists=exists, real=real)
         self.assertEqual(words[:12], ["--unshare-all", "--die-with-parent", "--new-session", "--ro-bind", "/", "/",
                                       "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"])
         self.assertNotIn("--share-net", words)
         text = " ".join(words)
-        # Later mounts cover earlier ones: the home folder is emptied, then the folders are shown, shorter
-        # paths first (so docs inside work stays read-only), then the agent-sentinel home is hidden again,
-        # and a policy inside a writable folder is made read-only again.
-        order = ["--tmpfs /run/user", "--tmpfs /home/me ", "--bind /home/me/work /home/me/work",
-                 "--ro-bind /home/me/work/docs /home/me/work/docs", "--tmpfs /home/me/.agent-sentinel",
-                 "--ro-bind /home/me/work/policy.json /home/me/work/policy.json"]
+        # Later mounts cover earlier ones: /run and the home folder are emptied, then the folders are shown,
+        # shorter paths first (so docs inside work stays read-only), then the agent-sentinel home is hidden again.
+        order = ["--tmpfs /run ", "--tmpfs /home/me ", "--bind /home/me/work /home/me/work",
+                 "--ro-bind /home/me/work/docs /home/me/work/docs", "--tmpfs /home/me/.agent-sentinel"]
         positions = [text.index(part) for part in order]
         self.assertEqual(positions, sorted(positions))
         self.assertIn("--ro-bind /home/me/.nvm /home/me/.nvm", text)
-        self.assertNotIn("/etc/policy.json", text)  # read-only already, under the read-only /
-        self.assertNotIn("p.json", text)  # hidden with the agent-sentinel home
+        self.assertNotIn("/var/run", text)  # a link to /run: hidden with it
+        self.assertNotIn("/run/user", text)  # inside /run
         self.assertIn("--share-net", bwrap_arguments(Settings(sandbox="bwrap", network=True), self.HOME, None))
-        self.assertNotIn("/run/user", bwrap_arguments(Settings(sandbox="bwrap"), self.HOME, None, exists=lambda p: False))
+        nothing = bwrap_arguments(Settings(sandbox="bwrap"), self.HOME, None, exists=lambda path: False, real=same)
+        self.assertNotIn("/run", nothing)
+
+    def test_bwrap_hides_every_place_where_the_hosts_services_have_sockets(self):
+        # PB-5: /run/docker.sock, /run/containerd, the system D-Bus, LXD; a socket works on a read-only mount.
+        exists, real = a_linux_host("/run", "/var/run", "/var/lib/lxd", "/var/snap/lxd/common/lxd",
+                                    "/run/systemd/resolve/stub-resolv.conf",
+                                    links={"/etc/resolv.conf": "/run/systemd/resolve/stub-resolv.conf"})
+        words = bwrap_arguments(Settings(sandbox="bwrap"), self.HOME, None, exists=exists, real=real)
+        hidden = [words[index + 1] for index, word in enumerate(words) if word == "--tmpfs"]
+        self.assertEqual(hidden, ["/tmp", "/run", "/var/run", "/var/lib/lxd", "/var/snap/lxd/common/lxd", "/home/me"])
+        self.assertNotIn("stub-resolv.conf", " ".join(words))
+        # With the network, the resolver's file comes back, alone: name lookups need it, and it is no socket.
+        networked = bwrap_arguments(Settings(sandbox="bwrap", network=True), self.HOME, None, exists=exists, real=real)
+        text = " ".join(networked)
+        resolver = "--ro-bind /run/systemd/resolve/stub-resolv.conf /run/systemd/resolve/stub-resolv.conf"
+        self.assertIn(resolver, text)
+        self.assertLess(text.index("--tmpfs /run "), text.index(resolver))
+
+    def test_bwrap_hides_the_accounts_own_home_folder_too_and_shows_a_folder_at_both_its_paths(self):
+        # PB-9: HOME may name another folder; the real one must not show through the read-only /.
+        exists, real = a_linux_host(links={"/home/me/tools": "/srv/tools"})
+        words = bwrap_arguments(Settings(sandbox="bwrap", read=("/home/me/tools",)), ["/tmp/x/home", "/home/me"],
+                                None, exists=lambda path: True, real=real)
+        text = " ".join(words)
+        self.assertLess(text.index("--tmpfs /home/me "), text.index("--tmpfs /tmp/x/home"))
+        self.assertIn("--ro-bind /home/me/tools /home/me/tools", text)
+        self.assertIn("--ro-bind /srv/tools /srv/tools", text)
+
+    def test_the_servers_program_must_be_visible_inside_bwrap(self):
+        exists, real = a_linux_host("/run", links={"/run/current-system": "/nix/store/abc-system"})
+        homes = ["/home/me"]
+
+        def problem(program, **folders):
+            return containment._hidden_program_problem(program, Settings(sandbox="bwrap", **folders), homes,
+                                                       exists=exists, real=real)
+
+        self.assertIsNone(problem("/usr/bin/node"))
+        self.assertIn("add --sandbox-read /home/me/.nvm/bin", problem("/home/me/.nvm/bin/node"))
+        self.assertIsNone(problem("/home/me/.nvm/bin/node", read=("/home/me/.nvm",)))
+        self.assertIn("inside /run", problem("/run/current-system/sw/bin/node"))
+        self.assertIsNone(problem("/run/current-system/sw/bin/node", read=("/run/current-system/sw/bin",)))
+        self.assertIn("inside /tmp", problem("/tmp/server/run"))
+
+    def test_a_folder_the_server_may_write_may_not_hold_the_proxys_own_files(self):
+        # PB-7: whether the file exists yet or not, and the agent-sentinel home too.
+        def problem(*protected):
+            return containment._writable_problem(("/w",), protected, real=same)
+
+        self.assertIn("/w/sub/audit.jsonl", problem("/w/sub/audit.jsonl"))
+        self.assertIn("could then change or replace", problem("/etc/policy.json", "/w/.agent-sentinel"))
+        self.assertIsNone(problem("/etc/policy.json", "/home/me/.agent-sentinel", None))
+        self.assertIsNone(containment._writable_problem((), ["/w/policy.json"], real=same))
 
     def test_sandbox_exec_denies_the_credentials_the_agent_sentinel_home_and_the_network(self):
         profile = sandbox_exec_profile(Settings(sandbox="sandbox-exec"), "/Users/me", "/Users/me/.agent-sentinel",
@@ -164,14 +244,66 @@ class TheSandboxesWords(unittest.TestCase):
         self.assertIn('(deny file-read* file-write* (subpath "/Users/me/.agent-sentinel"))', lines)
         self.assertIn('(deny file-write* (literal "/etc/agent/policy.json"))', lines)
         self.assertIn('(deny file-write* (literal "/private/etc/agent/policy.json"))', lines)
+        self.assertEqual(len(lines), len(set(lines)))
         with_network = sandbox_exec_profile(Settings(sandbox="sandbox-exec", network=True), "/Users/me", None,
                                             real=lambda path: path)
         self.assertNotIn("network", with_network)
         with self.assertRaises(ContainmentError):
             sandbox_exec_profile(Settings(sandbox="sandbox-exec"), '/Users/a"b', None, real=lambda path: path)
 
+    def test_sandbox_exec_denies_the_ways_to_start_a_program_outside_the_sandbox(self):
+        # PB-6: open, osascript and launchctl have launchd start a program that is not sandboxed.
+        lines = sandbox_exec_profile(Settings(sandbox="sandbox-exec"), "/Users/me", None, real=same).splitlines()
+        for line in ("(deny lsopen)", "(deny appleevent-send)", "(deny job-creation)",
+                     '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd") '
+                     '(global-name "com.apple.coreservices.appleevents"))'):
+            self.assertIn(line, lines)
+        executions = next(line for line in lines if line.startswith("(deny process-exec"))
+        for program in ("/usr/bin/open", "/usr/bin/osascript", "/bin/launchctl", "/usr/bin/crontab"):
+            self.assertIn(f'(literal "{program}")', executions)
+        # What runs later outside the sandbox may not be written: launch agents, shell startup files, cron.
+        for path in ("/Users/me/Library/LaunchAgents", "/Users/me/.zshrc", "/Users/me/.gitconfig", "/private/var/at"):
+            self.assertIn(f'(deny file-write* (subpath "{path}"))', lines)
+
+    def test_sandbox_exec_keeps_the_folders_on_the_way_to_a_denied_place_from_being_renamed(self):
+        # PB-7: renaming ~/.config would take ~/.config/gh out from under its denial; renaming a policy's
+        # folder would let a new one take its place.
+        lines = sandbox_exec_profile(Settings(sandbox="sandbox-exec"), "/Users/me", "/Users/me/x/.agent-sentinel",
+                                     ["/Users/me/proj/policy.json"], real=same).splitlines()
+        for folder in ("/Users/me/.config", "/Users/me/Library/Application Support", "/Users/me/Library",
+                       "/Users/me/x", "/Users/me/proj", "/Users/me", "/Users"):
+            self.assertIn(f'(deny file-write* (literal "{folder}"))', lines)
+        self.assertNotIn('(deny file-write* (literal "/"))', lines)
+
+    def test_sandbox_exec_denies_the_credentials_of_both_home_folders(self):
+        lines = sandbox_exec_profile(Settings(sandbox="sandbox-exec"), ["/tmp/h", "/Users/me"], None,
+                                     real=same).splitlines()
+        self.assertIn('(deny file-read* file-write* (subpath "/tmp/h/.ssh"))', lines)
+        self.assertIn('(deny file-read* file-write* (subpath "/Users/me/.ssh"))', lines)
+
+    @unittest.skipUnless(POSIX, "the home folders are POSIX paths")
+    def test_the_home_folders_are_homes_and_the_accounts_own(self):
+        with tempfile.TemporaryDirectory() as one, tempfile.TemporaryDirectory() as other:
+            one, other = os.path.realpath(one), os.path.realpath(other)
+            with mock.patch.dict(os.environ, {"HOME": one}), \
+                    mock.patch.object(containment, "_account_home", return_value=other):
+                self.assertEqual(containment._homes(), [one, other])
+            with mock.patch.dict(os.environ, {"HOME": one}), \
+                    mock.patch.object(containment, "_account_home", return_value="/"):
+                self.assertEqual(containment._homes(), [one])
+            with mock.patch.dict(os.environ, {"HOME": "/"}):
+                self.assertIsNone(containment._homes())
+
     def test_describe_says_what_the_server_gets(self):
         self.assertIn("job object", containment.describe(Settings(contain=True), "win32"))
+        # PB-4: cleanup, not containment of hostile code.
+        self.assertIn("cleanup, not isolation", containment.describe(Settings(contain=True), "win32"))
+        self.assertIn("cleanup, not isolation", containment.describe(Settings(contain=True), "linux"))
+        self.assertNotIn("everything it starts", containment.describe(Settings(contain=True), "win32"))
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as shown:
+            with self.assertRaises(SystemExit):
+                mcp_proxy._argument_parser().parse_args(["--help"])
+        self.assertIn("WMI", " ".join(shown.getvalue().split()))
         text = containment.describe(Settings(memory_mb=512, processes=4, cpu_seconds=60), "win32")
         self.assertIn("committed memory at most 512 MB per process", text)
         self.assertIn("at most 4 process(es)", text)
@@ -591,8 +723,14 @@ class TheRealProxy(unittest.TestCase):
         server = code / "sandboxed.py"
         server.write_text(SANDBOX_SERVER, encoding="utf-8")
         environment = dict(self.environment, HOME=str(home), AGENT_SENTINEL_HOME=str(agent_home))
-        proxy = self.start(["--sandbox", "bwrap", "--sandbox-allow", allowed, "--sandbox-read", code], server,
-                           allowed, environment=environment)
+        # The sandbox empties the account's own home folder as well as HOME's: a Python kept there is shown.
+        account_home = containment._account_home()
+        python = [] if not account_home else [
+            ["--sandbox-read", folder] for folder in dict.fromkeys(
+                os.path.realpath(folder) for folder in (sys.base_prefix, sys.prefix, os.path.dirname(sys.executable)))
+            if containment._within(folder, os.path.realpath(account_home))]
+        proxy = self.start(["--sandbox", "bwrap", "--sandbox-allow", allowed, "--sandbox-read", code,
+                            *[word for words in python for word in words]], server, allowed, environment=environment)
         self.assertEqual(self.ask(proxy), {"credential": "hidden", "agent_home": "hidden", "allowed": "written"})
         self.assertTrue((allowed / "written.txt").exists())
 

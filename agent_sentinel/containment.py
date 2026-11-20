@@ -7,9 +7,13 @@ a server may use as much memory and as many processes as it likes.
 Phase 1: --contain (standard library only)
 ------------------------------------------
 * Windows: before the server starts, the proxy puts itself into a job
-  object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. The server and everything it
-  starts inherit the job, so when the proxy's process ends, however it ends
-  (killed included), Windows ends them all. The proxy joins the job itself
+  object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. The server and the
+  processes it starts inherit the job, so when the proxy's process ends,
+  however it ends (killed included), Windows ends them. A process that
+  Windows starts on the server's behalf (through WMI, the Task Scheduler or
+  an out-of-process COM server) is not the server's child and is outside
+  the job; a server can also keep the job open by duplicating the proxy's
+  handle to it. The proxy joins the job itself
   because a process that subprocess starts cannot be started suspended and
   then assigned; nested jobs (Windows 8 and later) let this work when the
   client already runs the proxy in a job of its own. The limits
@@ -33,15 +37,25 @@ Phase 1: --contain (standard library only)
 Phase 2: --sandbox (implies --contain), with a tool already installed
 --------------------------------------------------------------------
 * bwrap (Linux, bubblewrap): the server sees the whole file system read-only,
-  a private /tmp and /dev, its own process list, and an empty home folder,
-  except the folders named with --sandbox-allow (read-write) and
-  --sandbox-read (read-only). The agent-sentinel home folder is hidden, and
-  so is /run/user (the session's sockets: the keyring, the ssh agent).
-  It has no network unless --sandbox-network is given.
+  a private /tmp and /dev, its own process list, and an empty home folder
+  (the one $HOME names and the account's own, when they differ), except the
+  folders named with --sandbox-allow (read-write) and --sandbox-read
+  (read-only). The agent-sentinel home folder is hidden, and so are /run and
+  the other places where the host's services listen on unix sockets
+  (HIDDEN_SYSTEM_PLACES: the Docker daemon, the system D-Bus, the session's
+  ssh agent and keyring), since a socket can be used on a read-only mount.
+  It has no network unless --sandbox-network is given. A folder the server
+  may write may not hold the proxy's own files (policy, pins, audit log)
+  or the agent-sentinel home: the server could change or replace them.
 * sandbox-exec (macOS): a generated profile denies reading and writing the
-  usual credential places in the home folder and the agent-sentinel home,
-  writing the proxy's own files (policy, pins, audit log), and the network
-  unless --sandbox-network is given. Everything else stays readable.
+  usual credential places in the home folder and the agent-sentinel home;
+  writing the proxy's own files, the files that run later outside the
+  sandbox (launch agents, shell startup files, cron and at jobs), and every
+  folder on the way to any of these (a renamed folder would take them out
+  from under the denials); asking LaunchServices, Apple Events or launchd
+  to start a program (that program would not be sandboxed); and the
+  network unless --sandbox-network is given. It starts from "allow
+  default": everything else stays readable and writable.
 * Windows has none: run the server as another user, or in an AppContainer
   (see the notes); --contain still ends it with the proxy.
 A tool that is not installed is not downloaded: the proxy refuses to start.
@@ -50,8 +64,11 @@ What this does NOT do
 ---------------------
 Phase 1 does not stop a hostile server from reading the user's files (such
 as ~/.ssh) or from writing the agent-sentinel home folder (the policy, the
-pins, the audit log): the server still runs as the same user. Only the
-phase 2 sandboxes reduce that.
+pins, the audit log): the server still runs as the same user. It cleans up
+after a server; it does not contain a hostile one, which can have a process
+started outside the job (Windows) or leave the process group (setsid). Only
+the phase 2 sandboxes reduce that, and sandbox-exec's deny list less than
+bwrap.
 
 Fail closed: when containment was asked for and any part of it cannot be set
 up, the proxy says why and does not start the server (or stops it at once).
@@ -60,7 +77,6 @@ up, the proxy says why and does not start the server (or stops it at once).
 from __future__ import annotations
 
 import ctypes
-import dataclasses
 import os
 import posixpath
 import signal
@@ -88,6 +104,27 @@ CREDENTIAL_PATHS = (
     ".cursor", ".codeium", ".codex", ".vscode", "Library/Keychains", "Library/Application Support/Claude",
     "Library/Application Support/Code/User", "Library/Application Support/Cursor/User",
 )
+
+# Places outside the home folder where the host's services listen on unix sockets: the Docker,
+# containerd and podman daemons, the system D-Bus, libvirt, databases, the session's own sockets
+# (/run/user: the ssh agent, the keyring), LXD. A unix socket can be connected to on a read-only
+# mount, and some of these are a way out of any sandbox (docker run -v /:/host), so bwrap covers
+# each that exists with an empty tmpfs, and a sandbox folder may not show one again.
+HIDDEN_SYSTEM_PLACES = ("/run", "/var/run", "/run/user", "/var/lib/lxd", "/var/snap/lxd/common/lxd")
+SESSION_SOCKETS = "/run/user"
+RESOLV_CONF = "/etc/resolv.conf"  # often a link into /run (systemd-resolved); shown again with --sandbox-network
+
+# What a server sandboxed by sandbox-exec may not write, relative to the home folder: what runs
+# later outside the sandbox (launch agents, shell startup files, git's configuration).
+PERSISTENCE_PATHS = (
+    "Library/LaunchAgents", ".zshrc", ".zshenv", ".zprofile", ".zlogin", ".zlogout", ".bashrc", ".bash_profile",
+    ".bash_login", ".profile", ".config/fish", ".gitconfig", ".config/git",
+)
+SYSTEM_PERSISTENCE_PATHS = ("/usr/lib/cron", "/private/var/at")  # crontab and at jobs (the same folder)
+# What starts a program for the caller outside its sandbox (macOS): the services, and their commands.
+LAUNCH_SERVICES = ("com.apple.coreservices.launchservicesd", "com.apple.coreservices.appleevents")
+LAUNCH_PROGRAMS = ("/usr/bin/open", "/usr/bin/osascript", "/bin/launchctl", "/usr/bin/crontab", "/usr/bin/at",
+                   "/usr/bin/batch")
 
 # Windows job objects (winnt.h).
 _JOB_EXTENDED_LIMITS = 9  # JobObjectExtendedLimitInformation
@@ -155,13 +192,16 @@ def cpu_seconds(text: str) -> int:
 # ---- whether it can work here ---------------------------------------------------------------------
 
 def check(settings: Settings, find: Callable[[str], str | None], platform: str = sys.platform,
-          user_home: str | None = None) -> str | None:
+          user_home: str | Sequence[str] | None = None, control_files: Sequence[str] = ()) -> str | None:
     """Why these settings cannot be used on this machine, or None. Nothing is started or changed.
 
     For the proxy before it starts, and for doctor. `find` looks a program
     up on PATH (the proxy's own lookup, which never looks in the current
     folder). The order matters for doctor: the platform is looked at before
     any path, so that nothing a configuration names is opened in vain.
+    user_home: the home folders a sandbox hides (default: _homes).
+    control_files: the proxy's own files (policy, pins, audit log), which no
+    folder the server may write may hold.
     """
     if not settings.active:
         return None
@@ -184,15 +224,15 @@ def check(settings: Settings, find: Callable[[str], str | None], platform: str =
             return "--sandbox bwrap: bwrap (bubblewrap) is not on PATH; install it, it is never downloaded"
         if len(settings.allow) + len(settings.read) > MAX_SANDBOX_PATHS:
             return f"--sandbox-allow and --sandbox-read may name at most {MAX_SANDBOX_PATHS} folders"
-        home = _user_home(user_home)
-        if home is None:
+        homes = _homes(user_home)
+        if homes is None:
             return "the home folder is / or unknown, so the sandbox could not hide it"
         for option, paths in (("--sandbox-allow", settings.allow), ("--sandbox-read", settings.read)):
             for path in paths:
-                problem = _sandbox_path_problem(path, home)
+                problem = _sandbox_path_problem(path, homes)
                 if problem:
                     return f"{option} {path}: {problem}"
-        return None
+        return _writable_problem(settings.allow, control_files)
     if platform != "darwin":
         return "--sandbox sandbox-exec needs macOS"
     if not os.path.isfile(SANDBOX_EXEC):
@@ -203,9 +243,38 @@ def check(settings: Settings, find: Callable[[str], str | None], platform: str =
     return None
 
 
-def _user_home(given: str | None) -> str | None:
-    home = os.path.realpath(given or os.path.expanduser("~"))
-    return None if home in ("/", "") or not home.startswith("/") else home
+def _homes(given: str | Sequence[str] | None = None) -> list[str] | None:
+    """The home folders a sandbox hides, as real paths; None when $HOME is / or unknown.
+
+    By default, the one $HOME names and the account's own (from the password
+    database) when it differs: a client or launcher may set HOME to another
+    folder, and the real one, with ~/.ssh in it, must not show through.
+    `given` replaces both (for tests). An account home of / is skipped.
+    """
+    if given is None:
+        names = [os.path.expanduser("~"), _account_home()]
+    else:
+        names = [given] if isinstance(given, str) else list(given)
+    homes: list[str] = []
+    for index, name in enumerate(names):
+        home = os.path.realpath(name) if name else ""
+        if home in ("/", "") or not home.startswith("/"):
+            if index == 0:
+                return None
+            continue
+        if home not in homes:
+            homes.append(home)
+    return homes
+
+
+def _account_home() -> str | None:
+    """The home folder of the account the proxy runs as (POSIX), whatever $HOME says; None when unknown."""
+    try:
+        import pwd  # POSIX only
+
+        return pwd.getpwuid(os.getuid()).pw_dir or None
+    except (ImportError, KeyError, AttributeError, OSError):
+        return None
 
 
 def _within(path: str, folder: str) -> bool:
@@ -213,8 +282,8 @@ def _within(path: str, folder: str) -> bool:
     return path == folder or path.startswith(folder.rstrip("/") + "/")
 
 
-def _sandbox_path_problem(path: str, home: str) -> str | None:
-    """Why a folder may not be shown to a sandboxed server, or None."""
+def _sandbox_path_problem(path: str, homes: Sequence[str]) -> str | None:
+    """Why a folder may not be shown to a sandboxed server, or None. Both its spelling and its real path count."""
     if not path.startswith("/"):
         return "is not a full path"
     if any(ord(character) < 32 for character in path):
@@ -222,69 +291,177 @@ def _sandbox_path_problem(path: str, home: str) -> str | None:
     real = os.path.realpath(path)
     if not os.path.exists(real):
         return "does not exist"
-    if _within(home, real):
-        return "would show the whole home folder, credentials included"
-    for credential in CREDENTIAL_PATHS:
-        place = posixpath.join(home, credential)
-        if _within(real, place) or (_within(place, real) and os.path.lexists(place)):
-            return f"would show {place}, a place where credentials are kept"
+    for shown in dict.fromkeys((posixpath.normpath(path), real)):
+        if any(_within(home, shown) for home in homes):
+            return "would show the whole home folder, credentials included"
+        for place in HIDDEN_SYSTEM_PLACES:
+            if os.path.lexists(place) and _within(os.path.realpath(place), shown):
+                return f"would show {place}, where the host's services have their sockets"
+        if _within(shown, SESSION_SOCKETS):
+            return f"is inside {SESSION_SOCKETS}, where the session's sockets are (the ssh agent, the keyring)"
+        for home in homes:
+            for credential in CREDENTIAL_PATHS:
+                place = posixpath.join(home, credential)
+                if _within(shown, place) or (_within(place, shown) and os.path.lexists(place)):
+                    return f"would show {place}, a place where credentials are kept"
+    return None
+
+
+def _writable_problem(allow: Sequence[str], protected: Iterable[str | None],
+                      real: Callable[[str], str] = os.path.realpath) -> str | None:
+    """Why a folder the server may write would let it change the proxy's own files, or None.
+
+    A file inside such a folder, whether it exists yet or not, could be
+    written, or replaced for the next session by renaming a folder on its
+    way: so a folder that holds the policy, the pins, the audit log or the
+    agent-sentinel home is refused.
+    """
+    names = [(name, real(name)) for name in protected if name]
+    for folder in allow:
+        where = real(folder)
+        for name, name_real in names:
+            if _within(name_real, where):
+                return (f"--sandbox-allow {folder}: it holds {name}, which the server could then change or replace; "
+                        "keep the policy, pins, audit log and agent-sentinel home out of the folders the server "
+                        "may write")
+    return None
+
+
+def _system_places(exists: Callable[[str], bool] = os.path.exists,
+                   real: Callable[[str], str] = os.path.realpath) -> list[str]:
+    """The HIDDEN_SYSTEM_PLACES that exist, as real paths, each once and none inside another already listed."""
+    found: list[str] = []
+    for place in HIDDEN_SYSTEM_PLACES:
+        if not exists(place):
+            continue
+        where = real(place)
+        if where != "/" and not any(_within(where, done) for done in found):
+            found.append(where)
+    return found
+
+
+def _shown_folders(settings: Settings, real: Callable[[str], str] = os.path.realpath) -> list[tuple[str, str]]:
+    """The folders a bwrap sandbox shows, as (path, "--ro-bind" or "--bind"), in the order to mount them.
+
+    Each folder is shown at its own spelling and at its real path, so that a
+    program found through a link is there either way. Shorter paths come
+    first, so that a folder inside another gets its own access; at one depth
+    a writable folder comes last.
+    """
+    shown: list[tuple[str, str]] = []
+    for how, paths in (("--ro-bind", settings.read), ("--bind", settings.allow)):
+        for path in paths:
+            for one in dict.fromkeys((posixpath.normpath(path), real(path))):
+                if (one, how) not in shown:
+                    shown.append((one, how))
+    return sorted(shown, key=lambda entry: (entry[0].count("/"), entry[1] == "--bind"))
+
+
+def _hidden_program_problem(program: str, settings: Settings, homes: Sequence[str],
+                            exists: Callable[[str], bool] = os.path.exists,
+                            real: Callable[[str], str] = os.path.realpath) -> str | None:
+    """Why the server's program would not be found inside a bwrap sandbox, or None.
+
+    The sandbox empties the home folders, /tmp and the system places; a
+    program in one of them must be in a folder named with --sandbox-read
+    or --sandbox-allow, at its spelling and at its real path.
+    """
+    hidden = [*homes, "/tmp", *_system_places(exists, real)]
+    shown = [folder for folder, _ in _shown_folders(settings, real)]
+    for one in dict.fromkeys((posixpath.normpath(program), real(program))):
+        place = next((folder for folder in hidden if _within(one, folder)), None)
+        if place is not None and not any(_within(one, folder) for folder in shown):
+            return (f"the server's program {one} is inside {place}, which the sandbox hides; add --sandbox-read "
+                    f"{posixpath.dirname(one)}")
     return None
 
 
 # ---- the sandboxes' own words ---------------------------------------------------------------------
 
-def bwrap_arguments(settings: Settings, home: str, agent_home: str | None, control_files: Iterable[str] = (),
-                    exists: Callable[[str], bool] = os.path.exists) -> list[str]:
+def bwrap_arguments(settings: Settings, home: str | Sequence[str], agent_home: str | None,
+                    exists: Callable[[str], bool] = os.path.exists,
+                    real: Callable[[str], str] = os.path.realpath) -> list[str]:
     """bubblewrap's options for a sandboxed server (the words between "bwrap" and "--").
 
+    home: the home folder, or the home folders ($HOME's and the account's), as real paths.
     Later mounts cover earlier ones, so the order is: everything read-only,
-    then a fresh /dev, /proc, /tmp, an empty /run/user and home folder, then
-    the folders the server may read or write (shorter paths first, so that a
-    folder inside another gets its own access), then the agent-sentinel home
-    hidden again, and the proxy's own files read-only again where an allowed
-    folder would have made them writable. Every path is used as given: real,
-    full paths (see check, and _sandbox_prefix, which makes them real).
+    then a fresh /dev, /proc, /tmp, an empty /run and the other system
+    places where services have their sockets (with --sandbox-network, the
+    resolver's file there shown again), the empty home folders, then the
+    folders the server may read or write (_shown_folders), then the
+    agent-sentinel home hidden again. check and _sandbox_prefix have made
+    sure that no folder the server may write holds the proxy's own files.
     """
+    homes = [home] if isinstance(home, str) else list(home)
     words = ["--unshare-all", "--die-with-parent", "--new-session",
              "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
     if settings.network:
         words.append("--share-net")
-    if exists("/run/user"):
-        words += ["--tmpfs", "/run/user"]
-    words += ["--tmpfs", home]
-    shown = sorted([(path, "--ro-bind") for path in settings.read] + [(path, "--bind") for path in settings.allow],
-                   key=lambda entry: (entry[0].count("/"), entry[1] == "--bind"))
-    for path, how in shown:
+    places = _system_places(exists, real)
+    for place in places:
+        words += ["--tmpfs", place]
+    if settings.network:
+        resolver = real(RESOLV_CONF)
+        if resolver != RESOLV_CONF and exists(resolver) and any(_within(resolver, place) for place in places):
+            words += ["--ro-bind", resolver, resolver]  # name lookups need it, and it holds no socket
+    for one in sorted(homes, key=lambda path: path.count("/")):
+        if exists(one):
+            words += ["--tmpfs", one]
+    for path, how in _shown_folders(settings, real):
         words += [how, path, path]
     if agent_home and exists(agent_home):
         words += ["--tmpfs", agent_home]
-    writable = [path for path, how in shown if how == "--bind"]
-    for name in control_files:
-        if (exists(name) and not (agent_home and _within(name, agent_home))
-                and any(_within(name, folder) for folder in writable)):
-            words += ["--ro-bind", name, name]
     return words
 
 
-def sandbox_exec_profile(settings: Settings, home: str, agent_home: str | None, control_files: Iterable[str] = (),
-                         real: Callable[[str], str] = os.path.realpath) -> str:
+def sandbox_exec_profile(settings: Settings, home: str | Sequence[str], agent_home: str | None,
+                         control_files: Iterable[str] = (), real: Callable[[str], str] = os.path.realpath) -> str:
     """The sandbox-exec (SBPL) profile for a sandboxed server. ContainmentError for a path it cannot quote.
 
+    home: the home folder, or the home folders ($HOME's and the account's).
     Later rules win over earlier ones, so everything is allowed first and the
     denials follow. `real` gives a path's real path: the sandbox matches real
-    paths (/tmp is /private/tmp), so both spellings are denied.
+    paths (/tmp is /private/tmp), so both spellings are denied. The denials
+    name paths, so a folder on the way to a denied place may not be renamed
+    or replaced either (a literal denial of writing it: what is inside stays
+    writable where it was).
     """
+    homes = [home] if isinstance(home, str) else list(home)
     lines = ["(version 1)", "(allow default)"]
     if not settings.network:
         lines.append("(deny network*)")
-    hidden = [posixpath.join(home, credential) for credential in CREDENTIAL_PATHS]
+    # A program started by LaunchServices (open), Apple Events (osascript) or launchd (launchctl) is not
+    # sandboxed: the server may not ask them to start one.
+    lines += ["(deny lsopen)", "(deny appleevent-send)", "(deny job-creation)",
+              "(deny mach-lookup " + " ".join(f"(global-name {_sbpl_string(name)})" for name in LAUNCH_SERVICES) + ")",
+              "(deny process-exec " + " ".join(f"(literal {_sbpl_string(path)})" for path in LAUNCH_PROGRAMS) + ")"]
+    hidden = [posixpath.join(one, credential) for one in homes for credential in CREDENTIAL_PATHS]
     if agent_home:
         hidden.append(agent_home)
+    unwritable = [posixpath.join(one, path) for one in homes for path in PERSISTENCE_PATHS]
+    unwritable += SYSTEM_PERSISTENCE_PATHS
+    files = list(control_files)
     for path in _with_real_paths(hidden, real):
         lines.append(f"(deny file-read* file-write* (subpath {_sbpl_string(path)}))")
-    for path in _with_real_paths(control_files, real):
+    for path in _with_real_paths(unwritable, real):
+        lines.append(f"(deny file-write* (subpath {_sbpl_string(path)}))")
+    for path in _with_real_paths(files, real):
         lines.append(f"(deny file-write* (literal {_sbpl_string(path)}))")
-    return "\n".join(lines) + "\n"
+    folders = _ancestors(_with_real_paths([*hidden, *unwritable, *files], real))
+    for path in _with_real_paths(folders, real):
+        lines.append(f"(deny file-write* (literal {_sbpl_string(path)}))")
+    return "\n".join(dict.fromkeys(lines)) + "\n"
+
+
+def _ancestors(paths: Iterable[str]) -> list[str]:
+    """The folders on the way to each path, / left out, each once."""
+    found: list[str] = []
+    for path in paths:
+        folder = posixpath.dirname(path.rstrip("/"))
+        while folder not in ("/", "") and folder not in found:
+            found.append(folder)
+            folder = posixpath.dirname(folder)
+    return found
 
 
 def _with_real_paths(paths: Iterable[str], real: Callable[[str], str]) -> list[str]:
@@ -309,9 +486,9 @@ def describe(settings: Settings, platform: str = sys.platform) -> str:
     if not settings.active:
         return "none"
     if platform == "win32":
-        parts = ["the server and everything it starts end with the proxy (a job object)"]
+        parts = ["the server and its child processes end with the proxy (a job object; cleanup, not isolation)"]
     else:
-        parts = ["the server's process group ends with the proxy, no core dumps, "
+        parts = ["the server's process group ends with the proxy (cleanup, not isolation), no core dumps, "
                  f"at most {SERVER_OPEN_FILES} open files"]
     if settings.memory_mb is not None:
         what = "committed memory" if platform == "win32" else "virtual memory"
@@ -364,7 +541,7 @@ def prepare(settings: Settings, find: Callable[[str], str | None], control_files
     """
     if not settings.active:
         return Containment()
-    problem = check(settings, find)
+    problem = check(settings, find, control_files=control_files)
     if problem is not None:
         raise ContainmentError(problem)
     if sys.platform == "win32":
@@ -387,25 +564,22 @@ def _agent_home() -> str:
 
 def _sandbox_prefix(settings: Settings, find: Callable[[str], str | None], control_files: Sequence[str],
                     server_executable: str | None) -> list[str]:
-    user_home = _user_home(None)
-    if user_home is None:
+    homes = _homes()
+    if homes is None:
         raise ContainmentError("the home folder is / or unknown, so the sandbox could not hide it")
     agent_home = _agent_home()
     files = [os.path.realpath(name) for name in control_files if name]
-    settings = dataclasses.replace(settings, allow=tuple(os.path.realpath(path) for path in settings.allow),
-                                   read=tuple(os.path.realpath(path) for path in settings.read))
     if settings.sandbox == "sandbox-exec":
-        return [SANDBOX_EXEC, "-p", sandbox_exec_profile(settings, user_home, agent_home, files)]
-    if server_executable is not None:
-        program = os.path.realpath(server_executable)
-        shown = [*settings.allow, *settings.read]
-        if _within(program, user_home) and not any(_within(program, folder) for folder in shown):
-            raise ContainmentError(f"the server's program {program} is inside the home folder, which the sandbox "
-                                   f"hides; add --sandbox-read {os.path.dirname(program)}")
+        return [SANDBOX_EXEC, "-p", sandbox_exec_profile(settings, homes, agent_home, files)]
+    problem = _writable_problem(settings.allow, [*files, agent_home])
+    if problem is None and server_executable is not None:
+        problem = _hidden_program_problem(server_executable, settings, homes)
+    if problem is not None:
+        raise ContainmentError(problem)
     bwrap = find("bwrap")
     if bwrap is None:
         raise ContainmentError("bwrap (bubblewrap) is not on PATH")
-    return [bwrap, *bwrap_arguments(settings, user_home, agent_home, files), "--"]
+    return [bwrap, *bwrap_arguments(settings, homes, agent_home), "--"]
 
 
 class _WindowsJob(Containment):

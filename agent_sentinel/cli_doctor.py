@@ -680,7 +680,9 @@ def _check_containment(lines: list[Line], proxy: ProxyCommand) -> str | None:
         )
     except ValueError:
         return None  # a value the proxy refuses: already a [fail] line
-    problem = containment.check(settings, mcp_proxy._resolve_executable)
+    control_files = [_option_path(path) for path in (proxy.value("--policy"), proxy.value("--pins"),
+                                                     proxy.value("--audit")) if path]
+    problem = containment.check(settings, mcp_proxy._resolve_executable, control_files=control_files)
     if problem:
         lines.append(Line("fail", f"the proxy will not start: it cannot contain the server as asked: "
                                   f"{printable(problem, limit=300)}"))

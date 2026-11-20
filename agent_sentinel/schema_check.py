@@ -32,7 +32,10 @@ patterns decide which properties are additional.
 The work is bounded: at most MAX_DEPTH levels of nesting are checked (a
 deeper part that the schema constrains is a problem: it cannot be checked),
 and at most MAX_STEPS checks are made in all (beyond that the value is a
-problem: too large to check). Problems are described without the values they
+problem: too large to check). Work that grows with the schema rather than
+the value (a long "type" list, comparing objects key by key) is paid for
+from the same budget each time, so that a server's schema cannot make every
+part of a large value slow. Problems are described without the values they
 are about, since a value may be a secret; the names on their path are made
 printable.
 """
@@ -67,8 +70,15 @@ STANDARD_META_SCHEMAS = frozenset(
     f"{scheme}://json-schema.org{path}{end}"
     for scheme in ("http", "https") for path in _META_SCHEMA_PATHS for end in ("", "#")
 )
-# An absolute URI with an authority ("https://...", "file:///...") or a network-path reference ("//host/...").
-_NETWORK_URI = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,31}://|//")
+# The drafts that set a schema's base URI with "id" (no $): 03 and 04.
+_ID_DRAFT_META_SCHEMAS = frozenset(
+    name for name in STANDARD_META_SCHEMAS if "/draft-03/" in name or "/draft-04/" in name
+)
+# A URI with a scheme ("https:", "file:", "https:evil.example" too, which URL parsers read as https://).
+_URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
+# URL parsers (WHATWG) drop C0 controls and spaces from both ends, and tabs and newlines from anywhere.
+_URL_ENDS = "".join(chr(code) for code in range(0x21))
+_URL_DROPPED = re.compile(r"[\t\n\r]")
 
 # The keywords the validator acts on: a part of a schema that has none of them accepts anything.
 KEYWORDS = frozenset((
@@ -90,42 +100,72 @@ def remote_refs(tool: Any) -> list[str]:
     or are malformed, and are not references. A schema with more than
     MAX_REFERENCE_NODES objects and arrays is itself reported: it cannot be
     looked through. Empty when nothing points outside.
+
+    What counts: a $ref, $dynamicRef or $recursiveRef that is not a local
+    "#..." pointer; a $schema other than the standard meta-schemas (a client
+    that does not know the meta-schema a schema names may fetch it); and an
+    $id that is a network address (see _is_address). In a schema whose
+    $schema names draft-03 or draft-04, "id" counts as $id does.
     """
     if not isinstance(tool, dict):
         return []
     found: list[str] = []
-    stack = [tool[key] for key in ("inputSchema", "outputSchema") if isinstance(tool.get(key), (dict, list))]
+    stack: list[tuple[Any, bool]] = []
+    for key in ("inputSchema", "outputSchema"):
+        schema = tool.get(key)
+        if isinstance(schema, (dict, list)):
+            old_ids = isinstance(schema, dict) and schema.get("$schema") in _ID_DRAFT_META_SCHEMAS
+            stack.append((schema, old_ids))
     nodes = 0
     while stack and len(found) < MAX_REFERENCES_REPORTED:
-        item = stack.pop()
+        item, old_ids = stack.pop()
         nodes += 1
         if nodes > MAX_REFERENCE_NODES:
             found.append(f"a schema with more than {MAX_REFERENCE_NODES} parts, too large to look through")
             break
         if isinstance(item, list):
-            stack.extend(child for child in item if isinstance(child, (dict, list)))
+            stack.extend((child, old_ids) for child in item if isinstance(child, (dict, list)))
             continue
         for key, value in item.items():
             if isinstance(value, str):
-                problem = _outside_reference(key, value)
+                problem = _outside_reference(key, value, old_ids)
                 if problem is not None and len(found) < MAX_REFERENCES_REPORTED:
                     found.append(problem)
             elif isinstance(value, (dict, list)):
-                stack.append(value)
+                stack.append((value, old_ids))
     return found
 
 
-def _outside_reference(key: Any, value: str) -> str | None:
-    """The description of `key: value` if it is a reference to somewhere outside the schema, else None."""
+def _outside_reference(key: Any, value: str, old_ids: bool = False) -> str | None:
+    """The description of `key: value` if it is a reference to somewhere outside the schema, else None.
+
+    old_ids: the schema is draft-03 or draft-04, where "id" sets the base URI.
+    """
     if key in _REFERENCE_KEYS:
         outside = not value.startswith("#")
-    elif key == "$id":
-        outside = _NETWORK_URI.match(value) is not None
+    elif key == "$id" or (old_ids and key == "id"):
+        outside = _is_address(value)
     elif key == "$schema":
-        outside = _NETWORK_URI.match(value) is not None and value not in STANDARD_META_SCHEMAS
+        outside = value not in STANDARD_META_SCHEMAS
     else:
         return None
     return f'{key} "{printable(value, limit=80)}"' if outside else None
+
+
+def _is_address(value: str) -> bool:
+    """Whether a URI may be fetched: it has a scheme, or is a network-path reference ("//host/...").
+
+    It is read as a WHATWG URL parser reads it, so that a spelling a browser or
+    Node accepts cannot hide one: controls and spaces at the ends and tabs and
+    newlines anywhere are dropped, "https:host/x" counts (a parser adds the
+    slashes), and a backslash counts as a slash ("\\\\host\\x"). A "urn:" name
+    is not an address: no resolver fetches it.
+    """
+    address = _URL_DROPPED.sub("", value.strip(_URL_ENDS))
+    if address[:1] in ("/", "\\") and address[1:2] in ("/", "\\"):
+        return True
+    scheme = _URI_SCHEME.match(address)
+    return scheme is not None and scheme.group().lower() != "urn:"
 
 
 # ---- the validator -------------------------------------------------------------------------------------
@@ -226,10 +266,11 @@ def _check_one(value: Any, schema: Any, path: tuple[Any, ...], root: str, proble
     if not isinstance(schema, dict):
         return []  # true, or not a schema at all: anything is accepted
     if len(path) > max_depth:
-        if KEYWORDS.intersection(schema):
+        # One lookup per keyword, never a walk over the schema's keys: a schema may have very many.
+        if any(keyword in schema for keyword in KEYWORDS):
             problems.append(f"{_where(root, path)} is nested more than {max_depth} levels deep, too deep to check")
         return []
-    problem = _type_problem(value, schema) or _value_problem(value, schema, budget)
+    problem = _type_problem(value, schema, budget) or _value_problem(value, schema, budget)
     if problem is None:
         if _is_number(value):
             problem = _number_problem(value, schema)
@@ -251,9 +292,20 @@ def _check_one(value: Any, schema: Any, path: tuple[Any, ...], root: str, proble
     return []
 
 
-def _type_problem(value: Any, schema: dict[str, Any]) -> str | None:
+def _spend(budget: list[int], steps: int) -> None:
+    """Take steps from the budget of a validation; _TooLarge when it runs out."""
+    budget[0] -= steps
+    if budget[0] < 0:
+        raise _TooLarge
+
+
+def _type_problem(value: Any, schema: dict[str, Any], budget: list[int]) -> str | None:
     wanted = schema.get("type")
     names = [wanted] if isinstance(wanted, str) else wanted if isinstance(wanted, list) else None
+    if names is not None and len(names) > len(_TYPE_CHECKS):
+        # The names must be unique, so a longer list repeats some or names unknown ones. Reading it is
+        # paid for from the budget, each time, so that a long list cannot make every part of a value slow.
+        _spend(budget, len(names))
     if not names or not all(isinstance(name, str) and name in _TYPE_CHECKS for name in names):
         return None  # no type, or one the validator does not know: not checked
     if any(_TYPE_CHECKS[name](value) for name in names):
@@ -350,6 +402,9 @@ def _json_equal(one: Any, other: Any, budget: list[int]) -> bool:
                 return False
             stack.extend(zip(first, second))
         elif isinstance(first, dict) and isinstance(second, dict):
+            if len(first) != len(second):
+                return False
+            _spend(budget, len(first))  # comparing the keys walks them
             if first.keys() != second.keys():
                 return False
             stack.extend((first[key], second[key]) for key in first)

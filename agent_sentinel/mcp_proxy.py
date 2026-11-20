@@ -2011,26 +2011,35 @@ class Proxy:
     def _result_schema_refusal(self, pending: _PendingRequest, member: str, value: Any) -> Decision | None:
         """Check a tool's result against its checked outputSchema (schema_checks.results); a refusal, or None.
 
-        Only a complete tools/call result that is not an error is checked: its
-        structuredContent must be there when the tool declares an outputSchema,
-        and match it (schema_check.validate). A tool that declares none is not
-        checked; one whose schemas this session cannot vouch for (not listed,
-        or too large to keep) counts as a problem. "warn" reports and records
-        a problem and lets the result go on; "enforce" refuses it, a block that
-        monitor mode lifts. Checked as the server sent it, before the scan.
+        Only a complete tools/call result is checked: its structuredContent
+        must be there when the tool declares an outputSchema, and match it
+        (schema_check.validate). A result that is not an object has none. An
+        error result (isError) need not have structuredContent, but what it
+        has is checked: marking a result as an error does not get it past the
+        schema. A tool that declares no outputSchema is not checked; one whose
+        schemas this session cannot vouch for (not listed, or too large to
+        keep) counts as a problem. "warn" reports and records a problem and
+        lets the result go on; "enforce" refuses it, a block that monitor mode
+        lifts. Checked as the server sent it, before the scan.
         """
         if pending.method != "tools/call" or member != "result" or pending.tool is None:
             return None
         settings = self._firewall.policy.schema_checks_for(pending.tool)
-        if settings.results == "off" or not isinstance(value, dict) or value.get("isError") is True:
+        if settings.results == "off":
             return None
-        if value.get("resultType", protocol.RESULT_COMPLETE) != protocol.RESULT_COMPLETE:
+        is_object = isinstance(value, dict)
+        if is_object and value.get("resultType", protocol.RESULT_COMPLETE) != protocol.RESULT_COMPLETE:
             return None  # an input_required result asks for input; the retried call's result is checked
+        if is_object and value.get("isError") is True and "structuredContent" not in value:
+            return None  # an error with nothing structured in it: nothing to check
         found, why = self._schemas.lookup(pending.tool) if self._schemas is not None else (None, "no schemas are kept")
         if found is None:
             problems = [f"the result cannot be checked: {why}"]
         elif not found.has_output:
             return None
+        elif not is_object:
+            problems = ["the result is not an object, so it has no structuredContent, although the tool declares "
+                        "an output schema"]
         elif "structuredContent" not in value:
             problems = ["the result has no structuredContent, although the tool declares an output schema"]
         else:
@@ -2745,10 +2754,12 @@ def _argument_parser() -> argparse.ArgumentParser:
     # Containing the server (containment.py). Each option below implies --contain; the proxy does not start
     # when what they ask for cannot be set up.
     parser.add_argument("--contain", action="store_true",
-                        help="end the server and everything it starts with the proxy (Windows: a job object; Linux "
-                             "and macOS: its own process group, no core dumps, at most "
-                             f"{containment.SERVER_OPEN_FILES} open files). This does not keep a hostile server "
-                             "from reading your files: see --sandbox")
+                        help="end the server and the processes it starts with the proxy (Windows: a job object; "
+                             "Linux and macOS: its own process group, no core dumps, at most "
+                             f"{containment.SERVER_OPEN_FILES} open files). This cleans up after a server; it does "
+                             "not contain a hostile one, which can still read your files and have a process "
+                             "started outside the job or group (Windows: WMI, the Task Scheduler; elsewhere: "
+                             "setsid): see --sandbox")
     parser.add_argument("--server-memory-mb", type=_server_memory_mb, default=None, metavar="MB",
                         help="with --contain: at most this much memory for each of the server's processes (Windows: "
                              "committed memory; elsewhere virtual memory, which Node reserves plenty of)")
