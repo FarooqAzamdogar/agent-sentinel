@@ -83,6 +83,16 @@ AGENT_CONFIG_PATTERN = (
     r"|(^|[\\/:])\.(bashrc|bash_profile|bash_login|zshrc|zshenv|zprofile|profile)\b"
     r"|(^|[\\/:])([\w.]+_)?profile\.ps1\b"
 )
+# A path spelled in a roundabout way: a "." or ".." part after a name, or two
+# separators in a row after a name ("app/.claude/./settings.json",
+# "app/.claude//settings.json", "app/.claude/x/../settings.json"). Every system
+# opens the plain path, but a text pattern such as AGENT_CONFIG_PATTERN does not
+# see it there, so the write tools are not given such a path at all. A leading
+# "./" or "../" is plain and still allowed; so is a trailing separator.
+ROUNDABOUT_PATH_PATTERN = (
+    r"[^\\/:][\\/]{2,}"
+    r"|(^|[\\/:])(?!\.\.?[\\/])[^\\/:]+[\\/]+\.\.?([\\/]|$)"
+)
 # The folders in the home folder that hold agents' own settings, and agent-sentinel's.
 # A "type": "path" entry with these roots also refuses every Windows short name
 # ("CLAUDE~1") and every value it cannot read with certainty.
@@ -93,11 +103,23 @@ HOME_CONFIG_ROOTS = ("~/.claude", "~/.cursor", "~/.codeium", "~/.gemini", "~/.co
 SECRET_ROOTS = ("~/.ssh", "~/.aws", "~/.agent-sentinel")
 # Text that sets what decides where an agent sends its requests, which code
 # Node loads, or whether the agent asks before it acts.
+#   * NAME= / "NAME": / NAME: anywhere (code, settings, a shell): a *_BASE_URL in
+#     upper case (as environment variables are written; "api_base_url = ..." in
+#     ordinary code is left alone), and Anthropic's own *_BASE_URL and
+#     NODE_OPTIONS in any case, because Windows and Node on Windows read
+#     environment variable names without case;
+#   * Windows' own ways of setting a variable, where case never matters: setx,
+#     $env:NAME = ..., PowerShell's env: drive (Set-Item env:NAME) and
+#     [Environment]::SetEnvironmentVariable('NAME', ...).
+_ANY_CASE_SETTING = r"\w*_base_url|node_options"
 CONTROL_SETTING_PATTERN = (
-    r"(?<![\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)"
+    r"(?<![\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\w*_base_url|node_options"
     r"|chat\.tools\.(global\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)"
     r"[\"']?\s*[:=]"
-    r"|\bsetx(\.exe)?\s+(/m\s+)?[\"']?(?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)\b"
+    r"|\bsetx(\.exe)?\s+(/m\s+)?[\"']?(" + _ANY_CASE_SETTING + r")\b"
+    r"|\$\{?env:(" + _ANY_CASE_SETTING + r")\}?\s*\+?="
+    r"|(?<![\w$:{])env:[\\/]?(" + _ANY_CASE_SETTING + r")\b"
+    r"|SetEnvironmentVariable\s*\(\s*[\"']?(" + _ANY_CASE_SETTING + r")\b"
 )
 
 # A value that starts with "-" can be read as an option by a program the tool
@@ -212,8 +234,10 @@ def write_protection(arguments: tuple[str, ...], action: str) -> list[dict[str, 
     Its path arguments may not name an agent's configuration, instruction or
     hook file (AGENT_CONFIG_PATTERN), nor anything in the home folders of
     agents' settings (HOME_CONFIG_ROOTS: a path entry, which also refuses
-    Windows short names and values it cannot read). No argument may set what
-    decides where the agent's requests go or whether it asks first
+    Windows short names and values it cannot read), nor be spelled in a
+    roundabout way that the text pattern would not see through
+    (ROUNDABOUT_PATH_PATTERN: "a/./b", "a//b", "a/x/../b"). No argument may set
+    what decides where the agent's requests go or whether it asks first
     (CONTROL_SETTING_PATTERN). Never for "arg": "*" on every tool: reading
     CLAUDE.md must stay possible.
     """
@@ -221,6 +245,7 @@ def write_protection(arguments: tuple[str, ...], action: str) -> list[dict[str, 
     for argument in arguments:
         entries.append({"arg": argument, "pattern": AGENT_CONFIG_PATTERN})
         entries.append({"arg": argument, "type": "path", "roots": list(HOME_CONFIG_ROOTS)})
+        entries.append({"arg": argument, "pattern": ROUNDABOUT_PATH_PATTERN})
     entries.append({"arg": "*", "pattern": CONTROL_SETTING_PATTERN})
     if action == "ask":
         for entry in entries:

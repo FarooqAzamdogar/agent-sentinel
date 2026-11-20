@@ -309,8 +309,13 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
           "action": "ask"
         },
         {
+          "arg": "file_path",
+          "pattern": "[^\\\\/:][\\\\/]{2,}|(^|[\\\\/:])(?!\\.\\.?[\\\\/])[^\\\\/:]+[\\\\/]+\\.\\.?([\\\\/]|$)",
+          "action": "ask"
+        },
+        {
           "arg": "*",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)\\b",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"']?(\\w*_base_url|node_options)\\b",
           "action": "ask"
         }
       ]
@@ -332,8 +337,13 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
           "action": "ask"
         },
         {
+          "arg": "file_path",
+          "pattern": "[^\\\\/:][\\\\/]{2,}|(^|[\\\\/:])(?!\\.\\.?[\\\\/])[^\\\\/:]+[\\\\/]+\\.\\.?([\\\\/]|$)",
+          "action": "ask"
+        },
+        {
           "arg": "*",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)\\b",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"']?(\\w*_base_url|node_options)\\b",
           "action": "ask"
         }
       ]
@@ -355,8 +365,13 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
           "action": "ask"
         },
         {
+          "arg": "file_path",
+          "pattern": "[^\\\\/:][\\\\/]{2,}|(^|[\\\\/:])(?!\\.\\.?[\\\\/])[^\\\\/:]+[\\\\/]+\\.\\.?([\\\\/]|$)",
+          "action": "ask"
+        },
+        {
           "arg": "*",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)\\b",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"']?(\\w*_base_url|node_options)\\b",
           "action": "ask"
         }
       ]
@@ -378,8 +393,13 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
           "action": "ask"
         },
         {
+          "arg": "notebook_path",
+          "pattern": "[^\\\\/:][\\\\/]{2,}|(^|[\\\\/:])(?!\\.\\.?[\\\\/])[^\\\\/:]+[\\\\/]+\\.\\.?([\\\\/]|$)",
+          "action": "ask"
+        },
+        {
           "arg": "*",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)\\b",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"']?(\\w*_base_url|node_options)\\b",
           "action": "ask"
         }
       ]
@@ -390,7 +410,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
       "deny_args": [
         {
           "arg": "command",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)\\b",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"']?(\\w*_base_url|node_options)\\b",
           "action": "ask"
         }
       ],
@@ -406,7 +426,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
       "deny_args": [
         {
           "arg": "command",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(?-i:[A-Z][A-Z0-9_]*_BASE_URL|NODE_OPTIONS)\\b",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"']?(\\w*_base_url|node_options)\\b",
           "action": "ask"
         }
       ],

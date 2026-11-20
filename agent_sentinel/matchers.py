@@ -27,7 +27,9 @@ A typed matcher (path, url, email) reads the value the way a program would.
 When it cannot read a value with certainty (an ambiguous URL, a Windows short
 name, a network path), it answers "found" in deny_args and "not accepted" in
 allow_args: either way the call is refused. All checks are on the text only.
-Nothing here touches the file system or the network.
+Nothing here touches the file system or the network, except that on Windows a
+home folder spelled with short names (HOME=C:\\Users\\ALEXAN~1) is asked for
+its long name once (_long_home_name).
 """
 
 from __future__ import annotations
@@ -316,6 +318,10 @@ _MACOS_PRIVATE = ("etc", "tmp", "var")
 _SHELL_VARIABLE = re.compile(r"\$[A-Za-z_{(]")
 # "%" then a name then "%", looked for at every "%" (the lookahead lets them overlap).
 _PERCENT_VARIABLE = re.compile(r"%(?=([A-Za-z_][^%\\/\"<>|*?\r\n]{0,63})%)")
+# cmd's batch parameters: %~dp0, %~f1, %*, and %0 to %9 when no hex digit follows (%2e is a percent escape).
+_BATCH_PARAMETER = re.compile(r"%~|%[0-9*](?![0-9A-Fa-f])")
+# cmd's delayed expansion: !NAME!.
+_DELAYED_VARIABLE = re.compile(r"!(?=[A-Za-z_][^!\\/\"<>|*?\r\n]{0,63}!)")
 # Two hex digits between "%" signs are a percent escape ("caf%C3%A9"), not a variable.
 _HEX_PAIR = re.compile(r"[0-9A-Fa-f]{2}")
 # MSYS2, Git Bash and Cygwin spellings of a Windows drive: "/c/Users", "/cygdrive/c", "/mnt/c".
@@ -324,8 +330,8 @@ _MSYS_DRIVE = re.compile(r"/(cygdrive(/|$)|mnt/[A-Za-z](/|$)|[A-Za-z](/|$))")
 
 
 def _names_a_variable(path: str) -> bool:
-    """True if the path holds $NAME, ${...}, $(...) or %NAME%, which some tools expand."""
-    if _SHELL_VARIABLE.search(path):
+    """True if the path holds $NAME, ${...}, $(...), %NAME%, %~dp0, %1 or !NAME!, which some tools expand."""
+    if _SHELL_VARIABLE.search(path) or _BATCH_PARAMETER.search(path) or _DELAYED_VARIABLE.search(path):
         return True
     return any(not _HEX_PAIR.fullmatch(found.group(1)) for found in _PERCENT_VARIABLE.finditer(path))
 
@@ -356,7 +362,43 @@ class _AliasBudget:
 
 
 def _home_folder() -> str:
-    return os.path.expanduser("~")
+    return _long_home_name(os.path.expanduser("~"))
+
+
+# The long forms of home folders spelled with short names, once found.
+_LONG_HOME_NAMES: dict[str, str] = {}
+
+
+def _long_home_name(path: str) -> str:
+    """On Windows, the long form of a home folder spelled with short (8.3) names; otherwise the path itself.
+
+    HOME or USERPROFILE can be set to "C:\\Users\\ALEXAN~1". The home folder is
+    chosen by the person running agent-sentinel, not by the agent, so here (and
+    only here) the system is asked for its long name (GetLongPathNameW, which
+    follows no link), and "~/.ssh" stays a usable root. A value an agent sends
+    is never read this way: its short names are refused. When the system cannot
+    say (no such folder), the path is kept, and a root under it is refused as before.
+    """
+    if os.name != "nt" or not _SHORT_NAME.search(path) or len(path) > MAX_PATH_CHARS:
+        return path
+    known = _LONG_HOME_NAMES.get(path)
+    if known is not None:
+        return known
+    try:
+        import ctypes
+
+        get_long_path_name = ctypes.WinDLL("kernel32").GetLongPathNameW
+        get_long_path_name.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
+        get_long_path_name.restype = ctypes.c_uint32
+        buffer = ctypes.create_unicode_buffer(MAX_PATH_CHARS + 1)
+        length = get_long_path_name(path, buffer, len(buffer))
+    except (AttributeError, OSError, ValueError):
+        return path
+    if not 0 < length < len(buffer) or _SHORT_NAME.search(buffer.value):
+        return path
+    if len(_LONG_HOME_NAMES) < 8:
+        _LONG_HOME_NAMES[path] = buffer.value
+    return buffer.value
 
 
 @dataclass(frozen=True)

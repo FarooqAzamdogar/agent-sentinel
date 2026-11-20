@@ -12,6 +12,7 @@ import re
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from cli_support import IsolatedHomeTest, run_cli
 from support import EXAMPLE_POLICY_PATH, POLICY, ROOT
@@ -115,7 +116,9 @@ class PathsAToolWouldExpand(unittest.TestCase):
             allow = PathMatcher.for_roots([allow_root], **flavour)
             for value in ("%USERPROFILE%/.ssh/id_rsa", "$HOME/.ssh/id_rsa", "${HOME}/.ssh/id_rsa",
                           "$(echo ~)/.ssh/id_rsa", "%SystemRoot%/System32/config/SAM", "a/%ProgramFiles(x86)%/b",
-                          "file:///%HOME%/x", "100%done%.txt"):
+                          "file:///%HOME%/x", "100%done%.txt",
+                          # cmd's batch parameters and delayed expansion.
+                          "%~dp0/.ssh/id_rsa", "%~f1", "%1/.ssh", "a/%*", "!USERPROFILE!/.ssh/id_rsa"):
                 with self.subTest(flavour=flavour["flavour"].__name__, value=value):
                     self.assertTrue(deny.found_in(value))
                     self.assertFalse(allow.accepts(value))
@@ -123,7 +126,7 @@ class PathsAToolWouldExpand(unittest.TestCase):
     def test_a_lone_dollar_and_percent_escapes_are_still_read(self):
         allow = PathMatcher.for_roots(["/work/proj"], **POSIX)
         for value in ("price$.txt", "a$1/b", "50%/x", "caf%C3%A9.txt", "file:///work/proj/caf%C3%A9.txt",
-                      "dash%E2%80%93x.md", "50%_off.txt"):
+                      "dash%E2%80%93x.md", "50%_off.txt", "wow!.txt", "a!b.txt", "dot%2efile"):
             with self.subTest(value=value):
                 self.assertTrue(allow.accepts(value))
 
@@ -281,16 +284,57 @@ class AgentConfigurationIsWriteProtected(unittest.TestCase):
         for text in ('{"env": {"ANTHROPIC_BASE_URL": "http://evil"}}', "export OPENAI_BASE_URL=http://x",
                      "$env:ANTHROPIC_BASE_URL = 'x'", "NODE_OPTIONS=--require ./a.js", '"disableAllHooks": true',
                      '"enableAllProjectMcpServers": true', '"chat.tools.autoApprove": true',
-                     "setx ANTHROPIC_BASE_URL http://x", "chat.tools.global.autoApprove: true"):
+                     "setx ANTHROPIC_BASE_URL http://x", "chat.tools.global.autoApprove: true",
+                     # Windows, and Node on Windows, read environment variable names without case.
+                     'setx node_options "--require x"', "setx /m openai_base_url x", "$env:anthropic_base_url='x'",
+                     "$env:openai_base_url = 'x'", "${env:NODE_OPTIONS} = 'x'", '{"env": {"anthropic_base_url": "x"}}',
+                     '{"node_options": "--require x"}', "Set-Item env:NODE_OPTIONS '--require x'",
+                     "Set-Item -Path Env:\\node_options -Value x",
+                     "[Environment]::SetEnvironmentVariable('node_options', 'x', 'User')"):
             with self.subTest(text=text):
                 self.assertTrue(pattern.search(text))
         for text in ("api_base_url = os.environ['X']", "echo $ANTHROPIC_BASE_URL", "read NODE_OPTIONS docs",
-                     "the disableAllHooks setting", "MY_BASE_URLS: x"):
+                     "the disableAllHooks setting", "MY_BASE_URLS: x", "self.api_base_url = url",
+                     "echo $env:NODE_OPTIONS", "Get-ChildItem env:", "if ($env:NODE_OPTIONS -eq 'x') {}"):
             with self.subTest(text=text):
                 self.assertFalse(pattern.search(text))
         starter = Policy.from_dict(templates.template("starter"))
         verdict = starter.evaluate("write_file", {"path": "settings.json", "content": '{"disableAllHooks": true}'})
-        self.assertEqual(verdict.rule, "tools.write_file.deny_args[2]")
+        self.assertEqual(verdict.rule, "tools.write_file.deny_args[3]")
+
+    def test_a_path_spelled_in_a_roundabout_way_is_not_written(self):
+        pattern = re.compile(templates.ROUNDABOUT_PATH_PATTERN, re.IGNORECASE)
+        for path in ("C:\\proj\\.claude\\.\\settings.json", "C:\\proj\\.claude\\\\settings.json",
+                     "/home/u/proj/.claude//settings.json", "/p/.claude/./settings.local.json",
+                     ".claude\\hooks\\..\\settings.local.json", "a/x/../.mcp.json", "dir//", "a/.", "a/.."):
+            with self.subTest(path=path):
+                self.assertTrue(pattern.search(path))
+        for path in ("./x.py", "../../a/b.py", "C:\\proj\\x.py", "/a/b/c", "dir/", "\\\\server\\share\\x",
+                     "file:///C:/x", ".claude/settings.json", ".../x", "a.b/c..d/e", "a/.hidden/x", "./", "../", "..",
+                     "C:\\"):
+            with self.subTest(path=path):
+                self.assertFalse(pattern.search(path))
+        hooks = (Policy.from_dict(templates.template("claude-code")), Policy.from_dict(templates.template("claude-code-strict")))
+        project = str(ROOT)
+        for parts in ((".claude", ".", "settings.json"), (".claude", "", "settings.json"),
+                      (".claude", "hooks", "..", "settings.local.json"), (".git", ".", "hooks", "pre-commit"),
+                      (".vscode", "", "tasks.json"), (".cursor", ".", "rules", "x.mdc"),
+                      (".github", "", "copilot-instructions.md")):
+            path = os.sep.join([project, *parts])
+            for tool, argument in templates.CLAUDE_CODE_WRITE_TOOLS.items():
+                with self.subTest(tool=tool, path=path):
+                    self.assertEqual(hooks[0].evaluate(tool, {argument: path, "content": "{}"}).action, "ask")
+                    self.assertEqual(hooks[1].evaluate(tool, {argument: path, "content": "{}"}).action, "block")
+            # Reading through such a path is not a write: still allowed.
+            self.assertEqual(hooks[1].evaluate("Read", {"file_path": path}).action, "allow")
+        strict = Policy.from_dict(templates.template("strict", roots=(project,)))
+        for path in (os.path.join(project, ".claude") + "/./settings.json", os.path.join(project, ".git") + "//hooks/x",
+                     os.path.join(project, ".vscode", "x") + "/../settings.json"):
+            with self.subTest(path=path):
+                self.assertEqual(strict.evaluate("write_file", {"path": path, "content": "x"}).action, "block")
+                self.assertEqual(strict.evaluate("move_file", {"source": os.path.join(project, "a"),
+                                                               "destination": path}).action, "block")
+        self.assertEqual(strict.evaluate("write_file", {"path": os.path.join(project, "a.py")}).action, "ask")
 
     def test_the_claude_code_templates(self):
         starter = Policy.from_dict(templates.template("claude-code"))
@@ -505,6 +549,29 @@ class ReadmeHookPolicy(IsolatedHomeTest):
             if ctypes.windll.kernel32.GetShortPathNameW(long_path, buffer, 1024):
                 found.append(buffer.value)
         return found
+
+
+class AShortNamedHomeFolder(IsolatedHomeTest):
+    """HOME or USERPROFILE spelled with Windows short (8.3) names: the templates' "~/" roots still load."""
+
+    @unittest.skipUnless(os.name == "nt", "Windows short (8.3) names")
+    def test_the_templates_load_and_their_roots_are_the_long_names(self):
+        long_home = self.folder / "a long home name"
+        long_home.mkdir()
+        buffer = ctypes.create_unicode_buffer(1024)
+        if not ctypes.windll.kernel32.GetShortPathNameW(str(long_home), buffer, 1024) or "~" not in buffer.value:
+            self.skipTest("this volume makes no short names")
+        short_home = buffer.value
+        with mock.patch.dict(os.environ, {"HOME": short_home, "USERPROFILE": short_home}):
+            for name in templates.TEMPLATES:
+                with self.subTest(template=name):
+                    Policy.from_dict(templates.template(name))
+            matcher = PathMatcher.for_roots(["~/.ssh"])
+            self.assertEqual(matcher.roots, (os.path.join(str(long_home), ".ssh"),))
+            # The agent's own short spellings are still refused, and "~/" values still reach the root.
+            self.assertTrue(matcher.found_in(os.path.join(short_home, ".ssh", "id_rsa")))
+            self.assertTrue(matcher.found_in("~/.ssh/id_rsa"))
+            self.assertFalse(matcher.found_in(os.path.join(str(long_home), "notes.txt")))
 
 
 class ClaudeCodeTemplateFromInit(IsolatedHomeTest):

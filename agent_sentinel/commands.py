@@ -8,14 +8,15 @@ says which of these classes the command line falls into:
 
     network       talks to another machine: curl, wget, nc, ssh, scp, rsync, ping, nslookup,
                   dig, Invoke-WebRequest, certutil -urlcache, git push/clone/fetch/pull, npm
-                  publish, gh ...
+                  publish, gh, a Bash /dev/tcp or /dev/udp redirection ...
     install       installs or runs code from a registry or the web: npm/pnpm/yarn install or
-                  add, pip install, uv pip install, npx, uvx, pipx run, a download piped to a
-                  shell, iex
+                  add, pip install, uv pip install, npx, uvx, pipx run, deno run <url>, a
+                  download piped to a shell, iex
     secret_read   names a credential file or an agent's configuration (cat .env, cat
                   ~/.aws/credentials), or prints the environment (env, printenv, set, Get-ChildItem env:)
     config_write  writes to such a file: a redirect (> or >>), tee, cp, mv, Set-Content,
-                  Out-File ... with an agent's configuration or a credential file as a target
+                  Out-File, [IO.File]::WriteAllText ... with an agent's configuration, a
+                  credential file or the PowerShell profile ($PROFILE) as a target
     obfuscation   hides what runs: base64 -d piped to a shell, powershell -EncodedCommand,
                   eval, iex, bash -c with a $( ) in its command
     encoded_host  a host name that carries data: a label of 32 or more characters, one that
@@ -24,25 +25,28 @@ says which of these classes the command line falls into:
 
 A command that cannot be read with certainty is "unreadable": an unclosed
 quote or $( ), a heredoc or here-string, ANSI-C quoting ($'...'), a program
-chosen at run time ($c args), more than MAX_SEGMENTS commands, more than
-MAX_COMMAND_CHARS characters, deeper nesting than MAX_DEPTH, or a control
-character. The policy decides what happens to it (see CommandRule).
+chosen at run time ($c args, PowerShell's & $c, & (...) and . (...)), a program
+name with a wildcard or a brace expansion (/???/cur?, {curl,x}), more than
+MAX_SEGMENTS commands, more than MAX_COMMAND_CHARS characters, deeper nesting
+than MAX_DEPTH, or a control character. The policy decides what happens to it
+(see CommandRule).
 
 This raises the bar; it is not a boundary. A shell can reach the same ends in
 ways no text reading follows: variables and aliases set earlier (c=curl in an
 earlier call), functions, scripts, python -c, node -e, Invoke-Expression of a
-string built at run time, globs (cat .e*), and programs this list does not
-name. Nothing here runs anything or touches the file system or the network.
+string built at run time, globs in arguments (cat .e*), and programs this list
+does not name. Nothing here runs anything or touches the file system or the network.
 """
 
 from __future__ import annotations
 
 import functools
+import posixpath
 import re
 from dataclasses import dataclass
 from typing import Any, Iterable, Iterator
 
-from .templates import AGENT_CONFIG_PATTERN, AGENT_SENTINEL_HOME_PATTERN, CREDENTIAL_PATTERN
+from .templates import AGENT_CONFIG_PATTERN, AGENT_SENTINEL_HOME_PATTERN, CREDENTIAL_PATTERN, ROUNDABOUT_PATH_PATTERN
 from .textutil import printable
 
 NETWORK = "network"
@@ -75,6 +79,8 @@ _READINGS_KEPT = 64  # read_command's cache
 # Stands for the output of a command substitution inside a word. A control
 # character, so it cannot come from the command itself (those are refused).
 _SUBST = "\x00"
+# Stands for a PowerShell ( ) group in an argument ("Set-Content ('x') y"), as a word of its own.
+_GROUP = "\x01"
 
 
 class Unreadable(Exception):
@@ -157,6 +163,11 @@ class _Command:
     pipeline: int  # commands of one pipeline share this number
     position: int  # place in the pipeline: 0 is the first
     written: str = ""  # the program's word as written
+    groups: tuple[str, ...] = ()  # PowerShell: the words of its ( ), $( ) and @( ) arguments
+
+
+# A segment of a pipeline: a simple command's text (quotes kept), and the texts of its PowerShell groups.
+_Segment = tuple[str, tuple[str, ...]]
 
 
 def _read(text: str, shell: str, budget: _Budget, depth: int) -> list[_Command]:
@@ -168,12 +179,22 @@ def _read(text: str, shell: str, budget: _Budget, depth: int) -> list[_Command]:
     commands: list[_Command] = []
     for pipeline in pipelines:
         number = budget.next_pipeline()
-        for position, segment in enumerate(pipeline):
+        for position, (segment, groups) in enumerate(pipeline):
             words, targets = _bash_words(segment) if shell == "bash" else _powershell_words(segment)
-            for command in _simple_commands(words, targets, shell, number, position):
+            for command in _simple_commands(words, targets, shell, number, position, _group_words(groups)):
                 commands.append(command)
                 commands.extend(_inner_commands(command, budget, depth))
     return commands
+
+
+def _group_words(groups: tuple[str, ...]) -> tuple[str, ...]:
+    """The words inside a command's PowerShell groups, split at commas and brackets too ('a','b' is a list)."""
+    found: list[str] = []
+    for body in groups:
+        words, targets = _powershell_words(body)
+        for word in (*words, *targets):
+            found.extend(part for part in re.split(r"[(),]+", word) if part)
+    return tuple(found)
 
 
 class _Splitter:
@@ -183,17 +204,29 @@ class _Splitter:
         self.text = text
         self.budget = budget
         self.depth = depth
-        self.pipelines: list[list[str]] = []
-        self.pipeline: list[str] = []
+        self.pipelines: list[list[_Segment]] = []
+        self.pipeline: list[_Segment] = []
         self.current: list[str] = []
+        self.groups: list[str] = []  # the current command's PowerShell group texts
+        self.last = ""  # the last character of the current command that is not a space ("" for none yet)
         self.open = 0  # "(" (and in PowerShell "{") not yet closed
+
+    def push(self, piece: str) -> None:
+        """Add text to the current command (keeping `last` up to date, so no check has to join it all)."""
+        self.current.append(piece)
+        visible = piece.rstrip()
+        if visible:
+            self.last = visible[-1]
 
     def end_command(self) -> None:
         segment = "".join(self.current).strip()
         self.current.clear()
+        self.last = ""
+        groups = tuple(self.groups)
+        self.groups.clear()
         if segment:
             self.budget.spend()
-            self.pipeline.append(segment)
+            self.pipeline.append((segment, groups))
 
     def end_pipeline(self) -> None:
         self.end_command()
@@ -204,10 +237,14 @@ class _Splitter:
     def at_word_start(self) -> bool:
         return not self.current or self.current[-1][-1:].isspace()
 
+    def ends_with_redirection(self) -> bool:
+        """True if the current command's text ends with ">" (so a "&" next is part of >& or 2>&1)."""
+        return bool(self.current) and self.current[-1].endswith(">")
+
     def nested(self, body: str, shell: str) -> None:
         """A command inside this one ($( ), backticks ...): its pipelines are read as pipelines of their own."""
         self.pipelines.extend(_nested_splitter(shell)(body, self.budget, self.depth + 1).split())
-        self.current.append(_SUBST)
+        self.push(_SUBST)
 
     def opened(self) -> None:
         self.open += 1
@@ -219,7 +256,7 @@ class _Splitter:
             raise Unreadable("a closing bracket has no opening one")
         self.end_pipeline()
 
-    def finish(self) -> list[list[str]]:
+    def finish(self) -> list[list[_Segment]]:
         if self.open:
             raise Unreadable("a bracket is not closed")
         self.end_pipeline()
@@ -240,7 +277,7 @@ class _BashSplitter(_Splitter):
             raise Unreadable("it nests commands more deeply than is followed")
         super().__init__(text, budget, depth)
 
-    def split(self) -> list[list[str]]:
+    def split(self) -> list[list[_Segment]]:
         text, i, n = self.text, 0, len(self.text)
         while i < n:
             c = text[i]
@@ -249,13 +286,13 @@ class _BashSplitter(_Splitter):
                 if not nxt:
                     raise Unreadable("it ends with a backslash")
                 if nxt != "\n":  # a backslash before a newline joins the lines
-                    self.current.append(text[i:i + 2])
+                    self.push(text[i:i + 2])
                 i += 2
             elif c == "'":
                 end = text.find("'", i + 1)
                 if end < 0:
                     raise Unreadable("a quote is not closed")
-                self.current.append(text[i:end + 1])
+                self.push(text[i:end + 1])
                 i = end + 1
             elif c == '"':
                 i = self.double_quoted(i)
@@ -291,8 +328,8 @@ class _BashSplitter(_Splitter):
                 if nxt == "&":
                     self.end_pipeline()
                     i += 2
-                elif nxt == ">" or "".join(self.current).endswith(">"):
-                    self.current.append(c)  # &> and >& are redirections
+                elif nxt == ">" or self.ends_with_redirection():
+                    self.push(c)  # &> and >& are redirections
                     i += 1
                 else:
                     self.end_pipeline()  # a command run in the background
@@ -304,7 +341,7 @@ class _BashSplitter(_Splitter):
                 self.closed()
                 i += 1
             else:
-                self.current.append(c)
+                self.push(c)
                 i += 1
         return self.finish()
 
@@ -319,7 +356,7 @@ class _BashSplitter(_Splitter):
                 i += 2
             elif c == '"':
                 parts.append('"')
-                self.current.append("".join(parts))
+                self.push("".join(parts))
                 return i + 1
             elif c == "$" and text[i + 1:i + 2] == "(":
                 body, i = _bash_closing_paren(text, i + 2, self.depth)
@@ -361,7 +398,7 @@ class _BashSplitter(_Splitter):
                 open_braces -= 1
                 if open_braces == 0:
                     parts.append("}")
-                    self.current.append("".join(parts))
+                    self.push("".join(parts))
                     return i + 1
             parts.append(c)
             i += 1
@@ -432,30 +469,48 @@ class _PowerShellSplitter(_Splitter):
     """Split a PowerShell command line into pipelines of simple commands.
 
     $( ), @( ), ( ) and { } blocks are read as commands of their own; so are
-    script blocks ({ ... } after ForEach-Object, Invoke-Command ...).
+    script blocks ({ ... } after ForEach-Object, Invoke-Command ...). A ( ),
+    $( ) or @( ) in an argument ("Set-Content ('.claude\\settings.json') x")
+    is also kept with the command it is in: its words are the command's
+    `groups`, and a ( ) leaves the word _GROUP in its place. The program
+    after the call operator & or a dot-source . must be a name: "& (gcm iwr)"
+    and ". (gcm iwr)" choose it when the command runs.
     """
 
     def __init__(self, text: str, budget: _Budget, depth: int) -> None:
         if depth > MAX_DEPTH:
             raise Unreadable("it nests commands more deeply than is followed")
         super().__init__(text, budget, depth)
+        self.calling = False  # the last thing seen was the call operator & or a dot-source "."
 
-    def split(self) -> list[list[str]]:
+    def end_command(self) -> None:
+        self.calling = False
+        super().end_command()
+
+    def at_statement_start(self) -> bool:
+        """True where a program name may come: nothing before it yet, or only an assignment ("$x = ")."""
+        return self.last in ("", "=")
+
+    def split(self) -> list[list[_Segment]]:
         text, i, n = self.text, 0, len(self.text)
         while i < n:
             c = text[i]
             nxt = text[i + 1:i + 2]
+            if self.calling and not c.isspace():
+                self.calling = False
+                if c == "(":
+                    raise Unreadable("the program is chosen when the command runs (& or . before a ( ) group)")
             if c == "`":  # PowerShell's escape character
                 if not nxt:
                     raise Unreadable("it ends with a backtick")
                 if nxt in "\r\n":  # a line continuation
                     i += 3 if text[i + 1:i + 3] == "\r\n" else 2
                 else:
-                    self.current.append(text[i:i + 2])
+                    self.push(text[i:i + 2])
                     i += 2
             elif c == "'":
                 end = _powershell_single_quote_end(text, i)
-                self.current.append(text[i:end])
+                self.push(text[i:end])
                 i = end
             elif c == '"':
                 i = self.double_quoted(i)
@@ -464,6 +519,7 @@ class _PowerShellSplitter(_Splitter):
             elif c in "$@" and nxt == "(":
                 body, i = _powershell_closing(text, i + 2, self.depth)
                 self.nested(body, "powershell")
+                self.groups.append(body)
             elif c == "<" and nxt == "#":
                 end = text.find("#>", i + 2)
                 if end < 0:
@@ -486,12 +542,26 @@ class _PowerShellSplitter(_Splitter):
                 if nxt == "&":
                     self.end_pipeline()
                     i += 2
-                elif not "".join(self.current).strip() or "".join(self.current).endswith(">"):
-                    self.current.append(c)  # the call operator, or part of 2>&1
+                elif self.ends_with_redirection():
+                    self.push(c)  # part of 2>&1
+                    i += 1
+                elif self.at_statement_start():
+                    self.push("& ")  # the call operator, a word of its own even in &"curl" or &iwr
+                    self.calling = True
                     i += 1
                 else:
                     self.end_pipeline()  # a background job
                     i += 1
+            elif c == "." and self.at_statement_start() and nxt[:1].isspace():
+                self.push(c)  # dot-sourcing: ". iwr x" runs iwr
+                self.calling = True
+                i += 1
+            elif c == "(" and not self.at_statement_start():
+                # A group in an argument: read as commands, and its words kept with this command.
+                body, i = _powershell_closing(text, i + 1, self.depth)
+                self.pipelines.extend(_PowerShellSplitter(body, self.budget, self.depth + 1).split())
+                self.groups.append(body)
+                self.push(f" {_GROUP} ")
             elif c in "({":
                 self.opened()
                 i += 1
@@ -499,7 +569,7 @@ class _PowerShellSplitter(_Splitter):
                 self.closed()
                 i += 1
             else:
-                self.current.append(c)
+                self.push(c)
                 i += 1
         return self.finish()
 
@@ -517,11 +587,12 @@ class _PowerShellSplitter(_Splitter):
                     i += 2
                     continue
                 parts.append('"')
-                self.current.append("".join(parts))
+                self.push("".join(parts))
                 return i + 1
             elif c == "$" and text[i + 1:i + 2] == "(":
                 body, i = _powershell_closing(text, i + 2, self.depth)
                 self.nested(body, "powershell")
+                self.groups.append(body)
                 parts.append(self.current.pop())
             else:
                 parts.append(c)
@@ -675,7 +746,8 @@ def _powershell_words(segment: str) -> tuple[list[str], list[str]]:
 # ---- simple commands -----------------------------------------------------------------------
 
 # Words that start a Bash compound command or a group, and come before its first program.
-_KEYWORDS = frozenset({"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "{", "}", "!", "time",
+# ("time" is a wrapper below, so that its option -p is not taken for the program.)
+_KEYWORDS = frozenset({"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "{", "}", "!",
                        "coproc", "[[", "]]", "function"})
 # Commands whose words are not a program to run: a loop header lists values.
 _HEADERS = frozenset({"for", "select", "case", "in", "esac"})
@@ -700,52 +772,97 @@ _WRAPPERS: dict[str, frozenset[str]] = {
     "unbuffer": frozenset(),
     "strace": frozenset({"-o", "-e", "-p", "-s"}),
     "watch": frozenset({"-n", "-d", "--interval"}),
+    "busybox": frozenset(),  # busybox wget ...
+    "corepack": frozenset(),  # corepack pnpm add ...
+    "chroot": frozenset({"--userspec", "--groups"}),  # then the new root folder
+    "flock": frozenset({"-w", "--wait", "--timeout", "-E", "--conflict-exit-code"}),  # then the lock file
+    "parallel": frozenset({"-j", "--jobs", "-S", "--sshlogin", "-a", "--arg-file", "--delay", "-n", "-N",
+                           "--max-args", "-I", "--timeout", "--joblog", "--results", "-d", "--delimiter", "-E"}),
     "&": frozenset(),  # PowerShell's call operator
+    ".": frozenset(),  # PowerShell's dot-sourcing (only there: in Bash "." reads a script file)
     "call": frozenset(),  # cmd
     "start": frozenset(),  # cmd
     "start-process": frozenset({"-argumentlist", "-workingdirectory", "-verb", "-windowstyle", "-credential",
                                 "-redirectstandardoutput", "-redirectstandardinput", "-redirectstandarderror"}),
     "saps": frozenset({"-argumentlist", "-workingdirectory", "-verb", "-windowstyle"}),
 }
+# Wrappers followed by one word that is not the program: timeout's duration, chroot's root, flock's lock file.
+_WRAPPERS_WITH_A_VALUE = frozenset({"timeout", "chroot", "flock"})
 _STRIPPED_EXTENSIONS = (".exe", ".cmd", ".bat", ".ps1")
+# What makes Bash expand a program's name into another one: *, ?, {a,b} or {a..b}; and [...], which
+# _check_program_word looks for without a pattern (a pattern would scan the rest of the word from every "[").
+_BASH_PATTERN = re.compile(r"[*?]|\{[^{}]*(,|\.\.)[^{}]*\}")
 
 
 def _program_name(word: str) -> str:
     """The program a word names: its last path part, lowercased, without .exe/.cmd/.bat/.ps1."""
-    name = re.split(r"[\\/]", word)[-1].lower()
+    name = _last_part(word).lower()
     for extension in _STRIPPED_EXTENSIONS:
         if name.endswith(extension) and len(name) > len(extension):
             return name[:-len(extension)]
     return name
 
 
+def _last_part(word: str) -> str:
+    return re.split(r"[\\/]", word)[-1]
+
+
 def _runtime_chosen(word: str) -> bool:
-    """True if the word that names the program holds a variable or a command's output."""
-    return _SUBST in word or "$" in word or "`" in word
+    """True if the word that names the program holds a variable, a command's output or a ( ) group."""
+    return _SUBST in word or _GROUP in word or "$" in word or "`" in word
+
+
+def _check_program_word(word: str, shell: str) -> None:
+    """Refuse (Unreadable) a program word whose program is only known when the command runs.
+
+    A word with spaces in it was quoted: a path with spaces ("C:\\Program
+    Files\\x\\curl.exe"), or a command text that env -S, watch and the like
+    run, which _inner_commands reads as a command line too. Its folders may hold
+    a variable ("$DIR/tool"), but not its last part; quoted, it holds no wildcards.
+    """
+    if any(ch.isspace() for ch in word):
+        if _runtime_chosen(_last_part(word)):
+            raise Unreadable("the program is chosen when the command runs (a variable or a command's output)")
+        return
+    if _runtime_chosen(word):
+        raise Unreadable("the program is chosen when the command runs (a variable or a command's output)")
+    if shell == "powershell":
+        wildcard = "*" in word or "?" in word and word != "?"  # "?" alone is Where-Object
+    else:
+        bracket = word.find("[")
+        wildcard = bool(_BASH_PATTERN.search(word)) or bracket >= 0 and word.find("]", bracket + 1) > 0
+    if wildcard:
+        # /???/cur? and {curl,x} are curl to the shell.
+        raise Unreadable("the program's name holds a wildcard or a brace expansion, which the shell expands")
 
 
 def _simple_commands(words: list[str], targets: list[str], shell: str, pipeline: int,
-                     position: int) -> list[_Command]:
+                     position: int, groups: tuple[str, ...] = ()) -> list[_Command]:
     """The command (or commands) one segment runs: assignments, keywords and wrappers peeled off."""
     rest = list(words)
     if shell == "powershell":
         rest = _powershell_statement(rest)
     while rest and (_ASSIGNMENT.match(rest[0]) and shell == "bash" or rest[0] in _KEYWORDS):
         rest.pop(0)
+        if shell == "powershell" and rest and rest[0] == _GROUP:
+            rest.pop(0)  # the condition of if ( ... ) or while ( ... ), read as commands of its own
+
+    def command(program: str, after: list[str], written: str = "") -> _Command:
+        return _Command(program, tuple(after), tuple(targets), shell, pipeline, position, written, groups)
+
     if not rest:
-        return [_Command("", (), tuple(targets), shell, pipeline, position)] if targets else []
+        return [command("", [])] if targets or groups else []
     if rest[0] in _HEADERS:
-        return [_Command("", tuple(rest[1:]), tuple(targets), shell, pipeline, position)]
+        return [command("", rest[1:])]
     peeled = 0
     while rest:
         word = rest[0]
-        if shell == "powershell" and peeled == 0 and word[:1] in ("$", "[", "@"):
-            # An expression ($x.Method(), [Type]::Call()), not a program to run.
-            return [_Command("", tuple(rest), tuple(targets), shell, pipeline, position)]
-        if _runtime_chosen(word):
-            raise Unreadable("the program is chosen when the command runs (a variable or a command's output)")
+        if shell == "powershell" and peeled == 0 and (word[:1] in ("$", "[", "@") or word == _GROUP):
+            # An expression ($x.Method(), [Type]::Call(), (...).Length), not a program to run.
+            return [command("", rest)]
+        _check_program_word(word, shell)
         name = _program_name(word)
-        if name not in _WRAPPERS or peeled >= _MAX_WRAPPERS:
+        if name not in _WRAPPERS or peeled >= _MAX_WRAPPERS or (name == "." and shell != "powershell"):
             break
         after = _after_wrapper(name, rest[1:])
         if after is None:  # "env" alone, "command -v curl": the wrapper is the program
@@ -754,8 +871,7 @@ def _simple_commands(words: list[str], targets: list[str], shell: str, pipeline:
         peeled += 1
     if not rest:
         return []
-    program = _program_name(rest[0])
-    return [_Command(program, tuple(rest[1:]), tuple(targets), shell, pipeline, position, rest[0])]
+    return [command(_program_name(rest[0]), rest[1:], rest[0])]
 
 
 def _powershell_statement(words: list[str]) -> list[str]:
@@ -768,7 +884,11 @@ def _powershell_statement(words: list[str]) -> list[str]:
 
 
 def _after_wrapper(name: str, words: list[str]) -> list[str] | None:
-    """The words from the wrapped program on, or None when the wrapper runs nothing itself."""
+    """The words from the wrapped program on, or None when the wrapper runs nothing itself.
+
+    env -S 'curl x' and flock f -c 'curl x' give a command text as one word: it
+    becomes the program word, which _inner_commands reads as a command line.
+    """
     takes_value = _WRAPPERS[name]
     if name == "command" and words and words[0] in ("-v", "-V"):
         return None
@@ -778,22 +898,30 @@ def _after_wrapper(name: str, words: list[str]) -> list[str] | None:
         lowered = word.lower()
         if name == "env" and _ASSIGNMENT.match(word):
             i += 1
+        elif name == "env" and (word in ("-S", "--split-string") or word.startswith(("-S", "--split-string="))):
+            # env -S 'curl x' splits the text into the program and its words.
+            if word in ("-S", "--split-string"):
+                return words[i + 1:] or None
+            return [word[2:] if word.startswith("-S") else word.partition("=")[2], *words[i + 1:]]
         elif lowered.startswith("-") and lowered != "-":
             if name in ("start-process", "saps") and "-filepath".startswith(lowered) and len(lowered) > 1:
                 return words[i + 1:] or None
             i += 2 if lowered in takes_value else 1
         else:
             break
-    if name == "timeout" and i < len(words):
-        i += 1  # the duration
+    if name in _WRAPPERS_WITH_A_VALUE and i < len(words):
+        i += 1  # the duration, the new root or the lock file
+    if name == "flock" and words[i:i + 1] and words[i] in ("-c", "--command"):
+        return words[i + 1:i + 2] or None  # flock f -c 'curl x'
     return words[i:] or None
 
 
 def _inner_commands(command: _Command, budget: _Budget, depth: int) -> Iterator[_Command]:
     """Commands that this one runs from its words: bash -c, pwsh -Command, cmd /c, find -exec, a quoted program."""
     program, words = command.program, list(command.words)
+    quoted_text = any(ch.isspace() for ch in command.written)
     if depth + 1 > MAX_DEPTH:
-        if _shell_script(program, words) is not None or program == "find" or " " in command.written:
+        if _shell_script(program, words) is not None or program == "find" or quoted_text:
             raise Unreadable("it nests commands more deeply than is followed")
         return
     script = _shell_script(program, words)
@@ -814,13 +942,24 @@ def _inner_commands(command: _Command, budget: _Budget, depth: int) -> Iterator[
                 for found in _simple_commands(inner, [], command.shell, budget.next_pipeline(), 0):
                     yield found
                     yield from _inner_commands(found, budget, depth + 1)
-    written = command.written.strip()
-    if " " in written and not re.search(r"[\\/]", written):
-        # A quoted command as the program ("watch 'curl x'"): read it as a command line.
-        yield from _read(" ".join([written, *words]), command.shell, budget, depth + 1)
+    if quoted_text:
+        # A quoted program word with spaces: "C:\Program Files\x\curl.exe" (read above by its last part), or a
+        # command text ("watch -n1 'curl https://x'", "env -S 'curl x'"), so it is read as a command line too,
+        # with the words after it kept as they were.
+        line = " ".join([command.written, *(_quoted(word, command.shell) for word in words)])
+        yield from _read(line, command.shell, budget, depth + 1)
+
+
+def _quoted(word: str, shell: str) -> str:
+    """A word quoted so that the shell reads it back as the same single word."""
+    if shell == "powershell":
+        return "'" + word.replace("'", "''") + "'"
+    return "'" + word.replace("'", "'\\''") + "'"
 
 
 _POSIX_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "fish", "csh", "tcsh"})
+# Programs that run the command text after -c (or --command) with a shell: su -c 'x', script -qc 'x'.
+_DASH_C_RUNNERS = frozenset({"su", "runuser", "script", "sg"})
 _POWERSHELLS = frozenset({"powershell", "pwsh"})
 # powershell.exe and pwsh options (and the short forms people use) that take a value.
 _POWERSHELL_OPTIONS_WITH_VALUE = frozenset({
@@ -838,6 +977,14 @@ def _shell_script(program: str, words: list[str]) -> tuple[str, str] | None:
                 return (words[index + 1], "bash") if index + 1 < len(words) else None
             if not word.startswith("-"):
                 return None  # a script file
+        return None
+    if program in _DASH_C_RUNNERS:
+        # The -c may come after a user or group name (su root -c x, sg staff -c x), so every word is looked at.
+        for index, word in enumerate(words):
+            if word.startswith("--command="):
+                return word.partition("=")[2], "bash"
+            if word == "--command" or re.fullmatch(r"-[a-zA-Z]*c", word):
+                return (words[index + 1], "bash") if index + 1 < len(words) else None
         return None
     if program in _POWERSHELLS:
         skip = False
@@ -911,11 +1058,28 @@ _RUNNERS = frozenset({"npx", "pnpx", "bunx", "uvx", "iex", "invoke-expression", 
                       "install-script"})
 _PYTHONS = re.compile(r"(python|py)([0-9.]*|w)")
 _PIPS = re.compile(r"pip[0-9.]*")
+# python -m <module> for these runs that package manager.
+_PYTHON_PACKAGE_MODULES = re.compile(r"(pip[0-9.]*|pipx|uv)")
+# deno subcommands that run or install code; run, compile and cache count when they name a remote module.
+_DENO_INSTALL = frozenset({"install", "i", "add", "x"})
+_DENO_RUN = frozenset({"run", "compile", "cache", "bundle", "test", "eval"})
+_REMOTE_MODULE = re.compile(r"(https?|npm|jsr):", re.IGNORECASE)
 _PROGRAM_WRITERS = frozenset({
     "tee", "cp", "mv", "ln", "install", "touch", "truncate", "rm", "unlink", "dd", "chmod", "chown", "rsync",
     "set-content", "sc", "add-content", "ac", "out-file", "new-item", "ni", "copy-item", "copy", "cpi", "move-item",
     "move", "mi", "remove-item", "ri", "del", "erase", "rename-item", "ren", "rni", "set-itemproperty",
+    "tee-object", "export-csv", "export-clixml", "xcopy", "robocopy",
 })
+# .NET file writes in PowerShell words: [IO.File]::WriteAllText(...), [IO.File]::Copy(...), a StreamWriter.
+_DOTNET_WRITE = re.compile(
+    r"::(write\w*|append\w*|create\w*|copy|move|replace|open|openwrite)\b|streamwriter|filestream",
+    re.IGNORECASE,
+)
+# The PowerShell profile, which PowerShell runs at every start: $PROFILE, $PROFILE.CurrentUserAllHosts ...
+_PROFILE_VARIABLE = re.compile(r"\$\{?profile\b", re.IGNORECASE)
+# Bash opens a network connection for a redirection to /dev/tcp/<host>/<port> or /dev/udp/<host>/<port>.
+_DEV_SOCKET = re.compile(r"(?:^|[<>&])/dev/(?:tcp|udp)/([^/\s]*)")
+_ROUNDABOUT_PATH = re.compile(ROUNDABOUT_PATH_PATTERN)
 _IN_PLACE_EDITORS = frozenset({"sed", "perl", "ruby"})
 _ENV_LISTERS = frozenset({"get-childitem", "gci", "dir", "ls", "get-item", "gi", "get-content", "gc", "cat", "type"})
 _DECODERS = frozenset({"base64", "openssl", "xxd", "certutil"})
@@ -1009,6 +1173,9 @@ def _network(command: _Command, earlier: list[_Command]) -> str | None:
             return f"'git {' '.join(positional[:2])}'"
     if program in ("npm", "pnpm", "yarn") and _subcommand(words) in ("publish", "unpublish"):
         return f"'{program} {_subcommand(words)}'"
+    for word in (*words, *command.targets):
+        if _DEV_SOCKET.search(word):
+            return f"a connection through '{word}'"
     if command.shell == "powershell":
         for word in (program, *words):
             if _DOTNET_NETWORK.search(word):
@@ -1021,13 +1188,36 @@ def _subcommand(words: Iterable[str]) -> str:
     return positional[0].lower() if positional else ""
 
 
+def _python_module(words: list[str]) -> tuple[str, list[str]] | None:
+    """The module of "python [options] -m <module> ..." (py -3 -m pip, python -I -m pip), and the words after it."""
+    i = 0
+    while i < len(words):
+        word = words[i]
+        found = re.fullmatch(r"-[A-Za-z]*m(.*)", word) if not word.startswith("--") else None
+        if found:
+            if found.group(1):
+                return found.group(1).lower(), words[i + 1:]  # -mpip
+            return (words[i + 1].lower(), words[i + 2:]) if i + 1 < len(words) else None
+        if word.startswith("-c") or not word.startswith("-") or word == "-":
+            return None  # inline code, a script or stdin: no module
+        i += 2 if word in ("-W", "-X", "--check-hash-based-pycs") else 1
+    return None
+
+
 def _install(command: _Command, earlier: list[_Command]) -> str | None:
     program, words = command.program, list(command.words)
     if program in _RUNNERS:
         return f"program '{program}'"
     name = "pip" if _PIPS.fullmatch(program) else program
-    if _PYTHONS.fullmatch(program) and words[:2] == ["-m", "pip"]:
-        name, words = "pip", words[2:]
+    module = _python_module(words) if _PYTHONS.fullmatch(program) else None
+    if module and _PYTHON_PACKAGE_MODULES.fullmatch(module[0]):
+        name, words = ("pip" if module[0].startswith("pip") and module[0] != "pipx" else module[0]), module[1]
+        program = name
+    if program == "deno":
+        positional = _positional(words)
+        sub = positional[0].lower() if positional else ""
+        if sub in _DENO_INSTALL or sub in _DENO_RUN and any(_REMOTE_MODULE.match(word) for word in positional[1:]):
+            return f"'deno {sub}'"
     if name in _PACKAGE_INSTALL:
         sub = _subcommand(words)
         if sub in _PACKAGE_INSTALL[name] or (name == "yarn" and sub in ("", "global")):
@@ -1043,9 +1233,28 @@ def _install(command: _Command, earlier: list[_Command]) -> str | None:
     return None
 
 
+def _spellings(word: str) -> Iterator[str]:
+    """A word, and what a file check must also see in it: its comma-separated parts (a PowerShell list,
+    'a','b') and the plain form of a path written in a roundabout way (.claude/./settings.json)."""
+    yield word
+    parts = [part for part in word.split(",") if part] if "," in word else [word]
+    for part in parts:
+        if part is not word:
+            yield part
+        if _ROUNDABOUT_PATH.search(part):
+            yield posixpath.normpath(part.replace("\\", "/"))
+
+
+def _named_files(command: _Command) -> Iterator[str]:
+    """Every word of a command that may name a file it reads: the program's own word, its words, its
+    redirections and the words of its PowerShell groups."""
+    for word in (command.written, *command.words, *command.targets, *command.groups):
+        yield from _spellings(word)
+
+
 def _secret_read(command: _Command, earlier: list[_Command]) -> str | None:
     program, words = command.program, command.words
-    for word in (*words, *command.targets):
+    for word in _named_files(command):
         if _SECRET_WORD.search(word):
             return f"word '{word}'"
     positional = _positional(words)
@@ -1067,17 +1276,36 @@ def _secret_read(command: _Command, earlier: list[_Command]) -> str | None:
     return None
 
 
+def _protected(word: str) -> bool:
+    """True if a word a command writes to names an agent's configuration, a credential file or $PROFILE."""
+    return any(_PROTECTED_TARGET.search(spelling) or _PROFILE_VARIABLE.match(spelling)
+               for spelling in _spellings(word))
+
+
+def _write_targets(words: Iterable[str]) -> Iterator[str]:
+    """The words a writing program may write to: those that are not options, and the values of options
+    written with them (--target-directory=x, -Destination:x)."""
+    for word in words:
+        if word.startswith("-") and word != "-":
+            value = re.split(r"[=:]", word, maxsplit=1)[1:]
+            if value and value[0]:
+                yield value[0]
+        else:
+            yield word
+
+
 def _config_write(command: _Command, earlier: list[_Command]) -> str | None:
     for target in command.targets:
-        if _PROTECTED_TARGET.search(target):
+        if _protected(target):
             return f"a redirection to '{target}'"
     program, words = command.program, command.words
     writes = program in _PROGRAM_WRITERS or (
-        program in _IN_PLACE_EDITORS and any(word.startswith(("-i", "--in-place", "-pi")) for word in words))
+        program in _IN_PLACE_EDITORS and any(word.startswith(("-i", "--in-place", "-pi")) for word in words)) or (
+        command.shell == "powershell" and any(_DOTNET_WRITE.search(word) for word in (command.written, *words)))
     if writes:
-        for word in _positional(words):
-            if _PROTECTED_TARGET.search(word):
-                return f"program '{program}' with '{word}'"
+        for word in (*_write_targets(words), *command.groups):
+            if _protected(word):
+                return f"program '{program or command.written}' with '{word}'"
     return None
 
 
@@ -1120,13 +1348,14 @@ def _decodes(command: _Command) -> bool:
 
 def _encoded_host(command: _Command) -> str | None:
     """A host name in a network command's words that looks like it carries data."""
-    for word in command.words:
+    for word in (*command.words, *command.targets):
         if word.startswith("-"):
             word = word.partition("=")[2]
             if not word:
                 continue
+        socket = _DEV_SOCKET.search(word)
         found = _URL_HOST.match(word)
-        host = found.group(1) if found else None
+        host = socket.group(1) if socket else found.group(1) if found else None
         if host is None:
             bare = _BARE_HOST.fullmatch(word)
             host = bare.group(1) if bare else None
