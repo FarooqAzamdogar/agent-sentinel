@@ -150,6 +150,19 @@ A list that comes in pages (nextCursor) is scanned across the boundary of
 two pages as well (_checked_page_boundary): the end of the page before is
 read with the start of the next.
 
+With --pin-server the server itself is pinned too (pins.py, "The server
+itself"): how it is launched, before it starts, and the serverInfo of its
+handshake. A server that differs from its pin is not started, or its
+handshake is refused (--on-server-change refuse, the default); with
+--on-server-change quarantine it runs quarantined (quarantine_server): every
+tool, prompt, resource and resource template is left out of its lists; its
+instructions are removed and never pinned; tool calls, prompts, resource
+reads, subscriptions (subscriptions/listen too), completions and any other
+request but the handshake, ping, the lists and logging/setLevel are
+refused; every request it sends the client (sampling, elicitation, roots;
+not ping) is refused, and every notification it sends but
+notifications/cancelled is dropped. Monitor mode logs the change only.
+
 Requests other than tool calls
 ------------------------------
 The policy's client_requests section may refuse any other method the client
@@ -242,9 +255,10 @@ from .firewall import (
     secret_rule,
 )
 from .jsonutil import finite_float, no_constant
+from .launch import launch_identity
 from .leaks import Found
 from .mcp_protocol import ShapeError
-from .pins import CHANGED, FULL, KIND_WORDS, PINNED_LISTS, ToolPins, definition_of, fingerprint
+from .pins import CHANGED, FULL, KIND_WORDS, NEW, PINNED_LISTS, ToolPins, definition_of, fingerprint, server_info_value
 from .policy import (
     PROMPTS_GET,
     RULE_CALL_TIMEOUT,
@@ -328,6 +342,14 @@ _LIST_ITEMS_KEY = {
     "resources/list": "resources",
     "resources/templates/list": "resourceTemplates",
 }
+# What a client may still ask of a server quarantined for differing from its pin (Proxy.quarantine_server): the
+# handshake, ping, the lists (every entry is removed) and the log level. The other requests are refused.
+_ASKED_OF_A_QUARANTINED_SERVER = frozenset({
+    protocol.INITIALIZE, protocol.SERVER_DISCOVER, "ping", *_LIST_ITEMS_KEY, "logging/setLevel",
+})
+# What such a server may still tell the client: that it cancelled a request of its own. Its other
+# notifications (log messages, progress, list changes, resource updates) are dropped.
+_TOLD_BY_A_QUARANTINED_SERVER = frozenset({"notifications/cancelled"})
 # One entry of each list, as audit events name it ("tool_changed", "prompt_lookalike", ...).
 _ENTRY_NAME = {"tools": "tool", "prompts": "prompt", "resources": "resource", "resourceTemplates": "resource_template"}
 # The lists whose names are what the client calls or fetches by: they follow the
@@ -344,6 +366,11 @@ TOOL_NAMES_STRICT = "strict"  # removed and quarantined
 TOOL_NAMES_WARN = "warn"  # kept, and reported on stderr and in the audit log (the default)
 TOOL_NAMES_OFF = "off"  # neither the naming rules nor look-alikes are checked
 TOOL_NAME_MODES = (TOOL_NAMES_STRICT, TOOL_NAMES_WARN, TOOL_NAMES_OFF)
+
+# proxy --on-server-change, with --pin-server: what happens when the server differs from its pin (pins.py).
+SERVER_CHANGE_REFUSE = "refuse"  # the proxy does not start (a changed launch) or refuses the handshake (serverInfo)
+SERVER_CHANGE_QUARANTINE = "quarantine"  # it starts, with every tool, prompt and resource template quarantined
+SERVER_CHANGE_MODES = (SERVER_CHANGE_REFUSE, SERVER_CHANGE_QUARANTINE)
 
 JsonObject = dict[str, Any]
 # What the boundary scan keeps of one entry of a list (_boundary_view): (member path, text) pairs, in the entry's order.
@@ -817,9 +844,14 @@ class Proxy:
         approvers: Sequence[ApprovalBackend] = (),
         approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT,
         report: str = proxy_report.NORMAL,
+        pin_server: bool = False,
+        on_server_change: str = SERVER_CHANGE_REFUSE,
     ) -> None:
         """
         pins:              the pins of this server (pins.ToolPins); default: kept in memory only.
+        pin_server:        compare the serverInfo of each handshake with the server's pin (proxy --pin-server).
+        on_server_change:  when it differs: SERVER_CHANGE_REFUSE refuses the handshake, SERVER_CHANGE_QUARANTINE
+                           lets it through; either way every tool, prompt and template is quarantined.
         tool_names:        what to do with a tool or prompt whose name breaks the MCP naming
                            rules: TOOL_NAMES_STRICT, TOOL_NAMES_WARN (the default) or TOOL_NAMES_OFF.
         elicitation_hosts: the hosts a URL-mode elicitation may send the user to (proxy
@@ -839,6 +871,12 @@ class Proxy:
             raise ValueError(f"approval_timeout must be more than 0 and at most {MAX_APPROVAL_TIMEOUT} seconds")
         if type(max_message_bytes) is not int or not 1 <= max_message_bytes <= MAX_MAX_MESSAGE_BYTES:
             raise ValueError(f"max_message_bytes must be a whole number from 1 to {MAX_MAX_MESSAGE_BYTES}")
+        if on_server_change not in SERVER_CHANGE_MODES:
+            raise ValueError(f"on_server_change must be one of {', '.join(SERVER_CHANGE_MODES)}")
+        self._pin_server = pin_server
+        self._on_server_change = on_server_change
+        # Why the whole server is quarantined (its pin changed: quarantine_server), or None. Guarded by `_state`.
+        self._server_quarantine: str | None = None
         self._firewall = firewall
         self._client_out = client_out
         self._server_in = server_in
@@ -1072,7 +1110,26 @@ class Proxy:
             return self._refuse_task_request(message)
         if method == "notifications/cancelled" and self._forget_cancelled_request(message):
             return _DROP  # it cancelled a call held for approval, which the server never saw
+        refused = self._refused_by_server_quarantine(message)
+        if refused is not None:
+            return refused
         return self._forward_request(message, label=_label(method))
+
+    def _refused_by_server_quarantine(self, message: JsonObject) -> _Outcome | None:
+        """Refuse a request a quarantined server (quarantine_server) may not answer; None when it may go on.
+
+        Such a server serves nothing: the client may still open the session,
+        ping it and list (every entry is removed), and set its log level. Any
+        other request, completion/complete for one, would bring the server's
+        answer to the client. Notifications get no answer, so they pass.
+        """
+        quarantined = self._whole_server_quarantined()
+        if quarantined is None or "id" not in message or message["method"] in _ASKED_OF_A_QUARANTINED_SERVER:
+            return None
+        method = message["method"]
+        reason = f"the whole server is quarantined: {quarantined}"
+        return self._refused(message, self._firewall.refuse(_label(method), reason, event="client_request",
+                                                            rule=RULE_QUARANTINE))
 
     def _refuse_batch(self, batch: list[Any]) -> _Outcome:
         # MCP no longer uses JSON-RPC batches. Refusing them keeps every
@@ -1403,18 +1460,28 @@ class Proxy:
     def _check_resource_request(self, message: JsonObject) -> _Outcome:
         """resources/read and resources/subscribe both ask the server to open a URI.
 
-        A URI that a quarantined resource template may produce is refused
-        first (_template_refusal), as a call to a quarantined tool is.
+        Any URI of a server quarantined for differing from its pin, and a URI
+        that a quarantined resource template may produce, is refused first
+        (_quarantined_read), as a call to a quarantined tool is.
         """
         params = message.get("params")
         uri = params.get("uri") if isinstance(params, dict) else None
         if not isinstance(uri, str) or not uri:
             decision = self._refusal(RESOURCE_READ, f"malformed {message['method']} request: missing uri")
             return self._forward_or_refuse(message, decision, label=RESOURCE_READ)
-        refusal = self._template_refusal(uri)
+        refusal = self._quarantined_read(uri)
         if refusal is not None:
             return self._forward_or_refuse(message, refusal, label=_label(uri))
         return self._check_policy(message, RESOURCE_READ, {"uri": uri}, label=_label(uri))
+
+    def _quarantined_read(self, uri: str, call_id: str | None = None) -> Decision | None:
+        """The refusal of a read of `uri` for a quarantine, or None: first a server that differs from its pin
+        (--pin-server: it serves nothing), then a quarantined resource template that may produce the URI."""
+        quarantined = self._whole_server_quarantined()
+        if quarantined is not None:
+            return self._refusal(_label(uri), f"the whole server is quarantined: {quarantined}", RULE_QUARANTINE,
+                                 call_id=call_id)
+        return self._template_refusal(uri, call_id)
 
     def _template_refusal(self, uri: str, call_id: str | None = None) -> Decision | None:
         """The refusal of a read of `uri` when a quarantined resource template may produce it, or None."""
@@ -1474,12 +1541,17 @@ class Proxy:
 
         Each resource URI it subscribes to is checked as a read of that URI,
         and one refusal refuses the whole request. The list-changed filters
-        ask only for notifications, which are scanned when they come.
+        ask only for notifications, which are scanned when they come. A
+        quarantined server (quarantine_server) is listened to for nothing.
         """
         try:
             uris = protocol.subscribed_uris(message.get("params"))
         except ShapeError as exc:
             return self._refuse_malformed_request(message, str(exc))
+        quarantined = self._whole_server_quarantined()
+        if quarantined is not None:  # a server that differs from its pin serves nothing (--pin-server)
+            reason = f"the whole server is quarantined: {quarantined}"
+            return self._refused(message, self._refusal(protocol.SUBSCRIPTIONS_LISTEN, reason, RULE_QUARANTINE))
         for uri in uris:
             decision = self._template_refusal(uri)  # a Decision is false when it refuses: compare with None
             if decision is None:
@@ -1724,10 +1796,11 @@ class Proxy:
         return self._forward_request(message, waiting.label, marks=self._marks_of(message), call_id=final.call_id)
 
     def _removed_while_waiting(self, message: JsonObject, label: str, call_id: str | None) -> Decision | None:
-        """The refusal of an approved call whose tool, prompt or resource template was quarantined while it waited."""
+        """The refusal of an approved call whose tool, prompt, resource template or whole server (--pin-server)
+        was quarantined while it waited."""
         method, params = message["method"], message["params"]
         if method in _RESOURCE_METHODS:
-            return self._template_refusal(params["uri"], call_id)
+            return self._quarantined_read(params["uri"], call_id)
         if method == "tools/call":
             if not self._wait_for_tool_lists():
                 reason = "timed out waiting for the tool list to be checked"
@@ -1935,14 +2008,35 @@ class Proxy:
     def _is_quarantined(self, tool: str) -> bool:
         """Whether a call to this tool must be refused because the tool cannot be vouched for."""
         with self._state:
-            # No tool can be vouched for if more were quarantined than can be
-            # remembered, or if the last tool list could not be checked at all.
-            return self._quarantine_overflowed or self._tools_unverified or tool in self._quarantined["tools"]
+            # No tool can be vouched for if more were quarantined than can be remembered, if the last tool
+            # list could not be checked at all, or if the server is no longer the one that was pinned.
+            return (self._quarantine_overflowed or self._tools_unverified or self._server_quarantine is not None
+                    or tool in self._quarantined["tools"])
 
     def _was_quarantined(self, kind: str, name: str) -> bool:
         """Whether this entry of a list (tools, prompts, resourceTemplates) was itself quarantined."""
         with self._state:
-            return self._quarantine_overflowed or name in self._quarantined[kind]
+            return self._quarantine_overflowed or self._server_quarantine is not None or name in self._quarantined[kind]
+
+    def quarantine_server(self, reason: str) -> None:
+        """Quarantine the whole server, for as long as the proxy runs (see "Lists, pins and names").
+
+        For a server that differs from its pin (proxy --pin-server): every
+        entry of its lists is left out, its instructions are removed (and not
+        pinned), calls, prompts, resource reads and subscriptions are refused,
+        and so is every other client request but the handshake, ping, the
+        lists and logging/setLevel (_refused_by_server_quarantine); every
+        request the server sends the client but ping is refused, and every
+        notification but notifications/cancelled is dropped.
+        """
+        with self._state:
+            if self._server_quarantine is None:
+                self._server_quarantine = reason
+
+    def _whole_server_quarantined(self) -> str | None:
+        """Why the whole server is quarantined (quarantine_server), or None."""
+        with self._state:
+            return self._server_quarantine
 
     def _set_tools_unverified(self, unverified: bool) -> None:
         with self._state:
@@ -2036,6 +2130,15 @@ class Proxy:
             refusal = self._firewall.refuse(label, problem, event="server_request", rule=RULE_MALFORMED)
             self._report_block(f"refused a '{printable(method, limit=100)}' request from the server", refusal)
             return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL, code=protocol.METHOD_NOT_FOUND))
+        allowed = ("ping",) if is_request else _TOLD_BY_A_QUARANTINED_SERVER
+        quarantined = self._whole_server_quarantined() if method not in allowed else None
+        if quarantined is not None:  # a server that differs from its pin tells the client nothing (--pin-server)
+            refusal = self._firewall.refuse(label, f"the whole server is quarantined: {quarantined}",
+                                            event="server_request", rule=RULE_QUARANTINE)
+            kind = "request" if is_request else "notification"
+            self._report_block(f"refused a '{printable(method, limit=100)}' {kind} from the quarantined server",
+                               refusal)
+            return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL)) if is_request else _DROP
 
         verdict = self._firewall.policy.server_request_verdict(method)
         decision = None
@@ -2348,6 +2451,10 @@ class Proxy:
         if problem is not None:
             return self._unsupported_reply(pending, msg_id, problem, _UNSUPPORTED_VERSION, code=protocol.INVALID_PARAMS)
         meta = result.get("_meta")
+        if self._pin_server:
+            refusal = self._check_server_info(pending, msg_id, result)
+            if refusal is not None:
+                return refusal
         for server_info in (result.get("serverInfo"), meta.get(_SERVER_INFO_KEY) if isinstance(meta, dict) else None):
             if isinstance(server_info, dict) and "icons" in server_info:
                 self._clean_icons_of(server_info, f"the server, in its reply to {pending.method}")
@@ -2359,6 +2466,36 @@ class Proxy:
             elif pending.method == protocol.SERVER_DISCOVER and self._era is None:
                 self._era = _MODERN
         return None
+
+    def _check_server_info(self, pending: _PendingRequest, msg_id: Any, result: JsonObject) -> JsonObject | None:
+        """With --pin-server: compare the serverInfo of a handshake reply with the server's pin; a refusal, or None.
+
+        The first serverInfo is pinned (pins.ToolPins.check_server_info). One
+        that differs quarantines the whole server (quarantine_server), and
+        with --on-server-change refuse (the default) the reply is refused
+        too. In monitor mode the change is logged and nothing happens.
+        """
+        meta = result.get("_meta")
+        server_info = result.get("serverInfo")
+        if not isinstance(server_info, dict) and isinstance(meta, dict):
+            server_info = meta.get(_SERVER_INFO_KEY)
+        server_info = server_info if isinstance(server_info, dict) else {}
+        status, changed = self._pins.check_server_info({"name": server_info_value(server_info.get("name")),
+                                                        "version": server_info_value(server_info.get("version"))})
+        self._save_pins()
+        if status != CHANGED:
+            return None
+        what = f"its serverInfo ({', '.join(changed)}) changed since it was pinned"
+        reason = f"the server is quarantined: {what}. {server_change_advice(self._pins.path)}"
+        decision = self._firewall.block(pending.label, reason, event="server_changed", rule=RULE_QUARANTINE,
+                                        call_id=pending.call_id)
+        if decision.allowed:  # monitor mode: logged as what would have been blocked
+            return None
+        self.quarantine_server(what)
+        self._report_block("quarantined every tool, prompt and resource template of the server", decision)
+        if self._on_server_change == SERVER_CHANGE_QUARANTINE:
+            return None
+        return _rpc_error(msg_id, decision.public_reason)
 
     def _malformed_reply(self, pending: _PendingRequest, msg_id: Any, reason: str) -> JsonObject:
         decision = self._firewall.refuse(
@@ -2471,12 +2608,24 @@ class Proxy:
         without being forwarded: the stricter checks and the pin are made for
         text, and a lenient client might still show the model what is inside.
         A null is removed too; it says nothing.
+
+        A server that differs from its pin (quarantine_server) cannot be
+        vouched for, so its instructions are removed whatever they say, and
+        are never pinned: they would steer the model, and become the baseline
+        its later instructions are compared with.
         """
         if "instructions" not in result:
             return
         instructions = result["instructions"]
         if instructions is None:
             del result["instructions"]
+            return
+        quarantined = self._whole_server_quarantined()
+        if quarantined is not None:
+            del result["instructions"]
+            decision = self._firewall.refuse(source, f"the whole server is quarantined: {quarantined}",
+                                             event="server_instructions", rule=RULE_QUARANTINE)
+            self._report_block("removed the instructions of the quarantined server", decision)
             return
         if not isinstance(instructions, str):
             del result["instructions"]
@@ -2643,6 +2792,10 @@ class Proxy:
         pinned = kind in PINNED_LISTS
         if not isinstance(item, dict) or (pinned and label == "?"):
             return "it is not a well-formed entry", None
+        with self._state:
+            server_quarantine = self._server_quarantine
+        if server_quarantine is not None:  # resources too: none of them can be read
+            return f"the whole server is quarantined: {server_quarantine}", None
         if pinned and self._was_quarantined(kind, item["name"]):
             # Even if it looks clean now. A template's uriTemplate as listed now is refused too.
             self._quarantine(kind, item["name"], self._template_texts(kind, item))
@@ -3161,6 +3314,13 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--approval-timeout", type=_approval_timeout, default=None, metavar="SECONDS",
                         help=f"refuse a call nobody answered within this time (default {DEFAULT_APPROVAL_TIMEOUT}, "
                              f"at most {MAX_APPROVAL_TIMEOUT})")
+    parser.add_argument("--pin-server", action="store_true",
+                        help="also pin the server itself in the --pins file: how it is launched (the program, a "
+                             "runner's package version, the SHA-256 of a local script) and the name and version it "
+                             "reports. A server that differs is refused, see --on-server-change")
+    parser.add_argument("--on-server-change", choices=SERVER_CHANGE_MODES, default=None,
+                        help="with --pin-server, a server that differs from its pin: refuse (the default) does not "
+                             "start it, or refuses its handshake; quarantine starts it with every tool quarantined")
     loudness = parser.add_mutually_exclusive_group()
     loudness.add_argument("--quiet", action="store_true",
                           help="print only errors (the server's own stderr is still passed on)")
@@ -3295,6 +3455,41 @@ def _report_policy_error(path: str, error: Exception) -> None:
         _warn(hint, limit=500)
 
 
+def server_change_advice(pins_path: Any) -> str:
+    """What the operator can do about a server that differs from its pin (proxy --pin-server)."""
+    command = ["agent-sentinel", "pins", "diff", "--server", "--pins", str(pins_path)]
+    return (f"If the change is expected, review it with: {proxy_report.shell_line(command)}; then pins accept "
+            "--server, and restart the proxy")
+
+
+def _check_server_launch(pins: ToolPins, firewall: Firewall, executable: str, command: list[str],
+                         label: str, say: Callable[..., None]) -> str | None:
+    """With --pin-server: compare how the server is about to be launched with its pin (pins.py).
+
+    The first launch is pinned. Returns what changed when it differs and
+    the change is not lifted by monitor mode (the caller then refuses to
+    start, or quarantines the server), else None.
+    """
+    status, changed = pins.check_server_launch(launch_identity(executable, command))
+    try:
+        pins.save()
+    except OSError as exc:
+        _warn(f"cannot save the pins file: {exc}")
+    if status == NEW:
+        say("--pin-server: pinned how the server is launched; it is compared at every later start")
+    if status != CHANGED:
+        return None
+    what = f"its launch ({', '.join(changed)}) changed since it was pinned"
+    decision = firewall.block(label, f"the server differs from its pin: {what}. {server_change_advice(pins.path)}",
+                              event="server_changed", rule=RULE_QUARANTINE)
+    if decision.allowed:  # monitor mode
+        say(f"monitor mode: the server differs from its pin ({what}); it starts as usual")
+        return None
+    _warn(f"the server differs from its pin: {what}. {server_change_advice(pins.path)} "
+          f"{proxy_report.rule_and_ref(decision)}", limit=2000)
+    return what
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _argument_parser()
     args = parser.parse_args(argv)
@@ -3306,6 +3501,12 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("give the MCP server command after '--'")
+    if args.pin_server and (args.pins is None or args.no_pins):
+        parser.error("--pin-server pins the server in the pins file: give --pins FILE, without --no-pins")
+    if args.on_server_change is not None and not args.pin_server:
+        parser.error("--on-server-change says what happens to a server that differs from its pin: it needs "
+                     "--pin-server")
+    on_server_change = args.on_server_change or SERVER_CHANGE_REFUSE
     backends = [approver.describe() for approver in args.approve_with]
     for backend in backends:
         if backends.count(backend) > 1:
@@ -3371,6 +3572,12 @@ def main(argv: list[str] | None = None) -> int:
     if group is not None:
         _report_session_group(group, firewall, say)
     _report_server_environment(args, environment, added, say)
+    server_changed = None
+    if args.pin_server:
+        server_changed = _check_server_launch(pins, firewall, executable, command, args.name or "server", say)
+        if server_changed is not None and on_server_change == SERVER_CHANGE_REFUSE:
+            _warn("refusing to start the server (--on-server-change refuse)")
+            return 2
     try:
         server = subprocess.Popen(
             [executable, *command[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -3387,8 +3594,12 @@ def main(argv: list[str] | None = None) -> int:
     proxy = Proxy(
         firewall, sys.stdout.buffer, server.stdin, pins=pins, max_message_bytes=args.max_message_bytes,
         tool_names=args.tool_names, elicitation_hosts=args.elicitation_host, approvers=args.approve_with,
-        approval_timeout=approval_timeout, report=report,
+        approval_timeout=approval_timeout, report=report, pin_server=args.pin_server,
+        on_server_change=on_server_change,
     )
+    if server_changed is not None:
+        _warn("every tool, prompt and resource template of the server is quarantined (--on-server-change quarantine)")
+        proxy.quarantine_server(server_changed)
 
     # Run one relay per direction. When either side closes, shut down.
     one_side_closed = threading.Event()

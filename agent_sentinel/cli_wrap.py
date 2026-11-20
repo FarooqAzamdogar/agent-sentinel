@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import __version__, clients, home, mcp_proxy
+from . import __version__, clients, control_plane, home, mcp_proxy
 from .cli_common import (
     EXIT_ERROR,
     EXIT_OK,
@@ -51,7 +51,7 @@ from .cli_common import (
     shown_command,
     shown_path,
 )
-from .cli_doctor import config_scope, project_of
+from .cli_doctor import config_scope, launch_lines, project_of
 from .clients import CLIENTS
 from .config_file import ConfigFile, edited_text, read_config, write_config
 from .leaks import redact_value
@@ -141,6 +141,9 @@ def run(args: argparse.Namespace) -> int:
     settings = _settings(args, loaded[0], python)
     plan = plan_wrap(config, args.client, servers, names, settings)
     _print_header(config, args.client, settings, *loaded)
+    exposed = control_plane.writable_warning(loaded[1], config.path, "this configuration file")
+    if exposed:
+        print(f"Warning: {exposed}")
     print_plan(plan)
     if args.client == "claude-desktop":
         _print_extensions(config.path)
@@ -254,12 +257,12 @@ def _settings(args: argparse.Namespace, policy_path: str, python: PythonCheck) -
 
 
 def make_folders(settings: ProxySettings) -> list[Path]:
-    """Create the audit log's folder and the pins folder if they are missing; return those created."""
+    """Create the audit log's folder and the pins folder (owner-only) if they are missing; return those created."""
     created = []
     for folder in (Path(settings.audit).parent, Path(settings.pins_folder)):
         if not folder.is_dir():
             try:
-                folder.mkdir(parents=True, exist_ok=True)
+                home.make_private_folder(folder)
             except OSError as exc:
                 raise CommandError(
                     f"cannot create the folder {folder}: {exc.strerror or exc}; nothing was changed"
@@ -320,7 +323,14 @@ def _wrap_step(config: ConfigFile, client: str, name: str, entry: Any, settings:
     if executable is None:
         says += (f"\n      (note: '{printable(words[0], limit=60)}' is not on this terminal's PATH; the proxy looks "
                  "for it on the PATH the client gives it, never in the current folder)")
+    says += "".join(f"\n      {line}" for line in launch_warnings(words))
     return Step(name, entry, new, says)
+
+
+def launch_warnings(words: list[str]) -> list[str]:
+    """doctor's launch checks of a server command, as warnings: wrap protects a server, not how it starts."""
+    return [("WARNING (doctor fails this): " if line.level == "fail" else "warning: ") + line.text
+            for line in launch_lines(words)]
 
 
 # ---- showing ---------------------------------------------------------------------------------------
@@ -437,6 +447,8 @@ def _print_snippet(args: argparse.Namespace) -> int:
     for line in clients.snippet(args.client, args.name, wrapped).splitlines():
         print(printable(line, limit=5000))
     print("If the server needs environment variables, keep them in the entry's env as before.")
+    for warning in launch_warnings(command):
+        print(warning[0].upper() + warning[1:])
     for folder in make_folders(settings):
         print(f"Created the folder {shown_path(folder)}")
     _warn_about_python(settings.python, python)

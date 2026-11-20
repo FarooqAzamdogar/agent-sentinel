@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 from typing import Any, TextIO
 
-from . import __version__, claude_hooks, home
+from . import __version__, claude_hooks, control_plane, home
 from .claude_hooks import HookAnswer, HookSettings
 from .cli_common import EXIT_ERROR, EXIT_OK, INSTALL_COMMAND, CommandError, full_path, load_policy, shown_path
 from .cli_wrap import this_python
@@ -196,7 +196,7 @@ def install_claude_code(args: argparse.Namespace) -> int:
         _warn_about_python(handler["command"], python)
         return EXIT_OK
     return _change_settings(Path(full_path(args.settings)), handler, args, python,
-                            {"policy": policy_path, "audit log": audit, "state folder": state})
+                            {"policy": policy_path, "audit log": audit, "state folder": state}, policy)
 
 
 def hook_handler(python: str, isolated: bool, policy: str, audit: str, state: str, log_args: bool = True
@@ -310,7 +310,7 @@ def _print_snippet(hooks: dict[str, Any], policy_path: str) -> None:
 
 
 def _change_settings(path: Path, handler: dict[str, Any], args: argparse.Namespace, python: PythonCheck,
-                     files: dict[str, str]) -> int:
+                     files: dict[str, str], policy: Policy | None = None) -> int:
     if is_app_state(path):
         raise CommandError(f"{path} is Claude Code's own state file, which agent-sentinel never edits; hooks belong "
                            "in a settings file such as ~/.claude/settings.json")
@@ -326,6 +326,9 @@ def _change_settings(path: Path, handler: dict[str, Any], args: argparse.Namespa
     print(f"\nSettings file: {shown_path(path)}" + ("" if config is not None else " (does not exist yet; it would be "
                                                                               "created)"))
     _warn_about_project(path, files)
+    exposed = control_plane.writable_warning(policy, path, "this settings file") if policy is not None else None
+    if exposed:
+        print(f"Warning: {exposed}")
     if new == old:
         print("The hooks are already in it, exactly as shown. Nothing to change.")
         return EXIT_OK
@@ -370,12 +373,12 @@ def _warn_about_project(settings: Path, files: dict[str, str]) -> None:
 
 
 def _make_folders(audit: str, state: str) -> list[Path]:
-    """Create the audit log's folder and the state folder if they are missing; return those created."""
+    """Create the audit log's folder and the state folder (owner-only) if they are missing; return those created."""
     created = []
     for folder in (Path(audit).parent, Path(state)):
         if not folder.is_dir():
             try:
-                folder.mkdir(parents=True, exist_ok=True)
+                home.make_private_folder(folder)
             except OSError as exc:
                 raise CommandError(f"cannot create the folder {folder}: {exc.strerror or exc}; nothing was changed"
                                    ) from exc

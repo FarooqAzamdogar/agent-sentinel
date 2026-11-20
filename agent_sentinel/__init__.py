@@ -42,6 +42,10 @@ Module map:
     clients.py        the MCP clients and where their configurations are
     config_file.py    reading and editing a client's configuration file safely
     wrapping.py       putting the proxy in front of one server entry, and taking it out
+    launch.py         what a server's launch command runs, and what is risky about it (doctor, wrap, pins)
+    advisories.py     known-bad MCP packages and popular names, as dated data (goes stale between releases)
+    control_plane.py  whether the agent can reach agent-sentinel's own files (doctor)
+    doctor_baseline.py  doctor --save-baseline / --baseline: what was added or changed since
     demo_server.py    the deliberately poisoned server of `agent-sentinel demo`
 """
 

@@ -400,7 +400,7 @@ def backup_folder(path: Path) -> tuple[Path, str]:
                           f"tree, where the backup of {path.name} (and the tokens in it) could be committed. Set "
                           f"{home.ENV_VAR} to a folder outside it; nothing was changed")
     try:
-        folder.mkdir(parents=True, exist_ok=True)
+        home.make_private_folder(folder)  # owner-only: the backups hold every token the originals do
         _ignore_everything(folder)
     except OSError as exc:
         raise ConfigError(f"cannot prepare the folder {folder} for the backup: {exc.strerror or exc}; "

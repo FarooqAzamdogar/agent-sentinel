@@ -89,7 +89,7 @@ from types import MappingProxyType
 from typing import Any, Iterable, Iterator, Mapping
 
 from . import jsonutil
-from .filelock import locked, replace_file
+from .filelock import locked, make_private_folder, replace_file
 
 UNTRUSTED = "untrusted"
 PRIVATE = "private"
@@ -356,7 +356,7 @@ class FileSessionStore(SessionStore):
         Raises SessionStateError if the folder or the file cannot be written.
         """
         try:
-            self.directory.mkdir(parents=True, exist_ok=True)
+            make_private_folder(self.directory)  # owner-only, the missing folders above it too
             with self._exclusive():
                 if not self.path.exists():
                     self._started = _now()
@@ -568,7 +568,7 @@ class GroupSessionStore(SessionStore):
         or the lock cannot be had in time.
         """
         try:
-            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            make_private_folder(self.directory)  # owner-only, the missing folders above it too
             with self._exclusive():
                 found, problem = self._load()
                 if found is None and problem is None:

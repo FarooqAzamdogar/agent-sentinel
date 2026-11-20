@@ -7,6 +7,10 @@ whatever the file's length, so a lock file may be empty.
 
 `replace_file` is how every file agent-sentinel rewrites is written (pins,
 session state, rate-limit counts, client configurations).
+
+`make_private_folder` is how every folder agent-sentinel creates is made:
+readable by its owner only (mode 0700 on POSIX), the missing folders above
+it too.
 """
 
 from __future__ import annotations
@@ -27,6 +31,33 @@ LOCK_TIMEOUT_SECONDS = 10.0
 # scanner, a file indexer, a reader of the file) has the file open.
 REPLACE_ATTEMPTS = 5
 REPLACE_PAUSE_SECONDS = 0.1
+# The folders agent-sentinel creates are its owner's only; and how many missing ones above it are created at most.
+PRIVATE_FOLDER_MODE = 0o700
+MAX_FOLDERS_CREATED = 64
+
+
+def make_private_folder(folder: str | Path) -> list[Path]:
+    """Create a folder, and each missing folder above it, readable by its owner only. Returns those created.
+
+    Mode 0700 on POSIX, whatever the umask leaves (it only takes bits away).
+    Path.mkdir(parents=True) would give the folders above it the default mode
+    instead. A folder that exists is left as it is. Raises OSError.
+    """
+    missing: list[Path] = []
+    current = Path(folder)
+    while not current.is_dir() and current.parent != current and len(missing) < MAX_FOLDERS_CREATED:
+        missing.append(current)
+        current = current.parent
+    created = []
+    for path in reversed(missing):
+        try:
+            path.mkdir(mode=PRIVATE_FOLDER_MODE)
+        except FileExistsError:
+            if not path.is_dir():
+                raise
+            continue
+        created.append(path)
+    return created
 
 if sys.platform == "win32":
     import msvcrt
