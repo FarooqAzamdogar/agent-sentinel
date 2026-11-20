@@ -33,7 +33,10 @@ and pins folders can be written; no two servers share a pins file; npx and
 uvx packages are pinned to a version; and which env names look like secrets
 written in the file (names only: a value is never printed). A leading "~" in
 --policy, --audit, --pins, --env-file and an --approve-with command: is the
-home folder, as the proxy reads it.
+home folder, as the proxy reads it. An entry whose proxy contains the server
+(--contain, a --server-* limit, --sandbox) is reported as contained or
+sandboxed, and is broken when that containment cannot be set up on this
+machine (containment.check).
 
 Nothing is changed and no server is started. A configuration may come from
 someone else (a project's checked-in .mcp.json), so doctor never runs a
@@ -64,7 +67,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import __version__, clients, config_file, elicitation, home, mcp_proxy, server_env
+from . import __version__, clients, config_file, containment, elicitation, home, mcp_proxy, server_env
 from .approvers import COMMAND_PREFIX
 from .cli_common import EXIT_FAIL, EXIT_OK, CommandError, full_path, shown_command, shown_path
 from .clients import CLIENTS
@@ -76,6 +79,7 @@ from .policy_errors import file_error_message
 from .server_env import looks_secret  # the proxy's own test, so that doctor and the proxy agree
 from .textutil import printable
 from .wrapping import (
+    CONTAIN_OPTIONS,
     FLAG_OPTIONS,
     VALUE_OPTIONS,
     ProxyCommand,
@@ -145,6 +149,7 @@ class ServerReport:
     policy: str | None = None  # full path, when the entry names one
     pins: str | None = None
     audit: str | None = None
+    containment: str | None = None  # "contained" or "sandboxed (bwrap)", when the proxy contains the server
 
 
 @dataclass
@@ -343,6 +348,7 @@ def _check_wrapped(report: ServerReport, proxy: ProxyCommand, entry: dict[str, A
     _check_server_command(lines, proxy.server)
     _check_passed_env(lines, proxy, entry)
     _check_env_redirects(lines, proxy, entry)
+    report.containment = _check_containment(lines, proxy)
     if project is not None:
         for what, path in (("policy", report.policy), ("pins file", report.pins), ("audit log", report.audit)):
             if path and clients.inside_folder(path, project):
@@ -608,6 +614,12 @@ def _approver_not_looked_up(program: str) -> str | None:
     return None
 
 
+def _sandbox_name(value: str) -> str:
+    if value not in containment.SANDBOXES:
+        raise argparse.ArgumentTypeError(f"choose from {', '.join(containment.SANDBOXES)}")
+    return value
+
+
 def _tool_names(value: str) -> str:
     if value not in mcp_proxy.TOOL_NAME_MODES:
         raise argparse.ArgumentTypeError(f"choose from {', '.join(mcp_proxy.TOOL_NAME_MODES)}")
@@ -622,6 +634,10 @@ _VALUE_CHECKS: dict[str, Callable[[str], Any]] = {
     "--approve-with": mcp_proxy._approver,
     "--pass-env": mcp_proxy._pass_env_name,
     "--tool-names": _tool_names,
+    "--server-memory-mb": mcp_proxy._server_memory_mb,
+    "--server-processes": mcp_proxy._server_processes,
+    "--server-cpu-seconds": mcp_proxy._server_cpu_seconds,
+    "--sandbox": _sandbox_name,
 }
 
 
@@ -639,6 +655,42 @@ def _check_server_command(lines: list[Line], server: list[str]) -> None:
         lines.append(Line("fail", f"the proxy will refuse to pass {printable(unsafe[0], limit=60)!r} to the batch file "
                                   f"{printable(executable, limit=120)} (cmd.exe would change it); start the program "
                                   "behind it directly"))
+
+
+def _check_containment(lines: list[Line], proxy: ProxyCommand) -> str | None:
+    """Whether the proxy contains the server (--contain, a limit, --sandbox), and whether it can here.
+
+    Returns "contained", "sandboxed (NAME)" or None. What the options ask for
+    is checked as the proxy checks it before it starts (containment.check):
+    a sandbox this machine does not have, a folder a sandbox may not show.
+    Their values were checked by _check_values.
+    """
+    if not any(option in CONTAIN_OPTIONS for option, _ in proxy.options):
+        return None
+    try:
+        settings = containment.Settings(
+            contain=proxy.has("--contain"),
+            memory_mb=_number(proxy.value("--server-memory-mb"), containment.memory_mb),
+            processes=_number(proxy.value("--server-processes"), containment.processes),
+            cpu_seconds=_number(proxy.value("--server-cpu-seconds"), containment.cpu_seconds),
+            sandbox=proxy.value("--sandbox"),
+            allow=tuple(_option_path(path) for path in proxy.values("--sandbox-allow")),
+            read=tuple(_option_path(path) for path in proxy.values("--sandbox-read")),
+            network=proxy.has("--sandbox-network"),
+        )
+    except ValueError:
+        return None  # a value the proxy refuses: already a [fail] line
+    problem = containment.check(settings, mcp_proxy._resolve_executable)
+    if problem:
+        lines.append(Line("fail", f"the proxy will not start: it cannot contain the server as asked: "
+                                  f"{printable(problem, limit=300)}"))
+    found = f"sandboxed ({printable(settings.sandbox, limit=20)})" if settings.sandbox else "contained"
+    lines.append(Line("info", f"{found}: {printable(containment.describe(settings), limit=300)}"))
+    return found
+
+
+def _number(value: str | None, read: Callable[[str], int]) -> int | None:
+    return None if value is None else read(value)
 
 
 def _check_passed_env(lines: list[Line], proxy: ProxyCommand, entry: dict[str, Any]) -> None:
@@ -898,6 +950,7 @@ def as_json(reports: list[ConfigReport], policies: dict[str, PolicyReport],
                 "policy": printable(server.policy, limit=500) if server.policy else None,
                 "pins": printable(server.pins, limit=500) if server.pins else None,
                 "audit": printable(server.audit, limit=500) if server.audit else None,
+                "containment": server.containment,
                 "findings": [{"level": line.level, "text": line.text} for line in server.lines],
             } for server in report.servers],
             "desktop_extensions": [printable(name, limit=100) for name in report.extensions],

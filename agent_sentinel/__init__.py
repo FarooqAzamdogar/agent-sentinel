@@ -21,6 +21,8 @@ Module map:
     pins.py           what the proxy remembers of tools, prompts, templates and instructions (pins file v2)
     elicitation.py    what an elicitation may ask the user
     server_env.py     the environment the server is started with
+    containment.py    keeping the server's processes in check (--contain: job object, process group; --sandbox)
+    schema_check.py   tool arguments and results against the server's schemas; references outside a schema
     approvers.py      how the proxy asks a person to approve a call (dialog, command, elicitation)
     proxy_report.py   what the proxy tells the operator on stderr
 

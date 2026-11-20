@@ -33,6 +33,7 @@ in the policy file:
     tools.send_email.allow_args[0]       a tool rule's allow rule
     tools.send_email.other_args          an argument no allow rule names
     tools.send_email.max_calls_per_minute, limits.max_calls_per_minute   rate limits
+    schema.arguments, schema.result, schema.remote_refs   the proxy's schema_checks (fixed ids, below)
     server_requests.sampling/createMessage
     client_requests.completion/complete
     flows[0]                             the first flow rule
@@ -103,6 +104,10 @@ RULE_HOOK_FAILED = "hook_failed"  # the Claude Code hook could not finish its ch
 RULE_SECRETS_IN_RESULTS = "secrets.in_results"
 RULE_SECRETS_CANARIES = "secrets.canaries"
 RULE_SECRETS_KNOWN_VALUES = "secrets.known_values_from_env"
+# The proxy's checks against the schemas a server declared (schema_checks; schema_check.py).
+RULE_SCHEMA_ARGUMENTS = "schema.arguments"  # a call's arguments do not match the tool's inputSchema
+RULE_SCHEMA_RESULT = "schema.result"  # a result's structuredContent does not match the tool's outputSchema
+RULE_SCHEMA_REMOTE_REFS = "schema.remote_refs"  # a tool's schema refers outside itself (quarantined)
 
 # An argument name is chosen by the agent; `matched_arg` keeps at most this much of it.
 MAX_MATCHED_ARG_CHARS = 200
@@ -149,10 +154,25 @@ MAX_KNOWN_VALUE_NAMES = 100
 # Higher is stricter. When several wildcard rules match, the strictest verdict wins.
 _STRICTNESS = {"allow": 0, "ask": 1, "block": 2}
 
+# ---- schema checks (the proxy only) ------------------------------------------------------
+#
+# "schema_checks", at the top of a policy and in a tool rule: what the proxy does with a tool's
+# arguments and results that do not match the schemas the server declared in its tool list, with
+# arguments that schema does not declare, and with a schema that refers outside itself.
+SCHEMA_CHECK_MODES = ("off", "warn", "enforce")
+SCHEMA_CHECK_CHOICES = {
+    "arguments": SCHEMA_CHECK_MODES,
+    "results": SCHEMA_CHECK_MODES,
+    "undeclared_args": ("allow", "block"),
+    "remote_refs": ("warn", "quarantine"),
+}
+# What applies when neither the tool rule nor the top of the policy says. Remote references are reported.
+SCHEMA_CHECK_DEFAULTS = {"arguments": "off", "results": "off", "undeclared_args": "allow", "remote_refs": "warn"}
+
 # The keys a policy file may have, at the top and in "secrets".
 _TOP_LEVEL_KEYS = (
     "default", "deny_args", "tools", "server_requests", "client_requests", "injection", "secrets", "limits",
-    "flows", "classify_by_annotations", "hide_blocked_tools",
+    "flows", "classify_by_annotations", "hide_blocked_tools", "schema_checks",
 )
 _SECRETS_KEYS = ("in_arguments", "in_results", "known_values_from_env", "canaries", "patterns")
 
@@ -259,6 +279,37 @@ class ArgRule:
 
 
 @dataclass(frozen=True)
+class SchemaChecks:
+    """A "schema_checks" section, at the top of a policy or in a tool rule. None: not set here.
+
+    arguments:       a call's arguments against the tool's inputSchema: "off", "warn" (reported and
+                     recorded, let through) or "enforce" (refused, rule schema.arguments).
+    results:         a tools/call result's structuredContent against the tool's outputSchema, the same
+                     three choices (rule schema.result).
+    undeclared_args: "block" refuses a call with a top-level argument the inputSchema's properties do
+                     not name (rule schema.arguments); "allow" leaves that to `arguments`.
+    remote_refs:     a tool whose schema refers outside itself: "warn" (reported) or "quarantine".
+    Policy.schema_checks_for gives the settings that apply to one tool, with every value set.
+    """
+
+    arguments: str | None = None
+    results: str | None = None
+    undeclared_args: str | None = None
+    remote_refs: str | None = None
+
+    def __post_init__(self) -> None:
+        for key, choices in SCHEMA_CHECK_CHOICES.items():
+            value = getattr(self, key)
+            if value is not None:
+                _expect_choice(value, f"schema_checks.{key}", choices)
+
+    def enabled(self) -> bool:
+        """Whether these settings ask the proxy to check calls or results against the schemas."""
+        return self.arguments in ("warn", "enforce") or self.results in ("warn", "enforce") or (
+            self.undeclared_args == "block")
+
+
+@dataclass(frozen=True)
 class ToolRule(_NamedRule):
     deny_args: tuple[ArgRule, ...] = ()
     allow_args: tuple[ArgRule, ...] = ()
@@ -268,6 +319,8 @@ class ToolRule(_NamedRule):
     max_calls_per_minute: int | None = None
     # Flow labels of the tools this rule matches, such as ("untrusted",) or ("private", "sink").
     labels: tuple[str, ...] = ()
+    # The tool's own schema_checks (proxy only); None: the policy's top-level settings apply.
+    schema_checks: SchemaChecks | None = None
 
 
 @dataclass(frozen=True)
@@ -389,6 +442,10 @@ class Policy:
     hide_blocked_tools               whether the proxy hides tools that tool_level_action says "block"
                                      from tools/list (default false). Hiding is not enforcement:
                                      a call to a hidden tool is still checked and refused.
+
+    Added in 0.6:
+
+    schema_checks                    the top-level SchemaChecks (proxy only); see schema_checks_for.
     """
 
     default: str = "block"
@@ -412,6 +469,8 @@ class Policy:
     flows: tuple[FlowRule, ...] = ()
     classify_by_annotations: bool = True
     hide_blocked_tools: bool = False
+    # ---- added in 0.6
+    schema_checks: SchemaChecks = field(default_factory=SchemaChecks)
 
     def __post_init__(self) -> None:
         # A policy can also be built in code, without the loader. An action such
@@ -428,6 +487,10 @@ class Policy:
             _check_code_arg_rules(rule.allow_args, f"{where}.allow_args", deny=False)
             for label in rule.labels:
                 _expect_label(label, f"{where}.labels")
+            if rule.schema_checks is not None and not isinstance(rule.schema_checks, SchemaChecks):
+                raise PolicyError(f"{where}.schema_checks must be a SchemaChecks, got {type_name(rule.schema_checks)}")
+        if not isinstance(self.schema_checks, SchemaChecks):
+            raise PolicyError(f"schema_checks must be a SchemaChecks, got {type_name(self.schema_checks)}")
         _check_code_arg_rules(self.deny_args, "deny_args", deny=True)
         if self.max_calls_per_minute is not None:
             _expect_calls_per_minute(self.max_calls_per_minute, "limits")
@@ -533,6 +596,7 @@ class Policy:
             flows=_flow_rules(data.get("flows", [])),
             classify_by_annotations=classify,
             hide_blocked_tools=hide,
+            schema_checks=_schema_checks(data.get("schema_checks", {}), "schema_checks"),
         )
 
     # ---- evaluating ---------------------------------------------------------
@@ -690,6 +754,33 @@ class Policy:
             return frozenset()
         return frozenset(label for rule in self.tools if rule.labels and rule.matches(tool) for label in rule.labels)
 
+    def schema_checks_for(self, tool: str) -> SchemaChecks:
+        """The schema_checks that apply to `tool` (the proxy's checks against the server's schemas), every value set.
+
+        For each setting: the tool rules that decide for the tool (the exact
+        rule if there is one, otherwise every wildcard that matches, as for
+        actions), and of those that set it, the strictest; else the top-level
+        "schema_checks"; else SCHEMA_CHECK_DEFAULTS. So an exact rule can make
+        an exception for one tool with a sloppy schema, as it can for an action.
+        """
+        rules = _deciding_rules(self.tools, tool) if isinstance(tool, str) else []
+        settings: dict[str, str] = {}
+        for key, choices in SCHEMA_CHECK_CHOICES.items():
+            given = [getattr(rule.schema_checks, key) for rule in rules if rule.schema_checks is not None]
+            given = [value for value in given if value is not None]
+            if given:
+                settings[key] = max(given, key=choices.index)  # the choices are listed from loosest to strictest
+            else:
+                top = getattr(self.schema_checks, key)
+                settings[key] = top if top is not None else SCHEMA_CHECK_DEFAULTS[key]
+        return SchemaChecks(**settings)
+
+    @property
+    def uses_schema_checks(self) -> bool:
+        """Whether any tool's calls or results are checked against the server's schemas (so the proxy keeps them)."""
+        return self.schema_checks.enabled() or any(
+            rule.schema_checks is not None and rule.schema_checks.enabled() for rule in self.tools)
+
     def flow_verdict(
         self, tool: str, marks: SessionMarks | Iterable[str], extra_labels: Iterable[str] = ()
     ) -> Verdict | None:
@@ -777,6 +868,12 @@ class Policy:
             RULE_SESSION: "the session state of the flow rules could not be recorded, so the result was withheld",
             RULE_HOOK_FAILED: "the Claude Code hook could not finish its checks (a policy that does not load, or "
                               "session state that cannot be used), so it refused",
+            RULE_SCHEMA_ARGUMENTS: "the proxy's check of a call's arguments against the input schema the server "
+                                   "declared for the tool (schema_checks.arguments, schema_checks.undeclared_args)",
+            RULE_SCHEMA_RESULT: "the proxy's check of a result's structuredContent against the output schema the "
+                                "server declared for the tool (schema_checks.results)",
+            RULE_SCHEMA_REMOTE_REFS: "the tool's schema refers to something outside itself, such as a $ref to a "
+                                     "web address, so the tool was quarantined (schema_checks.remote_refs)",
         }
         if rule_id in fixed:
             return fixed[rule_id]
@@ -1175,7 +1272,9 @@ def _tool_rule(name: Any, spec: Any) -> ToolRule:
     elif not isinstance(spec, dict):
         raise PolicyError(f"{where} must be an action ({listed(ACTIONS)}) or an object, got {type_name(spec)}")
     _expect_object(
-        spec, where, allowed_keys=("action", "deny_args", "allow_args", "other_args", "max_calls_per_minute", "labels")
+        spec, where,
+        allowed_keys=("action", "deny_args", "allow_args", "other_args", "max_calls_per_minute", "labels",
+                      "schema_checks"),
     )
     if "action" not in spec:
         # No default on purpose: a rule left without an action while editing must not come to mean allow.
@@ -1191,7 +1290,17 @@ def _tool_rule(name: Any, spec: Any) -> ToolRule:
         other_args=other_args,
         max_calls_per_minute=_calls_per_minute(spec, where),
         labels=_labels(spec.get("labels", []), f"{where}.labels", allow_sink=True),
+        schema_checks=_schema_checks(spec["schema_checks"], f"{where}.schema_checks") if "schema_checks" in spec
+        else None,
     )
+
+
+def _schema_checks(spec: Any, where: str) -> SchemaChecks:
+    """Read a "schema_checks" object: each key optional, each value one of its SCHEMA_CHECK_CHOICES."""
+    _expect_object(spec, where, allowed_keys=tuple(SCHEMA_CHECK_CHOICES))
+    for key, value in spec.items():
+        _expect_choice(value, f"{where}.{key}", SCHEMA_CHECK_CHOICES[key])
+    return SchemaChecks(**spec)
 
 
 def _labels(specs: Any, where: str, allow_sink: bool) -> tuple[str, ...]:

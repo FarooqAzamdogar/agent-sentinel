@@ -113,6 +113,8 @@ class Startup:
     # environment holds them. When given, they replace the policy's own guess (known_value_warnings),
     # which can only look at the proxy's environment.
     secret_warnings: Sequence[str] | None = None
+    # What --contain and --sandbox give the server (containment.describe); empty when not contained.
+    containment: str = ""
 
 
 def startup_lines(start: Startup) -> list[str]:
@@ -132,6 +134,8 @@ def startup_lines(start: Startup) -> list[str]:
     else:
         lines.append("  pins      in memory: definitions are compared with those first seen since the proxy started")
     lines.append(f"  server    {shown_server_command(start.server_command)}")
+    if start.containment:
+        lines.append(f"  contain   {start.containment}")
     if start.approvers:
         backends = ", else ".join(description for description, _ in start.approvers)
         lines.append(f"  approval  {backends}; no answer within {start.approval_timeout} s refuses the call")

@@ -71,8 +71,14 @@ from .textutil import printable
 VALUE_OPTIONS = frozenset({
     "--policy", "--audit", "--pins", "--name", "--pass-env", "--env-file", "--approve-with",
     "--approval-timeout", "--max-message-bytes", "--tool-names", "--elicitation-host",
+    "--server-memory-mb", "--server-processes", "--server-cpu-seconds", "--sandbox", "--sandbox-allow",
+    "--sandbox-read",
 })
-FLAG_OPTIONS = frozenset({"--no-log-args", "--no-pins", "--monitor", "--clean-env", "--quiet", "--verbose"})
+FLAG_OPTIONS = frozenset({"--no-log-args", "--no-pins", "--monitor", "--clean-env", "--quiet", "--verbose",
+                          "--contain", "--sandbox-network"})
+# The options that contain the server (proxy --contain and the options that imply it; containment.py).
+CONTAIN_OPTIONS = frozenset({"--contain", "--server-memory-mb", "--server-processes", "--server-cpu-seconds",
+                             "--sandbox", "--sandbox-allow", "--sandbox-read", "--sandbox-network"})
 # The shapes of command that start the proxy (read_proxy_command), each followed by "proxy":
 #   agent-sentinel                        the script (agent-sentinel.exe, .cmd, .bat)
 #   PYTHON [-I] -m agent_sentinel         a Python, with only harmless options of its own before -m
@@ -575,6 +581,7 @@ class ProxySettings:
     pins_folder: str
     monitor: bool = False
     isolated: bool = True  # start Python with -I (see the module docstring)
+    contain: bool = False  # start the proxy with --contain (containment.py)
 
 
 def server_label(name: str, taken: set[str]) -> str:
@@ -637,6 +644,8 @@ def wrap_entry(entry: dict[str, Any], settings: ProxySettings, label: str, pins:
         proxy_args += ["--pass-env", name]
     if settings.monitor:
         proxy_args.append("--monitor")
+    if settings.contain:
+        proxy_args.append("--contain")
     proxy_args += ["--", *words]
     new = _with_command(entry, settings.python, proxy_args)
     found = proxy_command_of(new)
