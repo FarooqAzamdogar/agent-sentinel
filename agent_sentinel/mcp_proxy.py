@@ -283,10 +283,14 @@ MAX_NAME_CHARS = 256  # tool names and request ids the proxy has to remember
 MAX_WAITING_APPROVALS = 16  # calls held for a person's answer; more are refused at once
 MAX_QUARANTINED_TEMPLATES = 1_000  # the uriTemplates of quarantined resource templates; past it, no read is let through
 
-# Pagination (_checked_page_boundary): while a list's cursor chain is open, the text of the last
-# entries of the page before, at most this many and this many bytes, is scanned with the next page.
-PAGE_BOUNDARY_ENTRIES = 3
+# Pagination (_checked_page_boundary): while a list's cursor chain is open, the text nearest the end
+# of the page before is scanned with the text nearest the start of the next page, this many bytes of
+# each (see _boundary_view).
 PAGE_BOUNDARY_BYTES = 4096
+MAX_BOUNDARY_MEMBERS = 8  # text members kept at a boundary: the five a model reads first, then others
+MAX_BOUNDARY_KEY_CHARS = 64  # a member with a longer name is not kept
+_MEMBER_OVERHEAD = 6  # what a kept value costs besides its key and its text: quotes, colon, comma, as in JSON
+_REPEATS_KEPT = 3  # as in textutil.text_views: a run of one text says nothing more after a few copies
 MAX_OPEN_CURSORS = 8  # cursor chains kept open at once, per list
 
 # limits.call_timeout_seconds applies to these requests: the ones the policy decides like a call.
@@ -352,6 +356,7 @@ _UNSUPPORTED_REPLY = "the server sent a reply this proxy cannot check"
 _UNSUPPORTED_VERSION = "the server chose a protocol version this proxy does not support"
 _UNCHECKED_CONTENT = "the content could not be checked, so it was withheld"
 _TIMEOUT_REFUSAL = "the server did not answer in time, so the request was cancelled"
+_TIMED_OUT_ID_REFUSAL = "the id of this request belongs to a request that timed out; send it with another id"
 _TEMPLATE_REFUSAL = "this resource cannot be read: its template was removed from the template list"
 # What a refused server is told: nothing about why.
 _SERVER_REFUSAL = "request refused"
@@ -382,11 +387,14 @@ class _PendingRequest:
 
 @dataclass(frozen=True)
 class _PageTail:
-    """The end of a page of a list whose next page has not been checked yet (see _checked_page_boundary)."""
+    """The end of a page of a list whose next page has not been checked yet (see _checked_page_boundary).
 
-    entries: tuple[dict[str, str], ...]  # the text members of its last entries, cut to PAGE_BOUNDARY_BYTES
-    names: tuple[str, ...]  # their names, to quarantine (tools, prompts, resource templates)
-    templates: tuple[str, ...]  # their uriTemplates (resource templates)
+    Side by side, for each entry with text in the boundary view (_boundary_view), in page order:
+    """
+
+    texts: tuple[dict[str, str], ...]  # the text kept of it, PAGE_BOUNDARY_BYTES in all
+    names: tuple[str, ...]  # its name, to quarantine (tools, prompts, resource templates); "" if it has none
+    templates: tuple[str, ...]  # its uriTemplate (resource templates); "" if it has none
 
 
 @dataclass(frozen=True)
@@ -557,40 +565,107 @@ def _cursor_digest(message: JsonObject) -> str | None:
     return _digest(cursor) if isinstance(cursor, str) and cursor else None
 
 
-# The members of a list entry a model reads first, in the order the boundary scan keeps them; others come after.
+# The members of a list entry a model reads first: the boundary scan always looks for them.
 _BOUNDARY_MEMBERS = ("description", "title", "name", "uriTemplate", "uri")
 
 
-def _boundary_view(entries: Iterable[Any], keep_end: bool) -> list[dict[str, str]]:
-    """The text members of list entries ({"name": ..., "description": ...}), PAGE_BOUNDARY_BYTES in all.
+def _boundary_view(entries: Sequence[Any], from_end: bool) -> list[tuple[int, dict[str, str]]]:
+    """The text nearest one end of a page of a list, PAGE_BOUNDARY_BYTES in all, for _checked_page_boundary.
 
-    One object per entry that is an object, in the same order (an empty one
-    when no room was left for it). keep_end: keep the end of the entries
-    (the end of a page): the last entry, and the end of each text, come
-    first; else the start. A description comes before a title, and those
-    before the other members. Only members whose value is text are kept:
-    those of the same name in neighbouring entries are what a scan reads as
-    one phrase.
+    A list is scanned whole (textutil.text_views), and one of the ways it is
+    read joins the values of one member ("description", "title", ...) over
+    the entries that have it, skipping the entries that do not. So for each
+    member this keeps the values of the entries nearest that end (the end of
+    the page when from_end, else its start) that have text in it, as many as
+    fit the member's share. The budget is shared fairly: a member that needs
+    less than an equal share leaves the rest to the others, so a long
+    description cannot crowd out a title. A kept value costs its key, its
+    text and _MEMBER_OVERHEAD bytes; the last value kept of a member is cut,
+    keeping the part nearest the boundary. The five members of
+    _BOUNDARY_MEMBERS are always looked for, and the first others found
+    nearest the boundary, MAX_BOUNDARY_MEMBERS in all. As in text_views, a run
+    of the same text is kept at most _REPEATS_KEPT times.
+
+    Returns (index into `entries`, {member: kept text}) for each entry with
+    text kept, in page order, its members in the entry's own order.
     """
-    room = PAGE_BOUNDARY_BYTES
-    entries = [entry for entry in entries if isinstance(entry, dict)]
-    kept: list[dict[str, str]] = [{} for _ in entries]
-    for index in reversed(range(len(entries))) if keep_end else range(len(entries)):
-        members = [(key, value) for key, value in entries[index].items()
-                   if isinstance(key, str) and isinstance(value, str)]
-        members.sort(key=lambda member: _member_rank(member[0]))
-        for key, value in members:
-            cost = len(key.encode("utf-8", "surrogatepass"))
-            if cost >= room:
+    found = _boundary_values(entries, from_end)
+    shares = _fair_shares({key: sum(_value_cost(key, value) for _, value in values)
+                           for key, values in found.items()}, PAGE_BOUNDARY_BYTES)
+    kept: dict[int, dict[str, str]] = {}
+    for key, values in found.items():
+        room = shares[key]
+        fixed = _value_cost(key, "")
+        for index, value in values:
+            piece = _cut_to_bytes(value, room - fixed, keep_end=from_end) if room > fixed else ""
+            if not piece:
+                break
+            kept.setdefault(index, {})[key] = piece
+            room -= _value_cost(key, piece)
+    return [(index, {key: kept[index][key] for key in entries[index] if key in kept[index]}) for index in sorted(kept)]
+
+
+def _boundary_values(entries: Sequence[Any], from_end: bool) -> dict[str, list[tuple[int, str]]]:
+    """For each text member, the (index, value) of the entries nearest one end that have text in it, nearest first.
+
+    A member is followed until its values would cost PAGE_BOUNDARY_BYTES,
+    which no share can exceed. The walk reads every entry otherwise: entries
+    without a member must not hide the next one that has it.
+    """
+    found: dict[str, list[tuple[int, str]]] = {key: [] for key in _BOUNDARY_MEMBERS}
+    cost = dict.fromkeys(found, 0)
+    for index in range(len(entries) - 1, -1, -1) if from_end else range(len(entries)):
+        entry = entries[index]
+        if not isinstance(entry, dict):
+            continue
+        for key, value in entry.items():
+            if not isinstance(key, str) or not isinstance(value, str) or not value or value.isspace():
                 continue
-            piece = _cut_to_bytes(value, room - cost, keep_end)
-            kept[index][key] = piece
-            room -= cost + len(piece.encode("utf-8", "surrogatepass"))
-    return [{key: found[key] for key in entry if key in found} for entry, found in zip(entries, kept)]
+            if key not in found:
+                if len(found) >= MAX_BOUNDARY_MEMBERS or len(key) > MAX_BOUNDARY_KEY_CHARS:
+                    continue
+                found[key], cost[key] = [], 0
+            values = found[key]
+            if cost[key] >= PAGE_BOUNDARY_BYTES:
+                continue
+            if len(values) >= _REPEATS_KEPT and all(text == value for _, text in values[-_REPEATS_KEPT:]):
+                continue
+            values.append((index, value))
+            cost[key] += _value_cost(key, value)
+    return {key: values for key, values in found.items() if values}
 
 
-def _member_rank(key: str) -> int:
-    return _BOUNDARY_MEMBERS.index(key) if key in _BOUNDARY_MEMBERS else len(_BOUNDARY_MEMBERS)
+def _value_cost(key: str, value: str) -> int:
+    """What one kept value of a member costs in the boundary view's budget, in bytes."""
+    return len(key.encode("utf-8", "surrogatepass")) + len(value.encode("utf-8", "surrogatepass")) + _MEMBER_OVERHEAD
+
+
+def _fair_shares(needs: Mapping[str, int], room: int) -> dict[str, int]:
+    """Split `room` among the members: each gets what it needs, up to an equal part of what the others leave."""
+    shares: dict[str, int] = {}
+    left = len(needs)
+    for key in sorted(needs, key=needs.__getitem__):
+        shares[key] = min(needs[key], room // left)
+        room -= shares[key]
+        left -= 1
+    return shares
+
+
+def _fewest(refused: Callable[[int], bool], total: int) -> int:
+    """The smallest count from 1 to `total` that `refused` holds for, taking it to hold for `total`.
+
+    A binary search, so at most about log2(total) scans: adding text to a
+    scan rarely takes a finding away. If it ever does, the count found is
+    still one that is refused.
+    """
+    low, high = 0, total
+    while high - low > 1:
+        middle = (low + high) // 2
+        if refused(middle):
+            high = middle
+        else:
+            low = middle
+    return high
 
 
 def _cut_to_bytes(text: str, size: int, keep_end: bool) -> str:
@@ -883,6 +958,9 @@ class Proxy:
             # skip the list's checks (pins, quarantine, hiding), or a result could set the
             # flow marks of another tool. MCP forbids reusing an id; the request is dropped,
             # unanswered, because any answer under that id would be taken for the first one's.
+            # The first one of a request that timed out was answered already, so this one is.
+            if self._id_timed_out(message["id"]):
+                return self._refuse_timed_out_id(message)
             return self._dropped("a client request that reuses the id of a request still waiting for its reply")
 
         # What every request must pass first: the protocol revision's rules, then the
@@ -1270,8 +1348,9 @@ class Proxy:
             if self._templates_overflowed:
                 return "too many resource templates were quarantined to keep track of, so no resource can be read"
             templates = list(self._quarantined_templates.items())
+        spellings = uri_template.spellings(uri) if templates else None
         for template, parts in templates:
-            if uri_template.may_match(parts, uri):
+            if uri_template.may_match(parts, spellings):
                 return f"the URI may come from the quarantined resource template '{printable(template, limit=120)}'"
         return None
 
@@ -1618,6 +1697,28 @@ class Proxy:
             return msg_id in self._pending or any(
                 waiting.message.get("id") == msg_id and not waiting.cancelled for waiting in self._waiting.values()
             )
+
+    def _id_timed_out(self, msg_id: Any) -> bool:
+        """Whether this id belongs to a forwarded request that timed out and whose late reply has not come."""
+        with self._state:
+            pending = self._pending.get(msg_id)
+            return pending is not None and pending.timed_out
+
+    def _refuse_timed_out_id(self, message: JsonObject) -> _Outcome:
+        """Answer a request that reuses the id of one that timed out, with an error, without forwarding it.
+
+        The client was told the first request timed out, so the id looks free
+        to it; but the server may still answer the first, and that late reply
+        would be taken for this one's. The id is free again once it came.
+        """
+        method = message["method"]
+        decision = self._firewall.refuse(
+            _label(method), f"{method} reuses the id of a request that timed out, whose late reply may still come",
+            event="client_request", public_reason=_TIMED_OUT_ID_REFUSAL, rule=RULE_MALFORMED,
+        )
+        self._report(f"refused a '{method}' request that reuses the id of a request that timed out "
+                     f"{proxy_report.rule_and_ref(decision)}")
+        return _Outcome(to_client=_rpc_error(message["id"], decision.public_reason, code=protocol.INVALID_REQUEST))
 
     def _forget_cancelled_request(self, message: JsonObject) -> bool:
         """Forget a request the client cancelled. True when it was only held for approval, never forwarded.
@@ -2582,51 +2683,76 @@ class Proxy:
 
         A list reply is scanned whole because a phrase can be split over two
         entries; the client joins the pages of a list into one, so a phrase
-        can also be split over the last entry of one page and the first of
-        the next. While a cursor chain is open, the text of the end of the
-        page before (_remember_page_end: its last PAGE_BOUNDARY_ENTRIES
-        entries, at most PAGE_BOUNDARY_BYTES) is scanned with the start of
-        this page (as much again) with the metadata rules. If that is
-        refused, the fewest entries at the start of this page that are
-        refused with that end are removed, and they and the fewest entries at
-        the end of the page before that take part are quarantined (tools,
-        prompts, resource templates: they cannot be used, and are left out of
-        later lists). The page before was already forwarded: its entries stay
-        in the client's list.
+        can also be split over the end of one page and the start of the next.
+        While a cursor chain is open, the text nearest the end of the page
+        before (_remember_page_end) is scanned with the text nearest the start
+        of this page (_boundary_view: for each member, the nearest entries
+        that have text in it, PAGE_BOUNDARY_BYTES of each side) with the
+        metadata rules. If that is refused, the fewest entries of this page's
+        side that are refused with that end are removed, and they and the
+        fewest entries of the end of the page before that take part are
+        quarantined (tools, prompts, resource templates: they cannot be used,
+        and are left out of later lists). The page before was already
+        forwarded: its entries stay in the client's list.
         """
         if pending.cursor is None or not entries:
             return entries
         with self._state:
             tail = self._page_tails[items_key].get(pending.cursor)
-        if tail is None or not tail.entries:
+        if tail is None or not tail.texts:
             return entries
-        head = [entry for entry in entries[:PAGE_BOUNDARY_ENTRIES] if isinstance(entry, dict)]
-        start = _boundary_view(head, keep_end=False)
+        head = _boundary_view(entries, from_end=False)
+        start = [text for _, text in head]
+        if not start:
+            return entries
         decision = self._firewall.scan_result(
-            pending.label, {items_key: [*tail.entries, *start]}, event="list_item", log_clean=False,
+            pending.label, {items_key: [*tail.texts, *start]}, event="list_item", log_clean=False,
             call_id=pending.call_id,
         )
         if decision.allowed:
             return entries
-        # The fewest entries of each side that are refused together (a few unrecorded scans of 8 KiB at most).
-        taken = next((count for count in range(1, len(start))
-                      if self._boundary_refused(items_key, tail.entries, start[:count])), len(start))
-        ended = next((count for count in range(1, len(tail.entries))
-                      if self._boundary_refused(items_key, tail.entries[-count:], start[:taken])), len(tail.entries))
+        removed, ended = self._boundary_entries(items_key, tail.texts, start)
         if items_key in PINNED_LISTS:
-            for name, template in zip(tail.names[-ended:], tail.templates[-ended:]):
+            for position in ended:
+                name = tail.names[position]
                 if name:
-                    self._quarantine(items_key, name, [template] if template else [])
-            for entry in head[:taken]:
+                    listed = {"name": name, "uriTemplate": tail.templates[position] or None}
+                    self._quarantine(items_key, name, self._template_texts(items_key, listed))
+            for position in removed:
+                entry = entries[head[position][0]]
                 if _is_name(entry.get("name")):
                     self._quarantine(items_key, entry["name"], self._template_texts(items_key, entry))
+        count = len(removed)
         self._report_block(
-            f"removed {taken} entr{'y' if taken == 1 else 'ies'} at the start of a page of the {items_key} list: "
+            f"removed {count} entr{'y' if count == 1 else 'ies'} near the start of a page of the {items_key} list: "
             "read with the end of the page before (already forwarded), they were refused; both are quarantined",
             decision,
         )
-        removed = {id(entry) for entry in head[:taken]}
-        return [entry for entry in entries if id(entry) not in removed]
+        dropped = {head[position][0] for position in removed}
+        return [entry for index, entry in enumerate(entries) if index not in dropped]
+
+    def _boundary_entries(
+        self, items_key: str, end: Sequence[dict[str, str]], start: Sequence[dict[str, str]],
+    ) -> tuple[list[int], list[int]]:
+        """Which entries of a refused boundary to remove (positions in `start`) and to quarantine (in `end`).
+
+        On each side, the fewest entries nearest the boundary that are refused
+        with the other side (_fewest: a binary search). If the farthest of
+        those is refused with the other side on its own, it alone is taken:
+        the entries in between, which a phrase may be padded with, are left
+        out. Each scan is unrecorded and of 2 * PAGE_BOUNDARY_BYTES at most,
+        about 2 * log2(entries) + 2 of them in all.
+        """
+        taken = _fewest(lambda count: self._boundary_refused(items_key, end, start[:count]), len(start))
+        removed = list(range(taken))
+        if taken > 1 and self._boundary_refused(items_key, end, [start[taken - 1]]):
+            removed = [taken - 1]
+        chosen = [start[position] for position in removed]
+        reach = _fewest(lambda count: self._boundary_refused(items_key, end[len(end) - count:], chosen), len(end))
+        ended = list(range(len(end) - reach, len(end)))
+        if reach > 1 and self._boundary_refused(items_key, [end[len(end) - reach]], chosen):
+            ended = [len(end) - reach]
+        return removed, ended
 
     def _boundary_refused(self, items_key: str, end: Sequence[dict[str, str]], start: Sequence[dict[str, str]]) -> bool:
         """Whether the end of one page read with the start of the next has a finding at the blocking severity.
@@ -2644,31 +2770,37 @@ class Proxy:
     def _remember_page_end(self, pending: _PendingRequest, items_key: str, delivered: JsonObject) -> None:
         """Keep the end of a page that was delivered with a nextCursor, for the next page's boundary scan.
 
-        What is kept is the text the client was sent (the delivered reply).
-        A page that was refused, or that has no nextCursor, closes its chain.
-        A page with fewer than PAGE_BOUNDARY_ENTRIES entries keeps some of the
-        end of the page before too. At most MAX_OPEN_CURSORS chains per list
-        are kept; the oldest is forgotten first.
+        What is kept is the text the client was sent (the delivered reply):
+        _boundary_view of the page, read from its end. The end of the page
+        before is read on after it, so a member this page has too little text
+        in is filled from the pages before. A page that was refused, or that
+        has no nextCursor, closes its chain. At most MAX_OPEN_CURSORS chains
+        per list are kept; the oldest is forgotten first.
         """
         result = delivered.get("result")
         entries = result.get(items_key) if isinstance(result, dict) else None
         next_cursor = result.get("nextCursor") if isinstance(result, dict) else None
         with self._state:
+            before = self._page_tails[items_key].pop(pending.cursor, None) if pending.cursor is not None else None
+        if not isinstance(entries, list) or not isinstance(next_cursor, str) or not next_cursor:
+            return
+        # Side by side: what to read of each entry, its name and its uriTemplate ("" when it has none).
+        texts: list[Any] = list(before.texts) if before is not None else []
+        names = list(before.names) if before is not None else []
+        templates = list(before.templates) if before is not None else []
+        for entry in entries:
+            if isinstance(entry, dict):
+                texts.append(entry)
+                names.append(entry["name"] if _is_name(entry.get("name")) else "")
+                template = entry.get("uriTemplate") if items_key == "resourceTemplates" else None
+                # One too long to read matches every URI (uri_template), cut or not: it is kept bounded.
+                templates.append(template[:uri_template.MAX_TEMPLATE_CHARS + 1] if isinstance(template, str) else "")
+        kept = _boundary_view(texts, from_end=True)
+        tail = _PageTail(tuple(text for _, text in kept), tuple(names[index] for index, _ in kept),
+                         tuple(templates[index] for index, _ in kept))
+        with self._state:
             tails = self._page_tails[items_key]
-            before = tails.pop(pending.cursor, None) if pending.cursor is not None else None
-            if not isinstance(entries, list) or not isinstance(next_cursor, str) or not next_cursor:
-                return
-            # Kept side by side: the text of each entry, its name and its uriTemplate ("" when it has none).
-            last = [entry for entry in entries if isinstance(entry, dict)][-PAGE_BOUNDARY_ENTRIES:]
-            kept = _boundary_view(last, keep_end=True)
-            names = [entry["name"] if _is_name(entry.get("name")) else "" for entry in last]
-            templates = [entry["uriTemplate"] if isinstance(entry.get("uriTemplate"), str) else "" for entry in last]
-            if before is not None and len(last) < PAGE_BOUNDARY_ENTRIES:
-                missing = PAGE_BOUNDARY_ENTRIES - len(last)
-                kept = _boundary_view([*before.entries[-missing:], *kept], keep_end=True)
-                names = [*before.names[-missing:], *names]
-                templates = [*before.templates[-missing:], *templates]
-            tails[_digest(next_cursor)] = _PageTail(tuple(kept), tuple(names), tuple(templates))
+            tails[_digest(next_cursor)] = tail
             while len(tails) > MAX_OPEN_CURSORS:
                 del tails[next(iter(tails))]
 
@@ -3021,10 +3153,15 @@ def _report_session_group(group: _JoinedGroup, firewall: Firewall, say: Callable
     joined, store, run = group.joined, group.store, group.run
     members = ", ".join(joined.members)
     client = f"{printable(run.program, limit=60)} {run.id}" if run.id != client_run.UNKNOWN else "unknown"
+    others = (f" (the file holds the sessions of {joined.others} other client run(s) too, each of its own)"
+              if joined.others else "")
     if joined.status == NEW_RUN:
-        text = f"began the flow session of client run {client}"
+        text = f"began the flow session of client run {client}{others}"
+        if joined.replaced:
+            text += (f"; the session of the client run begun first (its members: {', '.join(joined.replaced)}) "
+                     "was removed to make room")
     elif joined.status == JOINED:
-        text = f"joined the flow session of client run {client}, with {members}"
+        text = f"joined the flow session of client run {client}, with {members}{others}"
     elif joined.status == REPLACED:
         before = f" (its members: {', '.join(joined.replaced)})" if joined.replaced else ""
         text = f"began the flow session of client run {client}, replacing the file: {joined.detail}{before}"

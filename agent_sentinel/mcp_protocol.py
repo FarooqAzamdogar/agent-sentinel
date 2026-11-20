@@ -64,6 +64,7 @@ TASKS_METHOD_PREFIX = "tasks/"
 
 # ---- JSON-RPC error codes ---------------------------------------------------------
 
+INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 UNSUPPORTED_PROTOCOL_VERSION = -32022  # defined by 2026-07-28; clients retry with a listed version

@@ -24,8 +24,8 @@ from agent_sentinel import Firewall, Policy, client_run, mcp_proxy, session
 from agent_sentinel.cli_doctor import Line, ServerReport, session_group_lines
 from agent_sentinel.filelock import locked
 from agent_sentinel.session import (
-    JOINED, MAX_GROUP_MEMBERS, NEW_RUN, REPLACED, UNUSABLE, GroupSessionStore, MemorySessionStore,
-    SessionStateError,
+    JOINED, MAX_GROUP_MEMBERS, MAX_GROUP_RUNS, NEW_RUN, REPLACED, UNUSABLE, GroupSessionStore, MemorySessionStore,
+    SessionStateError, group_members,
 )
 from agent_sentinel.wrapping import ProxySettings, proxy_command_of, wrap_entry
 
@@ -52,6 +52,10 @@ class GroupStoreTest(unittest.TestCase):
     def document(self):
         return json.loads((self.folder / "claude-desktop.json").read_text(encoding="ascii"))
 
+    def run_in_file(self, index=-1):
+        """A client run's session in the file: the one begun last, by default."""
+        return self.document()["runs"][index]
+
 
 class TheLifecycle(GroupStoreTest):
     def test_the_first_proxy_begins_a_run_and_the_others_join_it(self):
@@ -60,8 +64,9 @@ class TheLifecycle(GroupStoreTest):
         second = self.store("mail")
         joined = second.join()
         self.assertEqual((joined.status, joined.members), (JOINED, ("files", "mail")))
-        self.assertEqual(self.document()["members"], ["files", "mail"])
-        self.assertEqual(self.document()["run"], "100@1")
+        self.assertEqual(len(self.document()["runs"]), 1)
+        self.assertEqual(self.run_in_file()["members"], ["files", "mail"])
+        self.assertEqual(self.run_in_file()["run"], "100@1")
 
     def test_marks_one_member_sets_refuse_a_sink_of_another_and_name_where_they_came_from(self):
         files, web, mail = self.store("files"), self.store("web"), self.store("mail")
@@ -82,20 +87,64 @@ class TheLifecycle(GroupStoreTest):
         restarted = self.store("files")
         self.assertEqual(restarted.join().status, JOINED)
         self.assertEqual(restarted.read().labels, {"private"})
-        self.assertEqual(self.document()["members"], ["files"])  # listed once
+        self.assertEqual(self.run_in_file()["members"], ["files"])  # listed once
 
-    def test_a_file_of_another_client_run_is_replaced(self):
-        old = self.store("files", run="100@1")
-        old.join()
-        old.add(["private", "untrusted"], "read_file")
-        new = self.store("mail", run="200@2")
-        joined = new.join()
-        self.assertEqual((joined.status, joined.replaced), (REPLACED, ("files",)))
-        self.assertEqual(new.read().labels, frozenset())
-        # The member of the old run now sees a file that is not its run's: every mark counts as set.
-        marks = old.read()
+    def test_another_client_run_gets_a_session_of_its_own_beside_the_first(self):
+        # Two windows (or two instances) of one client. The second used to replace the first's session,
+        # and every proxy of the first then refused every sink call until it was restarted.
+        first = self.store("files", run="100@1")
+        first.join()
+        first.add(["private", "untrusted"], "read_file")
+        second = self.store("files", run="200@2")
+        joined = second.join()
+        self.assertEqual((joined.status, joined.replaced, joined.others), (NEW_RUN, (), 1))
+        self.assertEqual(second.read().labels, frozenset())
+        marks = first.read()
+        self.assertFalse(marks.everything)
+        self.assertEqual(marks.labels, {"private", "untrusted"})
+        second.add(["untrusted"], "fetch_page")
+        self.assertEqual(first.read().labels, {"private", "untrusted"})  # each run keeps its own marks
+        self.assertEqual(second.read().labels, {"untrusted"})
+        mail = self.store("mail", run="100@1")
+        self.assertEqual((mail.join().status, mail.read().labels), (JOINED, {"private", "untrusted"}))
+        self.assertEqual([run["run"] for run in self.document()["runs"]], ["100@1", "200@2"])
+        flows = Policy.from_dict(FLOWS)
+        self.assertFalse(Firewall(flows, session_store=mail).check_call("send_email", {"to": "x"}).allowed)
+        self.assertTrue(Firewall(flows, session_store=second).check_call("send_email", {"to": "x"}).allowed)
+
+    def test_past_the_limit_the_run_begun_first_is_removed_and_its_members_fail_closed(self):
+        oldest = self.store("files", run="run-0")
+        oldest.join()
+        for index in range(1, MAX_GROUP_RUNS):
+            self.store("files", run=f"run-{index}").join()
+        self.assertFalse(oldest.read().everything)
+        joined = self.store("files", run="run-new").join()
+        self.assertEqual((joined.status, joined.replaced, joined.others), (NEW_RUN, ("files",), MAX_GROUP_RUNS - 1))
+        self.assertEqual(len(self.document()["runs"]), MAX_GROUP_RUNS)
+        marks = oldest.read()
         self.assertTrue(marks.everything)
-        self.assertIn("another client run", marks.why)
+        self.assertIn("removed from the session group file", marks.why)
+        self.assertTrue(oldest.add(["private"], "read_file").everything)  # and it is never put back
+        self.assertNotIn("run-0", [run["run"] for run in self.document()["runs"]])
+
+    def test_a_file_that_would_be_too_large_drops_the_runs_of_other_clients_first(self):
+        stores = [self.store("files", run=f"run-{index}") for index in range(4)]
+        for store in stores:
+            store.join()
+        labels = [f"l{index:03}" + "x" * 36 for index in range(session.MAX_MARKS)]
+        tool = "t" * session.MAX_CAUSE_TOOL_CHARS
+        for store in stores:  # four runs of as many long marks as a run takes do not fit in MAX_STATE_FILE_BYTES
+            store.add(labels, tool)
+        self.assertLessEqual((self.folder / "claude-desktop.json").stat().st_size, session.MAX_STATE_FILE_BYTES)
+        self.assertNotIn("run-0", [run["run"] for run in self.document()["runs"]])
+        self.assertTrue(stores[0].read().everything)
+        self.assertEqual(len(stores[3].read().labels), session.MAX_MARKS)
+
+    def test_doctor_reads_the_members_of_the_run_begun_last(self):
+        self.store("files", run="100@1").join()
+        self.store("mail", run="100@1").join()
+        self.store("files", run="200@2").join()
+        self.assertEqual(group_members(self.folder, "claude-desktop"), ("files",))
 
     def test_proxies_starting_at_the_same_moment_make_one_run(self):
         script = (
@@ -110,13 +159,14 @@ class TheLifecycle(GroupStoreTest):
                      for index in range(5)]
         statuses = sorted(process.communicate(timeout=60)[0].decode().strip() for process in processes)
         self.assertEqual(statuses, [JOINED] * 4 + [NEW_RUN])
-        members = json.loads((self.folder / "g.json").read_text(encoding="ascii"))["members"]
+        (run,) = json.loads((self.folder / "g.json").read_text(encoding="ascii"))["runs"]
+        members = run["members"]
         self.assertEqual(sorted(members), [f"m{index}" for index in range(5)])
 
     def test_the_list_of_members_is_bounded(self):
         for index in range(MAX_GROUP_MEMBERS + 5):
             self.store(f"m{index}").join()
-        self.assertEqual(len(self.document()["members"]), MAX_GROUP_MEMBERS)
+        self.assertEqual(len(self.run_in_file()["members"]), MAX_GROUP_MEMBERS)
         last = self.store("late")
         self.assertEqual(last.join().status, JOINED)  # it still shares the marks
         last.add(["private"], "read_file")
@@ -160,7 +210,7 @@ class FailingClosed(GroupStoreTest):
         store.join()
         store.add(["private"], "read_file")
         document = self.document()
-        document["marks"] = {}
+        document["runs"][0]["marks"] = {}
         store.path.write_text(json.dumps(document), encoding="ascii")
         self.assertIn("disappeared", store.read().why)
 
@@ -179,16 +229,26 @@ class FailingClosed(GroupStoreTest):
         store = self.store()
         store.join()
         good = self.document()
+        (run,) = good["runs"]
+
+        def with_run(**changes):
+            return dict(good, runs=[dict(run, **changes)])
+
         bad = [
             dict(good, extra=1),
             dict(good, group="other"),
             dict(good, version=2),
-            dict(good, instance="not-hex"),
-            dict(good, members=["../x"]),
-            dict(good, members=["a", "a"]),
-            dict(good, marks={"private": {"tool": "t", "time": "", "server": "../x"}}),
-            dict(good, marks={"sink": {"tool": "t", "time": "", "server": ""}}),
-            dict(good, marks={"private": {"tool": "t", "time": ""}}),
+            dict(good, runs=[]),
+            dict(good, runs=[run, run]),
+            dict(good, runs=[dict(run, run=f"r{index}") for index in range(MAX_GROUP_RUNS + 1)]),
+            dict(good, runs=run),
+            with_run(extra=1),
+            with_run(instance="not-hex"),
+            with_run(members=["../x"]),
+            with_run(members=["a", "a"]),
+            with_run(marks={"private": {"tool": "t", "time": "", "server": "../x"}}),
+            with_run(marks={"sink": {"tool": "t", "time": "", "server": ""}}),
+            with_run(marks={"private": {"tool": "t", "time": ""}}),
         ]
         for document in bad:
             with self.subTest(document=document):
@@ -346,6 +406,17 @@ class TheProxyJoinsItsGroup(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             mcp_proxy._report_session_group(group, firewall, mcp_proxy._warn)
         self.assertIn("session group 'claude-desktop': began the flow session", err.getvalue())
+
+    def test_the_startup_line_names_the_other_client_runs_and_one_removed_to_make_room(self):
+        store = GroupSessionStore(self.home / "sessions", "desk", "200@2", "files")
+        joined = session.GroupJoin(NEW_RUN, ("files",), replaced=("web", "mail"), others=MAX_GROUP_RUNS - 1)
+        group = mcp_proxy._JoinedGroup(store, joined, client_run.ClientRun("200@2", 2.0, "claude"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            mcp_proxy._report_session_group(group, Firewall(Policy.from_dict(FLOWS)), mcp_proxy._warn)
+        self.assertIn(f"began the flow session of client run claude 200@2 (the file holds the sessions of "
+                      f"{MAX_GROUP_RUNS - 1} other client run(s) too, each of its own); the session of the client "
+                      "run begun first (its members: web, mail) was removed to make room", err.getvalue())
 
     def test_a_home_folder_that_cannot_be_told_stops_the_proxy(self):
         err = io.StringIO()

@@ -111,9 +111,10 @@ def text_of(reply):
 class ProxyProcess:
     """A real `agent-sentinel proxy` in front of a server, driven over stdio as an MCP client drives it."""
 
-    def __init__(self, test, proxy_args, server=FAKE_SERVER, server_args=(), extra_env=None):
+    def __init__(self, test, proxy_args, server=FAKE_SERVER, server_args=(), extra_env=None, through=()):
+        """through: a command that starts the proxy in its place (the proxy's command is added to it)."""
         environment = {**test.environment, **(extra_env or {})}
-        command = [sys.executable, "-m", "agent_sentinel", "proxy", *map(str, proxy_args),
+        command = [*through, sys.executable, "-m", "agent_sentinel", "proxy", *map(str, proxy_args),
                    "--", sys.executable, str(server), *server_args]
         self.process = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1609,7 +1610,8 @@ class TheProxiesOfOneClient(EndToEndTest):
                          + REF + r"\Z")
         self.assertEqual(text_of(alone.call(3, "reply_with", sent)), "sent")
 
-        group = json.loads((self.home / ".agent-sentinel" / "sessions" / "desk.json").read_text(encoding="ascii"))
+        (group,) = json.loads((self.home / ".agent-sentinel" / "sessions" / "desk.json").read_text(
+            encoding="ascii"))["runs"]
         self.assertEqual(sorted(group["members"]), ["files", "mail"])
         self.assertEqual((group["marks"]["private"]["server"], group["marks"]["private"]["tool"]), ("files", "echo"))
         self.assertRegex(group["run"], rf"\A{os.getpid()}@")  # this test is the client that started both
@@ -1621,6 +1623,39 @@ class TheProxiesOfOneClient(EndToEndTest):
         for proxy in (files, mail):
             self.assertIn("session   group 'desk': flow marks shared", proxy.stderr)
             self.assertIn("session group 'desk': ", proxy.stderr)
+
+    def test_a_second_client_run_in_the_group_has_a_session_of_its_own(self):
+        # Two windows of one client: each starts its own proxies, with the same group. The second window's
+        # proxies used to take the group file over, and every sink call of the first was then refused.
+        policy = self.write("policy.json", {
+            "default": "block",
+            "tools": {"echo": {"action": "allow", "labels": ["untrusted", "private"]},
+                      "reply_with": {"action": "allow", "labels": ["sink"]}},
+            "flows": [{"after": ["untrusted", "private"], "then": "sink", "action": "block"}],
+            "server_requests": {"sampling/createMessage": "block"},
+        })
+        group = ("--session-group", "desk")
+        mail = self.proxy("--policy", policy, "--name", "mail", *group, server=E2E_SERVER)
+        mail.initialize()
+        mail.request(1, "tools/list")
+        sent = {"result": {"content": [{"type": "text", "text": "sent"}]}}
+        self.assertEqual(text_of(mail.call(2, "reply_with", sent)), "sent")
+        # The second window: a Python process in between is the client the proxy finds.
+        window = (sys.executable, "-c", "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))")
+        files = ProxyProcess(self, ["--policy", policy, "--name", "files", *group], E2E_SERVER, through=window)
+        files.initialize()
+        files.request(1, "tools/list")
+        self.assertIn("began the flow session of client run", files.stderr)
+        self.assertIn("1 other client run(s)", files.stderr)
+        self.assertEqual(text_of(mail.call(3, "reply_with", sent)), "sent")  # the first window still works
+        self.assertEqual(text_of(files.call(2, "echo", {"text": "the memo"})), "the memo")
+        self.assertEqual(text_of(mail.call(4, "reply_with", sent)), "sent")  # and the second one's marks are its own
+        runs = json.loads((self.home / ".agent-sentinel" / "sessions" / "desk.json").read_text(encoding="ascii"))["runs"]
+        self.assertEqual([run["members"] for run in runs], [["mail"], ["files"]])
+        self.assertEqual([sorted(run["marks"]) for run in runs], [[], ["private", "untrusted"]])
+        self.assertRegex(runs[0]["run"], rf"\A{os.getpid()}@")
+        self.assertNotRegex(runs[1]["run"], rf"\A{os.getpid()}@")
+        self.assertEqual(files.stop(), 0)
 
     def test_a_call_the_server_does_not_answer_in_time_is_answered_and_cancelled(self):
         policy = self.write("policy.json", {"default": "allow", "limits": {"call_timeout_seconds": 1}})
