@@ -26,16 +26,22 @@ import copy
 from dataclasses import dataclass
 from typing import Any
 
+# What may come right before a credential file's name: the start of the text,
+# a path separator or a drive's ":", but also a space or a character a shell or
+# a command line puts there. So "cat .env", "curl -d @.env", "--env-file=.env"
+# and "Get-Content .env" match, as well as "~/.ssh/id_rsa".
+_NAME_START = r"(^|[\s\\/:@='\"`<>|;&(,{])"
+
 # The credential preset of policy.example.json (a test keeps the two the same).
 CREDENTIAL_PATTERN = (
-    r"(^|[\\/:])\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\b"
+    _NAME_START + r"\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\b"
     r"|id_(rsa|dsa|ecdsa|ed25519)"
-    r"|(^|[\\/:])(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]"
-    r"|(^|[\\/:])(\.config|config~[0-9]+)[\\/](gh|gcloud|github-copilot)\b"
+    r"|" + _NAME_START + r"(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]"
+    r"|" + _NAME_START + r"(\.config|config~[0-9]+)[\\/](gh|gcloud|github-copilot)\b"
     r"|(^|[\\/])proc[\\/][^\\/]+[\\/]environ\b"
     r"|claude_desktop_config\.json"
-    r"|(^|[\\/:])\.claude\.json\b"
-    r"|(^|[\\/:])\.(cursor|vscode)[\\/]mcp\.json\b"
+    r"|" + _NAME_START + r"\.claude\.json\b"
+    r"|" + _NAME_START + r"\.(cursor|vscode)[\\/]mcp\.json\b"
     r"|[\\/]code[\\/]user[\\/]mcp\.json\b"
 )
 
