@@ -180,6 +180,36 @@ class ShowingAndApplying(WrapTest):
         _, out, _ = self.wrap()
         self.assertIn("has agent-sentinel 0.0.1 installed", out)
 
+    def test_the_install_advice_names_an_install_that_works(self):
+        # agent-sentinel is not on PyPI yet: "pip install agent-sentinel" would fail, or install someone else's
+        # package of that name into the Python the client starts.
+        self.place()
+        self.check_python.return_value = PythonCheck(True, None)
+        for args in (("--client", "claude-desktop"), ("--client", "codex", "--name", "files", "--", "npx", "x")):
+            with self.subTest(args=args):
+                code, out, err = run_cli("wrap", "--policy", self.policy, *args)
+                self.assertEqual(code, 0, err)
+                self.assertIn("python -m pip install git+https://github.com/FarooqAzamdogar/agent-sentinel.git", out)
+                self.assertIn("see Install in the README", out)
+                self.assertNotIn("pip install agent-sentinel", out)
+
+    def test_a_leading_tilde_is_the_home_folder(self):
+        # Windows PowerShell 5.1 and cmd pass "~" on as it is; it must not become a folder named "~".
+        config = self.place(path=self.user / "configs" / "claude.json")
+        self.write("user/my-policy.json", templates.template("starter"))
+        code, out, err = run_cli("wrap", "--client", "claude-desktop", "--config", "~/configs/claude.json",
+                                 "--policy", "~/my-policy.json", "--audit", "~/logs/audit.jsonl",
+                                 "--pins-dir", "~/my-pins", "--apply")
+        self.assertEqual(code, 0, err)
+        args = json.loads(config.read_text(encoding="utf-8"))["mcpServers"]["files"]["args"]
+        self.assertEqual(args[args.index("--policy") + 1], str(self.user / "my-policy.json"))
+        self.assertEqual(args[args.index("--audit") + 1], str(self.user / "logs" / "audit.jsonl"))
+        self.assertTrue(args[args.index("--pins") + 1].startswith(str(self.user / "my-pins") + os.sep))
+        self.assertFalse((self.project / "~").exists())
+        code, out, err = run_cli("unwrap", "--client", "claude-desktop", "--config", "~/configs/claude.json", "--apply")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(config.read_text(encoding="utf-8")), ORIGINAL)
+
     def test_a_user_install_is_started_without_isolation_and_the_risk_is_named(self):
         self.place()
         self.check_python.return_value = PythonCheck(False, __version__)
@@ -222,6 +252,22 @@ class Refusals(WrapTest):
         self.assertIn("not valid JSON", err)
         self.assertNotIn(TOKEN, err)
         self.assertNotIn(TOKEN[:12], err)
+
+    def test_a_backslash_mistake_in_a_secret_is_located_without_quoting_it(self):
+        # "\Z" is not a JSON escape. The hint written for policies would quote what follows the backslash.
+        secret = "Zx9QpLm77Kw2Rt5Y"
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text('{"mcpServers": {"db": {"command": "npx", "args": ["db-server@1.0.0"],\n'
+                               '  "env": {"DB_PASSWORD": "hunter2\\' + secret + '"}}}}', encoding="utf-8")
+        for command in (("wrap", "--client", "claude-desktop", "--policy", self.policy),
+                        ("unwrap", "--client", "claude-desktop")):
+            with self.subTest(command=command[0]):
+                code, out, err = run_cli(*command)
+                self.assertEqual(code, 2)
+                self.assertIn(":2:", err)
+                self.assertIn("a backslash inside text must be doubled", err)
+                self.assertNotIn(secret[:6], out + err)
+                self.assertNotIn("hunter2", out + err)
 
     def test_claude_codes_state_file_is_never_edited(self):
         state = self.write("project/.claude.json", {"mcpServers": {"a": {"command": "npx"}}})
@@ -274,6 +320,42 @@ class Refusals(WrapTest):
         self.assertEqual(code, 0)
         self.assertIn("not a plain variable name", out)
         self.assertIn("Nothing to wrap.", out)
+
+    def test_an_env_that_would_change_what_starts_as_the_proxy_leaves_the_entry_alone(self):
+        # The client gives "env" to the proxy's Python too; this one would import from another folder, even with -I.
+        self.place({"mcpServers": {"odd": {"command": "npx", "args": ["x"],
+                                           "env": {"__PYVENV_LAUNCHER__": r"evil\Scripts\python.exe"}}}})
+        before = self.config.read_bytes()
+        code, out, _ = self.wrap("--apply")
+        self.assertEqual(code, 0)
+        self.assertRegex(out, r"odd\s+skipped: its \"env\" sets __PYVENV_LAUNCHER__; with that, Python takes its own "
+                              r"program file from it")
+        self.assertIn("Nothing to wrap.", out)
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_a_python_without_isolation_is_not_written_into_a_projects_configuration(self):
+        # A pip --user install is found only without -I. In a project's file the client starts the proxy in the
+        # project, where the repository can put an agent_sentinel folder: doctor would call that entry broken.
+        self.check_python.return_value = PythonCheck(False, __version__)
+        self.write("repo/.git/HEAD", "ref: refs/heads/main\n")
+        mcp = self.write("project/.mcp.json", {"mcpServers": {"a": {"command": "npx", "args": ["x"]}}})
+        shared = self.write("repo/configs/servers.json", {"mcpServers": {"a": {"command": "npx", "args": ["x"]}}})
+        for args, path in ((["--client", "claude-code"], mcp),
+                           (["--client", "claude-desktop", "--config", shared], shared)):
+            before = path.read_bytes()
+            with self.subTest(path=path):
+                code, out, err = run_cli("wrap", *args, "--policy", self.policy, "--apply")
+                self.assertEqual(code, 0, err)
+                self.assertRegex(out, r"a\s+skipped: the program that would start the proxy, .+, runs -m "
+                                      r"agent_sentinel without -I \(or -P, Python 3\.11 and later\) from a "
+                                      r"configuration kept in the project")
+                self.assertIn("Nothing to wrap.", out)
+                self.assertEqual(path.read_bytes(), before)
+        # With -I it is written; a user's own file gets the entry without -I (see the --user install test above).
+        self.check_python.return_value = PythonCheck(True, __version__)
+        self.assertEqual(run_cli("wrap", "--client", "claude-code", "--policy", self.policy, "--apply")[0], 0)
+        self.assertEqual(json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]["a"]["args"][:3],
+                         ["-I", "-m", "agent_sentinel"])
 
     def test_options_that_do_not_go_together(self):
         self.place()
@@ -433,6 +515,49 @@ class ListingClients(WrapTest):
                 "/c", "evil.py", "&", "agent-sentinel", "proxy", "--policy", str(self.policy), "--", "x"]}}})
         _, out, _ = run_cli("clients")
         self.assertIn("2 server(s): 2 broken", out)
+        # Entries whose "env" makes the launcher install or import agent-sentinel from somewhere else.
+        self.config.unlink()
+        self.place({"mcpServers": {
+            "index": {"command": "uvx", "args": ["agent-sentinel==0.5.0", "proxy", "--policy", str(self.policy), "--",
+                                                 "x"], "env": {"UV_INDEX_URL": "https://evil.example/simple"}},
+            "path": {"command": sys.executable, "args": ["-m", "agent_sentinel", "proxy", "--policy", str(self.policy),
+                                                         "--", "x"], "env": {"PYTHONPATH": "evil"}},
+            "fine": {"command": sys.executable, "args": ["-I", "-m", "agent_sentinel", "proxy", "--policy",
+                                                         str(self.policy), "--", "x"], "env": {"PYTHONPATH": "evil"}}}})
+        _, out, _ = run_cli("clients")
+        self.assertIn("3 server(s): 1 protected, 2 broken", out)
+        # A launcher the client finds relative to its working folder, a Python option that changes what it
+        # imports, and a home folder of the entry's own (where the proxy reads "~").
+        self.config.unlink()
+        proxy = ["proxy", "--policy", str(self.policy), "--", "x"]
+        self.place({"mcpServers": {
+            "relative": {"command": "tools/python.exe", "args": ["-I", "-m", "agent_sentinel", *proxy]},
+            "prefix": {"command": sys.executable, "args": ["-I", "-X", "pycache_prefix=.c", "-m", "agent_sentinel",
+                                                           *proxy]},
+            "home": {"command": sys.executable, "args": ["-I", "-m", "agent_sentinel", *proxy],
+                     "env": {"USERPROFILE": "."}},
+            "fine": {"command": sys.executable, "args": ["-I", "-X", "utf8", "-m", "agent_sentinel", *proxy]}}})
+        _, out, _ = run_cli("clients")
+        self.assertIn("4 server(s): 1 protected, 3 broken", out)
+
+    def test_a_projects_configuration_is_counted_with_its_project_folder(self):
+        # The client starts the servers of a project's file in the project, which the repository fills.
+        proxy = ["proxy", "--policy", str(self.policy), "--", "x"]
+        servers = {
+            "plain": {"command": sys.executable, "args": ["-m", "agent_sentinel", *proxy]},
+            "options": {"command": sys.executable, "args": ["-B", "-X", "utf8", "-m", "agent_sentinel", *proxy]},
+            "isolated": {"command": sys.executable, "args": ["-I", "-X", "utf8", "-m", "agent_sentinel", *proxy]},
+            "uvx": {"command": "uvx", "args": ["agent-sentinel@0.5.0", *proxy]}}
+        self.write("project/.mcp.json", {"mcpServers": servers})
+        self.place({"mcpServers": servers})  # a user's own file: Python without -I is a warning there (doctor)
+        _, out, _ = run_cli("clients")
+        self.assertIn("4 server(s): 2 protected, 2 broken", out)
+        self.assertIn("4 server(s): 4 protected", out)
+        if sys.platform == "win32":  # Windows looks in the folder the client starts in before PATH
+            self.write("project/uvx.exe", "MZ")
+            _, out, _ = run_cli("clients")
+            self.assertIn("4 server(s): 1 protected, 3 broken", out)
+            self.assertIn("4 server(s): 4 protected", out)
 
     def test_nothing_found(self):
         code, out, _ = run_cli("clients")

@@ -35,6 +35,23 @@ class Reading(unittest.TestCase):
         self.assertEqual(jsonutil.loads('{"a": [1, 2.5, -1e2, true, null, "x"]}'),
                          {"a": [1, 2.5, -100.0, True, None, "x"]})
 
+    def test_the_digit_limit_is_the_same_with_or_without_a_sign_and_whatever_the_interpreter_allows(self):
+        limit = jsonutil.MAX_INT_DIGITS
+        # Python before 3.10.7 has no limit of its own, and it can be turned off; the count here must not need it.
+        previous = sys.get_int_max_str_digits() if hasattr(sys, "get_int_max_str_digits") else None
+        if previous is not None:
+            sys.set_int_max_str_digits(0)
+        try:
+            for sign in ("", "-"):
+                with self.subTest(sign=sign):
+                    self.assertEqual(jsonutil.loads(sign + "7" * limit), int(sign + "7" * limit))
+                    for digits in (limit + 1, limit + 2):
+                        with self.assertRaisesRegex(ValueError, f"a number with more than {limit} digits"):
+                            jsonutil.loads(sign + "7" * digits)
+        finally:
+            if previous is not None:
+                sys.set_int_max_str_digits(previous)
+
     def test_a_repeated_key_names_the_key(self):
         with self.assertRaises(jsonutil.RepeatedKeyError) as caught:
             jsonutil.loads('{"run_shell": "block", "run_shell": "allow"}')

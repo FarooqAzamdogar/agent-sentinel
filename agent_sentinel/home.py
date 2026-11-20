@@ -8,7 +8,8 @@
     <home>/audit.jsonl      the audit log that `wrap` gives every wrapped server
     <home>/pins/            one tool pins file per wrapped server
     <home>/hook-state/      the Claude Code hook's session state: flow marks and rate-limit counts
-    <home>/backups/         backups of configuration files in a project under version control (config_file.py)
+    <home>/backups/         backups of configuration files in a project under version control, with a
+                            .gitignore that ignores them all (config_file.py)
 
 Why not %APPDATA% on Windows: Claude Desktop installed from the Microsoft
 Store (an MSIX package) sees a private copy of AppData. Files that a proxy
@@ -44,7 +45,12 @@ class HomeError(CommandError):
 
 
 def is_absolute(path: str, platform: str | None = None) -> bool:
-    """True for a full path. On Windows that needs a drive or a network share: "\\\\folder" depends on the drive."""
+    """True for a full path. On Windows that needs a drive or a network share: "\\\\folder" depends on the drive.
+
+    "~" is not expanded here, since AGENT_SENTINEL_HOME never is. Paths the
+    proxy reads with "~" as the home folder (--policy and the other file
+    options) are expanded by the caller first, as doctor does.
+    """
     platform = platform or sys.platform
     if platform == "win32":
         drive, rest = ntpath.splitdrive(path)

@@ -234,6 +234,17 @@ class TheInspectCommand(IsolatedHomeTest):
         self.assertIn("nothing checks them", out)
         self.assertIn("unless it is started with an approver", out)
 
+    def test_a_policy_path_with_a_leading_tilde_is_in_the_home_folder(self):
+        # Windows PowerShell 5.1 and cmd pass "~" on as it is.
+        self.write("user/inspect-policy.json", {"default": "block", "tools": {"look": "allow"}})
+        code, out, err = run_cli("inspect", "--policy", "~/inspect-policy.json", "--",
+                                 *self.scenario(pages=[[{"name": "look"}]]))
+        self.assertEqual(code, 0, err)
+        self.assertRegex(out, r"look\s+allow\s+tools\.look")
+        code, _, err = run_cli("inspect", "--policy", "~/missing.json", "--", *FAKE)
+        self.assertEqual(code, 2)
+        self.assertIn(str(self.user / "missing.json"), err)
+
     def test_argument_rules_are_mentioned(self):
         code, out, _ = run_cli("inspect", "--policy", EXAMPLE_POLICY_PATH, "--",
                                *self.scenario(pages=[[{"name": "send_email"}]]))

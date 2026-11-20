@@ -2,11 +2,12 @@
 
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
 import support  # noqa: F401
-from agent_sentinel import wrapping
+from agent_sentinel import home, wrapping
 from agent_sentinel.wrapping import ProxySettings, WrapError, kind_of, read_proxy_command, unwrap_entry, wrap_entry
 
 ROOT = "C:\\sentinel" if sys.platform == "win32" else "/sentinel"
@@ -69,7 +70,24 @@ class Wrapping(unittest.TestCase):
         self.assertEqual(wrapping.proxy_command_of(plain).python_module(), (SETTINGS.python, False))
         self.assertEqual(wrapping.proxy_command_of(wrapped({"command": "x"})).python_module(), (SETTINGS.python, True))
         self.assertIsNone(read_proxy_command(["agent-sentinel", "proxy", "--", "x"]).python_module())
-        self.assertIsNone(read_proxy_command(["py", "-X", "utf8", "-m", "agent_sentinel", "proxy"]).python_module())
+        self.assertIsNone(read_proxy_command(["uvx", "agent-sentinel@0.5.0", "proxy", "--", "x"]).python_module())
+        self.assertEqual(read_proxy_command(["py", "-X", "utf8", "-m", "agent_sentinel", "proxy"]).python_module(),
+                         ("py", False))
+
+    def test_the_python_is_found_whatever_harmless_options_come_before_m(self):
+        # Doctor's -I check runs on what python_module finds: -B or -X utf8 before -m must not hide the Python.
+        for options, isolated, keeps_folder_out in (
+                ([], False, False), (["-B"], False, False), (["-X", "utf8"], False, False),
+                (["-W", "ignore"], False, False), (["-E", "-s"], False, False), (["-u"], False, False),
+                (["-3.12", "-O"], False, False), (["-P"], False, True), (["-I"], True, True),
+                (["-B", "-I"], True, True), (["-IB"], True, True), (["-sI"], True, True),
+                (["-X", "utf8", "-I"], True, True), (["-3.12", "-I", "-W", "ignore"], True, True)):
+            for python in ("py", os.path.join(ROOT, "python.exe"), "python3.12"):
+                found = read_proxy_command([python, *options, "-m", "agent_sentinel", "proxy", "--", "x"])
+                with self.subTest(python=python, options=options):
+                    self.assertEqual(found.python_module(), (python, isolated))
+                    self.assertEqual(found.imports_from_its_folder(), not keeps_folder_out)
+        self.assertFalse(read_proxy_command(["agent-sentinel", "proxy", "--", "x"]).imports_from_its_folder())
 
     def test_the_python_check_prefers_isolation_and_falls_back_only_when_it_must(self):
         def answers(isolated_version, plain_version):
@@ -107,6 +125,35 @@ class Wrapping(unittest.TestCase):
                               ("python3", ["-I", "-m", "agent_sentinel", "proxy", "--", "x"])):
             with self.subTest(command=command), self.assertRaises(WrapError):
                 wrapped({"command": command, "args": args})
+
+    def test_whatever_python_wrap_runs_under_its_entry_reads_back_as_wrapped(self):
+        entry = {"command": "npx", "args": ["-y", "srv@1.0.0"]}
+        for python in ("/opt/pypy3.10/bin/pypy3.10", r"C:\pypy3.10\pypy3.10.exe", "/opt/pypy/bin/pypy3",
+                       "/opt/graalpy/bin/graalpy", r"C:\graalpy\bin\graalpy.exe", "/usr/bin/python3.13d",
+                       "/usr/bin/python3.12-dbg", "/Library/Frameworks/Python.framework/Versions/3.12/bin/"
+                       "python3.12-intel64", r"C:\Python313\python_d.exe", r"C:\Python313\pythonw_d.exe",
+                       "/usr/bin/python3.13td", "/usr/bin/python3.13t", "/usr/bin/python3", r"C:\Python313\python.exe"):
+            for isolated in (True, False):
+                settings = ProxySettings(python, SETTINGS.policy, SETTINGS.audit, SETTINGS.pins_folder,
+                                         isolated=isolated)
+                with self.subTest(python=python, isolated=isolated):
+                    once = wrapped(entry, settings)
+                    # A path of the other system's kind is not a full path here ("/usr/bin" has no drive on
+                    # Windows), so the client would look for it relative to its working folder.
+                    self.assertEqual(wrapping.status_of(once), "protected" if home.is_absolute(python) else "broken")
+                    self.assertEqual(wrapping.proxy_command_of(once).python_module(), (python, isolated))
+                    with self.assertRaisesRegex(WrapError, "already wrapped"):
+                        wrapped(once, settings)
+                    self.assertEqual(unwrap_entry(once), entry)
+
+    def test_wrap_refuses_to_write_an_entry_it_would_not_read_back(self):
+        # A Python of a name the reader does not know: the entry would look like a command that runs
+        # something else before the proxy, and a second wrap would put a proxy in front of the proxy.
+        for python in ("/opt/bin/my-interpreter", r"C:\tools\node.exe", "/usr/bin/agent-sentinel", "/usr/bin/uvx"):
+            settings = ProxySettings(python, SETTINGS.policy, SETTINGS.audit, SETTINGS.pins_folder)
+            with self.subTest(python=python), self.assertRaises(WrapError) as caught:
+                wrapped({"command": "npx", "args": ["x"]}, settings)
+            self.assertIn("does not have a name agent-sentinel reads back as a Python", str(caught.exception))
 
     def test_env_must_hold_plain_variable_names(self):
         for env, expected in (({"A B": "1"}, "not a plain variable name"), (["A"], "is not an object"),
@@ -208,6 +255,49 @@ class ReadingTheProxyCommand(unittest.TestCase):
             with self.subTest(words=words):
                 self.assertIsNone(read_proxy_command(words))
 
+    def test_a_package_runner_must_run_agent_sentinel_at_a_version_and_nothing_else(self):
+        # pip, uv and pipx read "agent-sentinel@<URL>" as "install whatever is at that URL under this name".
+        for package in ("agent-sentinel@0.5.0", "agent-sentinel==0.5.0", "agent_sentinel@latest",
+                        "Agent-Sentinel==1!2.0.0rc1+local", "agent-sentinel@1", "agent-sentinel@0.5.0a1",
+                        "agent-sentinel==0.5.0.post1.dev2", "agent-sentinel@0.5.0RC1+abc.1"):
+            for launcher in (["uvx", package], ["uvx", "--from", package, "agent-sentinel"],
+                             ["pipx", "run", "--spec", package, "agent-sentinel"]):
+                with self.subTest(launcher=launcher):
+                    words = [*launcher, "proxy", "--policy", "p.json", "--", "server"]
+                    self.assertEqual(read_proxy_command(words).launcher, [*launcher, "proxy"])
+                    self.assertEqual(wrapping.status_of({"command": words[0], "args": words[1:]}), "protected")
+        for package in ("agent-sentinel@git+https://evil.example/x", "agent-sentinel@file:///C:/Users/Public/evil",
+                        "agent-sentinel@https://evil.example/x.whl", "agent-sentinel @ git+https://evil.example/x",
+                        "agent-sentinel@ git+https://evil.example/x", "agent-sentinel[extra]==0.5.0",
+                        "agent-sentinel==0.5.0; python_version>'3'", "agent-sentinel@../evil", "agent-sentinel>=0.5",
+                        "agent-sentinel.exe", "agent-sentinel@", "agent-sentinel==",
+                        # Not PEP 440 versions: uv reads each as a folder of that name in the client's folder.
+                        "agent-sentinel@0.5.0-evil", "agent-sentinel@1x", "agent-sentinel@1.zip",
+                        "agent-sentinel@0.5.0-local", "agent-sentinel==0.5.0-evil", "agent-sentinel==1x",
+                        "agent-sentinel@LATEST", "agent-sentinel@" + "9" * 19, "agent-sentinel@0.5.0\n"):
+            for launcher in (["uvx", package], ["uv", "tool", "run", package], ["pipx", "run", package],
+                             ["uvx", "--from", package, "agent-sentinel"],
+                             ["pipx", "run", "--spec", package, "agent-sentinel"]):
+                words = [*launcher, "proxy", "--policy", "p.json", "--", "server"]
+                with self.subTest(words=words):
+                    self.assertIsNone(read_proxy_command(words))
+                    self.assertTrue(wrapping.mentions_proxy(words))
+                    self.assertEqual(wrapping.status_of({"command": words[0], "args": words[1:]}), "broken")
+
+    def test_a_version_longer_than_64_characters_is_not_read(self):
+        # A well-formed version of any length would be matched; the cap keeps the check of a huge word short.
+        longest, too_long = "1." * 31 + "10", "1." * 40 + "1"
+        self.assertEqual((len(longest), len(too_long)), (64, 81))
+        for package, protected in (("agent-sentinel==" + longest, True), ("agent-sentinel@" + longest, True),
+                                   ("agent-sentinel==" + too_long, False), ("agent-sentinel@" + too_long, False),
+                                   ("agent-sentinel@" + "1." * 2_000_000 + "1", False)):
+            for launcher in (["uvx", package], ["uvx", "--from", package, "agent-sentinel"]):
+                words = [*launcher, "proxy", "--policy", "p.json", "--", "server"]
+                with self.subTest(launcher=[word[:40] for word in launcher]):
+                    self.assertEqual(read_proxy_command(words) is not None, protected)
+                    self.assertEqual(wrapping.status_of({"command": words[0], "args": words[1:]}),
+                                     "protected" if protected else "broken")
+
     def test_a_shortened_proxy_option_is_recognised(self):
         self.assertEqual(wrapping.shortened_option("--mon"), ["--monitor"])
         self.assertEqual(wrapping.shortened_option("--polic"), ["--policy"])
@@ -252,6 +342,236 @@ class StatusFromTheEntryAlone(unittest.TestCase):
                                 ({"url": "https://x"}, "remote"), ({"args": []}, "broken")):
             with self.subTest(entry=entry):
                 self.assertEqual(wrapping.status_of(entry), expected)
+
+    TAIL = ["proxy", "--policy", os.path.join(ROOT, "policy.json"), "--", "npx", "server"]
+
+    def status_and_problem(self, launcher, project=None):
+        words = [*launcher, *self.TAIL]
+        return wrapping.status_of({"command": words[0], "args": words[1:]}, project), \
+            wrapping.launcher_problem(read_proxy_command(words), project)
+
+    def test_a_launcher_written_as_a_relative_path_is_broken(self):
+        # The client starts "command" without a shell, in a folder of its choosing (often the project).
+        for launcher in (["tools/python.exe", "-I", "-m", "agent_sentinel"], [r".venv\Scripts\agent-sentinel.exe"],
+                         ["tools/uvx.exe", "agent-sentinel@0.5.0"], ["~/py/python.exe", "-I", "-m", "agent_sentinel"],
+                         ["./agent-sentinel"], ["bin/pipx", "run", "agent-sentinel==0.5.0"],
+                         [("/usr/bin/python3" if sys.platform == "win32" else r"C:\Python313\python.exe"),
+                          "-I", "-m", "agent_sentinel"]):
+            with self.subTest(launcher=launcher):
+                status, problem = self.status_and_problem(launcher)
+                self.assertEqual(status, "broken")
+                self.assertIn("is a relative path: the client starts it without a shell, so it runs whatever is at "
+                              "that path relative to its working folder", problem)
+        # A bare name is looked up on PATH; a full path is what it says.
+        for launcher in (["python", "-I", "-m", "agent_sentinel"], ["agent-sentinel"], ["agent-sentinel.exe"],
+                         ["uvx", "agent-sentinel@0.5.0"],
+                         [os.path.join(ROOT, "python.exe"), "-I", "-m", "agent_sentinel"],
+                         [os.path.join(ROOT, "Scripts", "agent-sentinel.exe")]):
+            with self.subTest(launcher=launcher):
+                self.assertEqual(self.status_and_problem(launcher), ("protected", None))
+
+    def test_only_python_options_that_change_nothing_it_imports_are_taken(self):
+        python = os.path.join(ROOT, "python.exe")
+        for options in (["-X", "utf8"], ["-X", "utf8=0"], ["-X", "utf8=1"], ["-W", "ignore"],
+                        ["-W", "ignore::DeprecationWarning"], ["-W", "error:a.message::a.module:3"],
+                        ["-X", "utf8", "-W", "default", "-B"]):
+            with self.subTest(options=options):
+                self.assertEqual(self.status_and_problem([python, "-I", *options, "-m", "agent_sentinel"]),
+                                 ("protected", None))
+        # -X pycache_prefix makes even -I run bytecode from that folder; a -W category with a dot is imported.
+        for options in (["-X", "pycache_prefix=.c"], ["-X", "pycache_prefix=C:/cache"], ["-X", "importtime"],
+                        ["-X", "frozen_modules=off"], ["-X", "presite=evil"], ["-X", "dev"], ["-X", "UTF8"],
+                        ["-X", "utf8", "-X", "pycache_prefix=.c"], ["-W", "ignore::this.Warning"],
+                        ["-W", "ignore::evil.X:mod:1"], ["-W", "a:b:c:d:e:f"]):
+            with self.subTest(options=options):
+                status, problem = self.status_and_problem([python, "-I", *options, "-m", "agent_sentinel"])
+                self.assertEqual(status, "broken")
+                self.assertIn("which can make Python import or run other code", problem)
+                self.assertIn(repr(options[-1]), problem)
+
+    NO_ISOLATION = ("runs -m agent_sentinel without -I (or -P, Python 3.11 and later) from a configuration kept in "
+                    "the project: the client starts it in the project, and Python then imports agent_sentinel from "
+                    "there first, so an agent_sentinel folder the repository puts there runs instead of the proxy")
+
+    def test_a_python_without_isolation_is_broken_in_a_projects_configuration(self):
+        # The client starts it in the project, where the repository can put an agent_sentinel folder that
+        # "python -m" imports first. -E and -s do not keep that folder out; -I and -P do.
+        with tempfile.TemporaryDirectory() as project:
+            for starter in ([os.path.join(ROOT, "python.exe")], ["python"], ["py", "-3.12"]):
+                for options in ([], ["-B"], ["-X", "utf8"], ["-W", "ignore"], ["-E"], ["-s"], ["-u"], ["-E", "-s"],
+                                ["-O", "-B"]):
+                    launcher = [*starter, *options, "-m", "agent_sentinel"]
+                    with self.subTest(launcher=launcher):
+                        self.assertEqual(self.status_and_problem(launcher), ("protected", None))  # a user's own file
+                        status, problem = self.status_and_problem(launcher, project)
+                        self.assertEqual(status, "broken")
+                        self.assertIn(self.NO_ISOLATION, problem)
+                for options in (["-I"], ["-IB"], ["-B", "-I"], ["-I", "-X", "utf8"], ["-P"], ["-P", "-E", "-s"]):
+                    launcher = [*starter, *options, "-m", "agent_sentinel"]
+                    with self.subTest(launcher=launcher):
+                        self.assertEqual(self.status_and_problem(launcher, project), ("protected", None))
+            # The script and the package runners do not import from the folder they are started in.
+            for launcher in (["agent-sentinel"], [os.path.join(ROOT, "Scripts", "agent-sentinel.exe")],
+                             ["uvx", "agent-sentinel@0.5.0"], ["pipx", "run", "agent-sentinel==0.5.0"]):
+                with self.subTest(launcher=launcher):
+                    self.assertEqual(self.status_and_problem(launcher, project), ("protected", None))
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows looks for a program in the current folder first")
+    def test_a_bare_launcher_that_the_project_folder_holds_is_broken(self):
+        # Clients look in the folder they start in (the project) before PATH, as it is and with these endings.
+        for launcher in (["agent-sentinel"], ["agent-sentinel.exe"], ["uvx", "agent-sentinel@0.5.0"],
+                         ["uv", "tool", "run", "agent-sentinel==0.5.0"], ["pipx", "run", "agent-sentinel==0.5.0"],
+                         ["py", "-3.12", "-I", "-m", "agent_sentinel"], ["python", "-I", "-m", "agent_sentinel"]):
+            for ending in ("", ".exe", ".com", ".bat", ".cmd"):
+                with tempfile.TemporaryDirectory() as project, self.subTest(launcher=launcher, ending=ending):
+                    open(os.path.join(project, launcher[0] + ending), "w").close()
+                    self.assertEqual(self.status_and_problem(launcher), ("protected", None))  # a user's own file
+                    status, problem = self.status_and_problem(launcher, project)
+                    self.assertEqual(status, "broken")
+                    self.assertIn(f"is written without a folder, and the project folder holds {launcher[0] + ending}: "
+                                  "on Windows the client looks for such a program in the folder it starts in (here "
+                                  "the project) before PATH, so that file would run instead", problem)
+        # cross-spawn (Node clients) tries every PATHEXT ending, and has cmd.exe open a .js or .vbs it finds.
+        with tempfile.TemporaryDirectory() as project, \
+                mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD;.VBS;.JS;bad;.a\\b"}):
+            open(os.path.join(project, "uvx.js"), "w").close()
+            status, problem = self.status_and_problem(["uvx", "agent-sentinel@0.5.0"], project)
+            self.assertEqual(status, "broken")
+            self.assertIn("the project folder holds uvx.js: on Windows", problem)
+        # Only a file in that very folder counts: not a folder of that name, nor a file beside it or below it. A
+        # full path is what it says, whatever the project holds.
+        with tempfile.TemporaryDirectory() as top:
+            project = os.path.join(top, "project")
+            for folder in ("uvx.exe", "python", "tools"):
+                os.makedirs(os.path.join(project, folder))
+            for path in (os.path.join(top, "uvx.exe"), os.path.join(project, "tools", "uvx.exe"),
+                         os.path.join(project, "agent-sentinel.ps1"), os.path.join(project, "python.exe")):
+                open(path, "w").close()
+            for launcher in (["uvx", "agent-sentinel@0.5.0"], ["agent-sentinel"],
+                             [os.path.join(ROOT, "python.exe"), "-I", "-m", "agent_sentinel"]):
+                with self.subTest(launcher=launcher):
+                    self.assertEqual(self.status_and_problem(launcher, project), ("protected", None))
+
+    @unittest.skipUnless(sys.platform == "win32", "network and device paths of this form are a Windows matter")
+    def test_a_project_folder_on_another_machine_is_never_looked_at(self):
+        # Merely looking at \\server\share signs in to that machine; the bare launcher is then not taken as safe.
+        looked_at = []
+        real = os.lstat
+
+        def look(path, *args, **kwargs):
+            looked_at.append(str(path))
+            return real(path, *args, **kwargs)
+
+        for project in (r"\\attacker.example\share\project", "//attacker.example/share/project",
+                        r"\\?\UNC\attacker.example\share\project", r"\\.\UNC\attacker.example\share\project"):
+            with self.subTest(project=project), mock.patch.object(os, "lstat", look):
+                status, problem = self.status_and_problem(["uvx", "agent-sentinel@0.5.0"], project)
+                self.assertEqual(status, "broken")
+                self.assertIn("is written without a folder, and the project folder is not on a drive of this "
+                              "machine, so it was not looked at", problem)
+                self.assertEqual(self.status_and_problem([os.path.join(ROOT, "python.exe"), "-I", "-m",
+                                                          "agent_sentinel"], project), ("protected", None))
+        self.assertEqual(looked_at, [])
+
+
+class EnvThatChangesWhatStarts(unittest.TestCase):
+    """The client starts the launcher with the entry's "env": some variables make it run other code."""
+
+    TAIL = ["proxy", "--policy", os.path.join(ROOT, "policy.json"), "--", "npx", "server"]
+    PYTHON = os.path.join(ROOT, "python.exe")
+    # (launcher, variables that change what it starts, variables that do not)
+    CASES = (
+        # Whatever the launcher, the proxy reads "~" in its options and its policy as the home folder these name.
+        ([PYTHON, "-I", "-m", "agent_sentinel"],
+         ["__PYVENV_LAUNCHER__", "PYTHONEXECUTABLE", "HOME", "USERPROFILE", "userprofile", "HOMEDRIVE", "HOMEPATH"],
+         ["PYTHONPATH", "PYTHONHOME", "APPDATA", "PATH", "UV_INDEX_URL", "PYTHONUNBUFFERED", "GITHUB_TOKEN"]),
+        ([PYTHON, "-m", "agent_sentinel"],
+         ["PYTHONPATH", "pythonpath", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONPLATLIBDIR", "PYTHONPYCACHEPREFIX",
+          "APPDATA", "HOME", "USERPROFILE", "__PYVENV_LAUNCHER__"],
+         ["PATH", "UV_INDEX_URL", "PYTHONUNBUFFERED", "PYTHONIOENCODING", "VIRTUAL_ENV"]),
+        ([PYTHON, "-E", "-s", "-m", "agent_sentinel"], ["__PYVENV_LAUNCHER__"], ["PYTHONPATH", "APPDATA"]),
+        (["python", "-I", "-m", "agent_sentinel"], ["PATH", "__PYVENV_LAUNCHER__"], ["PYTHONPATH"]),
+        (["py", "-3.12", "-I", "-m", "agent_sentinel"], ["VIRTUAL_ENV", "PY_PYTHON", "PYLAUNCHER_ALLOW_INSTALL", "PATH"],
+         ["PYTHONPATH"]),
+        (["agent-sentinel"], ["PATH", "PYTHONPATH", "PYTHONHOME", "APPDATA", "__PYVENV_LAUNCHER__"],
+         ["UV_INDEX_URL", "PYTHONUNBUFFERED"]),
+        ([os.path.join(ROOT, "Scripts", "agent-sentinel.exe")], ["PYTHONPATH", "APPDATA"], ["PATH", "PIP_INDEX_URL"]),
+        # uv reads its system configuration from %SYSTEMDRIVE%\ProgramData\uv\uv.toml on Windows.
+        (["uvx", "agent-sentinel==0.5.0"],
+         ["UV_INDEX", "UV_INDEX_URL", "UV_DEFAULT_INDEX", "UV_EXTRA_INDEX_URL", "UV_FIND_LINKS", "UV_CONFIG_FILE",
+          "UV_PYTHON", "UV_CACHE_DIR", "UV_TOOL_DIR", "UV_SOMETHING_NEW", "XDG_CONFIG_HOME", "APPDATA", "PATH",
+          "SSL_CERT_FILE", "PYTHONPATH", "SYSTEMDRIVE", "SystemDrive", "PROGRAMDATA"],
+         ["UV_NO_CONFIG", "UV_OFFLINE", "PYTHONUNBUFFERED", "GITHUB_TOKEN"]),
+        (["uv", "tool", "run", "--from", "agent-sentinel@0.5.0", "agent-sentinel"],
+         ["UV_INDEX_URL", "UV_PYTHON", "SYSTEMDRIVE"], ["UV_NO_CONFIG"]),
+        (["pipx", "run", "--spec", "agent-sentinel==0.5.0", "agent-sentinel"],
+         ["PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS", "PIP_CONFIG_FILE", "PIP_TRUSTED_HOST",
+          "PIPX_HOME", "PIPX_DEFAULT_PYTHON", "LOCALAPPDATA", "PYTHONPATH"],
+         ["PIP_DISABLE_PIP_VERSION_CHECK", "PYTHONUNBUFFERED"]),
+    )
+
+    def entry(self, launcher, env):
+        words = [*launcher, *self.TAIL]
+        return {"command": words[0], "args": words[1:], "env": env}
+
+    def redirected(self, entry, environ):
+        proxy = wrapping.proxy_command_of(entry)
+        self.assertIsNotNone(proxy)
+        return [name for name, _ in wrapping.env_redirects(entry, proxy, environ=environ)]
+
+    def test_each_launcher_has_its_own_variables(self):
+        for launcher, changing, harmless in self.CASES:
+            for name in changing:
+                with self.subTest(launcher=launcher, name=name):
+                    entry = self.entry(launcher, {name: "C:/evil-folder"})
+                    self.assertEqual(self.redirected(entry, {}), [name])
+                    self.assertEqual(wrapping.status_of(entry), "broken")
+            with self.subTest(launcher=launcher, harmless=harmless):
+                entry = self.entry(launcher, {name: "C:/elsewhere" for name in harmless})
+                self.assertEqual(self.redirected(entry, {}), [])
+                self.assertEqual(wrapping.status_of(entry), "protected")
+
+    def test_a_variable_set_to_its_own_value_changes_nothing(self):
+        entry = self.entry([self.PYTHON, "-m", "agent_sentinel"], {"APPDATA": "C:/Users/me/AppData/Roaming"})
+        self.assertEqual(self.redirected(entry, {"APPDATA": "C:/Users/me/AppData/Roaming"}), [])
+        self.assertEqual(self.redirected(entry, {"APPDATA": "C:/Users/someone-else/AppData/Roaming"}), ["APPDATA"])
+        with mock.patch.dict(os.environ, {"APPDATA": "C:/Users/me/AppData/Roaming"}):
+            self.assertEqual(wrapping.status_of(entry), "protected")
+
+    def test_a_home_folder_of_its_own_breaks_even_an_isolated_python(self):
+        isolated = [self.PYTHON, "-I", "-m", "agent_sentinel"]
+        for env, environ, expected in (({"USERPROFILE": "."}, {"USERPROFILE": "C:/Users/me"}, ["USERPROFILE"]),
+                                       ({"HOME": "."}, {}, ["HOME"]),
+                                       ({"USERPROFILE": "C:/Users/me"}, {"USERPROFILE": "C:/Users/me"}, []),
+                                       # A relative AGENT_SENTINEL_HOME is a folder under the client's working one.
+                                       ({"AGENT_SENTINEL_HOME": "sentinel"}, {}, ["AGENT_SENTINEL_HOME"]),
+                                       ({"AGENT_SENTINEL_HOME": "~/sentinel"}, {}, ["AGENT_SENTINEL_HOME"]),
+                                       ({"AGENT_SENTINEL_HOME": os.path.join(ROOT, "home")}, {}, [])):
+            with self.subTest(env=env, environ=environ):
+                entry = self.entry(isolated, env)
+                self.assertEqual(self.redirected(entry, environ), expected)
+                with mock.patch.dict(os.environ, environ):
+                    self.assertEqual(wrapping.status_of(entry), "broken" if expected else "protected")
+        found = wrapping.env_redirects(self.entry(isolated, {"USERPROFILE": "."}), wrapping.proxy_command_of(
+            self.entry(isolated, {})), environ={})
+        self.assertEqual(found, [("USERPROFILE", "the proxy takes its home folder, and \"~\" in its options and in "
+                                                 "the policy's paths, from another place")])
+
+    def test_wrap_does_not_write_an_entry_its_env_would_break(self):
+        plain = ProxySettings(SETTINGS.python, SETTINGS.policy, SETTINGS.audit, SETTINGS.pins_folder, isolated=False)
+        for settings, env, refused in ((SETTINGS, {"PYTHONPATH": "evil"}, False),
+                                       (SETTINGS, {"__PYVENV_LAUNCHER__": "evil/Scripts/python.exe"}, True),
+                                       (SETTINGS, {"USERPROFILE": "evil"}, True),
+                                       (plain, {"PYTHONPATH": "evil"}, True),
+                                       (plain, {"PYTHONUNBUFFERED": "1"}, False)):
+            entry = {"command": "npx", "args": ["server"], "env": env}
+            with self.subTest(isolated=settings.isolated, env=env):
+                if refused:
+                    with self.assertRaises(WrapError) as caught:
+                        wrapped(entry, settings)
+                    self.assertIn(f"its \"env\" sets {next(iter(env))}", str(caught.exception))
+                else:
+                    self.assertEqual(wrapping.status_of(wrapped(entry, settings)), "protected")
 
 
 class NamesAndPinsFiles(unittest.TestCase):

@@ -59,6 +59,9 @@ _BYTE_ORDER_MARKS = (
 # The end of the text an agent is shown for a block: " (ref 7f3a9c21)".
 _REF_SUFFIX = re.compile(r" \(ref [0-9a-f]{8}\)\Z")
 
+# How to install agent-sentinel, as the README's Install section says (it is not on PyPI yet).
+INSTALL_COMMAND = "python -m pip install git+https://github.com/FarooqAzamdogar/agent-sentinel.git"
+
 
 class CommandError(Exception):
     """A problem with what the command was given. main() prints it and exits with code 2."""
@@ -90,6 +93,15 @@ def load_policy(path: str) -> Policy | None:
 
 
 # ---- reading input -------------------------------------------------------------------
+
+def full_path(path: str) -> str:
+    """A path from the command line as a full path, with a leading "~" read as the user's home folder.
+
+    POSIX shells expand "~" before the command sees it; Windows PowerShell 5.1
+    and cmd pass it on as it is, and it would become a folder named "~".
+    """
+    return os.path.abspath(os.path.expanduser(path))
+
 
 def read_input(path: str, limit: int = MAX_INPUT_BYTES) -> bytes:
     """The bytes of a file, or of stdin for "-". At most `limit` bytes: a larger input is an error.

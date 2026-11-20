@@ -46,7 +46,7 @@ from pathlib import Path
 from typing import Any
 
 from . import home, server_probe, templates
-from .cli_common import EXIT_OK, CommandError, shown_command, shown_path
+from .cli_common import EXIT_OK, CommandError, full_path, shown_command, shown_path
 from .cli_inspect import timeout_seconds
 from .policy import Policy, PolicyError
 from .server_probe import ListedTool, ProbeResult
@@ -136,7 +136,7 @@ def _target(out: str | None, notes: bool) -> _Target:
     elif out == "-":
         raise CommandError("init writes files; give --out a file name")
     else:
-        policy, in_home = Path(os.path.abspath(out)), None
+        policy, in_home = Path(full_path(out)), None
         if not policy.parent.is_dir():
             raise CommandError(f"the folder {policy.parent} does not exist; create it first, or choose another --out")
     notes_path = _notes_path(policy) if notes else None

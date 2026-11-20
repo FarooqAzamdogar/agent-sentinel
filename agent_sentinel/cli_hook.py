@@ -35,7 +35,7 @@ from typing import Any, TextIO
 
 from . import __version__, claude_hooks, home
 from .claude_hooks import HookAnswer, HookSettings
-from .cli_common import EXIT_ERROR, EXIT_OK, CommandError, load_policy, shown_path
+from .cli_common import EXIT_ERROR, EXIT_OK, INSTALL_COMMAND, CommandError, full_path, load_policy, shown_path
 from .cli_wrap import this_python
 from .clients import inside_folder, is_app_state
 from .config_file import ConfigFile, create_config, read_config, with_top_level_value, write_config
@@ -43,7 +43,7 @@ from .firewall import new_ref
 from .leaks import redact_value
 from .policy import Policy
 from .textutil import printable
-from .wrapping import ISOLATED_MODULE, PACKAGE, PLAIN_MODULE, PythonCheck
+from .wrapping import ISOLATED_MODULE, PACKAGE, PLAIN_MODULE, SCRIPT, PythonCheck
 
 HELP = "enforce the policy inside Claude Code through its hooks (hook claude-code, hook install claude-code)"
 DESCRIPTION = (
@@ -175,13 +175,13 @@ def _send(answer: HookAnswer, held: str, stdout: TextIO, stderr: TextIO) -> None
 def install_claude_code(args: argparse.Namespace) -> int:
     if args.apply and args.settings is None:
         raise CommandError("--apply needs --settings FILE: agent-sentinel changes only a settings file it is given")
-    policy_path = os.path.abspath(args.policy)
+    policy_path = full_path(args.policy)
     policy = load_policy(policy_path)
     if policy is None:
         return EXIT_ERROR
     folder = None if (args.audit and args.state_dir) else home.home_folder()
-    audit = os.path.abspath(args.audit) if args.audit else str(home.audit_file(folder))
-    state = os.path.abspath(args.state_dir) if args.state_dir else str(home.hook_state_folder(folder))
+    audit = full_path(args.audit) if args.audit else str(home.audit_file(folder))
+    state = full_path(args.state_dir) if args.state_dir else str(home.hook_state_folder(folder))
     for what, path in (("policy", policy_path), ("audit log", audit), ("state folder", state)):
         if "${" in path:
             raise CommandError(f"the {what} path {printable(path, limit=200)} contains '${{', which Claude Code would "
@@ -195,7 +195,7 @@ def install_claude_code(args: argparse.Namespace) -> int:
         _print_snippet(hooks, policy_path)
         _warn_about_python(handler["command"], python)
         return EXIT_OK
-    return _change_settings(Path(os.path.abspath(args.settings)), handler, args, python,
+    return _change_settings(Path(full_path(args.settings)), handler, args, python,
                             {"policy": policy_path, "audit log": audit, "state folder": state})
 
 
@@ -266,9 +266,10 @@ def is_our_handler(handler: Any) -> bool:
     names = [re.split(r"[\\/]", word)[-1].lower() for word in words if isinstance(word, str)]
     for index in range(len(names) - 1):
         if names[index] == "hook" and names[index + 1] == "claude-code":
-            # The same names as a wrapped proxy entry (wrapping.PACKAGE): the script, the module, or a
+            # The same names as a wrapped proxy entry (wrapping.SCRIPT, PACKAGE): the script, the module, or a
             # package with its version, as uvx and pipx run it ("agent-sentinel@0.5.0", "agent-sentinel==0.5.0").
-            return any(PACKAGE.fullmatch(name) or name.split(".")[0] == "agent_sentinel" for name in names[:index])
+            return any(SCRIPT.fullmatch(name) or PACKAGE.fullmatch(name) or name.split(".")[0] == "agent_sentinel"
+                       for name in names[:index])
     return False
 
 
@@ -388,7 +389,7 @@ def _warn_about_python(python: str, check: PythonCheck) -> None:
     if check.version is None:
         print(f"\nWarning: {shown} cannot import agent_sentinel when started from another folder, so the hooks would "
               'fail, and with "onFailure": "block" Claude Code would block every tool call. Install the package for '
-              "it (pip install agent-sentinel) first.")
+              f"that Python first ({INSTALL_COMMAND}, run with that Python; see Install in the README).")
         return
     if not check.isolated:
         print(f"\nWarning: {shown} finds agent_sentinel only in your own site-packages (pip install --user), which "

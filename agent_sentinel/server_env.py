@@ -67,7 +67,8 @@ _SECRET_INSIDE_WORDS = ("PASSWORD", "PASSWD", "PASSPHRASE")
 # PWD on its own is the current folder (POSIX shells set it); only as part of a longer name,
 # as in MYSQL_PWD, is it a password.
 _NOT_SECRET_NAMES = frozenset(("PWD",))
-_NAME_PARTS = re.compile(r"[A-Z][a-z0-9]+|[A-Z0-9]+(?![a-z])|[a-z0-9]+")
+# The words of a name: a capitalised word, a run of capitals, or a run of digits (TOKEN2 is TOKEN and 2).
+_NAME_PARTS = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+")
 MAX_NAME_CHARS_READ = 200  # a name chosen by someone else is read this far
 
 
@@ -170,11 +171,12 @@ def looks_secret(name: str) -> bool:
     """Whether a variable's (or a header's) name says that its value is a secret: one of its words is TOKEN,
     KEY, AUTH, PWD, ..., or it has PASSWORD, PASSWD or PASSPHRASE anywhere in it.
 
-    Names are split into words at "_", "-" and where lower case turns to
-    upper case, so GITHUB_TOKEN, githubToken, X-Auth-Token, OPENAI_API_KEY,
-    MYSQL_PWD and PGPASSWORD look secret; KEYBOARD_LAYOUT,
-    TOKENIZERS_PARALLELISM, GIT_AUTHOR_NAME, PWD and PATH do not. The one
-    test for both the proxy's startup report and `doctor`.
+    Names are split into words at "_", "-", where lower case turns to upper
+    case, and around digits, so GITHUB_TOKEN, githubToken, X-Auth-Token,
+    OPENAI_API_KEY, GITHUB_TOKEN2, apiKey2, MYSQL_PWD and PGPASSWORD look
+    secret; KEYBOARD_LAYOUT, TOKENIZERS_PARALLELISM, GIT_AUTHOR_NAME, PWD
+    and PATH do not. The one test for both the proxy's startup report and
+    `doctor`.
     """
     name = name[:MAX_NAME_CHARS_READ]
     upper = name.upper()
