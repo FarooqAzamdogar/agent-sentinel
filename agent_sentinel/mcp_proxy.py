@@ -150,7 +150,9 @@ itself"): how it is launched, before it starts, and the serverInfo of its
 handshake. A server that differs from its pin is not started, or its
 handshake is refused (--on-server-change refuse, the default); with
 --on-server-change quarantine it runs with every tool, prompt and resource
-template quarantined (quarantine_server). Monitor mode logs the change only.
+template quarantined, its resources not read, and every request it sends the
+client (sampling, elicitation, roots; not ping) refused (quarantine_server).
+Monitor mode logs the change only.
 
 Requests other than tool calls
 ------------------------------
@@ -1125,6 +1127,10 @@ class Proxy:
         if not isinstance(uri, str) or not uri:
             decision = self._refusal(RESOURCE_READ, f"malformed {message['method']} request: missing uri")
             return self._forward_or_refuse(message, decision, label=RESOURCE_READ)
+        quarantined = self._whole_server_quarantined()
+        if quarantined is not None:  # a server that differs from its pin serves nothing (--pin-server)
+            decision = self._refusal(_label(uri), f"the whole server is quarantined: {quarantined}", RULE_QUARANTINE)
+            return self._forward_or_refuse(message, decision, label=_label(uri))
         return self._check_policy(message, RESOURCE_READ, {"uri": uri}, label=_label(uri))
 
     def _check_prompt_request(self, message: JsonObject) -> _Outcome:
@@ -1169,6 +1175,10 @@ class Proxy:
             uris = protocol.subscribed_uris(message.get("params"))
         except ShapeError as exc:
             return self._refuse_malformed_request(message, str(exc))
+        quarantined = self._whole_server_quarantined() if uris else None
+        if quarantined is not None:  # a server that differs from its pin serves nothing (--pin-server)
+            reason = f"the whole server is quarantined: {quarantined}"
+            return self._refused(message, self._refusal(protocol.SUBSCRIPTIONS_LISTEN, reason, RULE_QUARANTINE))
         for uri in uris:
             decision = self._firewall.check_call(RESOURCE_READ, {"uri": uri})
             if not decision.allowed:
@@ -1512,11 +1522,18 @@ class Proxy:
         """Quarantine every tool, prompt and resource template of this server, for as long as the proxy runs.
 
         For a server that differs from its pin (proxy --pin-server): they are
-        left out of every list, and calls and prompts are refused.
+        left out of every list, calls and prompts are refused, and so are
+        resource reads and subscriptions and every request the server sends
+        the client (sampling, elicitation, roots) but ping.
         """
         with self._state:
             if self._server_quarantine is None:
                 self._server_quarantine = reason
+
+    def _whole_server_quarantined(self) -> str | None:
+        """Why the whole server is quarantined (quarantine_server), or None."""
+        with self._state:
+            return self._server_quarantine
 
     def _set_tools_unverified(self, unverified: bool) -> None:
         with self._state:
@@ -1600,6 +1617,13 @@ class Proxy:
             refusal = self._firewall.refuse(label, problem, event="server_request", rule=RULE_MALFORMED)
             self._report_block(f"refused a '{printable(method, limit=100)}' request from the server", refusal)
             return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL, code=protocol.METHOD_NOT_FOUND))
+        quarantined = self._whole_server_quarantined() if is_request and method != "ping" else None
+        if quarantined is not None:  # a server that differs from its pin asks the client nothing (--pin-server)
+            refusal = self._firewall.refuse(label, f"the whole server is quarantined: {quarantined}",
+                                            event="server_request", rule=RULE_QUARANTINE)
+            self._report_block(f"refused a '{printable(method, limit=100)}' request from the quarantined server",
+                               refusal)
+            return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL))
 
         verdict = self._firewall.policy.server_request_verdict(method)
         decision = None

@@ -43,7 +43,9 @@ node -e, python -c), shell operators in arguments, sudo, a download piped to
 a runner, a package from a git repository, a container with --privileged,
 the host's root or home folder mounted, host namespaces or no image digest,
 and an argument that names a credential file, a whole drive or the whole
-home folder. The full command is then printed, never cut short.
+home folder. The full command is then printed, never cut short. A package is
+found behind a wrapper too (cmd /c npx ..., env, sh -c "npx ...", npm exec,
+pnpm dlx, yarn dlx: launch.commands_run).
 
 The control plane (control_plane.py): whether a server, a policy's
 allow_args root or a policy's write rules let the agent reach
@@ -53,9 +55,10 @@ change them. In a project's configuration, an approver program or an env
 file inside the project folder is broken (the agent's own tools could
 rewrite them).
 
---save-baseline FILE records what the configurations and Claude Code's
-settings hold; --baseline FILE fails on anything added, changed or removed
-since (doctor_baseline.py). Saving the baseline is the only thing doctor writes.
+--save-baseline FILE records what the configurations, Claude Code's
+settings and the servers of its ~/.claude.json hold; --baseline FILE fails
+on anything added, changed or removed since (doctor_baseline.py). Saving
+the baseline is the only thing doctor writes.
 
 Nothing is changed and no server is started. A configuration may come from
 someone else (a project's checked-in .mcp.json), so doctor never runs a
@@ -80,6 +83,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
@@ -195,6 +199,7 @@ class Extras:
     baseline_file: str | None = None  # --baseline
     drift: list[str] = field(default_factory=list)  # what differs from it (names only)
     saved_baseline: str | None = None  # --save-baseline
+    baseline_warnings: list[str] = field(default_factory=list)  # what the baseline could not read
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -203,8 +208,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--format", choices=("text", "json"), default="text", help="output format (default text)")
     baseline = parser.add_mutually_exclusive_group()
     baseline.add_argument("--save-baseline", metavar="FILE",
-                          help="record what the configurations and Claude Code's settings hold now (servers, hooks, "
-                               "env overrides), to compare with later; the only file doctor writes")
+                          help="record what the configurations and Claude Code's settings and ~/.claude.json hold "
+                               "now (servers, hooks, env overrides, permissions), to compare with later; the only "
+                               "file doctor writes")
     baseline.add_argument("--baseline", metavar="FILE",
                           help="fail on any server, hook or setting added, changed or removed since --save-baseline "
                                "wrote FILE (names are shown, never values)")
@@ -221,14 +227,18 @@ def run(args: argparse.Namespace) -> int:
     shared = shared_pins(reports)
     settings = control_plane.claude_settings()
     extras = Extras(control_plane=check_control_plane(reports, policies, settings))
+    state = control_plane.claude_state() if saved is not None or args.save_baseline else None
+    if state is not None and state.error:
+        extras.baseline_warnings.append(f"Claude Code's {shown_path(state.path)} cannot be read ({state.error}), so "
+                                        "the servers it holds are not compared")
     if saved is not None:
         extras.baseline_file = full_path(args.baseline)
-        current = baseline_items(reports, settings, saved.key)
+        current = baseline_items(reports, settings, saved.key, state)
         extras.drift = doctor_baseline.described(doctor_baseline.changes(saved.items, current))
     if args.save_baseline:
         target = Path(full_path(args.save_baseline))
         key = doctor_baseline.new_key()
-        doctor_baseline.save(target, doctor_baseline.Baseline(key, baseline_items(reports, settings, key)))
+        doctor_baseline.save(target, doctor_baseline.Baseline(key, baseline_items(reports, settings, key, state)))
         extras.saved_baseline = str(target)
     code = EXIT_FAIL if extras.drift else exit_code(reports, policies)
     if args.format == "json":
@@ -409,16 +419,33 @@ def _check_inside_project(report: ServerReport, project: Path) -> None:
     such as NODE_OPTIONS) there is broken.
     """
     for what, path in (("policy", report.policy), ("pins file", report.pins), ("audit log", report.audit)):
-        if path and clients.inside_folder(path, project):
+        if path and inside_project(path, project):
             report.lines.append(Line("warn", f"the {what} is inside the project folder, where the agent's own tools "
                                              "may be able to change it; keep it in the agent-sentinel home folder"))
     for what, path in [("env file", report.env_file), *(("approver program", program) for program in report.approvers)]:
-        if path and clients.inside_folder(path, project):
+        if path and inside_project(path, project):
             report.lines.append(Line("fail", f"the {what} {printable(path, limit=300)} is inside the project folder, "
                                              "where the agent's own tools may be able to rewrite it"
                                              + (" to approve every call" if what == "approver program" else "")
                                              + "; keep it in the agent-sentinel home folder (or another folder the "
                                                "agent cannot write)"))
+
+
+def inside_project(path: str, project: Path) -> bool:
+    """Whether a file is inside the project folder: as written, or as the system resolves both paths.
+
+    The second catches another spelling of the same place: a Windows short
+    (8.3) name such as C:\\Users\\FAROOQ~1, a link or a junction. Nothing on
+    another machine is looked at (_never_opened).
+    """
+    if clients.inside_folder(path, project):
+        return True
+    if _never_opened(path) or _never_opened(str(project)):
+        return False
+    try:
+        return clients.inside_folder(os.path.realpath(path), os.path.realpath(project))
+    except (OSError, ValueError):
+        return False
 
 
 def _local_path(path: str | None) -> str | None:
@@ -785,20 +812,20 @@ def launch_lines(words: list[str]) -> list[Line]:
     if not words:
         return []
     lines = []
-    ref = launch.runner_package(words)
-    if ref is not None:
+    # Each package a runner fetches, behind wrappers too: cmd /c npx ..., env ..., sh -c "npx ...", npm exec.
+    for ref in launch.runner_packages(words):
         lines += [Line(level, text) for level, text in launch.advisory_findings(ref)]
         squatted = launch.typosquat_of(ref)
         if squatted:
             lines.append(Line("warn", f"the package {printable(ref.spec, limit=120)!r} is named one letter away from "
                                       f"the popular {squatted!r}: a typosquat runs someone else's code under a "
                                       "name you meant to trust. Check that it is the package you mean"))
-    found = unpinned_package(words)
-    if found is not None:
-        package, pinned = found
-        lines.append(Line("warn", f"the package {printable(package, limit=80)!r} is not pinned to an exact version: "
-                                  "a new release would run without review. Pin it, for example "
-                                  f"{printable(pinned, limit=80)}"))
+        found = launch.unpinned_spec(ref)
+        if found is not None:
+            package, pinned = found
+            lines.append(Line("warn", f"the package {printable(package, limit=80)!r} is not pinned to an exact "
+                                      "version: a new release would run without review. Pin it, for example "
+                                      f"{printable(pinned, limit=80)}"))
     risks = launch.launch_risks(words)
     if risks:
         lines.append(Line("warn", f"the launch command {'; '.join(risks)}. The full command: {full_command(words)}"))
@@ -806,9 +833,45 @@ def launch_lines(words: list[str]) -> list[Line]:
 
 
 def full_command(words: list[str]) -> str:
-    """A command as one line to print in full: quoted, printable, recognisable secrets redacted, never cut short."""
-    text = redact(shell_line(words))
-    return printable(text, limit=max(1, len(text)))
+    """A command as one line to print in full: quoted, printable, recognisable secrets redacted, never cut short.
+
+    Quick on a hostile, megabytes-long command too: words are quoted, and
+    runs of plain ASCII text made printable, a piece at a time instead of
+    letter by letter (the result is the same as shell_line and printable give).
+    """
+    line = " ".join(_windows_word(word) for word in words) if sys.platform == "win32" else shell_line(words)
+    text = redact(line)
+    pieces, start = [], 0
+    for run in _PLAIN_TEXT.finditer(text):  # printable() leaves plain ASCII as it is
+        if run.start() > start:
+            pieces.append(printable(text[start:run.start()], limit=run.start() - start))
+        pieces.append(run.group())
+        start = run.end()
+    if start < len(text):
+        pieces.append(printable(text[start:], limit=len(text) - start))
+    return "".join(pieces)
+
+
+_PLAIN_TEXT = re.compile(r"[ -~]+")
+
+
+def _windows_word(word: str) -> str:
+    """One word as subprocess.list2cmdline quotes it (shell_line on Windows), a piece at a time.
+
+    Backslashes before a quote are doubled and the quote escaped; a word
+    with a space or a tab (or none at all) is quoted, its trailing
+    backslashes doubled.
+    """
+    parts = word.split('"')
+    pieces = []
+    for part in parts[:-1]:
+        kept = part.rstrip("\\")
+        pieces.append(kept + "\\" * (2 * (len(part) - len(kept))) + '\\"')
+    last = parts[-1]
+    if word and " " not in word and "\t" not in word:
+        return "".join(pieces) + last
+    kept = last.rstrip("\\")
+    return '"' + "".join(pieces) + kept + "\\" * (2 * (len(last) - len(kept))) + '"'
 
 
 def _secret_lines(entry: Any) -> list[Line]:
@@ -961,10 +1024,13 @@ def _hook_policy(path: str, lines: list[Line]) -> list[tuple[str, Policy]]:
     return [(path, loaded.policy)]
 
 
-def baseline_items(reports: list[ConfigReport], settings: list[control_plane.SettingsFile],
-                   key: bytes) -> dict[doctor_baseline.Where, str]:
-    """What --save-baseline records and --baseline compares: every configuration's servers, and the settings."""
+def baseline_items(reports: list[ConfigReport], settings: list[control_plane.SettingsFile], key: bytes,
+                   state: control_plane.SettingsFile | None = None) -> dict[doctor_baseline.Where, str]:
+    """What --save-baseline records and --baseline compares: every configuration's servers, Claude Code's
+    settings, and the servers and switches of its ~/.claude.json (`state`, control_plane.claude_state)."""
     items: dict[doctor_baseline.Where, str] = {}
+    if state is not None:
+        items.update(doctor_baseline.claude_state_items(key, str(state.path), state.document, state.error))
     for report in reports:
         if report.error and report.entries is None:
             items[("config", str(report.path), "(cannot be read)")] = "0" * 64
@@ -1042,6 +1108,8 @@ def _print_extras(extras: Extras) -> None:
     if extras.saved_baseline is not None:
         print(f"\n{_mark('info')}Saved the baseline to {shown_path(extras.saved_baseline)}; compare with it later: "
               f"agent-sentinel doctor --baseline {shown_path(extras.saved_baseline)}")
+    for text in extras.baseline_warnings:
+        print(f"  {_mark('warn')}{text}")
 
 
 def _print_config(report: ConfigReport) -> None:
@@ -1092,6 +1160,7 @@ def as_json(reports: list[ConfigReport], policies: dict[str, PolicyReport],
         "baseline": None if extras.baseline_file is None else {
             "file": printable(extras.baseline_file, limit=500), "changes": extras.drift},
         "saved_baseline": printable(extras.saved_baseline, limit=500) if extras.saved_baseline else None,
+        "baseline_warnings": extras.baseline_warnings,
         "summary": {status: counts(reports)[status] for status in STATUSES},
         "exit_code": code,
     }

@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import jsonutil
-from .filelock import locked, replace_file
+from .filelock import locked, make_private_folder, replace_file
 from .firewall import RATE_WINDOW_SECONDS
 from .session import LOCK_FILE_NAME, MAX_SESSION_ID_CHARS
 
@@ -83,7 +83,7 @@ class FileRateLimiter:
             return None  # nothing to count: the file is not even opened
         second = int(self._clock())
         try:
-            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)  # owner-only (home.PRIVATE_FOLDER_MODE)
+            make_private_folder(self.directory)  # owner-only, the missing folders above it too
             with self._thread_lock, locked(self._lock_path):
                 buckets = _recent(self._read(), second)
                 full = next(

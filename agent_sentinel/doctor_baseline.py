@@ -16,7 +16,14 @@ What is recorded, each as an HMAC-SHA256 under a random key kept in the file:
     project's in the current folder):
         "hooks", one item per event (every matcher and command of it)
         "env", one item per variable (its value: ANTHROPIC_BASE_URL and the like)
-        enableAllProjectMcpServers, disableAllHooks, enabledMcpjsonServers
+        "permissions", one item per member (allow, deny, ask, defaultMode, ...)
+        the switches and command-running settings of SETTINGS_KEYS
+        (enableAllProjectMcpServers, statusLine, apiKeyHelper, enabledPlugins, ...)
+    Claude Code's own ~/.claude.json (claude_state_items): the servers
+        `claude mcp add` writes there, the user's and each project's, member
+        by member as above, and each project's switches that let its
+        .mcp.json servers in (PROJECT_SWITCHES); nothing else of that file,
+        which changes at every start
 
 A value is never written to the file and never printed. The key makes a
 weak value (a short password in "env") costly to guess from the file, but
@@ -52,10 +59,20 @@ MAX_BASELINE_BYTES = 16 * 1024 * 1024
 MAX_ITEMS = 100_000
 MAX_WHERE_PARTS = 6
 MAX_NAME_CHARS = 4096
-# The members of a Claude Code settings file that are recorded whole (besides "hooks" and "env").
-SETTINGS_KEYS = ("enableAllProjectMcpServers", "disableAllHooks", "enabledMcpjsonServers")
+# The members of a Claude Code settings file that are recorded whole (besides "hooks", "env" and "permissions"):
+# the switches that let servers and hooks in or out, the settings that run a command (statusLine, apiKeyHelper
+# and the other helpers), plugins (they bring hooks and servers) and the sandbox.
+SETTINGS_KEYS = (
+    "enableAllProjectMcpServers", "disableAllHooks", "enabledMcpjsonServers", "disabledMcpjsonServers",
+    "allowedMcpServers", "deniedMcpServers", "statusLine", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport",
+    "otelHeadersHelper", "enabledPlugins", "extraKnownMarketplaces", "sandbox",
+)
 # Server members recorded by name only.
 NAMES_ONLY = ("env", "headers")
+# The per-project switches of Claude Code's ~/.claude.json that let a project's .mcp.json servers in, recorded
+# when they are set (a project opened for the first time has them empty, and adds nothing).
+PROJECT_SWITCHES = ("enabledMcpjsonServers", "disabledMcpjsonServers", "enableAllProjectMcpServers")
+MAX_PROJECTS = 10_000
 _HEX64 = frozenset("0123456789abcdef")
 
 Where = tuple[str, ...]
@@ -81,44 +98,90 @@ def _digest(key: bytes, value: Any) -> str:
     return hmac.new(key, text.encode("ascii", "backslashreplace"), hashlib.sha256).hexdigest()
 
 
+def _name(value: Any) -> str:
+    """A part of an item's "where": the text itself, or "sha256:<hex>" of one longer than MAX_NAME_CHARS."""
+    text = str(value)
+    if len(text) <= MAX_NAME_CHARS:
+        return text
+    return "sha256:" + hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
 def config_items(key: bytes, path: str, servers: Any) -> dict[Where, str]:
     """The items of one MCP configuration: each member of each server entry (env and headers by name only)."""
     items: dict[Where, str] = {}
+    path = _name(path)
     if not isinstance(servers, dict):
         items[("config", path, "servers")] = _digest(key, servers)
         return items
     for name, entry in servers.items():
-        where = ("config", path, "server", str(name))
+        where = ("config", path, "server", _name(name))
         if not isinstance(entry, dict):
             items[(*where, "(entry)")] = _digest(key, entry)
             continue
         for member, value in entry.items():
             if member in NAMES_ONLY and isinstance(value, dict):
                 value = sorted(str(variable) for variable in value)
-            items[(*where, str(member))] = _digest(key, value)
+            items[(*where, _name(member))] = _digest(key, value)
     return items
 
 
 def settings_items(key: bytes, path: str, document: dict[str, Any] | None, error: str | None) -> dict[Where, str]:
     """The items of one Claude Code settings file (see the module docstring)."""
+    path = _name(path)
     if document is None:
         return {("settings", path, "(cannot be read)"): _digest(key, error or "")}
     items: dict[Where, str] = {("settings", path, "(file)"): _digest(key, "present")}
     hooks = document.get("hooks")
     if isinstance(hooks, dict):
         for event, groups in hooks.items():
-            items[("settings", path, "hooks", str(event))] = _digest(key, groups)
+            items[("settings", path, "hooks", _name(event))] = _digest(key, groups)
     elif hooks is not None:
         items[("settings", path, "hooks")] = _digest(key, hooks)
     env = document.get("env")
     if isinstance(env, dict):
         for name, value in env.items():
-            items[("settings", path, "env", str(name))] = _digest(key, value)
+            items[("settings", path, "env", _name(name))] = _digest(key, value)
     elif env is not None:
         items[("settings", path, "env")] = _digest(key, env)
+    permissions = document.get("permissions")
+    if isinstance(permissions, dict):
+        for name, value in permissions.items():  # allow, deny, ask, defaultMode, additionalDirectories, ...
+            items[("settings", path, "permissions", _name(name))] = _digest(key, value)
+    elif permissions is not None:
+        items[("settings", path, "permissions")] = _digest(key, permissions)
     for name in SETTINGS_KEYS:
         if name in document:
             items[("settings", path, name)] = _digest(key, document[name])
+    return items
+
+
+def claude_state_items(key: bytes, path: str, document: dict[str, Any] | None,
+                       error: str | None) -> dict[Where, str]:
+    """The items of Claude Code's ~/.claude.json: its servers (the user's, and each project's), and the switches.
+
+    Only these are recorded: the rest of the file changes at every start.
+    A project's servers are named "PATH (project FOLDER)".
+    """
+    path = _name(path)
+    if document is None:
+        return {("config", path, "(cannot be read)"): "0" * 64}
+    items = config_items(key, path, document.get("mcpServers", {}))
+    projects = document.get("projects", {})
+    if not isinstance(projects, dict):
+        items[("settings", path, "projects")] = _digest(key, projects)
+        return items
+    for count, (folder, project) in enumerate(projects.items()):
+        where = _name(f"{path} (project {folder})")
+        if count >= MAX_PROJECTS:
+            items[("settings", path, "(more projects than a baseline keeps)")] = _digest(key, len(projects))
+            break
+        if not isinstance(project, dict):
+            items[("settings", where, "(entry)")] = _digest(key, project)
+            continue
+        items.update(config_items(key, where, project.get("mcpServers", {})))
+        for name in PROJECT_SWITCHES:
+            if project.get(name):
+                items[("settings", where, name)] = _digest(key, project[name])
     return items
 
 

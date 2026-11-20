@@ -38,6 +38,9 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from .cli_common import CommandError
+# Owner-only folders (see "Permissions" above). They live in filelock, which the session and hook-state stores
+# import too (this module cannot be: it imports what imports them).
+from .filelock import MAX_FOLDERS_CREATED, PRIVATE_FOLDER_MODE, make_private_folder  # noqa: F401
 
 ENV_VAR = "AGENT_SENTINEL_HOME"
 FOLDER_NAME = ".agent-sentinel"
@@ -46,11 +49,8 @@ AUDIT_FILE = "audit.jsonl"
 PINS_FOLDER = "pins"
 HOOK_STATE_FOLDER = "hook-state"
 BACKUPS_FOLDER = "backups"
-# Owner-only: the folders agent-sentinel creates, and the policy `init` writes (see "Permissions" above).
-PRIVATE_FOLDER_MODE = 0o700
+# Owner-only: the policy `init` writes (see "Permissions" above).
 PRIVATE_FILE_MODE = 0o600
-# How many missing folders above the one asked for make_private_folder creates at most.
-MAX_FOLDERS_CREATED = 64
 
 
 class HomeError(CommandError):
@@ -134,29 +134,6 @@ def pins_folder(home: Path) -> Path:
 
 def hook_state_folder(home: Path) -> Path:
     return home / HOOK_STATE_FOLDER
-
-
-def make_private_folder(folder: str | Path) -> list[Path]:
-    """Create a folder, and each missing folder above it, readable by its owner only. Returns those created.
-
-    Mode 0700 on POSIX, whatever the umask leaves (it only takes bits away).
-    A folder that exists is left as it is. Raises OSError.
-    """
-    missing: list[Path] = []
-    current = Path(folder)
-    while not current.is_dir() and current.parent != current and len(missing) < MAX_FOLDERS_CREATED:
-        missing.append(current)
-        current = current.parent
-    created = []
-    for path in reversed(missing):
-        try:
-            path.mkdir(mode=PRIVATE_FOLDER_MODE)
-        except FileExistsError:
-            if not path.is_dir():
-                raise
-            continue
-        created.append(path)
-    return created
 
 
 def make_folders(home: Path) -> list[Path]:

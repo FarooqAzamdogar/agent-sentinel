@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import clients, config_file, home
+from . import clients, config_file, home, jsonutil, launch
 from .config_file import ConfigError, read_config
 from .matchers import PathMatcher
 from .policy import Policy
@@ -54,9 +54,13 @@ MAX_DRY_RUNS = 20_000
 MAX_PATH_ARGUMENTS = 1000
 MAX_SHOWN = 5  # files named in one line; the rest are counted
 MAX_FOLDER_DEPTH = 128
+MAX_HOOK_COMMAND_CHARS = 16 * 1024  # of a hook's "command" text that is split into words
 # Claude Code's settings files, relative to the user's folder and to the project (the current folder).
 USER_SETTINGS = (Path(".claude") / "settings.json",)
 PROJECT_SETTINGS = (Path(".claude") / "settings.json", Path(".claude") / "settings.local.json")
+# Claude Code's own state file in the user's folder (claude_state), and how large it may be.
+CLAUDE_STATE = Path(".claude.json")
+MAX_CLAUDE_STATE_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -257,23 +261,29 @@ def policy_lines(label: str, policy: Policy, files: list[ControlFile], budget: B
 
 # ---- permissions -------------------------------------------------------------------------------------
 
-def permission_problem(mode: int, owned: bool, program: bool = False) -> str | None:
+def permission_problem(mode: int, owned: bool, program: bool = False, by_root: bool = False) -> str | None:
     """Why other users can get at a file or folder with this mode, or None (POSIX).
 
-    `program`: an approver program, which others may read and run, but not change.
+    `program`: an approver program, which others may read and run, but not
+    change. `by_root`: owned by the administrator (uid 0), who can change
+    anything anyway: only what other users can change matters then (a
+    system-wide policy or program must be readable by everyone).
     """
-    if not owned:
+    if not owned and not by_root:
         return "is owned by another user, who can change it"
     if mode & 0o022:
         return "can be changed by other users"
-    if not program and mode & 0o044:
+    if not program and not by_root and mode & 0o044:
         return "can be read by other users"
     return None
 
 
 def permission_lines(files: list[ControlFile], stat_of: Callable[[str], Any] = os.stat,
                      posix: bool = os.name == "posix", uid: int | None = None) -> list[str]:
-    """POSIX: each existing control file or folder that other users can read or change, or that another user owns."""
+    """POSIX: each existing control file or folder that other users can read or change, or that another user owns.
+
+    One that root owns is trusted, as long as no other user can change it.
+    """
     if not posix:
         return []
     if uid is None:
@@ -285,12 +295,21 @@ def permission_lines(files: list[ControlFile], stat_of: Callable[[str], Any] = o
         except (OSError, ValueError):
             continue  # not there (yet): nothing to say about its permissions
         folder = stat.S_ISDIR(found.st_mode)
-        problem = permission_problem(found.st_mode, found.st_uid == uid, program=control.what == "approver program")
+        owned, by_root = found.st_uid == uid, found.st_uid == 0
+        problem = permission_problem(found.st_mode, owned, program=control.what == "approver program",
+                                     by_root=by_root)
         if problem is None:
             continue
+        mode = f"(mode {stat.S_IMODE(found.st_mode):o})"
+        shown_path = printable(control.path, limit=300)
         fix = "chmod 755" if control.what == "approver program" else ("chmod 700" if folder else "chmod 600")
-        lines.append(f"{control.shown()} {problem} (mode {stat.S_IMODE(found.st_mode):o}). Make it yours alone: "
-                     f"{fix} {printable(control.path, limit=300)}")
+        if by_root and not owned:
+            lines.append(f"{control.shown()} {problem} {mode}. Let only root change it: sudo chmod go-w {shown_path}")
+        elif not owned:
+            lines.append(f"{control.shown()} {problem} {mode}. Use one of your own instead, and make it yours alone "
+                         f"({fix})")
+        else:
+            lines.append(f"{control.shown()} {problem} {mode}. Make it yours alone: {fix} {shown_path}")
     return lines
 
 
@@ -356,6 +375,37 @@ def claude_settings(environ: Mapping[str, str] | None = None, cwd: str | Path | 
     return found
 
 
+def claude_state(environ: Mapping[str, str] | None = None) -> SettingsFile | None:
+    """Claude Code's own state file, ~/.claude.json, read only (None when there is none).
+
+    It holds the servers `claude mcp add` writes for the user ("mcpServers")
+    and for each project (projects[PATH].mcpServers), and the switches that
+    let a project's .mcp.json servers in. It can be large (it keeps per-project
+    history), so it may be up to MAX_CLAUDE_STATE_BYTES.
+    """
+    user = home.user_folder(os.environ if environ is None else environ)
+    if user is None:
+        return None
+    path = user / CLAUDE_STATE
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_CLAUDE_STATE_BYTES + 1)
+        if len(raw) > MAX_CLAUDE_STATE_BYTES:
+            return SettingsFile(path, "user", error=f"it is larger than {MAX_CLAUDE_STATE_BYTES} bytes")
+        document = jsonutil.loads(raw.decode("utf-8-sig"))
+    except OSError as exc:
+        return SettingsFile(path, "user", error=printable(exc.strerror or exc, limit=300))
+    except UnicodeDecodeError:
+        return SettingsFile(path, "user", error="it is not UTF-8 text")
+    except (ValueError, RecursionError):  # what it says may quote the file, which can hold tokens
+        return SettingsFile(path, "user", error="it is not strict JSON")
+    if not isinstance(document, dict):
+        return SettingsFile(path, "user", error="not a JSON object")
+    return SettingsFile(path, "user", document)
+
+
 def hook_paths(settings: list[SettingsFile]) -> list[tuple[str, str]]:
     """(what, path) of each --policy, --audit and --state-dir that agent-sentinel's Claude Code hooks are given."""
     from .cli_hook import is_our_handler  # here: cli_hook imports what imports cli_doctor, which imports this module
@@ -368,12 +418,24 @@ def hook_paths(settings: list[SettingsFile]) -> list[tuple[str, str]]:
             for group in (groups if isinstance(groups, list) else ()):
                 handlers = group.get("hooks") if isinstance(group, dict) else None
                 for handler in (handlers if isinstance(handlers, list) else ()):
-                    if not is_our_handler(handler) or not isinstance(handler.get("args"), list):
+                    if not is_our_handler(handler):
                         continue
-                    words = [word for word in handler["args"] if isinstance(word, str)]
-                    for index, word in enumerate(words[:-1]):
-                        if word in options:
-                            found.append((options[word], os.path.expanduser(words[index + 1])))
+                    words = _handler_words(handler)
+                    for index, word in enumerate(words):
+                        name, equals, value = word.partition("=")  # --policy PATH, or --policy=PATH
+                        if name not in options:
+                            continue
+                        path = value if equals else (words[index + 1] if index + 1 < len(words) else "")
+                        if path:
+                            found.append((options[name], os.path.expanduser(path)))
                     if len(found) > MAX_CONTROL_FILES:
                         return found
     return found
+
+
+def _handler_words(handler: dict[str, Any]) -> list[str]:
+    """A hook handler's words: its "args" (as hook install writes it), or its "command" text split into words."""
+    args = handler.get("args")
+    if isinstance(args, list):
+        return [word for word in args if isinstance(word, str)]
+    return launch.shell_words(handler["command"][:MAX_HOOK_COMMAND_CHARS])

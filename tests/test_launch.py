@@ -1,5 +1,6 @@
 """What a server's launch command runs and what is risky about it (agent_sentinel/launch.py, advisories.py)."""
 
+import base64
 import hashlib
 import os
 import tempfile
@@ -132,11 +133,162 @@ class TheOtherRisks(unittest.TestCase):
         long_words = ["--/bash"] * 4000 + ["-x"] * 4000  # every word an interpreter, every one followed by options
         big = ["sh", "-c", "curl " * 200_000 + "| " * 10_000]
         piped = ["bash", "-c", "|".join(["curl x"] * 50_000)]
-        for words in (long_words, big, piped, ["docker", "run", *(["-v", "/a:/b"] * 3000), "img"]):
+        nested = ["bash", "-c", "; ".join(["bash -c 'sh -c \"cmd /c npx -y x\"'"] * 400)]
+        for words in (long_words, big, piped, nested, ["docker", "run", *(["-v", "/a:/b"] * 3000), "img"],
+                      ["bash"] + ["-" + "o" * 5000] * 4095,  # options that take values, of a shell
+                      ["node", "x.js"] + ["/" + ".ssh/" * 2000] * 400):  # 4 MB that looks like credential paths
             started = time.perf_counter()
             launch_risks(words, user_home=HOME)
             runner_package(words)
+            launch_identity("C:/x/" + words[0], words)
             self.assertLess(time.perf_counter() - started, 2)
+
+    def test_an_entry_as_large_as_a_configuration_is_checked_and_printed_quickly(self):
+        from agent_sentinel.cli_doctor import full_command, launch_lines
+        for words in (["node", "x.js"] + ["a" * 2000] * 2000,  # 4 MB, the largest configuration read
+                      ["sh", "-c", "curl " + "x" * 4_000_000 + " | sh"],
+                      ["node", "x.js"] + ["é" * 1000 + "a" * 1000] * 200):
+            started = time.perf_counter()
+            lines = launch_lines(words)
+            self.assertLess(time.perf_counter() - started, 3)
+            self.assertTrue(lines[-1].text.endswith(full_command(words[-1:])))  # in full, never cut short
+        from agent_sentinel.cli_common import shell_line
+        from agent_sentinel.leaks import redact
+        from agent_sentinel.textutil import printable
+        for words in (["a\x1b[2Jb", "é\u0301\u0301\u0301", "plain", "C:\\x y\\z", 'say "hi"', ""],
+                      ["a b\\", 'x\\"y', 'q\\\\"', "tab\there\\\\", '"', "\\"],
+                      ["--token", "ghp_abcdefghijklmnopqrstuvwxyz0123456789", "\u200b\x07"]):
+            with self.subTest(words=words):  # the quick way gives what printable() does, letter by letter
+                self.assertEqual(full_command(words), printable(redact(shell_line(words)), limit=10**6))
+        self.assertIn("a\\x1b[2Jb", full_command(["a\x1b[2Jb"]))
+
+    def test_a_command_longer_than_any_real_one_is_said_to_be(self):
+        words = ["node", "x.js", "a" * launch.MAX_LINTED_CHARS, f"{HOME}/.ssh/id_rsa"]
+        found = risks(*words)
+        self.assertTrue(any(risk.startswith(f"is longer than {launch.MAX_LINTED_CHARS} characters") for risk in found))
+        self.assertFalse(any(risk.startswith("names a credential") for risk in found))  # past the part read
+        self.assertEqual(risks("node", "x.js", "a" * 1000), [])
+
+
+class SimpleVariantsAreFlagged(unittest.TestCase):
+    """Spellings that once slipped past the lint (shell options with values, clusters, docker's own options)."""
+
+    def test_shell_options_before_c_and_node_clusters(self):
+        for words, flag in ((("bash", "-o", "errexit", "-c", "x"), "bash -c"),
+                            (("bash", "--rcfile", "/dev/null", "-c", "x"), "bash -c"),
+                            (("bash", "-O", "extglob", "-c", "x"), "bash -c"),
+                            (("bash", "+o", "history", "-euo", "pipefail", "-c", "x"), "bash -c"),
+                            (("node", "-pe", "x"), "node -pe"), (("node", "-ep", "x"), "node -ep")):
+            with self.subTest(words=words):
+                self.assertIn(f"runs code written on the command line ({flag})", risks(*words))
+        for words in (("bash", "-o", "errexit", "server.sh"), ("node", "-v"), ("node", "--check", "s.js")):
+            with self.subTest(words=words):
+                self.assertEqual([risk for risk in risks(*words) if "code written" in risk], [])
+
+    def test_docker_options_before_run_and_options_not_known_here(self):
+        found = risks("docker", "--context", "default", "run", "--privileged", "-v", "/:/host", "img")
+        self.assertIn("runs a container with --privileged (it has the run of the host)", found)
+        self.assertIn("mounts a whole drive (the root folder) into the container (-v /:/host)", found)
+        self.assertTrue(any(risk.startswith("runs the image img by a tag") for risk in found))
+        self.assertIn("runs a container with --privileged (it has the run of the host)",
+                      risks("docker", "-H", "unix:///var/run/docker.sock", "run", "--privileged", "img@sha256:1"))
+        digest = "img@sha256:" + "c" * 64
+        for words in (("docker", "run", "--pids-limit", "100", digest),  # a known option with a value
+                      ("docker", "run", "--some-new-limit", "100", digest),  # an unknown one, followed by a number
+                      ("podman", "run", "--some-new-path", "/srv/x", "--rm", digest)):
+            with self.subTest(words=words):
+                self.assertEqual([risk for risk in risks(*words) if "runs the image" in risk], [])
+        self.assertTrue(any("runs the image mcp/x:1 by a tag" in risk
+                            for risk in risks("docker", "run", "--pids-limit", "100", "mcp/x:1")))
+
+    def test_other_spellings_of_a_drive_or_the_home_folder(self):
+        for value in ("/.", "/./", "C:\\.", "C:/.", "/tmp/..", "\\."):
+            with self.subTest(value=value):
+                self.assertIn(f"gives the server a whole drive (the root folder) in an argument ({value})",
+                              risks("npx", "x@1.0.0", value))
+        self.assertTrue(any("mounts a whole drive" in risk
+                            for risk in risks("docker", "run", "-v", "/.:/host", "img@sha256:1")))
+        for value in ("$HOME/", "$HOME", "${HOME}/.", "~/", "~/.", "%USERPROFILE%\\", f"{HOME}/", f"{HOME}/."):
+            with self.subTest(value=value):
+                self.assertTrue(any(risk.startswith("gives the server the whole home folder")
+                                    for risk in risks("npx", "x@1.0.0", value)), value)
+        for value in ("//server/share", "\\\\server\\share", "$HOME/projects", "~user", "./x", "C:.", "C:x"):
+            with self.subTest(value=value):
+                self.assertEqual(risks("npx", "x@1.0.0", value), [])
+
+
+class BehindWrappers(unittest.TestCase):
+    """The commands a launch runs behind cmd /c, env, sh -c, powershell -Command, sudo, wsl (DOC-1)."""
+
+    def test_the_commands_behind_a_wrapper(self):
+        npx = ["npx", "-y", "x@1.0.0"]
+        encoded = base64.b64encode("npx -y x@1.0.0".encode("utf-16-le")).decode("ascii")
+        for words, expected in (
+            (["cmd", "/c", *npx], [npx]),
+            (["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c", "npx -y x@1.0.0"], [npx]),
+            (["cmd", "/cnpx", "-y", "x@1.0.0"], [npx]),
+            (["env", "-i", "-u", "HOME", "A=1", "B=2", *npx], [npx]),
+            (["env", "-S", "npx -y", "x@1.0.0"], [npx]),
+            (["env", "--", *npx], [npx]),
+            (["bash", "-c", "cd /srv && FOO=1 exec npx -y x@1.0.0"], [["cd", "/srv"], npx]),
+            (["bash", "-o", "errexit", "-lc", "npx -y 'x@1.0.0'"], [npx]),
+            (["powershell", "-NoProfile", "-Command", *npx], [npx]),
+            (["pwsh", "-enc", encoded], [npx]),
+            (["powershell.exe", "npx -y x@1.0.0"], [npx]),
+            (["sudo", "-u", "root", "--", *npx], [npx]),
+            (["wsl", "-d", "Ubuntu", "-e", *npx], [npx]),
+            (["wsl", *npx], [npx]),
+            (["runas", "/user:admin", "npx -y x@1.0.0"], [npx]),
+            (["cmd", "/c", "bash", "-c", "npx -y x@1.0.0"], [npx]),
+            (["cmd", "/c", "C:\\Program Files\\nodejs\\npx.cmd", "-y", "x@1.0.0"],
+             [["C:\\Program Files\\nodejs\\npx.cmd", "-y", "x@1.0.0"]]),
+            (npx, [npx]),
+            (["bash", "server.sh"], [["bash", "server.sh"]]),
+            (["cmd", "/c"], []),
+            (["env", "A=1"], []),
+        ):
+            with self.subTest(words=words):
+                self.assertEqual(launch.commands_run(list(words)), expected)
+
+    def test_the_packages_behind_a_wrapper_and_the_other_runners(self):
+        for words, expected in (
+            (("cmd", "/c", "npx", "-y", "postmark-mcp@1.0.16"), ("npx", "postmark-mcp", "1.0.16")),
+            (("cmd.exe", "/c", "npx -y postmark-mcp"), ("npx", "postmark-mcp", None)),
+            (("env", "npx", "-y", "postmark-mcp"), ("npx", "postmark-mcp", None)),
+            (("bash", "-c", "npx -y postmark-mcp@1.0.17"), ("npx", "postmark-mcp", "1.0.17")),
+            (("npm", "exec", "--yes", "postmark-mcp"), ("npm exec", "postmark-mcp", None)),
+            (("npm", "x", "--", "postmark-mcp@1.0.16"), ("npm exec", "postmark-mcp", "1.0.16")),
+            (("pnpm", "dlx", "postmark-mcp"), ("pnpm dlx", "postmark-mcp", None)),
+            (("pnpx", "postmark-mcp"), ("pnpm dlx", "postmark-mcp", None)),
+            (("yarn", "dlx", "-p", "postmark-mcp@1.0.16", "postmark"), ("yarn dlx", "postmark-mcp", "1.0.16")),
+            (("bun", "x", "postmark-mcp"), ("bunx", "postmark-mcp", None)),
+            (("npx", "-y", "npm:postmark-mcp@1.0.16"), ("npx", "postmark-mcp", "1.0.16")),
+            (("npx", "-y", "mail@npm:postmark-mcp@1.0.16"), ("npx", "postmark-mcp", "1.0.16")),
+            (("sudo", "uvx", "mcp-server-git==2025.1.1"), ("uvx", "mcp-server-git", "2025.1.1")),
+        ):
+            with self.subTest(words=words):
+                ref = runner_package(list(words))
+                self.assertEqual((ref.runner, ref.name, ref.version), expected)
+                self.assertTrue(advisory_findings(ref) or ref.name != "postmark-mcp")
+        found = launch.runner_packages(["bash", "-c", "npx -y a-server@1.0.0 && npx -y mcp-remote@0.1.15"])
+        self.assertEqual([ref.written for ref in found], ["npx a-server@1.0.0", "npx mcp-remote@0.1.15"])
+        self.assertEqual(launch.unpinned_package(["cmd", "/c", "npx", "-y", "some-mcp"]),
+                         ("some-mcp", "some-mcp@1.2.3"))
+        for words in (("npm", "start"), ("pnpm", "exec", "x"), ("yarn", "x"), ("cmd", "/c", "node", "s.js")):
+            with self.subTest(words=words):
+                self.assertIsNone(runner_package(list(words)))
+
+    def test_what_is_behind_a_wrapper_is_bounded(self):
+        deep = ["npx", "-y", "x@1.0.0"]
+        for _ in range(launch.MAX_WRAPPERS + 2):
+            deep = ["cmd", "/c", *deep]
+        self.assertEqual(launch.runner_packages(deep), [])  # too deep to look behind: nothing is assumed
+        self.assertTrue(any("cmd /c" in risk for risk in risks(*deep)))  # still inline code
+        many = ["bash", "-c", " ; ".join(f"npx -y p{number}-server@1.0.0" for number in range(100))]
+        self.assertEqual(len(launch.commands_run(many)), launch.MAX_COMMANDS)
+        self.assertLessEqual(len(launch.runner_packages(many)), launch.MAX_COMMANDS)
+        long_string = ["bash", "-c", "npx -y x@1.0.0 " + "a" * 100_000]
+        self.assertEqual(runner_package(long_string).name, "x")  # the start of a long string is still read
 
 
 class Packages(unittest.TestCase):
@@ -260,6 +412,52 @@ class WhatAServerPinHolds(unittest.TestCase):
         for words in (["python", "-m", "server"], ["python", "-c", "x"], ["cmd", "/c", "x"], ["docker", "run", "i"]):
             with self.subTest(words=words):
                 self.assertIsNone(launch_identity("C:/x/" + words[0], words)["script"])
+
+    def test_behind_a_wrapper_the_package_or_script_is_pinned(self):
+        identity = launch_identity("C:/Windows/System32/cmd.exe", ["cmd", "/c", "npx", "-y", "mcp-remote@0.1.16"])
+        self.assertEqual(identity["package"], "npx mcp-remote@0.1.16")  # so a new version is seen at the start
+        script = self.folder / "server.js"
+        script.write_bytes(b"console.log(2)")
+        for words in (["cmd", "/c", "node", "server.js"], ["env", "NODE_ENV=production", "node", "server.js"],
+                      ["bash", "-c", "exec node server.js"]):
+            with self.subTest(words=words):
+                identity = launch_identity("C:/x/" + words[0], words, cwd=str(self.folder))
+                self.assertEqual((identity["script"], identity["script_sha256"]),
+                                 (str(script), hashlib.sha256(b"console.log(2)").hexdigest()))
+        both = launch_identity("C:/x/bash", ["bash", "-c", "npx -y a-srv@1.0.0 && node server.js"],
+                               cwd=str(self.folder))
+        self.assertEqual((both["package"], both["script"]), ("npx a-srv@1.0.0", None))  # two commands: no one script
+        many = launch_identity("C:/x/bash", ["bash", "-c", " ; ".join(f"npx -y {'p' * 200}{n}@1.0.0"
+                                                                      for n in range(10))])
+        self.assertRegex(many["package"], r"\Asha256:[0-9a-f]{64}\Z")  # too long to keep as it is
+
+    def test_uv_run_and_a_runner_of_scripts_pin_the_script(self):
+        server = self.folder / "server.py"
+        server.write_bytes(b"print(1)")
+        sub = self.folder / "srv"
+        sub.mkdir()
+        (sub / "main.py").write_bytes(b"print(2)")
+        ts = self.folder / "server.ts"
+        ts.write_bytes(b"export {}")
+        for words, expected in (
+            (["uv", "run", "server.py"], server),
+            (["uv", "run", "--with", "mcp", "--", "server.py"], server),
+            (["uv", "--directory", "srv", "run", "main.py"], sub / "main.py"),
+            (["uv", "run", "--directory=srv", "python", "-u", "main.py"], sub / "main.py"),
+            (["npx", "-y", "tsx@4.19.0", "server.ts"], ts),
+            (["npx", "-y", "-p", "tsx@4.19.0", "tsx", "--no-warnings", "server.ts"], ts),
+            (["cmd", "/c", "npx", "-y", "tsx@4.19.0", "server.ts"], ts),
+        ):
+            with self.subTest(words=words):
+                identity = launch_identity("C:/x/" + words[0], words, cwd=str(self.folder))
+                self.assertEqual(identity["script"], str(expected))
+                self.assertEqual(identity["script_sha256"], hashlib.sha256(expected.read_bytes()).hexdigest())
+        self.assertEqual(launch_identity("C:/x/npx", ["npx", "-y", "tsx@4.19.0", "server.ts"],
+                                         cwd=str(self.folder))["package"], "npx tsx@4.19.0")
+        for words in (["uv", "run", "mcp-server"], ["uv", "run", "-m", "server"], ["uv", "sync"],
+                      ["uv", "tool", "run", "mcp-server-fetch==1.0.0"], ["npx", "-y", "some-server@1.0.0", "x.ts"]):
+            with self.subTest(words=words):
+                self.assertIsNone(launch_identity("C:/x/" + words[0], words, cwd=str(self.folder))["script"])
 
     def test_a_file_that_cannot_be_read_or_is_too_large_has_no_sha256(self):
         self.assertIsNone(launch.file_sha256(str(self.folder / "missing.js")))

@@ -196,6 +196,35 @@ class ThePinnedProxy(TempFolderTest):
         prompts = h.round_trip(request(4, "prompts/list"), {"prompts": [{"name": "summarize"}]})
         self.assertEqual(prompts["result"]["prompts"], [])
 
+    def test_a_quarantined_server_asks_the_client_nothing_and_serves_no_resource(self):
+        self.handshake(self.proxy())
+        h = self.proxy(on_change=mcp_proxy.SERVER_CHANGE_QUARANTINE)
+        self.assertIn("result", self.handshake(h, version="6.6.6"))
+        for number, method in enumerate(("sampling/createMessage", "elicitation/create", "roots/list"), start=10):
+            with self.subTest(method=method):
+                h.from_server(request(number, method, {"messages": [], "message": "x", "requestedSchema": {}}))
+                self.assertEqual(h.sent_to_client(), [])
+                (answer,) = h.sent_to_server()  # answered, so the server is not left waiting
+                self.assertEqual(answer["id"], number)
+                self.assertIn("error", answer)
+        h.from_server(request(20, "ping"))
+        self.assertEqual([message["method"] for message in h.sent_to_client()], ["ping"])
+        for number, method in ((21, "resources/read"), (22, "resources/subscribe")):
+            with self.subTest(method=method):
+                h.from_client(request(number, method, {"uri": "file:///notes/a.txt"}))
+                self.assertEqual(h.sent_to_server(), [])
+                (refusal,) = h.sent_to_client()
+                self.assertRegex(refusal["error"]["message"], r"\(ref [0-9a-f]{8}\)\Z")
+        records = [json.loads(line) for line in self.audit.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(any(record["event"] == "server_request" and record["rule"] == "quarantine"
+                            for record in records))
+        # The same server, unchanged, may ask and be read as before.
+        h = self.proxy()
+        self.handshake(h)
+        sampling = request(30, "sampling/createMessage", {"messages": []})
+        h.from_server(sampling)
+        self.assertEqual(h.sent_to_client(), [sampling])
+
     def test_monitor_mode_logs_the_change_and_blocks_nothing(self):
         self.handshake(self.proxy())
         h = self.proxy(monitor=True)
