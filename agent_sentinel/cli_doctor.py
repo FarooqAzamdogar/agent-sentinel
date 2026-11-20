@@ -11,23 +11,30 @@ For each configuration file (those `clients` finds, or the ones given with
     remote        a URL: the proxy speaks stdio only, so it cannot be protected
     broken        wrapped, but the proxy would not start or would not find what it needs:
                   no policy, a relative or missing policy, a policy that does not load,
-                  an unreadable pins file, a command that is not found, an argument a
-                  .cmd launcher cannot take, an option value the proxy refuses (checked
-                  by the proxy's own functions, such as --max-message-bytes over 1 GiB)
+                  an unreadable pins file, an env file it cannot use, a command that is
+                  not found, an argument a .cmd launcher cannot take, an option value
+                  the proxy refuses (checked by the proxy's own functions, such as
+                  --max-message-bytes over 1 GiB); or wrapped, but the entry's "env"
+                  can make something else start as the proxy (PYTHONPATH for a Python
+                  without -I, UV_INDEX_URL for uvx: wrapping.env_redirects)
 
 and these are checked too: every policy loads, with its warnings; the audit
 and pins folders can be written; no two servers share a pins file; npx and
 uvx packages are pinned to a version; and which env names look like secrets
-written in the file (names only: a value is never printed).
+written in the file (names only: a value is never printed). A leading "~" in
+--policy, --audit, --pins, --env-file and an --approve-with command: is the
+home folder, as the proxy reads it.
 
 Nothing is changed and no server is started. A configuration may come from
 someone else (a project's checked-in .mcp.json), so doctor never runs a
 program it names: whether a Python can import agent_sentinel is tried only
-for the Python that runs doctor itself. Files it names (policy, pins) are
-read only when they are ordinary files of at most MAX_CHECKED_FILE_BYTES,
-and a path on another machine (\\\\server\\share on Windows) is never
-touched: merely looking at one makes Windows sign in to that machine with
-the user's credentials. Everything read from a configuration or a policy is
+for the Python that runs doctor itself. Files it names (policy, pins, env
+file) are read only when they are ordinary files of at most
+MAX_CHECKED_FILE_BYTES, and a path on another machine (\\\\server\\share on
+Windows) is never touched: merely looking at one makes Windows sign in to
+that machine with the user's credentials. Neither is a device path
+(\\\\?\\..., \\\\.\\..., \\??\\...), which can name another machine too
+(_never_opened). Everything read from a configuration or a policy is
 printed through `printable`.
 
 Exit codes: 0 every stdio server is protected; 1 a server is not protected
@@ -47,7 +54,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import __version__, clients, elicitation, home, mcp_proxy
+from . import __version__, clients, elicitation, home, mcp_proxy, server_env
+from .approvers import COMMAND_PREFIX
 from .cli_common import EXIT_FAIL, EXIT_OK, CommandError, full_path, shown_command, shown_path
 from .clients import CLIENTS
 from .config_file import ConfigError, read_config
@@ -62,6 +70,7 @@ from .wrapping import (
     VALUE_OPTIONS,
     ProxyCommand,
     command_line,
+    env_redirects,
     installed_version,
     kind_of,
     mentions_proxy,
@@ -80,7 +89,8 @@ file does not exist
 
 A configuration may come from someone else (a project's .mcp.json), so doctor never starts a program it names
 (only the Python running doctor is asked which agent-sentinel it has) and never opens a path on another machine
-(\\\\server\\share): on Windows, merely looking at one sends your sign-in to that machine.
+(\\\\server\\share) or a device path (\\\\?\\, \\\\.\\, \\??\\): on Windows, merely looking at one sends your
+sign-in to that machine.
 
 examples:
   agent-sentinel doctor
@@ -273,9 +283,11 @@ def _check_wrapped(report: ServerReport, proxy: ProxyCommand, entry: dict[str, A
     report.policy = _policy_path(lines, proxy.value("--policy"))
     report.pins = _pins_path(lines, proxy)
     report.audit = _audit_path(lines, proxy.value("--audit"))
+    _check_env_file(lines, proxy.value("--env-file"))
     _check_name(lines, proxy.values("--name"))
     _check_server_command(lines, proxy.server)
     _check_passed_env(lines, proxy, entry)
+    _check_env_redirects(lines, proxy, entry)
     if project is not None:
         for what, path in (("policy", report.policy), ("pins file", report.pins), ("audit log", report.audit)):
             if path and clients.inside_folder(path, project):
@@ -286,9 +298,10 @@ def _check_wrapped(report: ServerReport, proxy: ProxyCommand, entry: dict[str, A
 def _check_launcher(lines: list[Line], proxy: ProxyCommand) -> None:
     """The program that starts the proxy exists, and a Python started with -m agent_sentinel can import it."""
     starter = proxy.launcher[0]
-    if _on_another_machine(starter):
-        lines.append(Line("fail", f"the program that starts the proxy, {printable(starter, limit=200)}, is on another "
-                                  "machine; doctor does not open network paths (see agent-sentinel doctor --help)"))
+    refused = _never_opened(starter)
+    if refused:
+        lines.append(Line("fail", f"the program that starts the proxy, {printable(starter, limit=200)}, {refused} "
+                                  "(see agent-sentinel doctor --help)"))
         return
     if not (os.path.isfile(starter) if home.is_absolute(starter) else mcp_proxy._resolve_executable(starter)):
         lines.append(Line("fail", f"the program that starts the proxy, {printable(starter, limit=200)}, was not found"))
@@ -320,7 +333,7 @@ def _check_launcher(lines: list[Line], proxy: ProxyCommand) -> None:
 
 def _is_this_python(program: str) -> bool:
     """Whether `program` is the Python running doctor (the only program doctor starts)."""
-    if not home.is_absolute(program) or _on_another_machine(program) or not sys.executable:
+    if not home.is_absolute(program) or _never_opened(program) or not sys.executable:
         return False
     try:
         return os.path.samefile(program, sys.executable)
@@ -328,15 +341,30 @@ def _is_this_python(program: str) -> bool:
         return False
 
 
-def _on_another_machine(path: str) -> bool:
-    """A Windows network path (\\\\server\\share\\..., also //server/share and \\\\?\\UNC\\...), never opened.
+def _never_opened(path: str) -> str | None:
+    """Why doctor must not look at `path` at all, or None. A Windows matter.
 
-    Windows answers any look at such a path, even "does it exist?", by
-    signing in to that server with the user's credentials. A checked-in
-    configuration must not be able to make doctor do that. Device paths
-    (\\\\.\\, \\\\?\\) start the same way and are refused with them.
+    Windows answers any look at a network path (\\\\server\\share\\..., also
+    //server/share), even "does it exist?", by signing in to that server with
+    the user's credentials. A checked-in configuration must not be able to
+    make doctor do that. A device or NT path (\\\\?\\..., \\\\.\\..., \\??\\...)
+    can name another machine as well (\\??\\UNC\\server\\share\\...), and
+    Python before 3.13 takes \\??\\... for a full path, so these are refused
+    too, without a look.
     """
-    return sys.platform == "win32" and path[:1] in ("\\", "/") and path[1:2] in ("\\", "/")
+    if sys.platform != "win32" or path[:1] not in ("\\", "/"):
+        return None
+    if path[1:2] == "?" or (path[1:2] in ("\\", "/") and path[2:3] in ("?", ".")):
+        return ("is a device path (\\\\?\\, \\\\.\\ or \\??\\); doctor does not open those, as they can name "
+                "another machine")
+    if path[1:2] in ("\\", "/"):
+        return "is on another machine; doctor does not open network paths"
+    return None
+
+
+def _option_path(path: str) -> str:
+    """A file path from a proxy option, read as the proxy reads it: a leading "~" is the home folder."""
+    return os.path.expanduser(path)
 
 
 def _too_big(path: str) -> bool:
@@ -350,14 +378,15 @@ def _policy_path(lines: list[Line], policy: str | None) -> str | None:
     if policy is None:
         lines.append(Line("fail", "no --policy, so the proxy will not start"))
         return None
-    if not home.is_absolute(policy):
-        lines.append(Line("fail", f"the policy path {printable(policy, limit=200)!r} is relative: the client starts "
-                                  "the proxy in a folder of its own choosing. Write the full path"))
+    written, policy = policy, _option_path(policy)
+    refused = _never_opened(policy)
+    if refused:
+        lines.append(Line("fail", f"the policy {printable(policy, limit=200)} {refused}, so it cannot tell whether "
+                                  "the proxy will start. Keep the policy on this machine"))
         return None
-    if _on_another_machine(policy):
-        lines.append(Line("fail", f"the policy {printable(policy, limit=200)} is on another machine; doctor does not "
-                                  "open network paths, so it cannot tell whether the proxy will start. Keep the "
-                                  "policy on this machine"))
+    if not home.is_absolute(policy):
+        lines.append(Line("fail", f"the policy path {printable(written, limit=200)!r} is relative: the client starts "
+                                  "the proxy in a folder of its own choosing. Write the full path"))
         return None
     if not os.path.isfile(policy):
         lines.append(Line("fail", f"there is no policy file at {printable(policy, limit=200)}"))
@@ -377,14 +406,15 @@ def _pins_path(lines: list[Line], proxy: ProxyCommand) -> str | None:
     if pins is None:
         lines.append(Line("warn", "no --pins: tool definitions are remembered only while the proxy runs"))
         return None
-    if not home.is_absolute(pins):
-        lines.append(Line("warn", f"the pins path {printable(pins, limit=200)!r} is relative to whatever folder the "
-                                  "client starts the proxy in. Write the full path"))
-        return None
-    if _on_another_machine(pins):
-        lines.append(Line("warn", f"the pins file {printable(pins, limit=200)} is on another machine; doctor does "
-                                  "not open network paths, so it was not checked"))
+    written, pins = pins, _option_path(pins)
+    refused = _never_opened(pins)
+    if refused:
+        lines.append(Line("warn", f"the pins file {printable(pins, limit=200)} {refused}, so it was not checked"))
         return os.path.normpath(pins)
+    if not home.is_absolute(pins):
+        lines.append(Line("warn", f"the pins path {printable(written, limit=200)!r} is relative to whatever folder "
+                                  "the client starts the proxy in. Write the full path"))
+        return None
     if os.path.exists(pins) and (not os.path.isfile(pins) or _too_big(pins)):
         lines.append(Line("fail", f"the pins path {printable(pins, limit=200)} is not an ordinary pins file "
                                   f"(a folder, a device, or over {MAX_CHECKED_FILE_BYTES} bytes)"))
@@ -402,16 +432,47 @@ def _audit_path(lines: list[Line], audit: str | None) -> str | None:
     if audit is None:
         lines.append(Line("warn", "no --audit: the proxy's decisions are not logged"))
         return None
+    written, audit = audit, _option_path(audit)
+    refused = _never_opened(audit)
+    if refused:
+        lines.append(Line("warn", f"the audit log {printable(audit, limit=200)} {refused}, so it was not checked"))
+        return os.path.normpath(audit)
     if not home.is_absolute(audit):
-        lines.append(Line("warn", f"the audit path {printable(audit, limit=200)!r} is relative to whatever folder the "
-                                  "client starts the proxy in. Write the full path"))
+        lines.append(Line("warn", f"the audit path {printable(written, limit=200)!r} is relative to whatever folder "
+                                  "the client starts the proxy in. Write the full path"))
         return None
-    if _on_another_machine(audit):
-        lines.append(Line("warn", f"the audit log {printable(audit, limit=200)} is on another machine; doctor does "
-                                  "not open network paths, so it was not checked"))
-    else:
-        _check_writable(lines, audit, "audit log", "decisions are not logged")
+    _check_writable(lines, audit, "audit log", "decisions are not logged")
     return os.path.normpath(audit)
+
+
+def _check_env_file(lines: list[Line], env_file: str | None) -> None:
+    """The proxy reads --env-file before it starts the server, and does not start when it cannot use it.
+
+    Read with the proxy's own reader, when it is an ordinary file; its errors
+    give a line number, never a value. An empty value means no env file to
+    the proxy too.
+    """
+    if not env_file:
+        return
+    path = _option_path(env_file)
+    refused = _never_opened(path)
+    if refused:
+        lines.append(Line("fail", f"the env file {printable(path, limit=200)} {refused}, so it cannot tell whether "
+                                  "the proxy will start. Keep the env file on this machine"))
+        return
+    if not home.is_absolute(path):
+        lines.append(Line("fail", f"the env file path {printable(env_file, limit=200)!r} is relative: the client "
+                                  "starts the proxy in a folder of its own choosing. Write the full path"))
+        return
+    if not os.path.isfile(path):
+        lines.append(Line("fail", f"there is no env file at {printable(path, limit=200)}, so the proxy will not "
+                                  "start"))
+        return
+    try:
+        server_env.read_env_file(path)  # at most MAX_ENV_FILE_BYTES
+    except (OSError, server_env.EnvFileError) as exc:
+        lines.append(Line("fail", f"the proxy cannot use the env file, so it will not start: "
+                                  f"{printable(exc, limit=300)}"))
 
 
 def _check_writable(lines: list[Line], path: str, what: str, consequence: str) -> None:
@@ -438,10 +499,13 @@ def _check_values(lines: list[Line], proxy: ProxyCommand) -> None:
     for option, value in proxy.options:
         if value is None or option not in _VALUE_CHECKS:
             continue
-        if option == "--approve-with" and _on_another_machine(value.partition(":")[2]):
-            lines.append(Line("fail", f"the approver {printable(value, limit=120)!r} is on another machine; doctor "
-                                      "does not open network paths, so it cannot tell whether the proxy will start"))
-            continue
+        if option == "--approve-with" and value.startswith(COMMAND_PREFIX):
+            program = _option_path(value[len(COMMAND_PREFIX):])
+            refused = _approver_not_looked_up(program)
+            if refused:
+                lines.append(Line("fail", f"the approver {printable(value, limit=120)!r} {refused}"))
+                continue
+            value = COMMAND_PREFIX + program
         try:
             checked = _VALUE_CHECKS[option](value)
         except argparse.ArgumentTypeError as exc:
@@ -460,6 +524,22 @@ def _check_values(lines: list[Line], proxy: ProxyCommand) -> None:
     if proxy.has("--quiet") and proxy.has("--verbose"):
         lines.append(Line("fail", "--quiet and --verbose are both given, and the proxy takes only one of them, so it "
                                   "will not start"))
+
+
+def _approver_not_looked_up(program: str) -> str | None:
+    """Why the program of an --approve-with command: is not looked for, or None when the proxy's check may run.
+
+    The proxy's check looks at the file. Only a name looked up on PATH, or a
+    full path on this machine, gets that far; anything else could make
+    Windows open a network path (see _never_opened).
+    """
+    refused = _never_opened(program)
+    if refused:
+        return f"{refused}, so it cannot tell whether the proxy will start"
+    if os.path.dirname(program) and not home.is_absolute(program):
+        return (f"names {printable(program, limit=120)!r}, which is a relative path (a full path on Windows starts "
+                "with a drive); doctor does not look for it. Write the program's full path")
+    return None
 
 
 def _tool_names(value: str) -> str:
@@ -506,6 +586,18 @@ def _check_passed_env(lines: list[Line], proxy: ProxyCommand, entry: dict[str, A
         lines.append(Line("warn", "--clean-env without --pass-env for "
                                   + ", ".join(printable(name, limit=60) for name in missing[:10])
                                   + ": the server will not get those variables"))
+
+
+def _check_env_redirects(lines: list[Line], proxy: ProxyCommand, entry: dict[str, Any]) -> None:
+    """Variables of the entry's env that can make something else start as the proxy (wrapping.env_redirects)."""
+    named: dict[str, list[str]] = {}
+    for name, changes in env_redirects(entry, proxy):
+        named.setdefault(changes, []).append(name)
+    for changes, names in named.items():
+        shown = ", ".join(printable(name, limit=60) for name in names[:10]) + (" ..." if len(names) > 10 else "")
+        lines.append(Line("fail", f"the entry's \"env\" sets {shown}; with that, {changes}, so what starts may not be "
+                                  "agent-sentinel. Take it out of \"env\" (an --env-file gives a variable to the "
+                                  "server alone)"))
 
 
 # ---- packages and secrets ------------------------------------------------------------------------------

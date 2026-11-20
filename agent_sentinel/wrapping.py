@@ -31,7 +31,11 @@ leaves out the user's own site-packages, so a `pip install --user` copy is
 not found with it: then `wrap` writes the entry without -I and says why.
 
 Each name in the entry's "env" becomes a --pass-env, so that the server
-still gets its tokens when the proxy is started with --clean-env.
+still gets its tokens when the proxy is started with --clean-env. The client
+gives "env" to whatever it starts, so the proxy's launcher gets it too. A
+variable there that changes what the launcher runs (PYTHONPATH for a Python
+without -I, UV_INDEX_URL for uvx, __PYVENV_LAUNCHER__ for any Python) makes
+the entry broken, and wrap does not write such an entry (env_redirects).
 
 Remote entries ("url", "serverUrl", or a type such as "http") cannot be
 wrapped: the proxy speaks stdio only.
@@ -44,6 +48,7 @@ import os
 import re
 import subprocess
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -61,9 +66,16 @@ FLAG_OPTIONS = frozenset({"--no-log-args", "--no-pins", "--monitor", "--clean-en
 #   PYTHON [-I] -m agent_sentinel         a Python, with only harmless options of its own before -m
 #   uvx / uv tool run / pipx run PACKAGE  a package runner, PACKAGE being agent-sentinel[@VERSION|==VERSION|@latest]
 SCRIPT = re.compile(r"agent[-_]sentinel(\.exe|\.cmd|\.bat)?", re.IGNORECASE)
+# A PEP 440 version, in a strict form: 1!0.5.0rc1.post2.dev3+local.4, every part but the release optional.
+# uv reads "NAME@X" as a version only when X is one; anything else ("0.5.0-evil", "1.zip") becomes a
+# requirement "NAME @ X", and X a path relative to the folder the client starts it in. Each number is at
+# most 18 digits, so that uv's 64-bit numbers hold it.
+_VERSION = r"(?i:([0-9]{1,18}!)?[0-9]{1,18}(\.[0-9]{1,18})*((a|b|rc)[0-9]{1,18})?(\.post[0-9]{1,18})?" \
+           r"(\.dev[0-9]{1,18})?(\+[a-z0-9]+(\.[a-z0-9]+)*)?)"
 # Only a version may follow the package's name. Anything else is a requirement that installs other code under
-# that name: "agent-sentinel@git+https://...", "agent-sentinel @ file:///...", extras, markers.
-PACKAGE = re.compile(r"agent[-_]sentinel((@|==)[0-9][0-9A-Za-z.+!-]*|@latest)?", re.IGNORECASE)
+# that name: "agent-sentinel@git+https://...", "agent-sentinel @ file:///...", extras, markers. "latest" is
+# lowercase only: uv knows no other spelling, and would read "@LATEST" as a folder named LATEST.
+PACKAGE = re.compile(r"(?i:agent[-_]sentinel)(@latest|(@|==)" + _VERSION + r")?")
 # Any word that names agent-sentinel, whatever follows the name (mentions_proxy).
 _NAMED = re.compile(r"agent[-_]sentinel([^A-Za-z0-9_-].*)?", re.IGNORECASE | re.DOTALL)
 # The file name of a Python, with .exe or not: python3.13, python3.13t (free-threaded), pythonw, python_d and
@@ -87,6 +99,51 @@ REMOTE_TYPES = frozenset({"http", "sse", "streamable-http", "streamablehttp", "w
 _NAME_CHARACTER = re.compile(r"[^A-Za-z0-9_.-]")
 MAX_NAME_CHARS = 64
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+# Variables of an entry's "env" that change what starts as the proxy (env_redirects). The client starts the
+# launcher with them, so they act on it, not only on the server behind it. Which ones count depends on the
+# launcher; each set comes with what it changes, as doctor says it.
+#   Every launcher ends in a Python, which takes its own program file from __PYVENV_LAUNCHER__ even with -I:
+#   told that it is x/Scripts/python.exe, it imports from x/Lib/site-packages when x holds a pyvenv.cfg.
+#   PYTHONEXECUTABLE does the same on macOS, and counts here with or without -I, to be safe.
+_EVERY_PYTHON = (frozenset({"__PYVENV_LAUNCHER__", "PYTHONEXECUTABLE"}), (),
+                 "Python takes its own program file from it, even with -I, and imports from the site-packages "
+                 "beside that file")
+#   A launcher written without a folder is looked up on PATH.
+_LOOKED_UP = (frozenset({"PATH"}), (),
+              "the client looks up the program that starts the proxy, written without a folder, on that PATH")
+#   The Windows py launcher chooses its Python by these.
+_PY_LAUNCHER = (frozenset({"VIRTUAL_ENV", "PY_PYTHON", "PY_PYTHON2", "PY_PYTHON3"}), ("PYLAUNCHER_",),
+                "the py launcher may start another Python")
+#   A Python started without -I or -E imports from what these name (the agent-sentinel script and the
+#   package runners start one that way).
+_PYTHON_IMPORTS = (frozenset({"PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONPLATLIBDIR",
+                              "PYTHONPYCACHEPREFIX"}), (),
+                   "a Python started without -I imports from the folders it names")
+#   A Python started without -I, -s or -S finds the user's own site-packages from these, and runs the
+#   .pth files there.
+_USER_SITE = (frozenset({"APPDATA", "HOME", "USERPROFILE"}), (),
+              "a Python started without -I finds the user's own site-packages, and runs their .pth files, "
+              "in another folder")
+#   uvx, uv tool run and pipx run choose by these where they get agent-sentinel from, which Python they
+#   install it for, and which saved copy they reuse: uv reads UV_*, pipx PIPX_* and the pip it runs PIP_*,
+#   each its configuration, cache and tools from the user's folders, and its downloads trust what the
+#   certificate variables name. Any variable of theirs counts, apart from a few that change none of that.
+_RUNNER = (frozenset({"PATH", "VIRTUAL_ENV", "CONDA_PREFIX", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+                      "PROGRAMDATA", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_CACHE_HOME", "XDG_DATA_HOME",
+                      "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"}),
+           ("UV_", "PIP_", "PIPX_"),
+           "the package runner may get agent-sentinel from another index or folder, or run it with another "
+           "Python or a saved copy")
+_RUNNER_HARMLESS = frozenset({
+    "UV_NO_CONFIG", "UV_NO_CACHE", "UV_OFFLINE", "UV_NO_PROGRESS", "UV_HTTP_TIMEOUT", "UV_REQUEST_TIMEOUT",
+    "UV_CONCURRENT_DOWNLOADS", "UV_CONCURRENT_BUILDS", "UV_CONCURRENT_INSTALLS", "UV_LINK_MODE",
+    "UV_COMPILE_BYTECODE", "UV_NATIVE_TLS",
+    "PIP_DISABLE_PIP_VERSION_CHECK", "PIP_NO_CACHE_DIR", "PIP_QUIET", "PIP_VERBOSE", "PIP_NO_COLOR",
+    "PIP_PROGRESS_BAR", "PIP_TIMEOUT", "PIP_RETRIES", "PIP_NO_INPUT", "PIP_ROOT_USER_ACTION",
+    "PIPX_USE_EMOJI",
+})
+_PY_LAUNCHER_NAME = re.compile(r"pyw?(\.exe)?", re.IGNORECASE)
+_FLAG_LETTERS = re.compile(r"-[IEsSBuOqb]+")
 
 
 class WrapError(ValueError):
@@ -273,6 +330,63 @@ def shortened_option(word: str) -> list[str]:
     return sorted(option for option in VALUE_OPTIONS | FLAG_OPTIONS if option.startswith(name))
 
 
+def env_redirects(entry: Any, proxy: ProxyCommand,
+                  environ: Mapping[str, str] | None = None) -> list[tuple[str, str]]:
+    """(name, what it changes) for each variable of the entry's "env" that can change what starts as the proxy.
+
+    A configuration need not touch the command to run other code under the
+    name agent-sentinel: "PYTHONPATH": "evil" or "UV_INDEX_URL": "https://..."
+    does it with the command left as it was. Which variables count depends on
+    the launcher (see _EVERY_PYTHON and the sets after it); names are compared
+    in capitals, as Windows does. A variable set to the value it has in
+    `environ` (this terminal's, by default) changes nothing the user did not
+    choose, so it does not count: people copy APPDATA into "env" so that a
+    client that leaves it out can start npx.
+    """
+    env = entry.get("env") if isinstance(entry, dict) else None
+    if not isinstance(env, dict):
+        return []
+    environ = os.environ if environ is None else environ
+    sets = _redirecting_sets(proxy.launcher)
+    found = []
+    for name, value in env.items():
+        upper = str(name).upper()
+        for names, prefixes, changes in sets:
+            if upper in names or (upper.startswith(prefixes) and upper not in _RUNNER_HARMLESS):
+                break
+        else:
+            continue
+        own = environ.get(str(name))
+        if isinstance(value, str) and own is not None and os.path.normcase(value) == os.path.normcase(own):
+            continue
+        found.append((str(name), changes))
+    return found
+
+
+def _redirecting_sets(launcher: list[str]) -> list[tuple[frozenset[str], tuple[str, ...], str]]:
+    """The sets of variables that change what this launcher starts (see env_redirects)."""
+    program = _program(launcher[0])
+    sets = [_EVERY_PYTHON]
+    if program == launcher[0]:
+        sets.append(_LOOKED_UP)
+    letters = set()
+    if _PYTHON.fullmatch(program):
+        if _PY_LAUNCHER_NAME.fullmatch(program):
+            sets.append(_PY_LAUNCHER)
+        index = 1
+        while index < len(launcher) and launcher[index] != "-m":  # the Python's own options (see _PYTHON_FLAGS)
+            if _FLAG_LETTERS.fullmatch(launcher[index]):
+                letters.update(launcher[index][1:])
+            index += 2 if launcher[index] in _PYTHON_VALUE_FLAGS else 1
+    elif not SCRIPT.fullmatch(program):
+        sets.append(_RUNNER)
+    if not letters & {"I", "E"}:
+        sets.append(_PYTHON_IMPORTS)
+    if not letters & {"I", "s", "S"}:
+        sets.append(_USER_SITE)
+    return sets
+
+
 def status_of(entry: Any) -> str:
     """"protected", "unprotected", "remote" or "broken", from the entry alone (no file is looked at).
 
@@ -280,7 +394,8 @@ def status_of(entry: Any) -> str:
     load, does the program exist). Monitor mode blocks nothing, so it is not
     protected. A proxy option written shortened, or --policy given twice,
     is broken: the proxy refuses the first, and a reader of the entry would
-    take the wrong --policy for the one that counts.
+    take the wrong --policy for the one that counts. So is an entry whose
+    "env" can change what starts as the proxy (env_redirects).
     """
     kind = kind_of(entry)
     if kind != "stdio":
@@ -290,6 +405,8 @@ def status_of(entry: Any) -> str:
     if proxy is None:
         return "broken" if mentions_proxy(words) else "unprotected"
     if any(shortened_option(option) for option, _ in proxy.options) or len(proxy.values("--policy")) > 1:
+        return "broken"
+    if env_redirects(entry, proxy):
         return "broken"
     return "unprotected" if proxy.has("--monitor") else "protected"
 
@@ -375,6 +492,12 @@ def wrap_entry(entry: dict[str, Any], settings: ProxySettings, label: str, pins:
         raise WrapError(f"the Python {printable(_program(settings.python), limit=60)!r} does not have a name "
                         "agent-sentinel reads back as a Python (python, pypy or graalpy, with or without a version), "
                         "so the wrapped entry would not be known as wrapped. Run wrap with a Python of such a name")
+    redirects = env_redirects(new, found)
+    if redirects:
+        names = ", ".join(printable(name, limit=60) for name, _ in redirects[:10])
+        raise WrapError(f"its \"env\" sets {names}; with that, {redirects[0][1]}, so the wrapped entry would not be "
+                        "protected. Take such variables out of \"env\" first (the proxy's --env-file can give them "
+                        "to the server alone)")
     return new
 
 

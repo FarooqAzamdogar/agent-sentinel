@@ -321,6 +321,18 @@ class Refusals(WrapTest):
         self.assertIn("not a plain variable name", out)
         self.assertIn("Nothing to wrap.", out)
 
+    def test_an_env_that_would_change_what_starts_as_the_proxy_leaves_the_entry_alone(self):
+        # The client gives "env" to the proxy's Python too; this one would import from another folder, even with -I.
+        self.place({"mcpServers": {"odd": {"command": "npx", "args": ["x"],
+                                           "env": {"__PYVENV_LAUNCHER__": r"evil\Scripts\python.exe"}}}})
+        before = self.config.read_bytes()
+        code, out, _ = self.wrap("--apply")
+        self.assertEqual(code, 0)
+        self.assertRegex(out, r"odd\s+skipped: its \"env\" sets __PYVENV_LAUNCHER__; with that, Python takes its own "
+                              r"program file from it")
+        self.assertIn("Nothing to wrap.", out)
+        self.assertEqual(self.config.read_bytes(), before)
+
     def test_options_that_do_not_go_together(self):
         self.place()
         code, _, err = self.wrap("--name", "x")
@@ -479,6 +491,17 @@ class ListingClients(WrapTest):
                 "/c", "evil.py", "&", "agent-sentinel", "proxy", "--policy", str(self.policy), "--", "x"]}}})
         _, out, _ = run_cli("clients")
         self.assertIn("2 server(s): 2 broken", out)
+        # Entries whose "env" makes the launcher install or import agent-sentinel from somewhere else.
+        self.config.unlink()
+        self.place({"mcpServers": {
+            "index": {"command": "uvx", "args": ["agent-sentinel==0.5.0", "proxy", "--policy", str(self.policy), "--",
+                                                 "x"], "env": {"UV_INDEX_URL": "https://evil.example/simple"}},
+            "path": {"command": sys.executable, "args": ["-m", "agent_sentinel", "proxy", "--policy", str(self.policy),
+                                                         "--", "x"], "env": {"PYTHONPATH": "evil"}},
+            "fine": {"command": sys.executable, "args": ["-I", "-m", "agent_sentinel", "proxy", "--policy",
+                                                         str(self.policy), "--", "x"], "env": {"PYTHONPATH": "evil"}}}})
+        _, out, _ = run_cli("clients")
+        self.assertIn("3 server(s): 1 protected, 2 broken", out)
 
     def test_nothing_found(self):
         code, out, _ = run_cli("clients")

@@ -238,7 +238,8 @@ class ReadingTheProxyCommand(unittest.TestCase):
     def test_a_package_runner_must_run_agent_sentinel_at_a_version_and_nothing_else(self):
         # pip, uv and pipx read "agent-sentinel@<URL>" as "install whatever is at that URL under this name".
         for package in ("agent-sentinel@0.5.0", "agent-sentinel==0.5.0", "agent_sentinel@latest",
-                        "Agent-Sentinel==1!2.0.0rc1+local"):
+                        "Agent-Sentinel==1!2.0.0rc1+local", "agent-sentinel@1", "agent-sentinel@0.5.0a1",
+                        "agent-sentinel==0.5.0.post1.dev2", "agent-sentinel@0.5.0RC1+abc.1"):
             for launcher in (["uvx", package], ["uvx", "--from", package, "agent-sentinel"],
                              ["pipx", "run", "--spec", package, "agent-sentinel"]):
                 with self.subTest(launcher=launcher):
@@ -249,7 +250,11 @@ class ReadingTheProxyCommand(unittest.TestCase):
                         "agent-sentinel@https://evil.example/x.whl", "agent-sentinel @ git+https://evil.example/x",
                         "agent-sentinel@ git+https://evil.example/x", "agent-sentinel[extra]==0.5.0",
                         "agent-sentinel==0.5.0; python_version>'3'", "agent-sentinel@../evil", "agent-sentinel>=0.5",
-                        "agent-sentinel.exe", "agent-sentinel@", "agent-sentinel=="):
+                        "agent-sentinel.exe", "agent-sentinel@", "agent-sentinel==",
+                        # Not PEP 440 versions: uv reads each as a folder of that name in the client's folder.
+                        "agent-sentinel@0.5.0-evil", "agent-sentinel@1x", "agent-sentinel@1.zip",
+                        "agent-sentinel@0.5.0-local", "agent-sentinel==0.5.0-evil", "agent-sentinel==1x",
+                        "agent-sentinel@LATEST", "agent-sentinel@" + "9" * 19, "agent-sentinel@0.5.0\n"):
             for launcher in (["uvx", package], ["uv", "tool", "run", package], ["pipx", "run", package],
                              ["uvx", "--from", package, "agent-sentinel"],
                              ["pipx", "run", "--spec", package, "agent-sentinel"]):
@@ -303,6 +308,83 @@ class StatusFromTheEntryAlone(unittest.TestCase):
                                 ({"url": "https://x"}, "remote"), ({"args": []}, "broken")):
             with self.subTest(entry=entry):
                 self.assertEqual(wrapping.status_of(entry), expected)
+
+
+class EnvThatChangesWhatStarts(unittest.TestCase):
+    """The client starts the launcher with the entry's "env": some variables make it run other code."""
+
+    TAIL = ["proxy", "--policy", os.path.join(ROOT, "policy.json"), "--", "npx", "server"]
+    PYTHON = os.path.join(ROOT, "python.exe")
+    # (launcher, variables that change what it starts, variables that do not)
+    CASES = (
+        ([PYTHON, "-I", "-m", "agent_sentinel"], ["__PYVENV_LAUNCHER__", "PYTHONEXECUTABLE"],
+         ["PYTHONPATH", "PYTHONHOME", "APPDATA", "HOME", "PATH", "UV_INDEX_URL", "PYTHONUNBUFFERED", "GITHUB_TOKEN"]),
+        ([PYTHON, "-m", "agent_sentinel"],
+         ["PYTHONPATH", "pythonpath", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONPLATLIBDIR", "PYTHONPYCACHEPREFIX",
+          "APPDATA", "HOME", "USERPROFILE", "__PYVENV_LAUNCHER__"],
+         ["PATH", "UV_INDEX_URL", "PYTHONUNBUFFERED", "PYTHONIOENCODING", "VIRTUAL_ENV"]),
+        ([PYTHON, "-E", "-s", "-m", "agent_sentinel"], ["__PYVENV_LAUNCHER__"], ["PYTHONPATH", "APPDATA"]),
+        (["python", "-I", "-m", "agent_sentinel"], ["PATH", "__PYVENV_LAUNCHER__"], ["PYTHONPATH"]),
+        (["py", "-3.12", "-I", "-m", "agent_sentinel"], ["VIRTUAL_ENV", "PY_PYTHON", "PYLAUNCHER_ALLOW_INSTALL", "PATH"],
+         ["PYTHONPATH"]),
+        (["agent-sentinel"], ["PATH", "PYTHONPATH", "PYTHONHOME", "APPDATA", "__PYVENV_LAUNCHER__"],
+         ["UV_INDEX_URL", "PYTHONUNBUFFERED"]),
+        ([os.path.join(ROOT, "Scripts", "agent-sentinel.exe")], ["PYTHONPATH", "APPDATA"], ["PATH", "PIP_INDEX_URL"]),
+        (["uvx", "agent-sentinel==0.5.0"],
+         ["UV_INDEX", "UV_INDEX_URL", "UV_DEFAULT_INDEX", "UV_EXTRA_INDEX_URL", "UV_FIND_LINKS", "UV_CONFIG_FILE",
+          "UV_PYTHON", "UV_CACHE_DIR", "UV_TOOL_DIR", "UV_SOMETHING_NEW", "XDG_CONFIG_HOME", "APPDATA", "PATH",
+          "SSL_CERT_FILE", "PYTHONPATH"],
+         ["UV_NO_CONFIG", "UV_OFFLINE", "PYTHONUNBUFFERED", "GITHUB_TOKEN"]),
+        (["uv", "tool", "run", "--from", "agent-sentinel@0.5.0", "agent-sentinel"], ["UV_INDEX_URL", "UV_PYTHON"],
+         ["UV_NO_CONFIG"]),
+        (["pipx", "run", "--spec", "agent-sentinel==0.5.0", "agent-sentinel"],
+         ["PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_FIND_LINKS", "PIP_CONFIG_FILE", "PIP_TRUSTED_HOST",
+          "PIPX_HOME", "PIPX_DEFAULT_PYTHON", "LOCALAPPDATA", "PYTHONPATH"],
+         ["PIP_DISABLE_PIP_VERSION_CHECK", "PYTHONUNBUFFERED"]),
+    )
+
+    def entry(self, launcher, env):
+        words = [*launcher, *self.TAIL]
+        return {"command": words[0], "args": words[1:], "env": env}
+
+    def redirected(self, entry, environ):
+        proxy = wrapping.proxy_command_of(entry)
+        self.assertIsNotNone(proxy)
+        return [name for name, _ in wrapping.env_redirects(entry, proxy, environ=environ)]
+
+    def test_each_launcher_has_its_own_variables(self):
+        for launcher, changing, harmless in self.CASES:
+            for name in changing:
+                with self.subTest(launcher=launcher, name=name):
+                    entry = self.entry(launcher, {name: "C:/evil-folder"})
+                    self.assertEqual(self.redirected(entry, {}), [name])
+                    self.assertEqual(wrapping.status_of(entry), "broken")
+            with self.subTest(launcher=launcher, harmless=harmless):
+                entry = self.entry(launcher, {name: "C:/elsewhere" for name in harmless})
+                self.assertEqual(self.redirected(entry, {}), [])
+                self.assertEqual(wrapping.status_of(entry), "protected")
+
+    def test_a_variable_set_to_its_own_value_changes_nothing(self):
+        entry = self.entry([self.PYTHON, "-m", "agent_sentinel"], {"APPDATA": "C:/Users/me/AppData/Roaming"})
+        self.assertEqual(self.redirected(entry, {"APPDATA": "C:/Users/me/AppData/Roaming"}), [])
+        self.assertEqual(self.redirected(entry, {"APPDATA": "C:/Users/someone-else/AppData/Roaming"}), ["APPDATA"])
+        with mock.patch.dict(os.environ, {"APPDATA": "C:/Users/me/AppData/Roaming"}):
+            self.assertEqual(wrapping.status_of(entry), "protected")
+
+    def test_wrap_does_not_write_an_entry_its_env_would_break(self):
+        plain = ProxySettings(SETTINGS.python, SETTINGS.policy, SETTINGS.audit, SETTINGS.pins_folder, isolated=False)
+        for settings, env, refused in ((SETTINGS, {"PYTHONPATH": "evil"}, False),
+                                       (SETTINGS, {"__PYVENV_LAUNCHER__": "evil/Scripts/python.exe"}, True),
+                                       (plain, {"PYTHONPATH": "evil"}, True),
+                                       (plain, {"PYTHONUNBUFFERED": "1"}, False)):
+            entry = {"command": "npx", "args": ["server"], "env": env}
+            with self.subTest(isolated=settings.isolated, env=env):
+                if refused:
+                    with self.assertRaises(WrapError) as caught:
+                        wrapped(entry, settings)
+                    self.assertIn(f"its \"env\" sets {next(iter(env))}", str(caught.exception))
+                else:
+                    self.assertEqual(wrapping.status_of(wrapped(entry, settings)), "protected")
 
 
 class NamesAndPinsFiles(unittest.TestCase):

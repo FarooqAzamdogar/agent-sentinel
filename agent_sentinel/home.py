@@ -45,7 +45,12 @@ class HomeError(CommandError):
 
 
 def is_absolute(path: str, platform: str | None = None) -> bool:
-    """True for a full path. On Windows that needs a drive or a network share: "\\\\folder" depends on the drive."""
+    """True for a full path. On Windows that needs a drive or a network share: "\\\\folder" depends on the drive.
+
+    "~" is not expanded here, since AGENT_SENTINEL_HOME never is. Paths the
+    proxy reads with "~" as the home folder (--policy and the other file
+    options) are expanded by the caller first, as doctor does.
+    """
     platform = platform or sys.platform
     if platform == "win32":
         drive, rest = ntpath.splitdrive(path)

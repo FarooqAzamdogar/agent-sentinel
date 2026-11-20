@@ -5,6 +5,7 @@ folder inside a temporary folder (IsolatedHomeTest): doctor never reads the
 real client configurations of the person running the tests.
 """
 
+import contextlib
 import json
 import os
 import sys
@@ -15,6 +16,34 @@ from cli_support import IsolatedHomeTest, run_cli
 from agent_sentinel import __version__, cli_doctor, clients, templates
 
 TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+@contextlib.contextmanager
+def no_look_at(marker):
+    """Record every look at a path that holds `marker`, and answer it without a real look.
+
+    The real function never sees such a path: on Windows, a real look at a
+    network path would try to sign in to that machine.
+    """
+    looked_at = []
+    answers = {"isfile": False, "isdir": False, "exists": False, "getsize": OSError, "samefile": OSError}
+
+    def spy(real, answer):
+        def look(*args, **kwargs):
+            if any(marker in str(arg) for arg in args):
+                looked_at.append(" ".join(str(arg) for arg in args))
+                if answer is OSError:
+                    raise FileNotFoundError(args[0])
+                return answer
+            return real(*args, **kwargs)
+        return look
+
+    with contextlib.ExitStack() as stack:
+        for name, answer in answers.items():
+            stack.enter_context(mock.patch.object(os.path, name, spy(getattr(os.path, name), answer)))
+        for name, answer in (("stat", OSError), ("lstat", OSError), ("access", False)):
+            stack.enter_context(mock.patch.object(os, name, spy(getattr(os, name), answer)))
+        yield looked_at
 
 
 class DoctorTest(IsolatedHomeTest):
@@ -166,7 +195,11 @@ class WhyAServerIsBroken(DoctorTest):
         for launcher in (["uvx", "agent-sentinel@git+https://evil.example/x"],
                          ["uvx", "--from", "agent-sentinel@file:///C:/Users/Public/evil", "agent-sentinel"],
                          ["pipx", "run", "--spec", "agent-sentinel@ git+https://evil.example/x", "agent-sentinel"],
-                         ["pipx", "run", "agent-sentinel@https://evil.example/x.whl"]):
+                         ["pipx", "run", "agent-sentinel@https://evil.example/x.whl"],
+                         # Not versions: uv installs from a folder of that name in the folder the client starts it in.
+                         ["uvx", "agent-sentinel@0.5.0-evil"], ["uvx", "agent-sentinel@1.zip"],
+                         ["uvx", "--from", "agent-sentinel@1x", "agent-sentinel"],
+                         ["uv", "tool", "run", "agent-sentinel@0.5.0-local"]):
             with self.subTest(launcher=launcher):
                 code, servers, _ = self.statuses(self.config({"s": {"command": launcher[0],
                                                                     "args": [*launcher[1:], *proxy_words]}}))
@@ -286,6 +319,30 @@ class WhyAServerIsBroken(DoctorTest):
         self.assertIn("the program that starts the proxy", " ".join(
             finding["text"] for finding in servers["t"]["findings"]))
 
+    @unittest.skipUnless(sys.platform == "win32", "device paths are a Windows matter")
+    def test_a_device_path_is_never_looked_at(self):
+        # \??\UNC\server\share is a network path too, and Python before 3.13 takes \??\... for a full path.
+        share = r"\??\UNC\attacker.example\share"
+        entry = self.wrapped(
+            "s", "--env-file", share + r"\server.env",
+            *(word for program in (share + r"\approve.exe", r"\\?\UNC\attacker.example\share\a.exe",
+                                   "//?/UNC/attacker.example/share/a.exe", r"\\.\UNC\attacker.example\share\a.exe",
+                                   "/??/UNC/attacker.example/share/a.exe")
+              for word in ("--approve-with", "command:" + program)),
+            policy=share + r"\policy.json", pins=r"\\?\UNC\attacker.example\share\pins.json",
+            audit="//./UNC/attacker.example/share/audit.jsonl", server=[share + r"\server.exe"])
+        launched = {"command": share + r"\python.exe", "args": entry["args"]}
+        with no_look_at("attacker.example") as looked_at:
+            _, servers, _ = self.statuses(self.config({"s": entry, "t": launched}))
+        self.assertEqual(looked_at, [])
+        texts = [finding["text"] for finding in servers["s"]["findings"]]
+        self.assertEqual(servers["s"]["status"], "broken")
+        self.assertEqual(len([text for text in texts if text.startswith("the approver")
+                              and "is a device path" in text]), 5, texts)
+        for what in ("the policy", "the pins file", "the audit log", "the env file"):
+            self.assertTrue([text for text in texts if text.startswith(what) and "is a device path" in text], what)
+        self.assertIn("is a device path", " ".join(finding["text"] for finding in servers["t"]["findings"]))
+
     def test_files_named_in_a_configuration_are_read_only_when_ordinary_and_small(self):
         status, text = self.reasons(self.wrapped("s", pins=self.home))
         self.assertEqual(status, "broken")
@@ -297,6 +354,57 @@ class WhyAServerIsBroken(DoctorTest):
             status, text = self.reasons(self.wrapped("s"))
             self.assertIn("is larger than 5 bytes, which no policy is", text)
         self.assertEqual(status, "broken")
+
+    def test_an_env_file_the_proxy_cannot_use_is_broken(self):
+        good = self.write("user/.agent-sentinel/server.env", "API_KEY=hunter22-value\n")
+        bad = self.write("user/.agent-sentinel/bad.env", "export API_KEY=hunter22-value\n")
+        for env_file, expected in ((self.folder / "missing.env", "there is no env file at"),
+                                   ("server.env", "the env file path 'server.env' is relative"),
+                                   (self.home, "there is no env file at"),
+                                   (bad, "the proxy cannot use the env file, so it will not start")):
+            with self.subTest(env_file=env_file):
+                status, text = self.reasons(self.wrapped("s", "--env-file", str(env_file)))
+                self.assertEqual(status, "broken")
+                self.assertIn(expected, text)
+                self.assertNotIn("hunter22", text)
+        for given in (["--env-file", str(good)], ["--env-file="]):  # an empty value: no env file, to the proxy too
+            status, text = self.reasons(self.wrapped("s", *given))
+            self.assertEqual(status, "protected", text)
+
+    def test_env_that_changes_what_starts_as_the_proxy_is_broken(self):
+        # The client starts the launcher with the entry's "env", not only the server behind it.
+        uvx, pipx, script, py = (self.write(f"bin/{name}.exe", "MZ") for name in ("uvx", "pipx", "agent-sentinel", "py"))
+        tail = self.wrapped("s")["args"][3:]  # proxy --policy ...
+        for launcher, env, expected in (
+            ([sys.executable, "-I", "-m", "agent_sentinel"], {"__PYVENV_LAUNCHER__": r"evil\Scripts\python.exe"},
+             "Python takes its own program file from it, even with -I"),
+            ([sys.executable, "-m", "agent_sentinel"], {"PYTHONPATH": "evil"},
+             "a Python started without -I imports from the folders it names"),
+            ([sys.executable, "-m", "agent_sentinel"], {"APPDATA": "evil"},
+             "a Python started without -I finds the user's own site-packages"),
+            ([str(script)], {"PYTHONHOME": "evil"}, "a Python started without -I imports from the folders it names"),
+            (["agent-sentinel"], {"PATH": "evil-bin"}, "the client looks up the program that starts the proxy"),
+            ([str(py), "-3.12", "-I", "-m", "agent_sentinel"], {"VIRTUAL_ENV": "evil"},
+             "the py launcher may start another Python"),
+            ([str(uvx), "agent-sentinel==0.5.0"], {"UV_INDEX_URL": "https://evil.example/simple"},
+             "the package runner may get agent-sentinel from another index or folder"),
+            ([str(uvx), "agent-sentinel==0.5.0"], {"PYTHONPATH": "evil"},  # the runner starts Python without -I
+             "a Python started without -I imports from the folders it names"),
+            ([str(pipx), "run", "--spec", "agent-sentinel==0.5.0", "agent-sentinel"],
+             {"PIP_INDEX_URL": "https://evil.example/simple"}, "the package runner may get agent-sentinel"),
+        ):
+            with self.subTest(launcher=launcher, env=env):
+                status, text = self.reasons({"command": launcher[0], "args": [*launcher[1:], *tail], "env": env})
+                self.assertEqual(status, "broken")
+                self.assertIn(f"the entry's \"env\" sets {next(iter(env))}; with that, {expected}", text)
+                self.assertNotIn("protected:", text)
+        # Variables that change nothing for that launcher, and one set to the value it has here.
+        for launcher, env in (([sys.executable, "-I", "-m", "agent_sentinel"], {"PYTHONPATH": "x", "APPDATA": "y"}),
+                              ([str(uvx), "agent-sentinel==0.5.0"], {"UV_NO_CONFIG": "1", "PYTHONUNBUFFERED": "1"}),
+                              ([sys.executable, "-m", "agent_sentinel"], {"APPDATA": os.environ["APPDATA"]})):
+            with self.subTest(launcher=launcher, env=env):
+                status, text = self.reasons({"command": launcher[0], "args": [*launcher[1:], *tail], "env": env})
+                self.assertEqual(status, "protected", text)
 
     def test_a_pins_file_the_proxy_cannot_read(self):
         pins = self.write("user/.agent-sentinel/pins/s.json", "not json")
@@ -474,6 +582,23 @@ class Files(DoctorTest):
         self.assertEqual(code, 0)
         self.assertEqual(servers["good"]["status"], "protected")
         self.assertEqual(report["configs"][0]["path"], str(self.user / "servers.json"))
+
+    def test_a_leading_tilde_in_the_proxys_files_is_the_home_folder(self):
+        # The proxy reads "~" in --policy, --audit, --pins, --env-file and --approve-with command: as the home folder.
+        self.write("user/.agent-sentinel/server.env", "LOG_LEVEL=debug\n")
+        approve = self.write("user/bin/approve.exe", "MZ")
+        approve.chmod(0o755)
+        entry = self.wrapped("s", "--env-file", "~/.agent-sentinel/server.env",
+                             "--approve-with", "command:~/bin/approve.exe", policy="~/.agent-sentinel/policy.json",
+                             pins="~/.agent-sentinel/pins/s.json", audit="~/.agent-sentinel/audit.jsonl")
+        code, servers, _ = self.statuses(self.config({"s": entry}))
+        texts = " | ".join(finding["text"] for finding in servers["s"]["findings"])
+        self.assertEqual((code, servers["s"]["status"]), (0, "protected"), texts)
+        self.assertNotIn("relative", texts)
+        self.assertEqual(servers["s"]["policy"], str(self.policy))
+        self.assertEqual(servers["s"]["pins"], str(self.home / "pins" / "s.json"))
+        self.assertEqual(servers["s"]["audit"], str(self.home / "audit.jsonl"))
+        self.assertFalse((self.folder / "~").exists())
 
     def test_vscode_files_use_their_own_key(self):
         path = self.write("project/.vscode/mcp.json", {"servers": {"s": {"type": "stdio", "command": "npx",
