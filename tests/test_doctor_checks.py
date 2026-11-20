@@ -101,17 +101,25 @@ class LaunchChecks(DoctorTest):
             "timeout": self.wrapped("timeout", server=["timeout", "100", "npx", "-y", "postmark-mcp"]),
             "git": self.wrapped("git", server=["uv", "--quiet", "tool", "run", "mcp-server-git==2025.1.1"]),
             "with": self.wrapped("with", server=["uvx", "--with", "mcp-server-git==2025.1.1", "x-server==1.0.0"]),
+            # DOC3-3, DOC3-4: deno's npm: packages, uv run --with (FastMCP's form), a registry's package file
+            "deno": self.wrapped("deno", server=["deno", "run", "-A", "npm:postmark-mcp@1.0.16"]),
+            "deno-x": self.wrapped("deno-x", server=["cmd", "/c", "deno", "x", "postmark-mcp"]),
+            "tarball": self.wrapped("tarball", server=["npx", "-y", "https://registry.npmjs.org/postmark-mcp/-/"
+                                                                      "postmark-mcp-1.0.16.tgz"]),
+            "uv-run": self.wrapped("uv-run", server=["uv", "run", "--with", "mcp-server-git==2025.1.1",
+                                                     "mcp-server-git"]),
         }
         code, found, _ = self.statuses(self.config(servers))
         self.assertEqual(code, 1)
-        for name in ("git", "with"):  # a known vulnerability warns, behind the runner's own options too
+        for name in ("git", "with", "uv-run"):  # a known vulnerability warns, behind the runner's own options too
             with self.subTest(name=name):
                 levels = {finding["level"] for finding in found[name]["findings"]
                           if "mcp-server-git==2025.1.1 has a known vulnerability, fixed in" in finding["text"]}
                 self.assertEqual(levels, {"warn"}, texts(found[name]))
         self.assertIn("uvx --with mcp-server-git==2025.1.1 has a known vulnerability", texts(found["with"]))
+        self.assertIn("uv run --with mcp-server-git==2025.1.1 has a known vulnerability", texts(found["uv-run"]))
         for name in servers:
-            if name in ("remote", "git", "with"):
+            if name in ("remote", "git", "with", "uv-run"):
                 continue
             with self.subTest(name=name):
                 self.assertEqual(found[name]["status"], "broken", texts(found[name]))
@@ -604,7 +612,8 @@ class ClientsAndInspect(IsolatedHomeTest):
         for words in (("cmd", "/c", "npx", "-y", "postmark-mcp"), ("pnpm", "dlx", "postmark-mcp"),
                       ("bash", "-c", "npx -y postmark-mcp@1.0.16"), ("cmd", "/s/c", "npx -y postmark-mcp"),
                       ("npm", "--yes", "exec", "postmark-mcp"),
-                      ("npx", "-p", "a-b-c@1.0.0", "-p", "postmark-mcp", "x")):
+                      ("npx", "-p", "a-b-c@1.0.0", "-p", "postmark-mcp", "x"),
+                      ("deno", "run", "-A", "npm:postmark-mcp@1.0.16")):
             with self.subTest(words=words), mock.patch("agent_sentinel.server_probe.probe") as probe:
                 code, _, err = run_cli("inspect", "--", *words)
                 self.assertEqual(code, 2)

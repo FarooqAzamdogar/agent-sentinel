@@ -5,8 +5,10 @@
                        "X && Y", powershell -Command X (or -EncodedCommand, iex), sudo X,
                        wsl X, exec X, timeout N X, nice X, corepack X
     runner_packages    the packages runners (npx, bunx, pnpm dlx, yarn dlx, npm exec, uvx,
-                       uv tool run, pipx run) fetch and run, behind such wrappers too:
-                       every npx -p, and the requirements of uvx --with
+                       uv tool run, pipx run, deno run npm:, deno x) fetch and run, behind
+                       such wrappers too: every npx -p, and the requirements of uvx --with
+                       and uv run --with; an npm registry's package file address names its
+                       package and version too
     runner_package     the first of them
     unpinned_package   such a package run without an exact version
     advisory_findings  a package of advisories.py: malware (fail) or a known vulnerability (warn)
@@ -18,7 +20,10 @@
                        mounted, or without an image digest, and arguments
                        that name credential files, a whole drive or the whole home folder
     launch_identity    what proxy --pin-server pins of a launch (pins.py): the program, the runners'
-                       packages as written, and the SHA-256 of the local script it starts
+                       packages as written, and the SHA-256 of the local script it starts, found
+                       past the interpreter's options as that interpreter reads them
+                       (_ScriptOptions); every file that may be the script is pinned when an
+                       option in front of it is not known here
 
 doctor (cli_doctor.launch_lines), clients, wrap and inspect report these;
 none of them starts a program or touches the network. launch_identity reads
@@ -41,7 +46,8 @@ import os
 import posixpath
 import re
 import shlex
-from dataclasses import dataclass
+import string
+from dataclasses import dataclass, replace
 
 from . import advisories, home
 from .advisories import NPM, PYPI
@@ -429,10 +435,13 @@ _NPX_VALUE_OPTIONS = frozenset({"-p", "--package", "-c", "--call", "--cache", "-
                                 "--workspace", "--node-options"})
 _UVX_VALUE_OPTIONS = frozenset({
     "--from", "--with", "-w", "--with-editable", "--with-requirements", "-p", "--python", "--index", "--index-url",
-    "--extra-index-url", "--default-index", "--find-links", "-f", "--constraint", "-c", "--override",
-    "--python-preference", "--refresh-package", "--reinstall-package", "--upgrade-package", "--cache-dir",
-    "--directory", "--project", "--config-file", "--env-file", "--index-strategy", "--keyring-provider",
-    "--resolution", "--prerelease", "--exclude-newer", "--link-mode", "--compile-bytecode",
+    "-i", "--extra-index-url", "--default-index", "--find-links", "-f", "--constraint", "--constraints", "-c",
+    "--override", "--overrides", "--build-constraint", "--build-constraints", "-b", "--python-preference",
+    "--refresh-package", "--reinstall-package", "--upgrade-package", "-P", "--cache-dir", "--directory", "--project",
+    "--config-file", "--env-file", "--index-strategy", "--keyring-provider", "--resolution", "--prerelease",
+    "--exclude-newer", "--exclude-newer-package", "--link-mode", "-C", "--config-setting", "--config-settings-package",
+    "--no-binary-package", "--no-build-package", "--python-platform", "--torch-backend", "--fork-strategy",
+    "--with-executables-from",
 })
 # uv's own options and those of `uv run` that take a value (for the script `uv run` starts).
 _UV_VALUE_OPTIONS = _UVX_VALUE_OPTIONS | frozenset({
@@ -456,14 +465,21 @@ _SUBCOMMAND_RUNNERS: dict[str, tuple[tuple[str, ...], str, str]] = {
 }
 
 
+JSR = "jsr"  # the JavaScript registry deno fetches "jsr:@scope/name" from (no advisories.py entries)
+
+
 @dataclass(frozen=True)
 class PackageRef:
     """The package a runner fetches: as written (`spec`), its registry name and its exact version, if any."""
 
-    runner: str  # "npx", "bunx", "npm exec", "pnpm dlx", "yarn dlx", "uvx", "uv tool run", "pipx run"
-    ecosystem: str  # advisories.NPM or advisories.PYPI
-    spec: str  # as written: "mcp-remote@0.1.16", "mcp-server-git==2026.1.14"
-    name: str  # npm: lowercase; PyPI: normalised (PEP 503); "" when it is no registry package
+    # "npx", "bunx", "npm exec", "pnpm dlx", "yarn dlx", "uvx", "uv tool run", "uv run", "pipx run", "deno run",
+    # "deno x"
+    runner: str
+    ecosystem: str  # advisories.NPM, advisories.PYPI or JSR
+    spec: str  # as written: "mcp-remote@0.1.16", "mcp-server-git==2026.1.14", "npm:postmark-mcp@1.0.16"
+    # npm: lowercase; PyPI: normalised (PEP 503); "" when it names no registry package (a registry's own
+    # package file address, https://registry.npmjs.org/NAME/-/NAME-VERSION.tgz, names one)
+    name: str
     version: str | None  # the exact version the spec pins, if it pins one
     source: str  # "registry", "git", "url" or "path"
     role: str = "run"  # "run": a package the runner runs; "with": a requirement beside it (uvx --with)
@@ -478,7 +494,9 @@ def runner_packages(words: list[str]) -> list[PackageRef]:
     """The packages the runners of a launch fetch and run (commands_run: behind wrappers too); each once.
 
     Every package a runner is given counts: each `npx -p`, and the
-    requirements of `uvx --with` (role "with").
+    requirements of `uvx --with` and `uv run --with` (role "with"). deno
+    fetches what `deno run npm:pkg@1.0.0` (or jsr:, or a web address) and
+    `deno x pkg` name.
     """
     found: list[PackageRef] = []
     for command in commands_run(words):
@@ -498,7 +516,9 @@ def _runner_of(words: list[str]) -> tuple[str, str, int] | None:
     """(runner, ecosystem, where its own arguments start) when `words` start a package runner; else None.
 
     The subcommand is found after the program's own options too:
-    `npm --yes exec`, `pnpm --silent dlx`, `uv --quiet tool run`.
+    `npm --yes exec`, `pnpm --silent dlx`, `uv --quiet tool run`. `uv run`
+    runs a command of the project's, and fetches only its --with requirements.
+    deno is read by _deno_packages.
     """
     program = program_name(words[0])
     if program in ("npx", "bunx"):
@@ -512,7 +532,9 @@ def _runner_of(words: list[str]) -> tuple[str, str, int] | None:
         at = _subcommand_at(words, 1, names)
         return (runner, ecosystem, at + 1) if at is not None else None
     if program == "uv":
-        at = _subcommand_at(words, 1, ("tool",))
+        at = _subcommand_at(words, 1, ("tool", "run"))
+        if at is not None and words[at] == "run":
+            return "uv run", PYPI, at + 1
         at = _subcommand_at(words, at + 1, ("run", "uvx")) if at is not None else None
         return ("uv tool run", PYPI, at + 1) if at is not None else None
     return None
@@ -544,6 +566,8 @@ def _subcommand_at(words: list[str], start: int, names: tuple[str, ...]) -> int 
 
 def _direct_packages(words: list[str]) -> list[PackageRef]:
     """The packages of a runner that is the command's own program (not behind a wrapper)."""
+    if words and program_name(words[0]) == "deno":
+        return _deno_packages(words)
     found = _runner_of(words) if words else None
     if found is None:
         return []
@@ -553,10 +577,53 @@ def _direct_packages(words: list[str]) -> list[PackageRef]:
         return [_npm_ref(runner, spec) for spec in _runner_specs(args, _NPX_VALUE_OPTIONS, _PACKAGE_OPTIONS)]
     if runner == "pipx run":
         return [_pypi_ref(runner, spec) for spec in _runner_specs(args, _PIPX_VALUE_OPTIONS, ("--spec",))]
-    refs = [_pypi_ref(runner, spec) for spec in _runner_specs(args, _UVX_VALUE_OPTIONS, ("--from",))]
-    for value in _option_values(args, _UVX_VALUE_OPTIONS, _WITH_OPTIONS):
+    refs = []
+    if runner != "uv run":  # uv run's command is the project's own (its script is pinned, see _uv_run_script)
+        refs = [_pypi_ref(runner, spec) for spec in _runner_specs(args, _UVX_VALUE_OPTIONS, ("--from",))]
+    value_options = _UV_VALUE_OPTIONS if runner == "uv run" else _UVX_VALUE_OPTIONS
+    for value in _option_values(args, value_options, _WITH_OPTIONS):
         refs += [_pypi_ref(runner, spec, role="with") for spec in _requirements(value)]
     return refs
+
+
+def _deno_packages(words: list[str]) -> list[PackageRef]:
+    """What deno fetches and runs: `deno run -A npm:pkg@1.0.0` (or `deno serve`, or `deno npm:...` for short;
+    also jsr: and a web address), and the package of `deno x pkg` (npm's when it names no registry)."""
+    args = words[1:MAX_WORDS_LINTED]
+    at = _first_plain_at(args, _DENO_OPTIONS)
+    if at is not None and args[at] == "x":
+        specs, runner = _script_words(args[at + 1:], _DENO_OPTIONS)[:1], "deno x"
+    else:
+        specs, runner = _subcommand_scripts("deno", args), "deno run"
+    refs = []
+    for spec in specs:
+        lowered = spec.lower()
+        if lowered.startswith(("http:", "https:")):
+            refs.append(_npm_ref(runner, spec))  # a web address: run unreviewed (a registry's file names its package)
+        elif lowered.startswith("jsr:"):
+            refs.append(_jsr_ref(runner, spec))
+        elif lowered.startswith("npm:") or runner == "deno x":
+            refs.append(replace(_npm_ref(runner, _without_subpath(spec)), spec=spec))
+    return refs
+
+
+def _without_subpath(spec: str) -> str:
+    """An npm or JSR spec without the file inside the package deno may name: "npm:preact@10/hooks" -> "npm:preact@10"."""
+    prefix = spec[:4] if spec[:4].lower() in ("npm:", "jsr:") else ""
+    if not prefix:
+        return spec  # no registry named: read as npx reads it ("user/repo" is a repository)
+    parts = spec[len(prefix):].split("/")
+    kept = 2 if parts[0].startswith("@") else 1
+    return prefix + "/".join(parts[:kept])
+
+
+def _jsr_ref(runner: str, spec: str) -> PackageRef:
+    """What a JSR spec names: "jsr:@std/http@1.0.0/file-server" -> @std/http, version 1.0.0."""
+    body = _without_subpath(spec)[4:]
+    at = body.find("@", 1)
+    name = (body if at == -1 else body[:at]).lower()
+    version = body[at + 1:] if at != -1 and _EXACT_VERSION.fullmatch(body[at + 1:]) else None
+    return PackageRef(runner, JSR, spec, name, version, "registry")
 
 
 def _runner_specs(args: list[str], value_options: frozenset[str], package_options: tuple[str, ...]) -> list[str]:
@@ -632,12 +699,37 @@ def _npm_ref(runner: str, spec: str) -> PackageRef:
                 and not spec.startswith((".", "/", "~")))):
         return PackageRef(runner, NPM, written, "", None, "git")  # "user/repo" is a GitHub repository to npm
     if lowered.startswith(("http:", "https:")) or "://" in spec:
-        return PackageRef(runner, NPM, written, "", None, "url")
+        name, version = _tarball_package(spec) or ("", None)
+        return PackageRef(runner, NPM, written, name, version, "url")
     if spec.startswith((".", "/", "~")) or ":" in spec or "\\" in spec:
         return PackageRef(runner, NPM, written, "", None, "path")
     name = (spec if at == -1 else spec[:at]).lower()
     version = spec[at + 1:] if at != -1 and _EXACT_VERSION.fullmatch(spec[at + 1:]) else None
     return PackageRef(runner, NPM, written, name, version, "registry")
+
+
+def _tarball_package(url: str) -> tuple[str, str | None] | None:
+    """(name, version) when an address is an npm registry's file of a package; else None.
+
+    Registries keep them as .../NAME/-/NAME-VERSION.tgz (a scoped
+    .../@scope/name/-/name-VERSION.tgz, or @scope%2fname): for example
+    https://registry.npmjs.org/postmark-mcp/-/postmark-mcp-1.0.16.tgz. The
+    version is None when it is no exact version.
+    """
+    scheme, found, rest = url[:MAX_PATH_CHARS].partition("://")
+    if not found or scheme.lower() not in ("http", "https"):
+        return None
+    path = rest.partition("/")[2].split("?", 1)[0].split("#", 1)[0]
+    folder, found, file = path.partition("/-/")
+    if not found or "/" in file or not file.lower().endswith(".tgz"):
+        return None
+    segments = folder.replace("%2f", "/").replace("%2F", "/").split("/")
+    name = "/".join(segments[-2:]) if len(segments) >= 2 and segments[-2].startswith("@") else segments[-1]
+    stem = file[:-4]
+    if not name or not stem.lower().startswith(segments[-1].lower() + "-"):
+        return None
+    version = stem[len(segments[-1]) + 1:]
+    return name.lower(), version if _EXACT_VERSION.fullmatch(version) else None
 
 
 def _pypi_ref(runner: str, spec: str, role: str = "run") -> PackageRef:
@@ -679,9 +771,11 @@ def unpinned_spec(ref: PackageRef) -> tuple[str, str] | None:
     """
     if ref.source != "registry" or ref.version is not None or ref.role != "run":
         return None
-    if ref.ecosystem == NPM:
-        at = ref.spec.find("@", 1)
-        return ref.spec, f"{ref.spec if at == -1 else ref.spec[:at]}@1.2.3"
+    if ref.ecosystem in (NPM, JSR):
+        prefix = ref.spec[:4] if ref.spec[:4].lower() in ("npm:", "jsr:") else ""  # deno's, and npm's alias
+        body = _without_subpath(ref.spec)[len(prefix):]
+        at = body.find("@", 1)
+        return ref.spec, f"{prefix}{body if at == -1 else body[:at]}@1.2.3"
     return ref.spec, _PYPI_NAME_END.split(ref.spec, maxsplit=1)[0] + "==1.2.3"
 
 
@@ -712,8 +806,9 @@ def version_before(version: str, bound: str) -> bool | None:
 
 
 def _same_package(ref: PackageRef, advisory: advisories.Advisory) -> bool:
+    """Whether a package is the advisory's: by its registry name, or as named by a registry's package file address."""
     wanted = advisory.name.lower() if advisory.ecosystem == NPM else pypi_name(advisory.name)
-    return ref.source == "registry" and ref.ecosystem == advisory.ecosystem and ref.name == wanted
+    return ref.source in ("registry", "url") and ref.ecosystem == advisory.ecosystem and ref.name == wanted
 
 
 def advisory_findings(ref: PackageRef) -> list[tuple[str, str]]:
@@ -1188,84 +1283,370 @@ LAUNCH_FIELDS = ("executable", "package", "script", "script_sha256")
 MAX_HASHED_BYTES = 64 * 1024 * 1024
 # The longest text of the packages pinned as it is; a longer one is pinned as "sha256:<hex>" of it.
 MAX_PINNED_PACKAGE_CHARS = 1024
-_SCRIPT_RUNNERS = frozenset({"node", "nodejs", "bun", "deno", "ruby", "perl", "php", "bash", "sh", "zsh", "dash",
-                             "ksh", "rscript", "lua", "tsx", "ts-node"})
 # Packages that a runner fetches to start a local script: npx -y tsx@4 server.ts.
 _SCRIPT_RUNNER_PACKAGES = frozenset({"tsx", "ts-node", "esno", "vite-node", "jiti", "node", "bun", "deno"})
-_PYTHON_VALUE_OPTIONS = ("-X", "-W")
 # Launchers whose own file says nothing of what runs: package runners (their package is pinned by its spec),
 # shells given a command, and container runtimes (an image is pinned by its digest, which doctor checks).
 _NOT_PINNED_BY_FILE = frozenset({"npx", "bunx", "pnpx", "uvx", "uv", "pipx", "cmd", "java", *_CONTAINER})
-_NODE_VALUE_OPTIONS = ("-r", "--require", "--import", "--loader", "--experimental-loader", "--env-file",
-                       "--conditions", "-C", "--title", "--inspect-port")
-_SCRIPT_STOPS = ("-e", "--eval", "-p", "--print", "-c")
+# The most words taken for one launch's script, when options in front of it are not known here (each is pinned).
+MAX_SCRIPT_CANDIDATES = 4
+# The most letters of one cluster of short options read (-euxo); no real one has more.
+MAX_CLUSTER_LETTERS = 32
+# A word that names something by a scheme (npm:, jsr:, https:, node:), not a local file; "C:" is a drive.
+_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]+:")
 
 
-def launch_target(executable: str, words: list[str], cwd: str | None = None) -> str | None:
-    """The local file a launch command runs: the script an interpreter is given, or else the program itself.
+@dataclass(frozen=True)
+class _ScriptOptions:
+    """How an interpreter reads the options in front of its script: getopt's way, with long options.
+
+    values:          long options that take the next word as their value (unless written --name=value);
+    flags:           long options that take none, and every one that begins with one of `flag_prefixes`;
+    short_values:    letters that take a value: the rest of their word, else the next word (-I lib, -Ilib);
+    short_attached:  letters whose value, if any, is the rest of their word only (perl -Mstrict, ruby -x);
+    short_flags:     letters that take none (a cluster such as -uB is read a letter at a time);
+    stops, short_stops:   options after which no script file runs (code on the command line, a module);
+    script, short_script: options whose value is the script itself (php -f FILE);
+    plus:            whether a word that begins with "+" is an option too (a shell's +o NAME).
+    An option that is none of these is not known here (see _script_words).
+    """
+
+    values: frozenset[str] = frozenset()
+    flags: frozenset[str] = frozenset()
+    flag_prefixes: tuple[str, ...] = ()
+    short_values: str = ""
+    short_attached: str = ""
+    short_flags: str = ""
+    stops: frozenset[str] = frozenset()
+    short_stops: str = ""
+    script: frozenset[str] = frozenset()
+    short_script: str = ""
+    plus: bool = False
+
+
+def _more(base: _ScriptOptions, values: tuple[str, ...] = (), flags: tuple[str, ...] = ()) -> _ScriptOptions:
+    """An interpreter's options with a few of its own added (tsx is node with options of its own)."""
+    return replace(base, values=base.values | frozenset(values), flags=base.flags | frozenset(flags))
+
+
+_PYTHON_OPTIONS = _ScriptOptions(
+    values=frozenset({"--check-hash-based-pycs"}),
+    flags=frozenset({"--help", "--version", "--help-env", "--help-xoptions", "--help-all"}),
+    short_values="XW", short_flags="bBdEhiIOPqRsSuvVx?", short_stops="cm",
+)
+_NODE_OPTIONS = _ScriptOptions(
+    values=frozenset({
+        "--require", "--import", "--loader", "--experimental-loader", "--env-file", "--env-file-if-exists",
+        "--conditions", "--title", "--inspect-port", "--debug-port", "--input-type", "--watch-path",
+        "--watch-kill-signal", "--experimental-default-type", "--experimental-config-file",
+        "--experimental-sea-config", "--experimental-policy", "--policy-integrity",
+        "--experimental-specifier-resolution", "--es-module-specifier-resolution", "--disable-warning",
+        "--disable-proto", "--redirect-warnings", "--unhandled-rejections", "--dns-result-order", "--icu-data-dir",
+        "--openssl-config", "--tls-cipher-list", "--tls-keylog", "--use-largepages", "--localstorage-file",
+        "--max-http-header-size", "--secure-heap", "--secure-heap-min", "--heapsnapshot-signal",
+        "--heapsnapshot-near-heap-limit", "--diagnostic-dir", "--report-dir", "--report-directory",
+        "--report-filename", "--report-signal", "--cpu-prof-dir", "--cpu-prof-name", "--cpu-prof-interval",
+        "--heap-prof-dir", "--heap-prof-name", "--heap-prof-interval", "--trace-event-categories",
+        "--trace-event-file-pattern", "--trace-require-module", "--snapshot-blob", "--build-snapshot-config",
+        "--allow-fs-read", "--allow-fs-write", "--security-revert", "--inspect-publish-uid", "--stack-size",
+        "--stack-trace-limit", "--max-old-space-size", "--max-semi-space-size", "--v8-pool-size",
+        "--network-family-autoselection-attempt-timeout", "--test-name-pattern", "--test-skip-pattern",
+        "--test-reporter", "--test-reporter-destination", "--test-concurrency", "--test-timeout", "--test-shard",
+        "--test-isolation", "--test-coverage-include", "--test-coverage-exclude", "--test-coverage-branches",
+        "--test-coverage-functions", "--test-coverage-lines", "--test-global-setup",
+    }),
+    flags=frozenset({
+        "--watch", "--check", "--interactive", "--test", "--permission", "--jitless", "--preserve-symlinks",
+        "--preserve-symlinks-main", "--abort-on-uncaught-exception", "--frozen-intrinsics", "--insecure-http-parser",
+        "--zero-fill-buffers", "--pending-deprecation", "--throw-deprecation", "--enable-source-maps", "--prof",
+        "--prof-process", "--cpu-prof", "--heap-prof", "--entry-url", "--build-snapshot", "--strip-types",
+        "--node-memory-debug", "--async-context-frame", "--help", "--version", "--v8-options", "--completion-bash",
+    }),
+    flag_prefixes=("--no-", "--experimental-", "--trace-", "--harmony", "--allow-", "--use-", "--tls-m",
+                   "--openssl-", "--force-", "--expose", "--enable-", "--disable-", "--report-", "--test-",
+                   "--watch-", "--inspect"),
+    short_values="rC", short_flags="chiv", short_stops="ep", stops=frozenset({"--eval", "--print", "--run"}),
+)
+_TSX_OPTIONS = _more(_NODE_OPTIONS, values=("--tsconfig", "--include", "--exclude", "--ignore"),
+                     flags=("--no-cache", "--clear-screen"))
+_TS_NODE_OPTIONS = _ScriptOptions(
+    values=frozenset({"--project", "--require", "--compiler", "--compiler-options", "--ignore", "--ignore-diagnostics",
+                      "--cwd", "--dir", "--scope-dir", "--transpiler"}),
+    flags=frozenset({"--transpile-only", "--type-check", "--compiler-host", "--files", "--pretty", "--skip-project",
+                     "--skip-ignore", "--prefer-ts-exts", "--log-error", "--esm", "--swc", "--emit", "--scope",
+                     "--show-config", "--interactive", "--version", "--help", "--cwd-mode", "--script-mode"}),
+    short_values="rPCOID", short_flags="THivh", short_stops="ep", stops=frozenset({"--eval", "--print"}),
+)
+_VITE_NODE_OPTIONS = _ScriptOptions(
+    values=frozenset({"--root", "--config", "--mode", "--options"}),
+    flags=frozenset({"--watch", "--script", "--help", "--version"}),
+    short_values="rcm", short_flags="wvh",
+)
+# deno's options take an optional value only as --name=value (--allow-read=/srv, -R=/srv), so most are flags.
+_DENO_OPTIONS = _ScriptOptions(
+    values=frozenset({"--config", "--import-map", "--cert", "--location", "--seed", "--log-level", "--ext",
+                      "--preload", "--require", "--conditions"}),
+    flags=frozenset({"--quiet", "--cached-only", "--check", "--reload", "--lock", "--env-file", "--node-modules-dir",
+                     "--vendor", "--frozen", "--unsafely-ignore-certificate-errors", "--v8-flags", "--hmr",
+                     "--permission-set", "--enable-testing-features-do-not-use", "--strace-ops", "--help"}),
+    flag_prefixes=("--allow-", "--deny-", "--no-", "--unstable", "--inspect", "--watch"),
+    short_values="cL", short_flags="AqrRWNESIPh",
+)
+_BUN_OPTIONS = _ScriptOptions(
+    values=frozenset({"--cwd", "--config", "--env-file", "--preload", "--require", "--import", "--tsconfig-override",
+                      "--define", "--loader", "--main-fields", "--extension-order", "--jsx-factory", "--jsx-fragment",
+                      "--jsx-import-source", "--jsx-runtime", "--conditions", "--port", "--install", "--filter",
+                      "--elide-lines", "--shell", "--title", "--unhandled-rejections", "--console-depth",
+                      "--fetch-preconnect", "--max-http-header-size", "--dns-result-order", "--user-agent"}),
+    flags=frozenset({"--bun", "--silent", "--watch", "--hot", "--smol", "--if-present", "--prefer-offline",
+                     "--prefer-latest", "--expose-gc", "--zero-fill-buffers", "--redis-preconnect", "--sql-preconnect",
+                     "--throw-deprecation", "--verbose", "--version", "--help", "--revision", "--workspaces",
+                     "--parallel", "--sequential", "--use-system-ca", "--use-openssl-ca"}),
+    flag_prefixes=("--no-", "--inspect", "--experimental-"),
+    short_values="crdlF", short_flags="bhiv", short_stops="ep", stops=frozenset({"--eval", "--print"}),
+)
+_RUBY_OPTIONS = _ScriptOptions(
+    values=frozenset({"--disable", "--enable", "--encoding", "--external-encoding", "--internal-encoding"}),
+    flags=frozenset({"--version", "--verbose", "--copyright", "--help", "--yjit", "--rjit", "--jit", "--debug"}),
+    flag_prefixes=("--disable-", "--enable-", "--yjit-", "--rjit-", "--jit-", "--dump", "--backtrace-limit",
+                   "--crash-report", "--parser"),
+    short_values="ICEXr", short_attached="0FKTWix", short_flags="acdhlnpsSvwyU", short_stops="e",
+)
+_PERL_OPTIONS = _ScriptOptions(
+    flags=frozenset({"--help", "--version"}),
+    short_values="I", short_attached="0CdDFilmMxV", short_flags="acnpsStTuUvwWXh", short_stops="eE",
+)
+_PHP_OPTIONS = _ScriptOptions(
+    values=frozenset({"--php-ini", "--define", "--zend-extension"}),
+    flags=frozenset({"--interactive", "--no-php-ini", "--no-chdir", "--info", "--modules", "--version", "--help",
+                     "--syntax-check", "--syntax-highlight", "--strip", "--hide-args", "--ini"}),
+    stops=frozenset({"--run", "--process-begin", "--process-code", "--process-end", "--rf", "--rc", "--re", "--rz",
+                     "--ri"}),
+    script=frozenset({"--file", "--process-file"}),
+    short_values="cdzSt", short_flags="aCehHilmnqsvw", short_stops="rBRE", short_script="fF",
+)
+_LUA_OPTIONS = _ScriptOptions(short_values="l", short_flags="ivEW", short_stops="e")
+_RSCRIPT_OPTIONS = _ScriptOptions(flag_prefixes=("--",), short_stops="e")  # Rscript's own are --name or --name=value
+_SHELL_OPTIONS = _ScriptOptions(
+    values=frozenset({"--rcfile", "--init-file"}),
+    flags=frozenset({"--login", "--noediting", "--noprofile", "--norc", "--posix", "--restricted", "--verbose",
+                     "--version", "--help", "--debugger", "--dump-strings", "--dump-po-strings", "--pretty-print"}),
+    short_values="oO", short_flags="".join(sorted(set(string.ascii_letters) - set("oOcs"))), short_stops="cs",
+    plus=True,
+)
+_INTERPRETERS: dict[str, _ScriptOptions] = {
+    "node": _NODE_OPTIONS, "nodejs": _NODE_OPTIONS, "jiti": _NODE_OPTIONS, "tsx": _TSX_OPTIONS,
+    "esno": _TSX_OPTIONS, "ts-node": _TS_NODE_OPTIONS, "vite-node": _VITE_NODE_OPTIONS, "deno": _DENO_OPTIONS,
+    "bun": _BUN_OPTIONS, "ruby": _RUBY_OPTIONS, "perl": _PERL_OPTIONS, "php": _PHP_OPTIONS, "lua": _LUA_OPTIONS,
+    "rscript": _RSCRIPT_OPTIONS, **{shell: _SHELL_OPTIONS for shell in _SHELLS if shell != "busybox"},
+}
+# deno's and bun's commands other than the ones that run a script; any other first word is a script to run
+# (`deno server.ts`, `bun server.ts`).
+_DENO_COMMANDS = frozenset({
+    "add", "approve-scripts", "audit", "bench", "bundle", "check", "clean", "compile", "completions", "coverage",
+    "deploy", "doc", "eval", "fmt", "help", "info", "init", "install", "jupyter", "lint", "lsp", "outdated",
+    "publish", "remove", "repl", "sandbox", "task", "test", "types", "uninstall", "update", "upgrade", "vendor", "x",
+})
+_BUN_COMMANDS = frozenset({
+    "a", "add", "audit", "build", "c", "completions", "create", "discord", "exec", "help", "i", "info", "init",
+    "install", "link", "outdated", "patch", "patch-commit", "pm", "publish", "remove", "repl", "rm", "test",
+    "unlink", "update", "upgrade", "why", "x",
+})
+# For _inline_code, which looks for node -e and python -c past the options that take a value.
+_NODE_VALUE_OPTIONS = (*sorted(_NODE_OPTIONS.values), "-r", "-C")
+_PYTHON_VALUE_OPTIONS = ("-X", "-W", "--check-hash-based-pycs")
+
+# What an option is to an interpreter (_read_option).
+_KNOWN, _UNKNOWN, _STOP, _SCRIPT = "known", "unknown", "stop", "script"
+
+
+def _read_option(word: str, following: str | None, spec: _ScriptOptions) -> tuple[str, int, str | None]:
+    """What an option word is to an interpreter: (what, how many words it takes, the script for _SCRIPT).
+
+    _KNOWN: an option known here; _UNKNOWN: one not known here, taken to be
+    one word (whether it takes the next is not known); _STOP: no script
+    file runs; _SCRIPT: the option gives the script (`following`, or the
+    value written in the word).
+    """
+    if word.startswith("--"):
+        name, equals, value = word.partition("=")
+        if name in spec.stops:
+            return _STOP, 1, None
+        if name in spec.script:
+            return (_SCRIPT, 1, value) if equals else (_SCRIPT, 2, following)
+        if equals:
+            return _KNOWN, 1, None  # it carries its value
+        if name in spec.values:
+            return _KNOWN, 2, None
+        if name in spec.flags or name.startswith(spec.flag_prefixes):
+            return _KNOWN, 1, None
+        return _UNKNOWN, 1, None
+    for position, letter in enumerate(word[1:1 + MAX_CLUSTER_LETTERS], start=1):
+        more = position + 1 < len(word)  # the word goes on after this letter
+        if letter in spec.short_stops:
+            return _STOP, 1, None
+        if letter in spec.short_script:
+            return (_SCRIPT, 1, word[position + 1:]) if more else (_SCRIPT, 2, following)
+        if letter in spec.short_values:
+            return _KNOWN, (1 if more else 2), None
+        if letter in spec.short_attached or word[position + 1:position + 2] == "=":
+            return _KNOWN, 1, None  # the rest of the word is its value (deno's -R=/srv too)
+        if letter not in spec.short_flags:
+            return _UNKNOWN, 1, None
+    return (_KNOWN if len(word) <= 1 + MAX_CLUSTER_LETTERS else _UNKNOWN), 1, None
+
+
+def _is_option(word: str, spec: _ScriptOptions) -> bool:
+    return len(word) > 1 and (word[0] == "-" or (spec.plus and word[0] == "+"))
+
+
+def _script_words(args: list[str], spec: _ScriptOptions) -> list[str]:
+    """The words that may be the script an interpreter runs, read past its options (_ScriptOptions); [] for none.
+
+    One word when every option in front of it is known here. A plain word
+    right after an option not known here may be that option's value or the
+    script, so it is taken and the words after it are read on, to the next
+    plain word: each word taken is pinned, and the script is one of them
+    (at most MAX_SCRIPT_CANDIDATES). No more is taken once it is clear that
+    no script file runs: code on the command line, a module, standard input.
+    """
+    found: list[str] = []
+    index, maybe_value = 0, False
+    while index < min(len(args), MAX_OPTIONS_SCANNED) and len(found) < MAX_SCRIPT_CANDIDATES:
+        word = args[index]
+        if word == "--":
+            return found + args[index + 1:index + 2]
+        if not _is_option(word, spec):
+            if word == "-":  # standard input
+                return found
+            found.append(word)
+            if not maybe_value:
+                return found
+            maybe_value = False
+            index += 1
+            continue
+        kind, taken, script = _read_option(word, args[index + 1] if index + 1 < len(args) else None, spec)
+        if kind == _STOP:
+            return found
+        if kind == _SCRIPT:
+            return found + ([script] if script else [])
+        maybe_value = kind == _UNKNOWN
+        index += taken
+    return found
+
+
+def _first_plain_at(args: list[str], spec: _ScriptOptions) -> int | None:
+    """Where the first word that is no option is (an option not known here taken to take none); None if none is."""
+    index = 0
+    while index < min(len(args), MAX_OPTIONS_SCANNED):
+        word = args[index]
+        if word == "--":
+            return index + 1 if index + 1 < len(args) else None
+        if not _is_option(word, spec):
+            return index
+        kind, taken, _ = _read_option(word, None, spec)
+        if kind in (_STOP, _SCRIPT):
+            return None
+        index += taken
+    return None
+
+
+def _interpreter_scripts(program: str, args: list[str]) -> list[str] | None:
+    """The words that may be an interpreter's script (_script_words); None when `program` is no interpreter known here."""
+    if _PYTHON.fullmatch(program):
+        return _script_words(args, _PYTHON_OPTIONS)
+    if program not in _INTERPRETERS:
+        program = program.rstrip("0123456789.")  # php8.3, lua5.4, ruby3.3
+    spec = _INTERPRETERS.get(program)
+    if spec is None:
+        return None
+    if program in ("deno", "bun"):
+        return _subcommand_scripts(program, args)
+    if program in ("tsx", "esno") and args[:1] == ["watch"]:
+        args = args[1:]
+    return _script_words(args, spec)
+
+
+def _subcommand_scripts(program: str, args: list[str]) -> list[str]:
+    """`deno [run|serve] ... SCRIPT` and `bun [run] ... SCRIPT`: the words that may be the script; [] for another
+    command of theirs."""
+    spec = _INTERPRETERS[program]
+    at = _first_plain_at(args, spec)
+    if at is None:
+        return []
+    if args[at] in (("run", "serve") if program == "deno" else ("run",)):
+        return _script_words(args[at + 1:], spec)
+    if args[at] in (_DENO_COMMANDS if program == "deno" else _BUN_COMMANDS):
+        return []
+    return _script_words(args, spec)
+
+
+def launch_targets(executable: str, words: list[str], cwd: str | None = None) -> list[str]:
+    """The local files a launch command runs: the script an interpreter is given, or else the program itself.
 
     Behind a wrapper (cmd /c node server.js, env, sh -c "exec ..."), the one
-    command it runs; None when it runs several. A runner's package (npx,
-    uvx) is pinned by its spec, so None for it, unless it runs a local script
-    (npx -y tsx@4 server.ts); `uv run server.py` gives the script. None too for
-    a Python started with -m or -c, and for inline code. A relative script is
-    read against `cwd` (the proxy's current folder), as the interpreter will.
+    command it runs; none when it runs several. A runner's package (npx,
+    uvx, deno's npm:) is pinned by its spec, so none for it, unless it runs
+    a local script (npx -y tsx@4 server.ts); `uv run server.py` gives the
+    script. None for a Python started with -m or -c, nor for inline code. A
+    relative script is read against `cwd` (the proxy's current folder), as
+    the interpreter will. One file, or several when an option in front of
+    the script is not known here (_script_words).
     """
     commands = commands_run(words)
     if len(commands) != 1:
-        return None
+        return []
     command = commands[0]
     found: str | None = executable
     if command != words[:MAX_WORDS_LINTED]:  # behind a wrapper: the wrapper finds the program, not the proxy
         found = command[0] if home.is_absolute(command[0]) else None
-    return _target_of(found, command, cwd)
+    return _targets_of(found, command, cwd)
 
 
-def _target_of(executable: str | None, words: list[str], cwd: str | None) -> str | None:
+def _targets_of(executable: str | None, words: list[str], cwd: str | None) -> list[str]:
     program = program_name(words[0])
     args = words[1:MAX_WORDS_LINTED]
     base = cwd
-    script: str | None
-    if _runner_of(words) is not None:
-        script = _runner_script(words)
+    runner = _runner_of(words)
+    scripts: list[str] | None
+    if runner is not None and runner[0] != "uv run":
+        scripts = _runner_script(words)
     elif program == "uv":
-        script, base = _uv_run_script(args, cwd)
+        scripts, base = _uv_run_script(args, cwd)
     elif program in _NOT_PINNED_BY_FILE:
-        return None
-    elif _PYTHON.fullmatch(program):
-        script = _first_plain_word(args, _PYTHON_VALUE_OPTIONS, stops=("-m", "-c"))
-    elif program in _SCRIPT_RUNNERS:
-        if program in ("deno", "bun") and args[:1] == ["run"]:
-            args = args[1:]
-        script = _first_plain_word(args, _NODE_VALUE_OPTIONS, stops=_SCRIPT_STOPS)
+        return []
     elif program in _POWERSHELL:
-        script = next((args[index + 1] for index in range(len(args) - 1)
-                       if args[index].lstrip("-/").lower() in ("file", "f")), None)
+        given = next((args[index + 1] for index in range(len(args) - 1)
+                      if args[index].lstrip("-/").lower() in ("file", "f")), None)
+        scripts = [given] if given else []
     else:
-        return os.path.abspath(executable) if executable else None
-    if script is None:
-        return None
-    return os.path.abspath(os.path.join(base or os.getcwd(), os.path.expanduser(script)))
+        scripts = _interpreter_scripts(program, args)
+        if scripts is None:
+            return [os.path.abspath(executable)] if executable else []
+    paths: list[str] = []
+    for script in scripts:
+        if script and not _SCHEME.match(script):  # npm:pkg, https://...: deno's package, pinned by its spec
+            path = os.path.abspath(os.path.join(base or os.getcwd(), os.path.expanduser(script)))
+            if path not in paths:
+                paths.append(path)
+    return paths
 
 
-def _runner_script(words: list[str]) -> str | None:
-    """The local script a runner's package starts: npx -y tsx@4 server.ts -> "server.ts"; else None."""
+def _runner_script(words: list[str]) -> list[str]:
+    """The words that may be the local script a runner's package starts: npx -y tsx@4 server.ts -> ["server.ts"]."""
     refs = _direct_packages(words)
     ref = refs[0] if refs else None
     runner = _runner_of(words)
     if ref is None or runner is None or ref.source != "registry" or ref.name not in _SCRIPT_RUNNER_PACKAGES:
-        return None
+        return []
     args = words[runner[2]:MAX_WORDS_LINTED]
     index = _first_plain_index(args, _NPX_VALUE_OPTIONS if ref.ecosystem == NPM else _UVX_VALUE_OPTIONS)
     if index is None:
-        return None
-    rest = args[index + 1:]
-    if ref.name in ("deno", "bun") and rest[:1] == ["run"]:
-        rest = rest[1:]
-    return _first_plain_word(rest, _NODE_VALUE_OPTIONS, stops=_SCRIPT_STOPS)
+        return []
+    return _interpreter_scripts(ref.name, args[index + 1:]) or []
 
 
-def _uv_run_script(args: list[str], cwd: str | None) -> tuple[str | None, str | None]:
+def _uv_run_script(args: list[str], cwd: str | None) -> tuple[list[str], str | None]:
     """(the script, the folder it is read against) of `uv [options] run [options] SCRIPT.py` (or `... run python S`)."""
     directory = None
     index = 0
@@ -1279,38 +1660,26 @@ def _uv_run_script(args: list[str], cwd: str | None) -> tuple[str | None, str | 
             if seen_run:
                 break
             if word != "run":
-                return None, None  # another uv command (uv tool run is a runner, see _runner_of)
+                return [], None  # another uv command (uv tool run is a runner, see _runner_of)
             seen_run = True
             index += 1
             continue
         if word in ("-m", "--module"):
-            return None, None
+            return [], None
         name, equals, value = word.partition("=")
         takes_value = not equals and word in _UV_VALUE_OPTIONS
         if name == "--directory":
             directory = value if equals else (args[index + 1] if index + 1 < len(args) else None)
         index += 2 if takes_value else 1
     if not seen_run or index >= len(args):
-        return None, None
+        return [], None
     base = os.path.join(cwd or os.getcwd(), directory) if directory else cwd
     target = args[index]
     if _PYTHON.fullmatch(program_name(target)):
-        return _first_plain_word(args[index + 1:], _PYTHON_VALUE_OPTIONS, stops=("-m", "-c")), base
+        return _script_words(args[index + 1:], _PYTHON_OPTIONS), base
     if target.lower().endswith((".py", ".pyw")):
-        return target, base
-    return None, None
-
-
-def _first_plain_word(args: list[str], value_options: tuple[str, ...], stops: tuple[str, ...]) -> str | None:
-    index = 0
-    while index < len(args):
-        word = args[index]
-        if word in stops or word.split("=", 1)[0] in stops:
-            return None
-        if not word.startswith("-") or word == "-":
-            return None if word == "-" else word
-        index += 2 if word in value_options else 1
-    return None
+        return [target], base
+    return [], None
 
 
 def file_sha256(path: str) -> str | None:
@@ -1337,14 +1706,37 @@ def file_sha256(path: str) -> str | None:
 def launch_identity(executable: str, words: list[str], cwd: str | None = None) -> dict[str, str | None]:
     """What --pin-server pins of a launch (LAUNCH_FIELDS): the program found, the runners' packages as
     written (behind wrappers too, joined with "; "), and the local script with its SHA-256 (None for each
-    that does not apply)."""
+    that does not apply).
+
+    When several files may be the script (an option in front of it is not
+    known here: _script_words), "script" holds their paths joined with "; "
+    and "script_sha256" the SHA-256 of their own SHA-256s, so that a change
+    to any of them is seen.
+    """
     packages = "; ".join(ref.written for ref in runner_packages(words)) or None
     if packages is not None and len(packages) > MAX_PINNED_PACKAGE_CHARS:
         packages = "sha256:" + hashlib.sha256(packages.encode("utf-8", "surrogatepass")).hexdigest()
-    script = launch_target(executable, words, cwd)
+    script, script_sha256 = _pinned_scripts(launch_targets(executable, words, cwd))
     return {
         "executable": os.path.abspath(executable),
         "package": packages,
         "script": script,
-        "script_sha256": file_sha256(script) if script else None,
+        "script_sha256": script_sha256,
     }
+
+
+def _pinned_scripts(paths: list[str]) -> tuple[str | None, str | None]:
+    """The "script" and "script_sha256" pinned of the files that may be the script (see launch_identity)."""
+    if not paths:
+        return None, None
+    if len(paths) == 1:
+        script, digest = paths[0], file_sha256(paths[0])
+    else:
+        script = "; ".join(paths)
+        combined = hashlib.sha256()
+        for path in paths:
+            combined.update(f"{file_sha256(path) or '-'} {path}\n".encode("utf-8", "surrogatepass"))
+        digest = combined.hexdigest()
+    if len(script) > MAX_PATH_CHARS:  # longer than a pins file keeps: pinned by its SHA-256
+        script = "sha256:" + hashlib.sha256(script.encode("utf-8", "surrogatepass")).hexdigest()
+    return script, digest

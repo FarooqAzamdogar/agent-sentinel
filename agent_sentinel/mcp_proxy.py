@@ -149,10 +149,14 @@ With --pin-server the server itself is pinned too (pins.py, "The server
 itself"): how it is launched, before it starts, and the serverInfo of its
 handshake. A server that differs from its pin is not started, or its
 handshake is refused (--on-server-change refuse, the default); with
---on-server-change quarantine it runs with every tool, prompt and resource
-template quarantined, its resources not read, and every request it sends the
-client (sampling, elicitation, roots; not ping) refused (quarantine_server).
-Monitor mode logs the change only.
+--on-server-change quarantine it runs quarantined (quarantine_server): every
+tool, prompt, resource and resource template is left out of its lists; its
+instructions are removed and never pinned; tool calls, prompts, resource
+reads, subscriptions (subscriptions/listen too), completions and any other
+request but the handshake, ping, the lists and logging/setLevel are
+refused; every request it sends the client (sampling, elicitation, roots;
+not ping) is refused, and every notification it sends but
+notifications/cancelled is dropped. Monitor mode logs the change only.
 
 Requests other than tool calls
 ------------------------------
@@ -283,6 +287,14 @@ _LIST_ITEMS_KEY = {
     "resources/list": "resources",
     "resources/templates/list": "resourceTemplates",
 }
+# What a client may still ask of a server quarantined for differing from its pin (Proxy.quarantine_server): the
+# handshake, ping, the lists (every entry is removed) and the log level. The other requests are refused.
+_ASKED_OF_A_QUARANTINED_SERVER = frozenset({
+    protocol.INITIALIZE, protocol.SERVER_DISCOVER, "ping", *_LIST_ITEMS_KEY, "logging/setLevel",
+})
+# What such a server may still tell the client: that it cancelled a request of its own. Its other
+# notifications (log messages, progress, list changes, resource updates) are dropped.
+_TOLD_BY_A_QUARANTINED_SERVER = frozenset({"notifications/cancelled"})
 # One entry of each list, as audit events name it ("tool_changed", "prompt_lookalike", ...).
 _ENTRY_NAME = {"tools": "tool", "prompts": "prompt", "resources": "resource", "resourceTemplates": "resource_template"}
 # The lists whose names are what the client calls or fetches by: they follow the
@@ -792,7 +804,26 @@ class Proxy:
             return self._refuse_task_request(message)
         if method == "notifications/cancelled" and self._forget_cancelled_request(message):
             return _DROP  # it cancelled a call held for approval, which the server never saw
+        refused = self._refused_by_server_quarantine(message)
+        if refused is not None:
+            return refused
         return self._forward_request(message, label=_label(method))
+
+    def _refused_by_server_quarantine(self, message: JsonObject) -> _Outcome | None:
+        """Refuse a request a quarantined server (quarantine_server) may not answer; None when it may go on.
+
+        Such a server serves nothing: the client may still open the session,
+        ping it and list (every entry is removed), and set its log level. Any
+        other request, completion/complete for one, would bring the server's
+        answer to the client. Notifications get no answer, so they pass.
+        """
+        quarantined = self._whole_server_quarantined()
+        if quarantined is None or "id" not in message or message["method"] in _ASKED_OF_A_QUARANTINED_SERVER:
+            return None
+        method = message["method"]
+        reason = f"the whole server is quarantined: {quarantined}"
+        return self._refused(message, self._firewall.refuse(_label(method), reason, event="client_request",
+                                                            rule=RULE_QUARANTINE))
 
     def _refuse_batch(self, batch: list[Any]) -> _Outcome:
         # MCP no longer uses JSON-RPC batches. Refusing them keeps every
@@ -1169,13 +1200,14 @@ class Proxy:
 
         Each resource URI it subscribes to is checked as a read of that URI,
         and one refusal refuses the whole request. The list-changed filters
-        ask only for notifications, which are scanned when they come.
+        ask only for notifications, which are scanned when they come. A
+        quarantined server (quarantine_server) is listened to for nothing.
         """
         try:
             uris = protocol.subscribed_uris(message.get("params"))
         except ShapeError as exc:
             return self._refuse_malformed_request(message, str(exc))
-        quarantined = self._whole_server_quarantined() if uris else None
+        quarantined = self._whole_server_quarantined()
         if quarantined is not None:  # a server that differs from its pin serves nothing (--pin-server)
             reason = f"the whole server is quarantined: {quarantined}"
             return self._refused(message, self._refusal(protocol.SUBSCRIPTIONS_LISTEN, reason, RULE_QUARANTINE))
@@ -1519,12 +1551,15 @@ class Proxy:
             return self._quarantine_overflowed or self._server_quarantine is not None or name in self._quarantined[kind]
 
     def quarantine_server(self, reason: str) -> None:
-        """Quarantine every tool, prompt and resource template of this server, for as long as the proxy runs.
+        """Quarantine the whole server, for as long as the proxy runs (see "Lists, pins and names").
 
-        For a server that differs from its pin (proxy --pin-server): they are
-        left out of every list, calls and prompts are refused, and so are
-        resource reads and subscriptions and every request the server sends
-        the client (sampling, elicitation, roots) but ping.
+        For a server that differs from its pin (proxy --pin-server): every
+        entry of its lists is left out, its instructions are removed (and not
+        pinned), calls, prompts, resource reads and subscriptions are refused,
+        and so is every other client request but the handshake, ping, the
+        lists and logging/setLevel (_refused_by_server_quarantine); every
+        request the server sends the client but ping is refused, and every
+        notification but notifications/cancelled is dropped.
         """
         with self._state:
             if self._server_quarantine is None:
@@ -1617,13 +1652,15 @@ class Proxy:
             refusal = self._firewall.refuse(label, problem, event="server_request", rule=RULE_MALFORMED)
             self._report_block(f"refused a '{printable(method, limit=100)}' request from the server", refusal)
             return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL, code=protocol.METHOD_NOT_FOUND))
-        quarantined = self._whole_server_quarantined() if is_request and method != "ping" else None
-        if quarantined is not None:  # a server that differs from its pin asks the client nothing (--pin-server)
+        allowed = ("ping",) if is_request else _TOLD_BY_A_QUARANTINED_SERVER
+        quarantined = self._whole_server_quarantined() if method not in allowed else None
+        if quarantined is not None:  # a server that differs from its pin tells the client nothing (--pin-server)
             refusal = self._firewall.refuse(label, f"the whole server is quarantined: {quarantined}",
                                             event="server_request", rule=RULE_QUARANTINE)
-            self._report_block(f"refused a '{printable(method, limit=100)}' request from the quarantined server",
+            kind = "request" if is_request else "notification"
+            self._report_block(f"refused a '{printable(method, limit=100)}' {kind} from the quarantined server",
                                refusal)
-            return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL))
+            return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL)) if is_request else _DROP
 
         verdict = self._firewall.policy.server_request_verdict(method)
         decision = None
@@ -2044,12 +2081,24 @@ class Proxy:
         without being forwarded: the stricter checks and the pin are made for
         text, and a lenient client might still show the model what is inside.
         A null is removed too; it says nothing.
+
+        A server that differs from its pin (quarantine_server) cannot be
+        vouched for, so its instructions are removed whatever they say, and
+        are never pinned: they would steer the model, and become the baseline
+        its later instructions are compared with.
         """
         if "instructions" not in result:
             return
         instructions = result["instructions"]
         if instructions is None:
             del result["instructions"]
+            return
+        quarantined = self._whole_server_quarantined()
+        if quarantined is not None:
+            del result["instructions"]
+            decision = self._firewall.refuse(source, f"the whole server is quarantined: {quarantined}",
+                                             event="server_instructions", rule=RULE_QUARANTINE)
+            self._report_block("removed the instructions of the quarantined server", decision)
             return
         if not isinstance(instructions, str):
             del result["instructions"]
@@ -2218,7 +2267,7 @@ class Proxy:
             return "it is not a well-formed entry", None
         with self._state:
             server_quarantine = self._server_quarantine
-        if pinned and server_quarantine is not None:
+        if server_quarantine is not None:  # resources too: none of them can be read
             return f"the whole server is quarantined: {server_quarantine}", None
         if pinned and self._was_quarantined(kind, item["name"]):
             return "it was quarantined earlier", None  # even if it looks clean now

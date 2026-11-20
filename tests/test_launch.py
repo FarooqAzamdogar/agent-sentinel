@@ -424,12 +424,166 @@ class OtherSpellings(unittest.TestCase):
                       ["uvx", "--with", "a" + ",>=1" * 1_000_000, "x"], ["uvx"] + ["--python", "3"] * 2048 + ["x"],
                       ["bash", "-c", "(" * 1_000_000 + "npx x" + ")" * 1_000_000],
                       ["cmd", "/c", "start " + "/x " * 3000 + "npx -y x"],
-                      ["docker", "run"] + ["-v", "/." * 2000 + "run:/h"] * 2000 + ["img"]):
+                      ["docker", "run"] + ["-v", "/." * 2000 + "run:/h"] * 2000 + ["img"],
+                      # review round 3: option clusters, deno, uv run, registry files, options not known here
+                      ["bash", "-" + "x" * 4_000_000, "s.sh"], ["deno", "-" + "A" * 4_000_000, "run", "s.ts"],
+                      ["deno", "run", "npm:" + "a/" * 2_000_000], ["npx", "https://h/" + "x/-/" * 1_000_000 + ".tgz"],
+                      ["node"] + ["--zz", "v"] * 2000 + ["s.js"], ["uv", "run"] + ["--with", "a," * 100_000] * 64):
             started = time.perf_counter()
             launch_risks(words, user_home=HOME)
             launch.runner_packages(words)
             launch_identity("C:/x/" + words[0], words)
             self.assertLess(time.perf_counter() - started, 2)
+
+
+class ScriptsPastTheirOptions(unittest.TestCase):
+    """Review round 3 (DOC3-2): the script --pin-server hashes is found past the interpreter's options, as that
+    interpreter reads them; after an option not known here, every file that may be the script is pinned."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = Path(self.tmp.name).resolve()
+        for name in ("server.ts", "server.js", "server.rb", "server.pl", "server.php", "server.py", "server.sh",
+                     "deno.json", "x.ini"):
+            (self.folder / name).write_text("good", encoding="utf-8")
+        (self.folder / "lib").mkdir()
+
+    def identity(self, words):
+        return launch_identity("C:/x/" + words[0], words, cwd=str(self.folder))
+
+    def test_an_option_that_takes_a_value_is_passed_over(self):
+        for words in (
+            ["deno", "run", "--config", "deno.json", "server.ts"], ["deno", "run", "-c", "deno.json", "server.ts"],
+            ["deno", "run", "--import-map", "deno.json", "server.ts"], ["deno", "run", "-R=./lib", "-A", "server.ts"],
+            ["deno", "-q", "run", "server.ts"], ["deno", "serve", "server.ts"], ["deno", "server.ts"],
+            ["bun", "run", "--cwd", "lib", "server.ts"], ["bun", "--bun", "run", "server.ts"], ["bun", "server.ts"],
+            ["node", "--watch-path", "lib", "server.js"], ["node", "--input-type", "module", "server.js"],
+            ["node", "--stack-size", "2000", "server.js"], ["node", "-r", "dotenv/config", "server.js"],
+            ["node", "--inspect=9229", "--no-warnings", "server.js"], ["node", "--", "server.js"],
+            ["ruby", "-I", "lib", "server.rb"], ["ruby", "-Ilib", "-rjson", "-W0", "server.rb"],
+            ["perl", "-I", "lib", "server.pl"], ["perl", "-Mstrict", "-w", "server.pl"],
+            ["php", "-c", "x.ini", "server.php"], ["php", "-d", "memory_limit=1G", "server.php"],
+            ["php", "-f", "server.php"], ["php8.3", "-dx=1", "server.php"],
+            ["python", "--check-hash-based-pycs", "always", "server.py"], ["python", "-X", "utf8", "server.py"],
+            ["python", "-Wignore", "-uB", "server.py"],
+            ["bash", "--rcfile", "x.ini", "server.sh"], ["bash", "-o", "pipefail", "server.sh"],
+            ["bash", "-euo", "pipefail", "server.sh"], ["sh", "+O", "extglob", "server.sh"],
+            ["tsx", "--tsconfig", "deno.json", "server.ts"], ["tsx", "watch", "server.ts"],
+            ["ts-node", "-P", "deno.json", "-T", "server.ts"],
+            ["npx", "-y", "tsx@4.19.0", "--tsconfig", "deno.json", "server.ts"],
+            ["uv", "run", "python", "-X", "utf8", "server.py"],
+        ):
+            with self.subTest(words=words):
+                expected = self.folder / next(word for word in words if word.startswith("server."))
+                identity = self.identity(words)
+                self.assertEqual(identity["script"], str(expected))
+                self.assertEqual(identity["script_sha256"], hashlib.sha256(b"good").hexdigest())
+
+    def test_a_change_to_the_script_is_seen(self):
+        for words in (["deno", "run", "--config", "deno.json", "server.ts"], ["ruby", "-I", "lib", "server.rb"],
+                      ["bash", "-o", "pipefail", "server.sh"]):
+            with self.subTest(words=words):
+                before = self.identity(words)
+                script = self.folder / words[-1]
+                script.write_text("evil", encoding="utf-8")
+                self.addCleanup(script.write_text, "good", encoding="utf-8")
+                self.assertNotEqual(self.identity(words)["script_sha256"], before["script_sha256"])
+
+    def test_no_script_when_code_a_module_or_standard_input_runs(self):
+        for words in (["python", "-uc", "print(1)"], ["python", "-um", "server"], ["node", "-pe", "1"],
+                      ["node", "--run", "start"], ["ruby", "-e", "1"], ["perl", "-E", "say 1"], ["php", "-r", "echo 1;"],
+                      ["bash", "-s"], ["sh", "-"], ["deno", "task", "start"], ["deno", "eval", "1"], ["bun", "install"],
+                      ["deno", "run", "-A", "npm:some-server@1.0.0"]):
+            with self.subTest(words=words):
+                self.assertEqual((self.identity(words)["script"], self.identity(words)["script_sha256"]), (None, None))
+
+    def test_after_an_option_not_known_here_each_file_that_may_be_the_script_is_pinned(self):
+        words = ["node", "--some-new-option", "deno.json", "server.js"]
+        identity = self.identity(words)
+        self.assertEqual(identity["script"], f"{self.folder / 'deno.json'}; {self.folder / 'server.js'}")
+        self.assertRegex(identity["script_sha256"], r"\A[0-9a-f]{64}\Z")
+        for changed in ("server.js", "deno.json"):  # whichever it was
+            with self.subTest(changed=changed):
+                (self.folder / changed).write_text("evil", encoding="utf-8")
+                self.assertNotEqual(self.identity(words)["script_sha256"], identity["script_sha256"])
+                (self.folder / changed).write_text("good", encoding="utf-8")
+        self.assertEqual(self.identity(["node", "--some-new-option", "server.js"])["script"],
+                         str(self.folder / "server.js"))  # nothing else to take
+        many = ["node"] + [word for number in range(10) for word in ("--zz", f"v{number}")] + ["server.js"]
+        self.assertEqual(len(self.identity(many)["script"].split("; ")), launch.MAX_SCRIPT_CANDIDATES)
+        self.assertRegex(self.identity(["node", "--zz", "a" * 3000, "--zz", "b" * 3000])["script"],
+                         r"\Asha256:[0-9a-f]{64}\Z")  # longer than a pins file keeps a path
+
+
+class DenoUvRunAndRegistryFiles(unittest.TestCase):
+    """Review round 3 (DOC3-3, DOC3-4): deno's npm: and jsr: packages, uv run --with, a registry's package file."""
+
+    @staticmethod
+    def levels(*words):
+        return [level for ref in launch.runner_packages(list(words)) for level, _ in advisory_findings(ref)]
+
+    def test_deno_runs_packages_of_npm_and_jsr(self):
+        self.assertEqual(self.levels("deno", "run", "-A", "npm:postmark-mcp@1.0.16"), ["fail"])
+        self.assertEqual(self.levels("deno", "run", "--allow-net", "npm:postmark-mcp"), ["fail"])
+        self.assertEqual(self.levels("deno", "npm:postmark-mcp@1.0.17/dist/index.js"), ["fail"])
+        self.assertEqual(self.levels("deno", "serve", "-A", "npm:mcp-remote@0.1.15"), ["warn"])
+        self.assertEqual(self.levels("deno", "x", "postmark-mcp@1.0.16"), ["fail"])
+        self.assertEqual(self.levels("cmd", "/c", "deno", "run", "-A", "npm:postmark-mcp@1.0.16"), ["fail"])
+        (jsr,) = launch.runner_packages(["deno", "run", "-A", "jsr:@std/http@1.0.0/file-server"])
+        self.assertEqual((jsr.ecosystem, jsr.name, jsr.version, jsr.written),
+                         ("jsr", "@std/http", "1.0.0", "deno run jsr:@std/http@1.0.0/file-server"))
+        self.assertEqual(launch.unpinned_spec(runner_package(["deno", "run", "jsr:@std/http/file-server"])),
+                         ("jsr:@std/http/file-server", "jsr:@std/http@1.2.3"))
+        self.assertEqual(launch.unpinned_spec(runner_package(["npx", "npm:@scope/pkg"])),
+                         ("npm:@scope/pkg", "npm:@scope/pkg@1.2.3"))
+        for words in (["deno", "run", "-A", "server.ts"], ["deno", "task", "start"], ["deno", "eval", "1"]):
+            with self.subTest(words=words):
+                self.assertEqual(launch.runner_packages(words), [])
+        self.assertEqual(runner_package(["deno", "run", "https://example.com/mod.ts"]).source, "url")
+        self.assertTrue(any("a web address" in risk for risk in risks("deno", "run", "https://example.com/mod.ts")))
+        identity = launch_identity("C:/x/deno", ["deno", "run", "-A", "npm:postmark-mcp@1.0.16"])
+        self.assertEqual((identity["package"], identity["script"]), ("deno run npm:postmark-mcp@1.0.16", None))
+
+    def test_the_requirements_of_uv_run_with(self):
+        found = launch.runner_packages(["uv", "run", "--with", "mcp-server-git==2025.1.1", "mcp-server-git"])
+        self.assertEqual([(ref.written, ref.role) for ref in found],
+                         [("uv run --with mcp-server-git==2025.1.1", "with")])
+        self.assertEqual(self.levels("uv", "--quiet", "run", "-w", "a-b-c,mcp-server-git==2025.1.1", "x"), ["warn"])
+        self.assertIsNone(launch.unpinned_spec(found[0]))  # a requirement is not asked to be pinned
+        fastmcp = ["uv", "run", "--with", "fastmcp", "fastmcp", "run", "server.py"]  # what FastMCP writes
+        self.assertEqual([ref.spec for ref in launch.runner_packages(fastmcp)], ["fastmcp"])
+        self.assertEqual(typosquat_of(launch.runner_packages(["uv", "run", "--with", "mcp-server-gti", "x"])[0]),
+                         "mcp-server-git")
+        self.assertEqual(launch.runner_packages(["uv", "run", "server.py"]), [])
+        self.assertEqual(launch_identity("C:/x/uv", ["uv", "run", "--with", "mcp-server-git==2025.1.1", "x"])["package"],
+                         "uv run --with mcp-server-git==2025.1.1")
+
+    def test_a_registry_file_address_names_its_package_and_version(self):
+        for url, expected in (
+            ("https://registry.npmjs.org/postmark-mcp/-/postmark-mcp-1.0.16.tgz", ("postmark-mcp", "1.0.16")),
+            ("https://registry.npmjs.org/@scope/srv/-/srv-1.0.0.tgz", ("@scope/srv", "1.0.0")),
+            ("https://registry.npmjs.org/@scope%2fsrv/-/srv-1.0.0.tgz?x=1", ("@scope/srv", "1.0.0")),
+            ("https://npm.example.com/repository/npm/postmark-mcp/-/postmark-mcp-1.0.17.tgz",
+             ("postmark-mcp", "1.0.17")),
+            ("https://registry.npmjs.org/postmark-mcp/-/postmark-mcp-next.tgz", ("postmark-mcp", None)),
+            ("https://x.example/p.tgz", ("", None)),
+            ("https://registry.npmjs.org/a-pkg/-/other-1.0.0.tgz", ("", None)),
+        ):
+            with self.subTest(url=url):
+                ref = runner_package(["npx", "-y", url])
+                self.assertEqual((ref.name, ref.version, ref.source), (*expected, "url"))
+                self.assertIsNone(launch.unpinned_spec(ref))
+        self.assertEqual(self.levels("npx", "-y", "https://registry.npmjs.org/postmark-mcp/-/postmark-mcp-1.0.16.tgz"),
+                         ["fail"])
+        self.assertEqual(self.levels("npx", "https://registry.npmjs.org/mcp-remote/-/mcp-remote-0.1.15.tgz"), ["warn"])
+
+    def test_uv_options_that_take_no_value_or_one(self):
+        for words in (["uvx", "--compile-bytecode", "mcp-server-git==2025.1.1"],
+                      ["uvx", "-i", "https://pypi.example/simple", "mcp-server-git==2025.1.1"],
+                      ["uv", "tool", "run", "-C", "key=value", "mcp-server-git==2025.1.1"]):
+            with self.subTest(words=words):
+                self.assertEqual(runner_package(words).name, "mcp-server-git")
 
 
 class Packages(unittest.TestCase):

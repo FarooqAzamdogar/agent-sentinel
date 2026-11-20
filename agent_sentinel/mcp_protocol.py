@@ -553,7 +553,8 @@ COVERAGE = (
              "and roots when server_requests blocks their request, and always loses tasks. Reply: protocolVersion "
              "must be a legacy version the proxy knows (else refused); tasks removed from the server's "
              "capabilities; serverInfo icons cleaned; instructions scanned with the metadata rules, pinned, and "
-             "removed if either fails; the whole reply scanned."),
+             "removed if either fails (or, unpinned, if the server is quarantined by --pin-server); the whole reply "
+             "scanned."),
     Coverage("server/discover", "client", MODERN_ONLY, (FORWARDED, SCANNED),
              "Reply: supportedVersions cut down to the versions the proxy knows (none left: refused); tasks removed; "
              "serverInfo icons cleaned; instructions checked as for initialize. The session becomes a 2026-07-28 one."),
@@ -569,7 +570,7 @@ COVERAGE = (
              "(params.task), a quarantined tool. Reply: resultType checked; scanned; secrets.in_results; flow marks."),
     Coverage("resources/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
              "Each resource scanned and its icons cleaned; one whose URI has characters the proxy cannot forward is "
-             "removed. Not pinned."),
+             "removed. Not pinned. Empty from a server quarantined by --pin-server."),
     Coverage("resources/templates/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
              "Each template scanned and pinned; a template that fails is removed and quarantined."),
     Coverage("resources/read", "client", ALL_REVISIONS, (CHECKED,),
@@ -587,15 +588,20 @@ COVERAGE = (
              "A quarantined prompt is refused. When the policy opts in (a client_requests section, or a tools rule "
              "named 'prompts/get'), checked like a call of 'prompts/get' with {name, arguments}. Reply scanned."),
     Coverage("completion/complete", "client", "2025-03-26 and later", (CHECKED,),
-             "Its params (what the user is typing) pass the secret guard, then client_requests."),
+             "Its params (what the user is typing) pass the secret guard, then client_requests. Refused to a "
+             "server quarantined by --pin-server."),
     Coverage("tasks/*", "client", "2025-11-25 and 2026-07-28 (extension)", (REFUSED,),
              "Answered 'method not found' (-32601): tasks are not supported."),
     Coverage("notifications/cancelled", "client", ALL_REVISIONS, (FORWARDED,),
              "One that cancels a call held for approval refuses that call and is not forwarded (the server never "
              "saw the call); otherwise forwarded."),
+    Coverage("logging/setLevel", "client", ALL_REVISIONS, (FORWARDED,),
+             "The policy's client_requests may refuse it ('method not found'). With the handshake, ping and the "
+             "lists, the only request a server quarantined by --pin-server is still sent."),
     Coverage("any other request or notification", "client", ALL_REVISIONS, (FORWARDED,),
-             "ping, logging/setLevel, resources/unsubscribe, notifications/initialized and the rest: the policy's "
-             "client_requests may refuse them ('method not found'; a notification is dropped). Replies are scanned."),
+             "ping, resources/unsubscribe, notifications/initialized and the rest: the policy's client_requests may "
+             "refuse them ('method not found'; a notification is dropped). Replies are scanned. A server quarantined "
+             "by --pin-server is sent none of these requests but ping (refused, with a reference)."),
     Coverage("reply to a server request", "client", LEGACY_ONLY, (CHECKED, REWRITTEN),
              "Must answer a request the server made, else dropped. Rebuilt from its result or error; passes the "
              "secret guard (refused: the server is told 'request refused'). The answer to one of the proxy's own "
@@ -623,7 +629,8 @@ COVERAGE = (
     Coverage("notifications from the server", "server", ALL_REVISIONS, (CHECKED, SCANNED),
              "Progress, log messages, list_changed, resources/updated, "
              "notifications/subscriptions/acknowledged and the rest: server_requests may block them (dropped); "
-             "scanned. notifications/cancelled also forgets the server request it cancels."),
+             "scanned. notifications/cancelled also forgets the server request it cancels. A server quarantined by "
+             "--pin-server has every notification but notifications/cancelled dropped."),
     Coverage("input_required result", "server", MODERN_ONLY, (CHECKED, SCANNED),
              "Only in reply to tools/call, prompts/get or resources/read of a request that named 2026-07-28. Each "
              "inputRequests entry (elicitation/create, sampling/createMessage, roots/list) passes server_requests, "
