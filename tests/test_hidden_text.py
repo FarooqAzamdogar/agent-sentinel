@@ -165,6 +165,57 @@ class SplitCarriers(unittest.TestCase):
                 self.assertEqual(clean_for_forwarding(text), text)
 
 
+class ScatteredBits(unittest.TestCase):
+    """Round 3 of the review (DET-C3-2): one to seven bits between each two visible characters, too few for a
+    run, were neither decoded nor removed when forwarded."""
+
+    PAIRS = (("\N{ZERO WIDTH SPACE}", "\N{ZERO WIDTH NON-JOINER}"),
+             ("\N{ZERO WIDTH NON-JOINER}", "\N{ZERO WIDTH JOINER}"),
+             ("\N{WORD JOINER}", "\N{ZERO WIDTH NO-BREAK SPACE}"),
+             ("\N{INVISIBLE TIMES}", "\N{INVISIBLE PLUS}"))
+
+    def test_bits_after_each_word_or_letter_are_read_whole_and_removed(self):
+        carried = "".join(format(byte, "08b") for byte in INJECTION.encode())
+        for zero, one in self.PAIRS:
+            for size in (1, 4, 6, 7):
+                groups = [carried[i:i + size].replace("0", zero).replace("1", one)
+                          for i in range(0, len(carried), size)]
+                after_words = " ".join("word" + group for group in groups)
+                after_letters = "".join(letter + group for letter, group in zip("Lorem ipsum dolor " * 40, groups))
+                for text in (after_words, after_letters):
+                    with self.subTest(pair=ascii(zero + one), size=size, words=text is after_words):
+                        self.assertEqual(decode_invisible(text).hidden, INJECTION)
+                        found = rules(text)
+                        self.assertEqual(found.get("invisible_smuggling"), "high")
+                        self.assertEqual(found.get("instruction_override"), "high")
+                        self.assertFalse(checked({"content": [{"type": "text", "text": text}]}).decision.allowed)
+                        cleaned = clean_for_forwarding(text)
+                        self.assertFalse(set(cleaned) & {zero, one})
+                        self.assertIsNone(decode_invisible(cleaned))
+
+    def test_ordinary_text_with_many_invisible_characters_spells_nothing(self):
+        persian = "\N{ARABIC LETTER MEEM}\N{ARABIC LETTER FARSI YEH}\N{ZERO WIDTH NON-JOINER}" \
+                  "\N{ARABIC LETTER KHAH}\N{ARABIC LETTER WAW}\N{ARABIC LETTER ALEF} " * 200
+        family = "\U0001f468\N{ZERO WIDTH JOINER}\U0001f469\N{ZERO WIDTH JOINER}\U0001f467 "
+        for text in (
+            persian,
+            persian + family * 40,  # ZWNJ and ZWJ: both characters of one pair
+            persian + "long\N{ZERO WIDTH SPACE}word " * 100,  # ZWSP and ZWNJ
+            "\N{BYTE ORDER MARK}line\N{WORD JOINER}one\n" * 200,  # the two take turns: "UUUU..." is no payload
+            "a\N{ZERO WIDTH SPACE}b\N{ZERO WIDTH NON-JOINER}" * 300,
+        ):
+            with self.subTest(text=ascii(text[:16])):
+                self.assertNotIn("invisible_smuggling", rules(text))
+                self.assertEqual(clean_for_forwarding(text), text)
+
+    def test_a_few_bits_in_all_are_not_read(self):
+        # Fewer than 64 carriers of one pair: no payload of eight characters can be in them.
+        carried = "".join(format(byte, "08b") for byte in b"Ignore!").replace("0", "​").replace("1", "‌")
+        text = " ".join("word" + carried[i:i + 4] for i in range(0, len(carried), 4))
+        self.assertNotIn("invisible_smuggling", rules(text))
+        self.assertEqual(clean_for_forwarding(text), text)
+
+
 def bits_of(data, zero, one):
     return "".join(format(byte, "08b") for byte in data).replace("0", zero).replace("1", one)
 
@@ -310,9 +361,30 @@ class MediaIsExemptOnlyWhereItIsRendered(unittest.TestCase):
                        {"content": [{"type": "resource", "content": [image]}]}, image):
             with self.subTest(result=str(result)[:50]):
                 self.assertFalse(checked(result).decision.allowed)
-        for result in ({"content": [image]}, [image], {"result": {"content": [image]}}):
+        for result in ({"content": [image]}, [image], {"jsonrpc": "2.0", "id": 1, "result": {"content": [image]}}):
             with self.subTest(result=str(result)[:50]):
                 self.assertTrue(checked(result).decision.allowed)
+
+    def test_extra_members_of_a_tool_result_are_not_where_media_is_rendered(self):
+        # Round 3 (DET-C3-3): "messages" only in a prompt or a sampling request, "result" and "params" only
+        # in a whole JSON-RPC message. The same picture under them in a tool's result is decoded.
+        image = {"type": "image", "mimeType": "image/png", "data": B64_INJECTION}
+        text = {"type": "text", "text": "ok"}
+        for result in (
+            {"content": [text], "messages": [{"role": "user", "content": image}]},
+            {"content": [text], "result": {"content": [image]}},
+            {"content": [text], "params": {"messages": [{"content": [image]}]}},
+            {"content": [image], "messages": [{"content": image}]},  # neither a tool's result nor a prompt
+        ):
+            with self.subTest(result=str(result)[:60]):
+                self.assertFalse(checked(result).decision.allowed)
+        for allowed in (
+            {"messages": [{"role": "user", "content": image}]},
+            {"jsonrpc": "2.0", "method": "sampling/createMessage", "params": {"messages": [{"content": image}]}},
+            {"method": "sampling/createMessage", "params": {"messages": [{"content": [image]}]}},
+        ):
+            with self.subTest(allowed=str(allowed)[:60]):
+                self.assertTrue(checked(allowed, event="server_request").decision.allowed)
 
     def test_a_data_uri_in_text_is_decoded(self):
         self.assertFalse(checked("Logo: data:image/png;base64," + B64_INJECTION).decision.allowed)
@@ -451,6 +523,11 @@ class HostileInputStaysQuick(unittest.TestCase):
             "random binary base64": (b64_of(__import__("random").Random(4).randbytes(6_000)) + " ") * 100,
             "padding then binary data": (b64_of(b"\0" * 3_000 + bytes(range(1, 32)) * 100) + " ") * 100,
             "printable pieces in binary data": (b64_of((bytes(range(31)) + b"x" * 40) * 60) + " ") * 100,
+            # Round 3: bits scattered a few at a time, read joined across the text.
+            "three bits after each word": (" w" + "\N{ZERO WIDTH SPACE}\N{ZERO WIDTH NON-JOINER}" * 2) * 200_000,
+            "one bit after each letter": ("a\N{WORD JOINER}b\N{ZERO WIDTH NO-BREAK SPACE}") * 200_000,
+            "random zero-width characters": "".join(__import__("random").Random(5).choice(
+                "​‌‍⁠﻿⁢⁤ ") for _ in range(800_000)),
         }
         for name, text in cases.items():
             with self.subTest(case=name):

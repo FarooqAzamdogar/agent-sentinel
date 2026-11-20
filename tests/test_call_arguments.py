@@ -193,6 +193,26 @@ class TheJsonCopy(unittest.TestCase):
         with self.assertRaises(UnscannableError):
             normalised_arguments({"n": 10 ** 5000})
 
+    def test_json_and_other_values_are_held_to_the_same_depth(self):
+        # Round 3 (DET-C3-5): a part inside MAX_ARGUMENT_DEPTH containers is read, one more level is refused,
+        # whether the value is JSON already (returned uncopied) or has a part that must be made JSON.
+        def nested(levels, leaf, kind=list):
+            value = leaf
+            for _ in range(levels):
+                value = kind([value])
+            return value
+
+        limit = textutil.MAX_ARGUMENT_DEPTH
+        for leaf in ("x", 1, None, decimal.Decimal("1"), {}, []):
+            for kind in (list, tuple):
+                with self.subTest(leaf=repr(leaf), kind=kind.__name__):
+                    normalised_arguments(nested(limit - 1, {"a": leaf}, kind))  # the leaf `limit` deep: read
+                    normalised_arguments(nested(limit, leaf, kind))
+                    with self.assertRaises(UnscannableError):
+                        normalised_arguments(nested(limit + 1, leaf, kind))
+        self.assertTrue(textutil._is_plain_json(nested(limit, "x")))
+        self.assertFalse(textutil._is_plain_json(nested(limit + 1, "x")))
+
     def test_a_large_value_is_made_json_quickly(self):
         # 60,000 objects and arrays and 120,000 other parts: quicker than collecting their texts (texts_in).
         value = {"rows": [{"id": n, "name": f"row {n}", "tags": ["a", "b"]} for n in range(30_000)]}

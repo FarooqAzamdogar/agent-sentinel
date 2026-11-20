@@ -29,6 +29,7 @@ import dataclasses
 import datetime
 import decimal
 import enum
+import heapq
 import itertools
 import json
 import os
@@ -387,9 +388,11 @@ def _is_plain_json(value: Any) -> bool:
 
     Every container a dict with text keys or a list, every other part a str,
     int, float, bool or None, of exactly those types; and the bounds hold:
-    nesting depth, parts (counted as the copying walk counts them) and the
-    length of each integer. A value that holds itself goes too deep, or has
-    too many parts, before this ends: the copying walk then refuses it.
+    nesting depth (no part, container or not, inside more than
+    MAX_ARGUMENT_DEPTH containers, as in the copying walk), parts (counted
+    as the copying walk counts them) and the length of each integer. A value
+    that holds itself goes too deep, or has too many parts, before this
+    ends: the copying walk then refuses it.
     """
     kind = type(value)
     if kind is not dict and kind is not list:
@@ -399,8 +402,8 @@ def _is_plain_json(value: Any) -> bool:
     parts = 0
     while stack:
         item, depth = stack.pop()
-        if depth > MAX_ARGUMENT_DEPTH:
-            return False
+        if depth >= MAX_ARGUMENT_DEPTH and (depth > MAX_ARGUMENT_DEPTH or item):
+            return False  # a part deeper than MAX_ARGUMENT_DEPTH: this one, or its members
         parts += 1 + len(item)
         if parts > MAX_ARGUMENT_PARTS:
             return False
@@ -549,6 +552,10 @@ def _copy_container(
             else:
                 later.append((child, items, index, depth + 1))
         members = len(listed)
+    if members and depth >= MAX_ARGUMENT_DEPTH:
+        # Its members are deeper than MAX_ARGUMENT_DEPTH: refused here even when
+        # they are plain JSON and copied above, as _is_plain_json refuses them.
+        raise UnscannableError("the arguments are nested too deeply to check")
     later.reverse()  # taken from the stack in order
     stack.extend(later)
     return members
@@ -781,21 +788,32 @@ class _Alphabet(NamedTuple):
     """One way of hiding text in invisible characters, and how a run of it is found."""
 
     pair: str  # the characters read as 0 and 1; "" for variation selectors, read as bytes
-    run: re.Pattern[str]  # a run long enough to read: two selectors, or eight bits (one character)
+    # Each group of carriers: two selectors or more; for bits, one carrier or
+    # more (a run long enough to read alone has eight, one character).
+    run: re.Pattern[str]
     others: re.Pattern[str]  # the characters of a run that are not carriers
 
 
 def _alphabet(pair: str) -> _Alphabet:
     codes = frozenset(map(ord, pair)) if pair else _SELECTOR_CODES
-    return _Alphabet(pair, _run_of(codes, 8 if pair else 2), re.compile(f"[^{_class_of(codes)}]+"))
+    return _Alphabet(pair, _run_of(codes, 1 if pair else 2), re.compile(f"[^{_class_of(codes)}]+"))
 
 
 _ALPHABETS = (_alphabet(""), *(_alphabet(pair) for pair in _BIT_PAIRS))
 _ANY_CARRIER = re.compile(f"[{_SELECTORS}{_class_of(map(ord, ''.join(_BIT_PAIRS)))}]")
 # How much of one text these decoders read: characters of carrier runs (and
-# what stands between their carriers), and runs of each alphabet.
+# what stands between their carriers), runs of each alphabet, and groups of
+# bits too short to read alone (one to seven between two visible characters).
 _MAX_CARRIER_CHARS = 128 * 1024
 _MAX_CARRIER_RUNS = 256
+_MAX_BIT_GROUPS = 8 * 1024
+# Bits scattered in groups of one to seven are read joined across the visible
+# text only when there are this many of one pair (a payload of
+# HIDDEN_TEXT_CHARS characters), and both of its characters occur: ordinary
+# text uses one of them alone (Persian ZWNJ), which reads as no text at all.
+# Of them, the first _MAX_SCATTERED_BITS are read (4 KiB of hidden text).
+_MIN_SCATTERED_BITS = 8 * HIDDEN_TEXT_CHARS
+_MAX_SCATTERED_BITS = 8 * 4096
 
 
 class Unhidden(NamedTuple):
@@ -841,8 +859,9 @@ def decode_invisible(text: str) -> Unhidden | None:
         # A span read by two alphabets (U+200C belongs to two pairs) counts for the first that spelled text.
         if any(_overlaps(taken, start, end) for start, end in spans):
             continue
-        for index, (start, end) in enumerate(spans):
-            bisect.insort(taken, (start, end, spelled if index == 0 else ""))
+        # The spans are in order: merged in one pass (scattered bits can have thousands).
+        taken = list(heapq.merge(taken, [(start, end, spelled if index == 0 else "")
+                                         for index, (start, end) in enumerate(spans)]))
         hidden.append(spelled)
     if not hidden:
         return None
@@ -867,30 +886,96 @@ def _overlaps(taken: list[tuple[int, int, str]], start: int, end: int) -> bool:
 def _spelled_runs(text: str, alphabet: _Alphabet, chars_left: list[int]) -> list[tuple[list[tuple[int, int]], str]]:
     """What the runs of one alphabet in `text` spell: (the spans of the runs, the text), for each that spells text.
 
+    A run long enough to read alone (two selectors, eight bits) that spells
+    HIDDEN_TEXT_CHARS characters is one finding. The other runs are read
+    joined (see `_joined_reading`); for bits, so are the groups of one to
+    seven carriers between visible characters, when there are enough of them.
+
     chars_left: [characters of runs that may still be read], shared by every alphabet.
     """
     found: list[tuple[list[tuple[int, int]], str]] = []
     rest: list[tuple[int, int, str, str | None]] = []  # runs too short to count alone: span, carriers, spelled
-    for match in itertools.islice(alphabet.run.finditer(text), _MAX_CARRIER_RUNS):
-        if chars_left[0] <= 0:
+    short: list[tuple[int, int, str]] = []  # groups of fewer than eight bits, in order with `rest`: span, carriers
+    runs = groups = 0
+    for match in alphabet.run.finditer(text):
+        if chars_left[0] <= 0 or runs >= _MAX_CARRIER_RUNS or groups >= _MAX_BIT_GROUPS:
             break
+        groups += 1
         start, end = match.start(), min(match.end(), match.start() + chars_left[0])
         chars_left[0] -= end - start
         carriers = alphabet.others.sub("", text[start:end])
+        if alphabet.pair and len(carriers) < 8:
+            short.append((start, end, carriers))
+            continue
+        runs += 1
         spelled = _carriers_spelled(carriers, alphabet.pair)
         if spelled is not None and len(spelled) >= HIDDEN_TEXT_CHARS:
             found.append(([(start, end)], spelled))
         else:
             rest.append((start, end, carriers, spelled))
+    joined = _joined_reading(rest, short, alphabet.pair)
+    if joined is not None:
+        found.append(joined)
+    return found
+
+
+def _joined_reading(
+    rest: list[tuple[int, int, str, str | None]], short: list[tuple[int, int, str]], pair: str
+) -> tuple[list[tuple[int, int]], str] | None:
+    """What the runs too short to read alone spell together: (their spans, the text), or None.
+
+    The runs (`rest`) are read as one, their carriers joined in order, or,
+    if that is not text, what each of them spells, joined. Bits scattered in
+    groups of one to seven (`short`, as "word" + four bits + " word" + four
+    bits ...) are read with them, all the carriers in order (`_scattered_text`).
+    That reading, of every carrier, wins when it is a payload and has no
+    larger share of unprintable characters than the other.
+    """
+    reading: tuple[list[tuple[int, int]], str] | None = None
     if rest:
-        together = _carriers_spelled("".join(carriers for _, _, carriers, _ in rest), alphabet.pair)
+        together = _carriers_spelled("".join(carriers for _, _, carriers, _ in rest), pair)
         if together is not None:
-            found.append(([(start, end) for start, end, _, _ in rest], together))
+            reading = ([(start, end) for start, end, _, _ in rest], together)
         else:
             texts = [(start, end, spelled) for start, end, _, spelled in rest if spelled]
             if texts:
-                found.append(([(start, end) for start, end, _ in texts], "".join(spelled for _, _, spelled in texts)))
-    return found
+                reading = ([(start, end) for start, end, _ in texts], "".join(spelled for _, _, spelled in texts))
+    if not short:
+        return reading
+    groups = sorted([(start, end, carriers) for start, end, carriers, _ in rest] + short)
+    scattered = _scattered_text("".join(carriers for _, _, carriers in groups), pair)
+    if scattered is None:
+        return reading
+    if reading is not None and len(reading[1]) >= HIDDEN_TEXT_CHARS:
+        if _unprintable(reading[1]) < _unprintable(scattered):
+            return reading
+    return [(start, end) for start, end, _ in groups], scattered
+
+
+# Bits scattered over a text spell a payload only if it reads as more than
+# one character over and over: two characters of a pair that take turns
+# regularly (a word joiner here, a byte order mark there) spell "UUUU".
+_MIN_DISTINCT_CHARS = 5
+
+
+def _scattered_text(carriers: str, pair: str) -> str | None:
+    """What the carriers of one pair, gathered from across a text, spell; None unless it is a payload.
+
+    That needs _MIN_SCATTERED_BITS carriers or more, both characters of the
+    pair, and text of HIDDEN_TEXT_CHARS characters or more, with
+    _MIN_DISTINCT_CHARS different ones, in the first _MAX_SCATTERED_BITS.
+    """
+    if len(carriers) < _MIN_SCATTERED_BITS or pair[0] not in carriers or pair[1] not in carriers:
+        return None
+    spelled = _bits_spelled(carriers[:_MAX_SCATTERED_BITS], pair)
+    if spelled is None or len(spelled) < HIDDEN_TEXT_CHARS or len(set(spelled)) < _MIN_DISTINCT_CHARS:
+        return None
+    return spelled
+
+
+def _unprintable(text: str) -> float:
+    """The share of the characters of `text` that are not printable (U+FFFD among them)."""
+    return sum(1 for ch in _NOT_PLAIN_ASCII.findall(text) if ch == _REPLACEMENT or not ch.isprintable()) / len(text)
 
 
 def _carriers_spelled(carriers: str, pair: str) -> str | None:
@@ -959,6 +1044,13 @@ _CONTROLS_AND_BIDI = {
 # that draw nothing, spaces and line breaks may stand between them, as in a
 # run the decoder reads (_BETWEEN_CARRIERS). Removed whole.
 _ZERO_WIDTH_RUN = _run_of(map(ord, "\u200b\u200c\u200d\u2060\ufeff"), 8)
+# Bits scattered one to seven at a time between visible characters: a pair
+# whose characters, read in order across the whole text, spell text is
+# removed whole (`_without_scattered_bits`). U+2062/U+2064 go anyway.
+_ZERO_WIDTH_CHARS = re.compile("[\u200b\u200c\u200d\u2060\ufeff]")
+_ZERO_WIDTH_PAIRS = tuple(
+    (pair, re.compile(f"[^{pair}]+"), {ord(ch): None for ch in pair}) for pair in _BIT_PAIRS if "\u2062" not in pair
+)
 # Variation selectors that clean_for_forwarding reduces: every run of them,
 # one or more long (a single one is kept only where it belongs).
 _SELECTORS_TO_REDUCE = re.compile(f"[{_SELECTORS}]+")
@@ -997,7 +1089,10 @@ def clean_for_forwarding(text: str) -> str:
       * the invisible operators U+2061 to U+2064, and runs of eight or more
         zero-width spaces, joiners, word joiners and byte order marks, also
         when other characters that draw nothing, or spaces, stand between
-        them (_ZERO_WIDTH_RUN);
+        them (_ZERO_WIDTH_RUN); and every character of one of the pairs that
+        carry bits (U+200B/U+200C, U+200C/U+200D, U+2060/U+FEFF) when those
+        characters, read in order across the whole text, spell text: bits
+        scattered a few at a time between visible characters;
       * all but the first of a run of variation selectors, and that one too
         unless it belongs after the character before it: VS15 or VS16 after
         a character that can be drawn as an emoji, U+FE00 after a
@@ -1020,10 +1115,28 @@ def clean_for_forwarding(text: str) -> str:
         text = _LONE_CARRIAGE_RETURN.sub("\n", text)
     if TAG_CHARACTERS.search(text):
         text = _FLAG_OR_TAGS.sub(lambda match: match.group() if match.group("flag") else "", text)
+    text = _without_scattered_bits(text)
     if _ZERO_WIDTH_RUN.search(text):
         text = _ZERO_WIDTH_RUN.sub("", text)
     if _SELECTORS_TO_REDUCE.search(text):
         text = _SELECTORS_TO_REDUCE.sub(_one_selector_at_most, text)
+    return text
+
+
+def _without_scattered_bits(text: str) -> str:
+    """`text` without the characters of each zero-width pair that, read in order across it, spell text.
+
+    Only for a text with _MIN_SCATTERED_BITS zero-width characters or more,
+    and a pair with that many and both of its characters (ordinary text uses
+    one of them alone, which spells nothing). As decode_invisible reads such
+    bits (`_scattered_text`).
+    """
+    counted = itertools.islice(_ZERO_WIDTH_CHARS.finditer(text), _MIN_SCATTERED_BITS)
+    if sum(1 for _ in counted) < _MIN_SCATTERED_BITS:
+        return text
+    for pair, others, removed in _ZERO_WIDTH_PAIRS:
+        if pair[0] in text and pair[1] in text and _scattered_text(others.sub("", text), pair) is not None:
+            text = text.translate(removed)
     return text
 
 
@@ -1228,49 +1341,62 @@ def _schema_text(schema: Any) -> str:
 
 # The content blocks whose "data" holds encoded media, not text for the model.
 _MEDIA_TYPES = ("image", "audio")
-# Where a whole request or reply keeps what is read for content blocks: its
-# "result" (a tool's result, a prompt) or its "params" (a sampling request).
-_MESSAGE_PARTS = ("result", "params")
 
 
 def media_blocks(value: Any) -> frozenset[int]:
     """The id() of each image and audio content block in a JSON-like value that a client renders as media.
 
-    Only the places where MCP puts the content a client renders count:
+    Only the places where MCP puts the content a client renders count, and
+    each only in the kind of value that has it:
 
-      * an item of the "content" array of a result;
+      * an item of the "content" array of a tool's result (an object with a
+        "content" array and no "messages");
       * the "content" of one of the "messages" of a prompt or a sampling
-        request: a single block, or an item of an array of blocks;
+        request (an object with a "messages" array and no "content"): a
+        single block, or an item of an array of blocks;
       * an item of the value itself, when it is an array (a tool's output
         given as its blocks).
 
-    A result, prompt or request may also be read whole, with these under its
-    "result" or "params". An image-shaped object anywhere else (_meta,
-    structuredContent, a block nested in a block, an array in an array, the
-    value itself) is not one: it would be shown as text, if at all. Only the
-    exact "data" member of these blocks is read as media (see text_views); a
-    copy of the same text elsewhere is not. At most MAX_CONTAINERS blocks are
-    looked at.
+    A whole JSON-RPC message may be read too: then the "params" of a request
+    or notification (an object with a "method") or the "result" of a reply
+    (one with "jsonrpc" and no "method") is read as above, and nothing else
+    of it. An object with both "content" and "messages" is neither kind, so
+    none of its blocks counts; nor does an extra "result", "params" or
+    "messages" member of a tool's result. An image-shaped object anywhere
+    else (_meta, structuredContent, a block nested in a block, an array in an
+    array, the value itself) is not one: it would be shown as text, if at
+    all. Only the exact "data" member of these blocks is read as media (see
+    text_views); a copy of the same text elsewhere is not. At most
+    MAX_CONTAINERS blocks are looked at.
     """
-    holders = [value]
-    if isinstance(value, dict):
-        holders += [value[part] for part in _MESSAGE_PARTS if isinstance(value.get(part), dict)]
     blocks: list[Iterable[Any]] = [value] if isinstance(value, list) else []
-    for holder in holders:
-        if not isinstance(holder, dict):
-            continue
-        if isinstance(holder.get("content"), list):
-            blocks.append(holder["content"])
-        messages = holder.get("messages")
-        if isinstance(messages, list):
+    holder = _content_holder(value)
+    if holder is not None:
+        content, messages = holder.get("content"), holder.get("messages")
+        if isinstance(content, list) and "messages" not in holder:
+            blocks.append(content)
+        elif isinstance(messages, list) and "content" not in holder:
             for message in itertools.islice(messages, MAX_CONTAINERS):
-                content = message.get("content") if isinstance(message, dict) else None
-                blocks.append(content if isinstance(content, list) else [content])
+                inner = message.get("content") if isinstance(message, dict) else None
+                blocks.append(inner if isinstance(inner, list) else [inner])
     found: set[int] = set()
     for block in itertools.islice(itertools.chain.from_iterable(blocks), MAX_CONTAINERS):
         if isinstance(block, dict) and block.get("type") in _MEDIA_TYPES and isinstance(block.get("data"), str):
             found.add(id(block))
     return frozenset(found)
+
+
+def _content_holder(value: Any) -> dict[str, Any] | None:
+    """The object of `value` that holds rendered content blocks: a request's params, a reply's result, or itself."""
+    if not isinstance(value, dict):
+        return None
+    if isinstance(value.get("method"), str):  # a request or notification, or an entry of an input_required result
+        params = value.get("params")
+        return params if isinstance(params, dict) else None
+    if "jsonrpc" in value:  # a whole reply
+        result = value.get("result")
+        return result if isinstance(result, dict) else None
+    return value
 
 
 # --------------------------------------------------------------------------

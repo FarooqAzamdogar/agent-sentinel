@@ -465,6 +465,26 @@ class MediaBlocks(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(media_blocks(value), frozenset())
 
+    def test_each_place_counts_only_in_the_kind_of_value_that_has_it(self):
+        # Round 3 (DET-C3-3): a tool's result has "content", a prompt or a sampling request "messages"; a whole
+        # JSON-RPC message keeps them under "result" or "params". Extra members of a tool's result do not count.
+        image = {"type": "image", "data": "abc"}
+        text = {"type": "text", "text": "ok"}
+        for value in [
+            {"content": [text], "messages": [{"role": "user", "content": image}]},
+            {"content": [text], "result": {"content": [image]}},
+            {"content": [text], "params": {"messages": [{"content": [image]}]}},
+            {"content": [image], "messages": [{"content": image}]},  # both: neither kind
+            {"result": {"content": [image]}},  # not a whole reply: no "jsonrpc"
+            {"method": "tools/call", "result": {"content": [image]}},
+        ]:
+            with self.subTest(value=value):
+                self.assertEqual(media_blocks(value), frozenset())
+        reply = {"jsonrpc": "2.0", "id": 1, "result": {"content": [image]}}
+        self.assertEqual(media_blocks(reply), {id(image)})
+        entry = {"method": "sampling/createMessage", "params": {"messages": [{"content": image}]}}
+        self.assertEqual(media_blocks(entry), {id(image)})
+
     def test_values_without_media_have_none(self):
         for value in [None, "text", {"type": "image"}, {"type": "image", "data": 5}, [[{"type": "text"}]]]:
             with self.subTest(value=value):
