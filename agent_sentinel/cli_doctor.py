@@ -293,7 +293,8 @@ def session_group_lines(servers: list[ServerReport], sessions: Path | None = Non
       did not share its marks (see client_run.py).
     """
     wrapped = [server for server in servers if server.proxied]
-    groups = {server.session_group for server in wrapped}
+    # The proxy takes a group's name in lower case (session.group_name): "Team" and "team" are one group.
+    groups = {server.session_group.lower() if server.session_group else None for server in wrapped}
     if len(groups) < 2:
         return _lone_member_lines(wrapped, sessions)
     named = ", ".join(f"{server.name} ({printable(server.session_group, limit=64) if server.session_group else 'none'})"

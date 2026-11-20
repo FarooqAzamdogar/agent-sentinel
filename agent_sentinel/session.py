@@ -115,8 +115,12 @@ LOCK_FILE_NAME = "sessions.lock"
 GROUP_FILE_FORMAT = "agent-sentinel-session-group"
 GROUP_FILE_VERSION = 1
 # A group's name, as proxy --session-group takes it: it names a file, so the characters of a server name only.
+# It is folded to lower case (group_name), since Windows and macOS file names ignore case.
 GROUP_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 MEMBER_NAME = GROUP_NAME  # a member is a proxy --name, which allows the same characters
+# Names that Windows gives to devices, not files, with any extension: "nul.json" may not be a file there.
+_DEVICE_NAME = re.compile(r"(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?")
+GROUP_NAME_RULE = "1 to 64 letters, digits, '_', '-' or '.', and not a Windows device name such as 'nul' or 'com1'"
 MAX_GROUP_MEMBERS = 64
 # The client runs a group file holds at once; past it, the run begun first is removed to make room.
 MAX_GROUP_RUNS = 32
@@ -143,6 +147,19 @@ class SessionStateError(Exception):
     agent: if it were delivered, the session would hold content it does not
     know about, and a flow rule would let a call through that it should refuse.
     """
+
+
+def group_name(text: Any) -> str | None:
+    """The name of the session group `text` names (GROUP_NAME_RULE), in lower case; None if it names none.
+
+    Lower case because the group names a file, and on Windows and macOS
+    "Team" and "team" are one file: told apart here, the second proxy would
+    find the first's file and take it for another group's.
+    """
+    if not isinstance(text, str) or not GROUP_NAME.fullmatch(text):
+        return None
+    folded = text.lower()
+    return None if _DEVICE_NAME.fullmatch(folded) else folded
 
 
 def is_label(value: Any) -> bool:
@@ -517,24 +534,26 @@ class GroupSessionStore(SessionStore):
     ) -> None:
         """
         directory:   the folder of the group files (<home>/sessions).
-        group:       the group's name (GROUP_NAME): the file is <directory>/<group>.json.
+        group:       the group's name (GROUP_NAME_RULE), taken in lower case (group_name): the file is
+                     <directory>/<group>.json.
         run_id:      the client run this proxy belongs to (client_run.py); "unknown" when it cannot be told.
         member:      this proxy's --name; it marks the marks this proxy sets.
         run_started: when the client process started (seconds since the epoch), if known: a damaged file
                      last written before then is replaced at join.
         """
-        if not isinstance(group, str) or not GROUP_NAME.fullmatch(group):
-            raise ValueError("the group must be 1 to 64 letters, digits, '_', '-' or '.'")
+        folded = group_name(group)
+        if folded is None:
+            raise ValueError(f"the group must be {GROUP_NAME_RULE}")
         if not isinstance(run_id, str) or not 0 < len(run_id) <= MAX_RUN_ID_CHARS or not run_id.isprintable():
             raise ValueError(f"the run id must be printable text of 1 to {MAX_RUN_ID_CHARS} characters")
         if not isinstance(member, str) or not MEMBER_NAME.fullmatch(member):
             raise ValueError("the member name must be 1 to 64 letters, digits, '_', '-' or '.'")
         self.directory = Path(directory)
-        self.group = group
+        self.group = folded
         self.run_id = run_id
         self.member = member
-        self.path = self.directory / f"{group}.json"
-        self._lock_path = self.directory / f"{group}.lock"
+        self.path = self.directory / f"{folded}.json"
+        self._lock_path = self.directory / f"{folded}.lock"
         self._run_started = run_started
         self._lock_timeout = lock_timeout
         self._thread_lock = threading.Lock()
@@ -675,7 +694,7 @@ class GroupSessionStore(SessionStore):
         return _parse_group_file(data)
 
     def _write(self, found: _GroupFile) -> int:
-        """Replace the file; return how many runs it holds besides this proxy's. Atomic: a crash leaves the old or the new.
+        """Replace the file; return how many runs it holds besides this proxy's. Atomic: a crash leaves old or new.
 
         If it would be larger than a reader takes (MAX_STATE_FILE_BYTES), the
         runs of other clients are dropped, the one begun first first.
@@ -717,15 +736,16 @@ def group_members(directory: str | Path, group: str) -> tuple[str, ...] | None:
     The latest run is the one begun last. Only reads: the file is never
     locked or changed, so what it says may be a moment old.
     """
-    if not isinstance(group, str) or not GROUP_NAME.fullmatch(group):
+    folded = group_name(group)
+    if folded is None:
         return None
     try:
-        with open(Path(directory) / f"{group}.json", "rb") as handle:
+        with open(Path(directory) / f"{folded}.json", "rb") as handle:
             data = handle.read(MAX_STATE_FILE_BYTES + 1)
     except OSError:
         return None
     found, _ = _parse_group_file(data) if len(data) <= MAX_STATE_FILE_BYTES else (None, None)
-    return found.runs[-1].members if found is not None and found.group == group else None
+    return found.runs[-1].members if found is not None and found.group == folded else None
 
 
 _GROUP_KEYS = {"format", "version", "group", "runs"}

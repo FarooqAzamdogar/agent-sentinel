@@ -258,7 +258,9 @@ from .policy import (
     PolicyError,
 )
 from .policy_errors import file_error_message, type_name
-from .session import GROUP_NAME, JOINED, NEW_RUN, REPLACED, GroupJoin, GroupSessionStore, SessionStateError
+from .session import (
+    GROUP_NAME_RULE, JOINED, NEW_RUN, REPLACED, GroupJoin, GroupSessionStore, SessionStateError, group_name,
+)
 from .detector import METADATA, SEVERITY_ORDER, max_severity, scan_views
 from .textutil import UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable, text_views
 
@@ -287,9 +289,12 @@ MAX_QUARANTINED_TEMPLATES = 1_000  # the uriTemplates of quarantined resource te
 # of the page before is scanned with the text nearest the start of the next page, this many bytes of
 # each (see _boundary_view).
 PAGE_BOUNDARY_BYTES = 4096
-MAX_BOUNDARY_MEMBERS = 8  # text members kept at a boundary: the five a model reads first, then others
-MAX_BOUNDARY_KEY_CHARS = 64  # a member with a longer name is not kept
-_MEMBER_OVERHEAD = 6  # what a kept value costs besides its key and its text: quotes, colon, comma, as in JSON
+# The text members kept at a boundary, on each side: the five a model reads first, then others (nested
+# ones too, such as "inputSchema/properties/q/description"), the first found nearest the boundary.
+MAX_BOUNDARY_MEMBERS = 16
+MAX_BOUNDARY_DEPTH = 12  # how deep into an entry text is looked for; deeper text is not kept
+MAX_BOUNDARY_PATH_CHARS = 128  # a member's path ("annotations/title") is cut to its last this many characters
+_MEMBER_OVERHEAD = 6  # what a kept value costs besides its path and its text: quotes, colon, comma, as in JSON
 _REPEATS_KEPT = 3  # as in textutil.text_views: a run of one text says nothing more after a few copies
 MAX_OPEN_CURSORS = 8  # cursor chains kept open at once, per list
 
@@ -339,6 +344,8 @@ TOOL_NAMES_OFF = "off"  # neither the naming rules nor look-alikes are checked
 TOOL_NAME_MODES = (TOOL_NAMES_STRICT, TOOL_NAMES_WARN, TOOL_NAMES_OFF)
 
 JsonObject = dict[str, Any]
+# What the boundary scan keeps of one entry of a list (_boundary_view): (member path, text) pairs, in the entry's order.
+_KeptEntry = tuple[tuple[str, str], ...]
 
 # A name the proxy may put into a command line it suggests to the operator (pins diff NAME). The name
 # comes from the server, and Windows quoting (list2cmdline) does not stop cmd.exe reading "&" or
@@ -392,7 +399,7 @@ class _PageTail:
     Side by side, for each entry with text in the boundary view (_boundary_view), in page order:
     """
 
-    texts: tuple[dict[str, str], ...]  # the text kept of it, PAGE_BOUNDARY_BYTES in all
+    texts: tuple[_KeptEntry, ...]  # the text kept of it, PAGE_BOUNDARY_BYTES in all
     names: tuple[str, ...]  # its name, to quarantine (tools, prompts, resource templates); "" if it has none
     templates: tuple[str, ...]  # its uriTemplate (resource templates); "" if it has none
 
@@ -569,70 +576,132 @@ def _cursor_digest(message: JsonObject) -> str | None:
 _BOUNDARY_MEMBERS = ("description", "title", "name", "uriTemplate", "uri")
 
 
-def _boundary_view(entries: Sequence[Any], from_end: bool) -> list[tuple[int, dict[str, str]]]:
+def _boundary_view(
+    entries: Sequence[Any], from_end: bool, wanted: Iterable[str] = (),
+) -> list[tuple[int, _KeptEntry]]:
     """The text nearest one end of a page of a list, PAGE_BOUNDARY_BYTES in all, for _checked_page_boundary.
 
     A list is scanned whole (textutil.text_views), and one of the ways it is
-    read joins the values of one member ("description", "title", ...) over
-    the entries that have it, skipping the entries that do not. So for each
-    member this keeps the values of the entries nearest that end (the end of
-    the page when from_end, else its start) that have text in it, as many as
-    fit the member's share. The budget is shared fairly: a member that needs
-    less than an equal share leaves the rest to the others, so a long
-    description cannot crowd out a title. A kept value costs its key, its
-    text and _MEMBER_OVERHEAD bytes; the last value kept of a member is cut,
-    keeping the part nearest the boundary. The five members of
-    _BOUNDARY_MEMBERS are always looked for, and the first others found
-    nearest the boundary, MAX_BOUNDARY_MEMBERS in all. As in text_views, a run
-    of the same text is kept at most _REPEATS_KEPT times.
+    read joins the texts at one path ("description", "annotations/title",
+    "inputSchema/properties/q/description", "arguments/*/description": a
+    member, nested or not, with list positions as "*") over the entries that
+    have it, skipping the entries that do not. So for each member this keeps
+    the values of the entries nearest that end (the end of the page when
+    from_end, else its start) that have text in it, as many as fit the
+    member's share. The budget is shared fairly: a member that needs less than
+    an equal share leaves the rest to the others, so a long description cannot
+    crowd out a title. A kept value costs its path, its text and
+    _MEMBER_OVERHEAD bytes; the last value kept of a member is cut, keeping
+    the part nearest the boundary. The five members of _BOUNDARY_MEMBERS and
+    the `wanted` ones (the members the other side of the boundary kept) are
+    always looked for, and besides them the first others found nearest the
+    boundary, MAX_BOUNDARY_MEMBERS - 5 of them. As in text_views, a run of the
+    same text is kept at most _REPEATS_KEPT times.
 
-    Returns (index into `entries`, {member: kept text}) for each entry with
-    text kept, in page order, its members in the entry's own order.
+    `entries` are list entries, or what this kept of entries before (a
+    _KeptEntry, read as it is). Returns (index into `entries`, the (member,
+    kept text) pairs) for each entry with text kept, in page order, its texts
+    in the entry's own order.
     """
-    found = _boundary_values(entries, from_end)
-    shares = _fair_shares({key: sum(_value_cost(key, value) for _, value in values)
+    found = _boundary_values(entries, from_end, wanted)
+    shares = _fair_shares({key: sum(_value_cost(key, value) for _, _, value in values)
                            for key, values in found.items()}, PAGE_BOUNDARY_BYTES)
-    kept: dict[int, dict[str, str]] = {}
+    kept: dict[int, list[tuple[int, str, str]]] = {}
     for key, values in found.items():
         room = shares[key]
         fixed = _value_cost(key, "")
-        for index, value in values:
+        for index, position, value in values:
             piece = _cut_to_bytes(value, room - fixed, keep_end=from_end) if room > fixed else ""
             if not piece:
                 break
-            kept.setdefault(index, {})[key] = piece
+            kept.setdefault(index, []).append((position, key, piece))
             room -= _value_cost(key, piece)
-    return [(index, {key: kept[index][key] for key in entries[index] if key in kept[index]}) for index in sorted(kept)]
+    return [(index, tuple((key, piece) for _, key, piece in sorted(kept[index]))) for index in sorted(kept)]
 
 
-def _boundary_values(entries: Sequence[Any], from_end: bool) -> dict[str, list[tuple[int, str]]]:
-    """For each text member, the (index, value) of the entries nearest one end that have text in it, nearest first.
+def _boundary_values(
+    entries: Sequence[Any], from_end: bool, wanted: Iterable[str] = (),
+) -> dict[str, list[tuple[int, int, str]]]:
+    """For each member, the (index, position, value) of the entries nearest one end that have text in it, nearest first.
 
-    A member is followed until its values would cost PAGE_BOUNDARY_BYTES,
-    which no share can exceed. The walk reads every entry otherwise: entries
-    without a member must not hide the next one that has it.
+    `position` is the value's place among the texts of its entry
+    (_entry_texts). A member is followed until its values would cost
+    PAGE_BOUNDARY_BYTES, which no share can exceed. The walk reads every entry
+    otherwise (entries without a member must not hide the next one that has
+    it), unless every member is full and no other can be added.
     """
-    found: dict[str, list[tuple[int, str]]] = {key: [] for key in _BOUNDARY_MEMBERS}
+    found: dict[str, list[tuple[int, int, str]]] = {key: [] for key in (*_BOUNDARY_MEMBERS, *wanted)}
     cost = dict.fromkeys(found, 0)
+    others = 0  # members found that were not looked for from the start
+    full = 0  # members whose values cost PAGE_BOUNDARY_BYTES already
+    room_for_others = MAX_BOUNDARY_MEMBERS - len(_BOUNDARY_MEMBERS)
     for index in range(len(entries) - 1, -1, -1) if from_end else range(len(entries)):
         entry = entries[index]
-        if not isinstance(entry, dict):
-            continue
-        for key, value in entry.items():
-            if not isinstance(key, str) or not isinstance(value, str) or not value or value.isspace():
+        texts = entry if isinstance(entry, tuple) else _entry_texts(entry) if isinstance(entry, dict) else ()
+        positions = range(len(texts) - 1, -1, -1) if from_end else range(len(texts))
+        for position in positions:
+            key, value = texts[position]
+            if not value or value.isspace():
                 continue
             if key not in found:
-                if len(found) >= MAX_BOUNDARY_MEMBERS or len(key) > MAX_BOUNDARY_KEY_CHARS:
+                if others >= room_for_others:
                     continue
                 found[key], cost[key] = [], 0
+                others += 1
             values = found[key]
             if cost[key] >= PAGE_BOUNDARY_BYTES:
                 continue
-            if len(values) >= _REPEATS_KEPT and all(text == value for _, text in values[-_REPEATS_KEPT:]):
+            if len(values) >= _REPEATS_KEPT and all(text == value for _, _, text in values[-_REPEATS_KEPT:]):
                 continue
-            values.append((index, value))
+            values.append((index, position, value))
             cost[key] += _value_cost(key, value)
+            full += cost[key] >= PAGE_BOUNDARY_BYTES
+        if full == len(found) and others >= room_for_others:
+            break  # nothing further can be kept
     return {key: values for key, values in found.items() if values}
+
+
+def _entry_texts(entry: Mapping[str, Any]) -> _KeptEntry:
+    """The (member path, text) of every text value in a list entry, in document order.
+
+    A path is the keys down to the value joined by "/", with "*" for a
+    position in a list, as textutil.text_views groups texts:
+    "inputSchema/properties/q/description", "arguments/*/name". A path longer
+    than MAX_BOUNDARY_PATH_CHARS is cut to its end (two paths that are then
+    the same are read as one, which only joins more). Containers deeper than
+    MAX_BOUNDARY_DEPTH are not entered. Walked without recursion.
+    """
+    texts: list[tuple[str, str]] = []
+    stack: list[tuple[Any, str, int]] = [(entry, "", 0)]
+    while stack:
+        value, path, depth = stack.pop()
+        if isinstance(value, str):
+            if path:
+                texts.append((path, value))
+        elif depth < MAX_BOUNDARY_DEPTH:
+            # Pushed in reverse, so that they come out in document order; numbers and the like are left out.
+            if isinstance(value, dict):
+                stack.extend([(child, _member_path(path, key), depth + 1) for key, child in reversed(value.items())
+                              if isinstance(key, str) and isinstance(child, _TEXT_HOLDERS)])
+            elif isinstance(value, list):
+                inner = _member_path(path, "*")
+                stack.extend([(child, inner, depth + 1) for child in reversed(value)
+                              if isinstance(child, _TEXT_HOLDERS)])
+    return tuple(texts)
+
+
+_TEXT_HOLDERS = (str, dict, list)  # what _entry_texts reads: JSON's text, objects and arrays
+
+
+def _member_path(path: str, step: str) -> str:
+    """`path` one step further down, cut to its last MAX_BOUNDARY_PATH_CHARS characters (see _entry_texts)."""
+    joined = f"{path}/{step}" if path else step
+    return joined[-MAX_BOUNDARY_PATH_CHARS:] if len(joined) > MAX_BOUNDARY_PATH_CHARS else joined
+
+
+def _scannable(kept: Iterable[_KeptEntry]) -> list[list[dict[str, str]]]:
+    """Kept entries in the shape the scan reads: texts of one member share one path, in document order."""
+    return [[{key: text} for key, text in entry] for entry in kept]
 
 
 def _value_cost(key: str, value: str) -> int:
@@ -2686,8 +2755,9 @@ class Proxy:
         can also be split over the end of one page and the start of the next.
         While a cursor chain is open, the text nearest the end of the page
         before (_remember_page_end) is scanned with the text nearest the start
-        of this page (_boundary_view: for each member, the nearest entries
-        that have text in it, PAGE_BOUNDARY_BYTES of each side) with the
+        of this page (_boundary_view: for each member, nested ones included,
+        the nearest entries that have text in it, PAGE_BOUNDARY_BYTES of each
+        side; this side always looks for the members the end kept) with the
         metadata rules. If that is refused, the fewest entries of this page's
         side that are refused with that end are removed, and they and the
         fewest entries of the end of the page before that take part are
@@ -2701,12 +2771,13 @@ class Proxy:
             tail = self._page_tails[items_key].get(pending.cursor)
         if tail is None or not tail.texts:
             return entries
-        head = _boundary_view(entries, from_end=False)
+        ended_with = dict.fromkeys(key for entry in reversed(tail.texts) for key, _ in reversed(entry))
+        head = _boundary_view(entries, from_end=False, wanted=ended_with)
         start = [text for _, text in head]
         if not start:
             return entries
         decision = self._firewall.scan_result(
-            pending.label, {items_key: [*tail.texts, *start]}, event="list_item", log_clean=False,
+            pending.label, {items_key: _scannable([*tail.texts, *start])}, event="list_item", log_clean=False,
             call_id=pending.call_id,
         )
         if decision.allowed:
@@ -2732,7 +2803,7 @@ class Proxy:
         return [entry for index, entry in enumerate(entries) if index not in dropped]
 
     def _boundary_entries(
-        self, items_key: str, end: Sequence[dict[str, str]], start: Sequence[dict[str, str]],
+        self, items_key: str, end: Sequence[_KeptEntry], start: Sequence[_KeptEntry],
     ) -> tuple[list[int], list[int]]:
         """Which entries of a refused boundary to remove (positions in `start`) and to quarantine (in `end`).
 
@@ -2754,7 +2825,7 @@ class Proxy:
             ended = [len(end) - reach]
         return removed, ended
 
-    def _boundary_refused(self, items_key: str, end: Sequence[dict[str, str]], start: Sequence[dict[str, str]]) -> bool:
+    def _boundary_refused(self, items_key: str, end: Sequence[_KeptEntry], start: Sequence[_KeptEntry]) -> bool:
         """Whether the end of one page read with the start of the next has a finding at the blocking severity.
 
         Not recorded: it only narrows down which entries a recorded refusal
@@ -2763,7 +2834,7 @@ class Proxy:
         threshold = self._firewall.policy.block_severity
         if threshold is None:
             return False
-        views = text_views({items_key: [*end, *start]}, strict=True)
+        views = text_views({items_key: _scannable([*end, *start])}, strict=True)
         worst = max_severity(scan_views(views, profile=METADATA))
         return worst is not None and SEVERITY_ORDER[worst] >= SEVERITY_ORDER[threshold]
 
@@ -2977,10 +3048,11 @@ def _server_name(text: str) -> str:
 
 
 def _session_group(text: str) -> str:
-    """--session-group: it names a file in <home>/sessions, so the characters of a server name only."""
-    if not GROUP_NAME.fullmatch(text):
-        raise argparse.ArgumentTypeError("must be 1 to 64 letters, digits, '_', '-' or '.'")
-    return text
+    """--session-group: it names a file in <home>/sessions, so the characters of a server name only, in lower case."""
+    group = group_name(text)
+    if group is None:
+        raise argparse.ArgumentTypeError(f"must be {GROUP_NAME_RULE}")
+    return group
 
 
 def _pass_env_name(text: str) -> str:
@@ -3026,8 +3098,8 @@ def _argument_parser() -> argparse.ArgumentParser:
                              "every audit record and at the start of every line the proxy prints")
     parser.add_argument("--session-group", type=_session_group, default=None, metavar="NAME",
                         help="share flow marks with the other proxies of the same client run that name this group "
-                             "(kept in <home>/sessions/NAME.json; needs --name). wrap gives every server of one "
-                             "client the same group")
+                             "(kept in <home>/sessions/NAME.json, NAME in lower case; needs --name). wrap gives "
+                             "every server of one client the same group")
     parser.add_argument("--pins", type=_file_path, default=None, metavar="FILE",
                         help="remember tool, prompt and template definitions in FILE, and quarantine one that "
                              "changes later")

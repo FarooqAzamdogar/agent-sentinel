@@ -603,14 +603,18 @@ class SessionGroups(WrapTest):
         self.assertEqual(self.wrap("--apply", "--session-group", "work")[0], 0)
         self.assertEqual(self.groups(), {"files": "work", "github": "work"})
         self.place()
+        self.assertEqual(self.wrap("--apply", "--session-group", "Work")[0], 0)  # one file whatever the case
+        self.assertEqual(self.groups(), {"files": "work", "github": "work"})
+        self.place()
         self.assertEqual(self.wrap("--apply", "--no-session-group")[0], 0)
         self.assertEqual(self.groups(), {"files": None, "github": None})
 
     def test_a_group_that_could_name_another_file_is_refused(self):
         self.place()
-        code, _, err = self.wrap("--session-group", "../x")
-        self.assertEqual(code, 2)
-        self.assertIn("--session-group", err)
+        for name in ("../x", "nul"):
+            code, _, err = self.wrap("--session-group", name)
+            self.assertEqual(code, 2)
+            self.assertIn("--session-group", err)
         code, _, err = self.wrap("--session-group", "x", "--no-session-group")
         self.assertEqual(code, 2)
 

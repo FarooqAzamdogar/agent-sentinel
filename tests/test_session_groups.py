@@ -5,6 +5,7 @@ The attack: one server delivers untrusted text, another private data, a third se
 be a session of its own, so a flow rule never saw the three together.
 """
 
+import argparse
 import contextlib
 import io
 import json
@@ -426,7 +427,8 @@ class TheProxyJoinsItsGroup(unittest.TestCase):
 
     def test_session_group_needs_a_name_and_a_plain_group(self):
         for argv in (["--policy", "p.json", "--session-group", "g", "--", "x"],
-                     ["--policy", "p.json", "--name", "a", "--session-group", "../g", "--", "x"]):
+                     ["--policy", "p.json", "--name", "a", "--session-group", "../g", "--", "x"],
+                     ["--policy", "p.json", "--name", "a", "--session-group", "NUL", "--", "x"]):
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), \
                     self.assertRaises(SystemExit) as caught:
                 mcp_proxy.main(argv)
@@ -454,6 +456,37 @@ class WrapAndDoctor(unittest.TestCase):
         (different,) = session_group_lines([server("a", "g"), server("b", "h")])
         self.assertIn("different session groups", different.text)
         self.assertIsInstance(different, Line)
+        # Round-2 review (PA2-3): the proxy takes the name in lower case, so these are one group.
+        self.assertEqual(session_group_lines([server("a", "Claude-Desktop"), server("b", "claude-desktop")]), [])
+
+
+class GroupNames(GroupStoreTest):
+    """Round-2 review (PA2-3): "G" and "g" named two groups, but on Windows and macOS one file, so the second proxy
+    found the first's file, took it for another group's, and refused every sink-labelled call until it was deleted."""
+
+    def test_names_that_differ_only_in_case_are_one_group(self):
+        first = self.store("files", group="Claude-Desktop")
+        self.assertEqual(first.join().status, NEW_RUN)
+        second = self.store("mail", group="claude-DESKTOP")
+        self.assertEqual(second.join().status, JOINED)
+        self.assertEqual((first.group, second.group), ("claude-desktop", "claude-desktop"))
+        self.assertEqual([path.name for path in self.folder.glob("*.json")], ["claude-desktop.json"])
+        self.assertEqual(self.document()["group"], "claude-desktop")
+        self.assertEqual(group_members(self.folder, "CLAUDE-desktop"), ("files", "mail"))
+        self.assertEqual(mcp_proxy._session_group("Claude-Desktop"), "claude-desktop")
+
+    def test_windows_device_names_are_refused(self):
+        for name in ("nul", "NUL", "con", "Aux", "prn", "com1", "LPT9", "nul.json", "com3.x.y"):
+            with self.subTest(name=name):
+                self.assertIsNone(session.group_name(name))
+                with self.assertRaises(ValueError):
+                    self.store(group=name)
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    mcp_proxy._session_group(name)
+                self.assertIsNone(group_members(self.folder, name))
+        for name in ("null", "console", "com10", "com", "lpt", "aux-tools", "my.nul", "nul_", ".", ".."):
+            with self.subTest(name=name):
+                self.assertEqual(session.group_name(name), name)
 
 
 if __name__ == "__main__":

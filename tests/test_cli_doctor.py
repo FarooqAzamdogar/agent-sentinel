@@ -801,11 +801,19 @@ class SessionGroups(DoctorTest):
         GroupSessionStore(self.home / "sessions", "desk", "1@1", "b").join()
         _, out, _ = self.doctor(path)
         self.assertNotIn("joined the latest client run", out)
+        # The proxy takes a group's name in lower case, and so does doctor.
+        upper = self.config({"a": self.wrapped("a", "--session-group", "Desk"),
+                             "b": self.wrapped("b", "--session-group", "DESK")}, name="upper.json")
+        _, out, _ = self.doctor(upper)
+        self.assertNotIn("session group", out)
 
     def test_a_group_the_proxy_refuses_is_broken(self):
         entry = self.wrapped("a", "--session-group", "../x")
         code, servers, _ = self.statuses(self.config({"a": entry}))
         self.assertEqual((code, servers["a"]["status"]), (1, "broken"))
+        device = self.wrapped("a", "--session-group", "NUL")
+        _, servers, _ = self.statuses(self.config({"a": device}, name="device.json"))
+        self.assertEqual(servers["a"]["status"], "broken")
         unnamed = self.wrapped("a", "--session-group", "desk")
         unnamed["args"].remove("--name")
         unnamed["args"].remove("a")
