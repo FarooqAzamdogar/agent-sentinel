@@ -51,7 +51,11 @@ def recorded(name, **changes):
 
 
 class HookTest(TempFolderTest):
-    """Runs the hook command in this process, with a policy, an audit log and a state folder in a temp folder."""
+    """Runs the hook command in this process, with a policy, an audit log and a state folder in a temp folder.
+
+    The user's folder is in the temp folder too: SessionStart reads ~/.claude/settings.json, and a
+    test must never read the real one.
+    """
 
     session = "session-one"
 
@@ -60,6 +64,13 @@ class HookTest(TempFolderTest):
         self.policy = self.write("policy.json", HOOK_POLICY)
         self.audit = self.folder / "audit.jsonl"
         self.state = self.folder / "state"
+        self.user = self.folder / "user"
+        self.user.mkdir()
+        environment = mock.patch.dict(os.environ, {"HOME": str(self.user), "USERPROFILE": str(self.user)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in ("HOMEDRIVE", "HOMEPATH"):
+            os.environ.pop(name, None)  # restored by the patch when the test ends
 
     def hook(self, event, *extra):
         """Run one event (a dict, or raw bytes); return (exit code, the JSON answer or None, stderr)."""

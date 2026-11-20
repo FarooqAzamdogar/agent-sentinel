@@ -37,6 +37,7 @@ in the policy file:
     client_requests.completion/complete
     flows[0]                             the first flow rule
     secrets.patterns[0]                  the first custom secret format
+    hook.config_changes                  the Claude Code hook refused a change to Claude Code's settings
 
 Checks that are not written in the policy have the fixed names below (RULE_*).
 """
@@ -103,6 +104,7 @@ RULE_HOOK_FAILED = "hook_failed"  # the Claude Code hook could not finish its ch
 RULE_SECRETS_IN_RESULTS = "secrets.in_results"
 RULE_SECRETS_CANARIES = "secrets.canaries"
 RULE_SECRETS_KNOWN_VALUES = "secrets.known_values_from_env"
+RULE_HOOK_CONFIG_CHANGES = "hook.config_changes"  # the Claude Code hook refused a settings change (hook section)
 
 # An argument name is chosen by the agent; `matched_arg` keeps at most this much of it.
 MAX_MATCHED_ARG_CHARS = 200
@@ -146,15 +148,22 @@ MAX_CANARY_CHARS = 200
 MAX_CANARIES = 100
 MAX_KNOWN_VALUE_NAMES = 100
 
+# ---- hook mode -------------------------------------------------------------------------
+
+# hook.config_changes: what the Claude Code hook does with a change to Claude Code's settings
+# or skills made during a session. "audit" records it; "block" also refuses it.
+CONFIG_CHANGES = ("audit", "block")
+
 # Higher is stricter. When several wildcard rules match, the strictest verdict wins.
 _STRICTNESS = {"allow": 0, "ask": 1, "block": 2}
 
-# The keys a policy file may have, at the top and in "secrets".
+# The keys a policy file may have, at the top, in "secrets" and in "hook".
 _TOP_LEVEL_KEYS = (
     "default", "deny_args", "tools", "server_requests", "client_requests", "injection", "secrets", "limits",
-    "flows", "classify_by_annotations", "hide_blocked_tools",
+    "flows", "classify_by_annotations", "hide_blocked_tools", "hook",
 )
 _SECRETS_KEYS = ("in_arguments", "in_results", "known_values_from_env", "canaries", "patterns")
+_HOOK_KEYS = ("config_changes", "treat_auto_as_non_prompting")
 
 
 def limit_rule(bucket: str) -> str:
@@ -334,6 +343,30 @@ class SecretPattern:
 
 
 @dataclass(frozen=True)
+class HookOptions:
+    """The "hook" section: settings that only the Claude Code hook reads (claude_hooks.py).
+
+    {"config_changes": "block", "treat_auto_as_non_prompting": true}
+
+    config_changes:               "audit" (the default): a change to Claude Code's settings files or
+                                  skills during a session is recorded in the audit log, with the
+                                  top-level keys that changed. "block": it is also refused, so the
+                                  running session keeps the settings it had. The file stays changed
+                                  either way, and the next session reads it.
+    treat_auto_as_non_prompting:  true: in Claude Code's "auto" permission mode an "ask" is refused,
+                                  as in a mode that shows no prompt. Default false: "auto" shows the
+                                  prompt, except for the calls it never prompts for (claude_hooks.NEVER_PROMPTS).
+    """
+
+    config_changes: str = "audit"
+    treat_auto_as_non_prompting: bool = False
+
+    def __post_init__(self) -> None:
+        _expect_choice(self.config_changes, "hook.config_changes", CONFIG_CHANGES)
+        _expect_bool(self.treat_auto_as_non_prompting, "hook.treat_auto_as_non_prompting")
+
+
+@dataclass(frozen=True)
 class Verdict:
     action: str  # "allow", "ask" or "block"
     reason: str  # full detail, for the audit log and the human approver; never includes a pattern
@@ -389,6 +422,10 @@ class Policy:
     hide_blocked_tools               whether the proxy hides tools that tool_level_action says "block"
                                      from tools/list (default false). Hiding is not enforcement:
                                      a call to a hidden tool is still checked and refused.
+
+    Added in 0.6:
+
+    hook                             the "hook" section (HookOptions): settings only the Claude Code hook reads.
     """
 
     default: str = "block"
@@ -412,6 +449,8 @@ class Policy:
     flows: tuple[FlowRule, ...] = ()
     classify_by_annotations: bool = True
     hide_blocked_tools: bool = False
+    # ---- added in 0.6
+    hook: HookOptions = field(default_factory=HookOptions)
 
     def __post_init__(self) -> None:
         # A policy can also be built in code, without the loader. An action such
@@ -449,6 +488,8 @@ class Policy:
         for name, value in (("classify_by_annotations", self.classify_by_annotations),
                             ("hide_blocked_tools", self.hide_blocked_tools)):
             _expect_bool(value, name)
+        if not isinstance(self.hook, HookOptions):
+            raise PolicyError(f"hook must be a HookOptions, got {type_name(self.hook)}")
 
     # ---- loading ------------------------------------------------------------
 
@@ -533,6 +574,7 @@ class Policy:
             flows=_flow_rules(data.get("flows", [])),
             classify_by_annotations=classify,
             hide_blocked_tools=hide,
+            hook=_hook_options(data.get("hook", {})),
         )
 
     # ---- evaluating ---------------------------------------------------------
@@ -777,6 +819,8 @@ class Policy:
             RULE_SESSION: "the session state of the flow rules could not be recorded, so the result was withheld",
             RULE_HOOK_FAILED: "the Claude Code hook could not finish its checks (a policy that does not load, or "
                               "session state that cannot be used), so it refused",
+            RULE_HOOK_CONFIG_CHANGES: f'hook.config_changes is "{self.hook.config_changes}": the Claude Code hook '
+                                      "refuses a change to Claude Code's settings or skills made during a session",
         }
         if rule_id in fixed:
             return fixed[rule_id]
@@ -1433,6 +1477,15 @@ def _server_request_rules(specs: Any) -> tuple[ServerRequestRule, ...]:
         _expect_choice(action, f"server_requests.{name}", ("allow", "block"))
         rules.append(ServerRequestRule(name, action))
     return tuple(rules)
+
+
+def _hook_options(spec: Any) -> HookOptions:
+    """Read the optional "hook" section (HookOptions checks the values)."""
+    _expect_object(spec, "hook", allowed_keys=_HOOK_KEYS)
+    return HookOptions(
+        config_changes=spec.get("config_changes", "audit"),
+        treat_auto_as_non_prompting=spec.get("treat_auto_as_non_prompting", False),
+    )
 
 
 def _calls_per_minute(spec: dict[str, Any], where: str) -> int | None:

@@ -1031,6 +1031,43 @@ class TheHook(EndToEndTest):
         rules = [r.get("rule") for r in self.records(self.audit) if r["tool"] == "mcp__mail__send"]
         self.assertEqual(rules, ["tools.mcp__mail__send", "flows[0]", "flows[0]"])
 
+    def test_elicitations_settings_changes_and_mcp_output_that_hides_text(self):
+        policy = self.write("hook-0.6.json", {
+            "default": "allow", "tools": {"mcp__github__get_issue": "allow"},
+            "hook": {"config_changes": "block"},
+        })
+        project = self.folder / "project"
+        settings = self.write("project/.claude/settings.json", {"model": "x", "env": {"TOKEN": "never-logged-1"}})
+        session = {"session_id": "e1"}
+        self.assertEqual(self.hook(("session_start.json", {**session, "cwd": str(project)}), policy)[:2], (0, None))
+        settings.write_text(json.dumps({"model": "x", "env": {"TOKEN": "never-logged-2"}, "hooks": {}}),
+                            encoding="utf-8")
+        code, answer, err = self.hook(("config_change.json", {**session, "file_path": str(settings)}), policy)
+        self.assertEqual((code, answer["decision"]), (2, "block"))  # the running session keeps its settings
+        self.assertRegex(err, "the settings change was not applied to this session " + REF)
+
+        code, answer, err = self.hook(("elicitation_url.json", {**session, "url": "http://auth.example.com/"}), policy)
+        self.assertEqual((code, answer["hookSpecificOutput"]["action"]), (2, "decline"))
+        self.assertEqual(self.hook(("elicitation_form.json", session), policy)[:2], (0, None))  # left to the dialog
+        token = "ghp_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+        code, answer, _ = self.hook(("elicitation_result.json", {**session, "content": {"key": token}}), policy)
+        self.assertEqual((code, answer["hookSpecificOutput"]["action"]), (2, "decline"))
+
+        hidden = [{"type": "text", "text": "Issue 7: \x1b[8mcrash\x1b[0m on start‮"}]
+        code, answer, _ = self.hook(("post_tool_use_mcp.json", {**session, "tool_response": hidden}), policy)
+        self.assertEqual(code, 0)
+        self.assertEqual(answer["hookSpecificOutput"]["updatedMCPToolOutput"],
+                         [{"type": "text", "text": "Issue 7: crash on start"}])
+
+        records = self.records(self.audit)
+        change = next(r for r in records if r["event"] == "config_change")
+        self.assertEqual((change["action"], change["rule"]), ("block", "hook.config_changes"))
+        self.assertIn("top-level keys changed: env; top-level keys added: hooks", change["reason"])
+        self.assertTrue({r["event"] for r in records}.issuperset({"server_request", "client_reply", "cleaned"}))
+        log = self.audit.read_text(encoding="utf-8")
+        self.assertNotIn("never-logged", log)
+        self.assertNotIn(token, log)
+
     def test_what_cannot_be_read_or_checked_is_blocked(self):
         for data in (b"{not json", b"", b"\xff\xfe not text", b"[" * 100000,
                      b'{"hook_event_name": "PreToolUse", "session_id": 5}'):
@@ -1090,8 +1127,8 @@ class TheHook(EndToEndTest):
         self.assertEqual(code, 0, out)
         written = json.loads(settings.read_text(encoding="utf-8"))
         self.assertEqual(written["model"], "x")
-        self.assertEqual(sorted(written["hooks"]), ["PostToolUse", "PostToolUseFailure", "PreToolUse",
-                                                    "SessionStart", "Stop"])
+        self.assertEqual(sorted(written["hooks"]), ["ConfigChange", "Elicitation", "ElicitationResult", "PostToolUse",
+                                                    "PostToolUseFailure", "PreToolUse", "SessionStart", "Stop"])
         self.assertEqual(len(list(settings.parent.glob("settings.json.agent-sentinel-*.bak"))), 1)
         code, out, _ = self.cli("hook", "install", "claude-code", "--policy", self.policy, "--settings", settings,
                                 "--apply")

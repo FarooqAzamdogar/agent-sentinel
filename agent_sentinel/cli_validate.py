@@ -84,3 +84,10 @@ def _print_new_settings(policy: Policy) -> None:
         if policy.default == "block":
             hidden.append("every tool without a rule")
         print(f"Hidden from the tool list (blocked outright): {', '.join(hidden) or 'none'}.")
+    hook = []
+    if policy.hook.config_changes == "block":
+        hook.append("changes to Claude Code's settings during a session are refused")
+    if policy.hook.treat_auto_as_non_prompting:
+        hook.append("an 'ask' in auto mode is refused")
+    if hook:
+        print(f"Claude Code hook: {'; '.join(hook)}.")

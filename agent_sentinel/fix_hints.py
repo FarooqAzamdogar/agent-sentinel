@@ -19,9 +19,11 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from .elicitation import RULE_FORM as RULE_ELICITATION_FORM, RULE_URL as RULE_ELICITATION_URL
 from .policy import (
     RULE_CALLER,
     RULE_DEFAULT,
+    RULE_HOOK_CONFIG_CHANGES,
     RULE_HOOK_FAILED,
     RULE_INDEX,
     RULE_INJECTION,
@@ -59,6 +61,9 @@ _FIXED_KINDS = {
     RULE_SESSION: "session",
     RULE_CALLER: "caller",
     RULE_HOOK_FAILED: "hook_failed",
+    RULE_HOOK_CONFIG_CHANGES: "config_change",
+    RULE_ELICITATION_URL: "elicitation",
+    RULE_ELICITATION_FORM: "elicitation",
 }
 _INDEXED_KINDS = (
     (re.compile(rf"deny_args{_INDEX}"), "deny_global"),
@@ -71,7 +76,8 @@ _PART_KINDS = {"other_args": "other_args", "max_calls_per_minute": "limit_tool"}
 # policy. `suggest` never proposes to loosen them; `report` says so next to them.
 PROTECTIVE_KINDS = frozenset({
     "deny_global", "deny_tool", "secrets", "secrets_results", "canary", "known_value", "secret_pattern",
-    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "hook_failed",
+    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "hook_failed", "config_change",
+    "elicitation",
 })
 
 
@@ -148,7 +154,8 @@ def fix_hint(
         return (
             "The policy sends this call to a person, and nobody could be asked; the reason says why. The proxy "
             "needs an approver that can ask (--approve-with), and refuses when it fails or too many calls wait; "
-            "the Claude Code hook refuses in a permission mode that shows no prompt, such as bypassPermissions. "
+            "the Claude Code hook refuses in a permission mode that shows no prompt, such as bypassPermissions, "
+            "and for a call a mode runs without one (SubagentHandback in auto mode). "
             "Make sure someone can be asked rather than allowing the call."
         )
     argument = f" in argument {_name(matched_arg)}" if isinstance(matched_arg, str) else ""
@@ -324,6 +331,17 @@ _FIXED_HINTS = {
         "The Claude Code hook could not finish its checks, so it refused (the reason says why: often a policy "
         "that does not load, or a state folder that cannot be written). Fix that cause; no policy rule changes "
         "this."
+    ),
+    "config_change": (
+        "A Claude Code settings file or skill changed during the session, and hook.config_changes is \"block\", so "
+        "the running session did not apply it; the file itself stays changed, and the next session reads it. If "
+        "you made the change, start a new session; if not, find out what wrote the file and undo it. "
+        '"audit" records such changes without refusing them.'
+    ),
+    "elicitation": (
+        "An MCP server asked the user for something an elicitation may not ask: an address that is not a public "
+        "https one, or a password, key or card number in a form. The request was declined. Look at the server; no "
+        "policy setting allows this."
     ),
     "none": (
         "This record names no rule: it was written by agent-sentinel before 0.5, or edited. Its reason says what "

@@ -57,9 +57,15 @@ class PrintingTheSnippet(InstallTest):
         self.assertEqual(code, 0, err)
         snippet = json.loads(out[out.index("{"):out.index("\nWhich file:")])
         hooks = snippet["hooks"]
-        self.assertEqual(set(hooks), {"SessionStart", "PreToolUse", "PostToolUse", "PostToolUseFailure"})
+        self.assertEqual(set(hooks), {"SessionStart", "PreToolUse", "PostToolUse", "PostToolUseFailure",
+                                      "Elicitation", "ElicitationResult", "ConfigChange"})
         self.assertEqual(hooks["PreToolUse"][0]["matcher"], "*")
-        self.assertEqual(hooks["PostToolUse"][0]["matcher"], "WebFetch|WebSearch|mcp__.*")
+        self.assertEqual(hooks["PostToolUse"][0]["matcher"],
+                         "WebFetch|WebSearch|ReadMcpResourceTool|ListMcpResourcesTool|mcp__.*")
+        self.assertEqual(hooks["Elicitation"][0]["matcher"], "*")
+        self.assertEqual(hooks["ElicitationResult"][0]["matcher"], "*")
+        self.assertEqual(hooks["ConfigChange"][0]["matcher"],
+                         "user_settings|project_settings|local_settings|policy_settings|skills")
         handler = hooks["PreToolUse"][0]["hooks"][0]
         self.assertEqual(handler["type"], "command")
         self.assertEqual(handler["command"], os.path.abspath(sys.executable))
@@ -86,6 +92,32 @@ class PrintingTheSnippet(InstallTest):
         self.assertEqual(handler["args"][-1], "--no-log-args")
         self.assertIn(str(audit), handler["args"])
         self.assertIn(str(state), handler["args"])
+
+    def test_subagent_reports_are_scanned_only_on_request(self):
+        code, out, _ = self.install("--scan-subagent-reports")
+        self.assertEqual(code, 0)
+        hooks = json.loads(out[out.index("{"):out.index("\nWhich file:")])["hooks"]
+        matcher = "WebFetch|WebSearch|ReadMcpResourceTool|ListMcpResourcesTool|mcp__.*|Agent|SubagentHandback"
+        self.assertEqual(hooks["PostToolUse"][0]["matcher"], matcher)
+        self.assertEqual(hooks["PostToolUseFailure"][0]["matcher"], matcher)
+        self.assertIn("MCP resources and subagent reports)", out)
+        code, _, err = self.install("--scan-subagent-reports", "--scan-all-results")
+        self.assertEqual(code, 2)
+        self.assertIn("not allowed with argument", err)
+
+    def test_it_warns_about_tools_whose_output_or_prompt_it_cannot_cover(self):
+        self.policy = self.write("policy.json", {"default": "ask", "tools": {"Read": "allow"}})
+        _, out, _ = self.install()
+        self.assertIn("so is an 'ask' for SubagentHandback in auto mode", out)
+        self.assertIn("Monitor, whose streamed events no hook can scan", out)
+        self.assertNotIn("hook.config_changes", out)
+        self.policy = self.write("policy.json", {"default": "block", "tools": {"Monitor": "block"},
+                                                 "hook": {"config_changes": "block",
+                                                          "treat_auto_as_non_prompting": True}})
+        _, out, _ = self.install()
+        self.assertIn("SubagentHandback, ReadMcpResourceTool, ListMcpResourcesTool, Monitor (it has no rule", out)
+        self.assertNotIn("whose streamed events", out)
+        self.assertIn("is refused (hook.config_changes)", out)
 
     def test_a_python_that_finds_the_package_only_in_user_site_packages_runs_it_without_isolation(self):
         self.python_check.return_value = PythonCheck(False, __version__)
@@ -166,7 +198,7 @@ class ChangingASettingsFile(InstallTest):
         hooks = document["hooks"]
         self.assertEqual(hooks["Stop"], EXISTING["hooks"]["Stop"])
         self.assertEqual(hooks["PreToolUse"][0], EXISTING["hooks"]["PreToolUse"][0], "the user's own hook stays first")
-        self.assertEqual(len(self.our_handlers(document)), 4)
+        self.assertEqual(len(self.our_handlers(document)), 7)
         self.assertTrue((self.home / "hook-state").is_dir())
         self.assertIn("Backup of the original", out)
 
@@ -181,7 +213,7 @@ class ChangingASettingsFile(InstallTest):
         other = self.write("other-policy.json", POLICY)
         run_cli("hook", "install", "claude-code", "--policy", other, "--settings", self.settings, "--apply")
         handlers = self.our_handlers(json.loads(self.settings.read_text(encoding="utf-8")))
-        self.assertEqual(len(handlers), 4)
+        self.assertEqual(len(handlers), 7)
         self.assertTrue(all(str(other) in handler["args"] for handler in handlers))
 
     def test_a_missing_settings_file_is_created_only_with_apply(self):
