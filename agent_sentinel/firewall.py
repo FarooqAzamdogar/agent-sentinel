@@ -797,10 +797,33 @@ class Firewall:
 
         args: the call's arguments, when the caller has them: a command section's
               labels_by_class add labels by what the command does ("cat .env"
-              is secret_read, which a policy may label "private").
+              is secret_read, which a policy may label "private"). They are
+              read as check_call reads them, from their JSON copy (see
+              _labelled_arguments).
         """
-        labels = self.tool_labels(tool) | self.policy.command_labels(tool, args)
+        labels = self.tool_labels(tool) | self.policy.command_labels(tool, self._labelled_arguments(tool, args))
         return frozenset(label for label in labels if label != SINK)
+
+    def _labelled_arguments(self, tool: str, args: Any) -> Any:
+        """The arguments a command section's labels_by_class read: the JSON copy that check_call checked.
+
+        `run` passes the tool's own objects, in which the command may be an
+        Enum or a path that check_call read as its text; the proxy and the
+        hook pass JSON, which is returned as it is. The copy is made only when
+        a command section gives this tool labels. Arguments that cannot be made
+        JSON are passed as they are (check_call refuses such a call): a
+        command that is not text cannot be read, and gets every label its
+        sections could give.
+        """
+        if args is None or not isinstance(tool, str):
+            return args
+        if not any(rule.command is not None and rule.command.labels_by_class and rule.matches(tool)
+                   for rule in self.policy.tools):
+            return args
+        try:
+            return normalised_arguments(args)
+        except UnscannableError:
+            return args
 
     def mark_delivered(self, tool: str, marks: Iterable[str] | None = None, args: Any = None) -> None:
         """Record that a result of `tool` is reaching the agent: the session gains its marks.
