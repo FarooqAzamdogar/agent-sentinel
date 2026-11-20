@@ -113,6 +113,20 @@ The biggest release so far: commands that set up real MCP clients, Claude Code h
 - An integer of more than 4300 digits is refused the same way on every Python, with or without a minus sign.
 - `wrap` and `hook install` point to the install from GitHub, not to `pip install agent-sentinel` (not on PyPI yet).
 - `wrap`, `unwrap`, `hook install`, `init --out`, `inspect --policy` and `doctor --config` expand a leading `~`, which Windows PowerShell 5.1 and cmd pass on as it is.
+- doctor, clients and wrap: a package runner entry counts as agent-sentinel only with a PEP 440 version after '@' or '==' (or '@latest' in lowercase); 'agent-sentinel@0.5.0-evil', '@1x' and '@1.zip', which uv installs from a folder of that name, are broken.
+- doctor, clients and wrap: an entry whose "env" changes what its launcher runs is broken, and doctor names each variable. Such variables are __PYVENV_LAUNCHER__ (any Python, even with -I), PYTHONPATH and the user-site folders (a Python without -I), PATH (a launcher named without a folder), VIRTUAL_ENV/PY_PYTHON (py), and UV_*, PIP_*, PIPX_*, configuration folders and certificate variables (uvx, uv tool run, pipx run). wrap does not write such an entry.
+- doctor never looks at a device path (\\?\, \\.\, \??\): an approver written as command:\??\UNC\server\... no longer makes it open a network share on Python 3.10 to 3.12.
+- doctor reads a leading '~' in --policy, --audit, --pins, --env-file and --approve-with command: as the home folder, as the proxy does, and checks that the proxy can use the --env-file.
+- doctor and clients: a wrapped entry whose launcher is a relative path ('tools/python.exe', '.venv\Scripts\agent-sentinel.exe', '~/py/python.exe') is broken. The client starts it without a shell, so it runs whatever is at that path relative to its working folder, often the project.
+- doctor and clients: a Python launcher's own -X option other than utf8, or a -W option whose category names a module, makes the entry broken. '-X pycache_prefix=.c' runs bytecode from that folder even with -I, and '-W ignore::mod.Warning' imports mod at start-up.
+- doctor, clients and wrap: an entry whose "env" sets HOME, USERPROFILE, HOMEDRIVE or HOMEPATH to a value other than the terminal's, or AGENT_SENTINEL_HOME to a relative path, is broken for every launcher (also with -I). The proxy would read '~' in its options and in the policy's paths from another folder. wrap does not write such an entry.
+- doctor, clients and wrap: SYSTEMDRIVE in the env of a uvx, uv tool run or pipx run entry makes it broken (uv reads %SYSTEMDRIVE%\ProgramData\uv\uv.toml).
+- A package runner's word after '@' or '==' longer than 64 characters is not read as agent-sentinel at a version, and is never run through the version pattern.
+- doctor and clients: a Python launcher is read the same way whatever harmless options come before '-m agent_sentinel' (-B, -X utf8, -W ignore, -E -s, -u). The -I check and the import check now always run, and the 'started without -I' warning is printed for these entries too.
+- doctor and clients: in a project's configuration (.mcp.json, .vscode/mcp.json, a project's .cursor/mcp.json, or a --config file inside a git/hg/svn/jj work tree), a Python launcher started without -I (or -P, Python 3.11+) is broken. The client starts it in the project, where an agent_sentinel folder would run instead of the proxy. In a user's own configuration it stays a warning.
+- wrap: does not write an entry without -I (a pip --user install) into a project's configuration. It skips the entry and says why.
+- doctor and clients, Windows: in a project's configuration, a launcher written without a folder (agent-sentinel, uvx, uv, pipx, py, python) is broken when the project folder holds a file of that name or with .exe, .com, .bat, .cmd or a PATHEXT ending, because clients look in their working folder before PATH. Only that folder is looked at, and never a network path.
+- -P is accepted among a Python launcher's options. doctor fails it when the Python running doctor is older than 3.11.
 
 ## 0.4.1 (2026-11-18)
 

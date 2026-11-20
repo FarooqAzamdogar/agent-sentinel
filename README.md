@@ -56,7 +56,7 @@ python -m agent_sentinel --version   # the same, if the command is not on your P
 Good to know:
 
 - Install it into a Python you will keep. `wrap` and `hook install` write the **full path of this Python** into your client's settings.
-- They start that Python with `-I` (isolated mode), so that a folder named `agent_sentinel` in your project can never run in place of the real one. `-I` does not see a `pip install --user` copy. If you used `--user`, `wrap` warns you and leaves `-I` out. A virtual environment or a normal install avoids this.
+- They start that Python with `-I` (isolated mode), so that a folder named `agent_sentinel` in your project can never run in place of the real one. `-I` does not see a `pip install --user` copy. If you used `--user`, `wrap` warns you and leaves `-I` out in your own client files (Claude Desktop, your user-level Cursor or Windsurf file). In a project's file (`.mcp.json`, `.vscode/mcp.json`, `.cursor/mcp.json`) it skips the entry and says why, because the client starts in the project, and `doctor` calls such an entry broken. A virtual environment or a normal install avoids this.
 - From a clone of the repository, `python -m pip install .` does the same, and `python -m agent_sentinel` works without installing.
 - When the package is published on PyPI, `pipx install agent-sentinel` and `uvx agent-sentinel` will also work. They do not work yet.
 
@@ -172,7 +172,18 @@ Quit the client completely and start it again (Claude Desktop: also quit it from
 agent-sentinel doctor
 ```
 
-`doctor` reads every client configuration and says for each server: **protected**, **NOT protected**, **remote** (cannot be protected) or **broken** (the proxy would not start). It also checks that the policies load and that the logs and pins can be written. It changes nothing and starts no server. Exit code 0 means every stdio server is protected.
+`doctor` reads every client configuration and says for each server: **protected**, **NOT protected**, **remote** (cannot be protected) or **broken** (the proxy would not start, or the entry could start something else in its place). It also checks that the policies load and that the logs and pins can be written. It changes nothing and starts no server. Exit code 0 means every stdio server is protected.
+
+An entry counts as broken, with a line that says why, when for example:
+
+- the proxy would refuse one of its options (a shortened option, a value out of range), or its `--policy`, `--env-file` or approver program is missing or written as a relative path. A leading `~` counts as your home folder, as the proxy reads it;
+- the program that starts the proxy is written as a relative path (`tools/python.exe`, `~/py/python.exe`): clients start it without a shell, relative to their working folder;
+- a package runner does not run agent-sentinel at a version: only `uvx agent-sentinel@0.5.0`, `@latest` (lowercase), `==0.5.0` and the like count, not a URL, a path, extras or a word such as `@0.5.0-evil`;
+- the entry's own `"env"` changes what starts: for example `PYTHONPATH` for a Python without `-I`, `UV_INDEX_URL`, `PIP_INDEX_URL` or `SYSTEMDRIVE` for a runner, or `HOME`/`USERPROFILE` set to another folder (the proxy would read `~` from there). A variable set to the value your terminal has does not count;
+- a Python launcher has an option that changes what it runs (`-X` other than `utf8`, a `-W` that names a module);
+- in a project's configuration: a Python started without `-I` (or `-P`, Python 3.11 and later), whatever its other options, because an `agent_sentinel` folder in the project would run instead; and on Windows, a launcher written without a folder (`agent-sentinel`, `uvx`, `python` ...) when the project folder holds a file of that name, because Windows looks there before `PATH`.
+
+`doctor` is a check of what the files say, not a guarantee that a configuration from a repository you do not trust is safe: see [SECURITY.md](SECURITY.md).
 
 ### 6. See what happened
 
