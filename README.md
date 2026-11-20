@@ -631,7 +631,7 @@ Write options in full: the proxy refuses shortened ones such as `--mon`.
 | `--elicitation-host HOST` | A host a URL-mode elicitation may send the user to. Repeat it for more; `*.example.com` for subdomains. Default: any public https address. |
 | `--clean-env` | Start the server with a minimal environment (PATH, system and temporary folders, home folder ...) instead of every variable the proxy has. |
 | `--pass-env NAME` | Also give the server this variable with `--clean-env`. Repeat it for more; `NAME*` for every variable starting with NAME. |
-| `--env-file FILE` | Add the `NAME=VALUE` lines of FILE to the server's environment. Values are never printed. |
+| `--env-file FILE` | Add the `NAME=VALUE` lines of FILE to the server's environment. Values are never printed. Variables only the server needs belong here, not in the client entry's `"env"`, which also reaches the proxy and its launcher. |
 | `--approve-with BACKEND` | Ask a person about "ask" calls: `dialog`, `elicitation` or `command:PROGRAM`. Repeat it to give a fallback. Without it, "ask" calls are refused. See [Asking a person](#asking-a-person-approval). |
 | `--approval-timeout SECONDS` | Refuse a call nobody answered within this time. Default 120, at most 3600. |
 | `--quiet` | Print only errors. The server's own stderr is still passed on. |
