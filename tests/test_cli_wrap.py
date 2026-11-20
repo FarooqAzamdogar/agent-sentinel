@@ -502,6 +502,19 @@ class ListingClients(WrapTest):
                                                          str(self.policy), "--", "x"], "env": {"PYTHONPATH": "evil"}}}})
         _, out, _ = run_cli("clients")
         self.assertIn("3 server(s): 1 protected, 2 broken", out)
+        # A launcher the client finds relative to its working folder, a Python option that changes what it
+        # imports, and a home folder of the entry's own (where the proxy reads "~").
+        self.config.unlink()
+        proxy = ["proxy", "--policy", str(self.policy), "--", "x"]
+        self.place({"mcpServers": {
+            "relative": {"command": "tools/python.exe", "args": ["-I", "-m", "agent_sentinel", *proxy]},
+            "prefix": {"command": sys.executable, "args": ["-I", "-X", "pycache_prefix=.c", "-m", "agent_sentinel",
+                                                           *proxy]},
+            "home": {"command": sys.executable, "args": ["-I", "-m", "agent_sentinel", *proxy],
+                     "env": {"USERPROFILE": "."}},
+            "fine": {"command": sys.executable, "args": ["-I", "-X", "utf8", "-m", "agent_sentinel", *proxy]}}})
+        _, out, _ = run_cli("clients")
+        self.assertIn("4 server(s): 1 protected, 3 broken", out)
 
     def test_nothing_found(self):
         code, out, _ = run_cli("clients")

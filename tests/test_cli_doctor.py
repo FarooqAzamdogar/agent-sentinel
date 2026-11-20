@@ -208,6 +208,39 @@ class WhyAServerIsBroken(DoctorTest):
                 self.assertIn("from a package that is not agent-sentinel at a version",
                               servers["s"]["findings"][0]["text"])
 
+    def test_a_launcher_written_as_a_relative_path_is_broken(self):
+        # A checked-in .mcp.json: the client starts "command" without a shell, from the project, where the
+        # repository can put any program at that path. "~" is not the home folder there either.
+        tail = self.wrapped("s", policy="~/.agent-sentinel/policy.json")["args"][3:]  # proxy --policy ~/...
+        for launcher in (["tools/python.exe", "-I", "-m", "agent_sentinel"], [r".venv\Scripts\agent-sentinel.exe"],
+                         ["tools/uvx.exe", "agent-sentinel@0.5.0"], ["~/py/python.exe", "-I", "-m", "agent_sentinel"]):
+            self.write("project/" + launcher[0].replace("\\", "/"), "MZ")  # as the repository would put it
+            with self.subTest(launcher=launcher):
+                status, text = self.reasons({"command": launcher[0], "args": [*launcher[1:], *tail]})
+                self.assertEqual(status, "broken")
+                self.assertIn(f"the program that starts the proxy, {launcher[0]}, is a relative path: the client "
+                              "starts it without a shell, so it runs whatever is at that path relative to its working "
+                              "folder (often the project), and \"~\" is not the home folder there", text)
+                self.assertNotIn("protected:", text)
+        os.chmod(self.write("bin/agent-sentinel.exe", "MZ"), 0o755)
+        with mock.patch.dict(os.environ, {"PATH": str(self.folder / "bin")}):  # a bare name: looked up on PATH
+            status, text = self.reasons({"command": "agent-sentinel.exe", "args": tail})
+        self.assertEqual(status, "protected", text)
+
+    def test_a_python_option_that_can_change_what_it_imports_is_broken(self):
+        # -X pycache_prefix makes even "python -I" run bytecode from that folder; "-W ignore::this.X" imports `this`.
+        tail = self.wrapped("s")["args"][3:]
+        for options in (["-X", "pycache_prefix=.c"], ["-X", "importtime"], ["-W", "ignore::this.X"]):
+            with self.subTest(options=options):
+                status, text = self.reasons({"command": sys.executable,
+                                             "args": ["-I", *options, "-m", "agent_sentinel", *tail]})
+                self.assertEqual(status, "broken")
+                self.assertIn(f"is started with {options[0]} {options[1]!r}, which can make Python import or run "
+                              "other code", text)
+        status, text = self.reasons({"command": sys.executable, "args": ["-I", "-X", "utf8", "-W", "ignore",
+                                                                        "-m", "agent_sentinel", *tail]})
+        self.assertEqual(status, "protected", text)
+
     def test_an_option_value_the_proxy_refuses_is_broken(self):
         for extra, expected in (
             (["--max-message-bytes", "2147483648"], "--max-message-bytes '2147483648' (must be 1 to 1073741824 bytes)"),
@@ -392,6 +425,17 @@ class WhyAServerIsBroken(DoctorTest):
              "a Python started without -I imports from the folders it names"),
             ([str(pipx), "run", "--spec", "agent-sentinel==0.5.0", "agent-sentinel"],
              {"PIP_INDEX_URL": "https://evil.example/simple"}, "the package runner may get agent-sentinel"),
+            # uv's system configuration is %SYSTEMDRIVE%\ProgramData\uv\uv.toml.
+            ([str(uvx), "agent-sentinel==0.5.0"], {"SYSTEMDRIVE": "."}, "the package runner may get agent-sentinel"),
+            # Where the proxy reads "~" (--policy ~/... loads the project's own policy) and finds its home folder.
+            ([sys.executable, "-I", "-m", "agent_sentinel"], {"USERPROFILE": "."},
+             "the proxy takes its home folder, and \"~\" in its options and in the policy's paths, from another place"),
+            ([sys.executable, "-I", "-m", "agent_sentinel"], {"HOME": "."}, "the proxy takes its home folder"),
+            ([sys.executable, "-I", "-m", "agent_sentinel"], {"HOMEDRIVE": "D:"}, "the proxy takes its home folder"),
+            ([sys.executable, "-I", "-m", "agent_sentinel"], {"HOMEPATH": "."}, "the proxy takes its home folder"),
+            ([sys.executable, "-I", "-m", "agent_sentinel"], {"AGENT_SENTINEL_HOME": "sentinel"},
+             "the proxy takes its home folder"),
+            ([str(script)], {"HOMEPATH": "."}, "the proxy takes its home folder"),
         ):
             with self.subTest(launcher=launcher, env=env):
                 status, text = self.reasons({"command": launcher[0], "args": [*launcher[1:], *tail], "env": env})
@@ -401,7 +445,10 @@ class WhyAServerIsBroken(DoctorTest):
         # Variables that change nothing for that launcher, and one set to the value it has here.
         for launcher, env in (([sys.executable, "-I", "-m", "agent_sentinel"], {"PYTHONPATH": "x", "APPDATA": "y"}),
                               ([str(uvx), "agent-sentinel==0.5.0"], {"UV_NO_CONFIG": "1", "PYTHONUNBUFFERED": "1"}),
-                              ([sys.executable, "-m", "agent_sentinel"], {"APPDATA": os.environ["APPDATA"]})):
+                              ([sys.executable, "-m", "agent_sentinel"], {"APPDATA": os.environ["APPDATA"]}),
+                              ([sys.executable, "-I", "-m", "agent_sentinel"],
+                               {"USERPROFILE": os.environ["USERPROFILE"], "HOME": os.environ["HOME"],
+                                "AGENT_SENTINEL_HOME": str(self.home)})):
             with self.subTest(launcher=launcher, env=env):
                 status, text = self.reasons({"command": launcher[0], "args": [*launcher[1:], *tail], "env": env})
                 self.assertEqual(status, "protected", text)

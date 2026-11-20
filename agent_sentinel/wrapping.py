@@ -34,8 +34,11 @@ Each name in the entry's "env" becomes a --pass-env, so that the server
 still gets its tokens when the proxy is started with --clean-env. The client
 gives "env" to whatever it starts, so the proxy's launcher gets it too. A
 variable there that changes what the launcher runs (PYTHONPATH for a Python
-without -I, UV_INDEX_URL for uvx, __PYVENV_LAUNCHER__ for any Python) makes
-the entry broken, and wrap does not write such an entry (env_redirects).
+without -I, UV_INDEX_URL for uvx, __PYVENV_LAUNCHER__ for any Python) or
+where the proxy finds "~" (USERPROFILE, HOME) makes the entry broken, and
+wrap does not write such an entry (env_redirects). A launcher written as a
+relative path, or a Python option that can change what it imports, makes
+the entry broken too (launcher_problem).
 
 Remote entries ("url", "serverUrl", or a type such as "http") cannot be
 wrapped: the proxy speaks stdio only.
@@ -52,6 +55,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import home
 from .textutil import printable
 
 # The proxy options that take a value, and those that do not (the command-line
@@ -76,6 +80,9 @@ _VERSION = r"(?i:([0-9]{1,18}!)?[0-9]{1,18}(\.[0-9]{1,18})*((a|b|rc)[0-9]{1,18})
 # that name: "agent-sentinel@git+https://...", "agent-sentinel @ file:///...", extras, markers. "latest" is
 # lowercase only: uv knows no other spelling, and would read "@LATEST" as a folder named LATEST.
 PACKAGE = re.compile(r"(?i:agent[-_]sentinel)(@latest|(@|==)" + _VERSION + r")?")
+# A runner's package word is matched against PACKAGE only when it is at most this long: the name, "==" and a
+# version of up to 64 characters, far longer than any real one. A longer word is not agent-sentinel at a version.
+MAX_PACKAGE_CHARS = len("agent-sentinel==") + 64
 # Any word that names agent-sentinel, whatever follows the name (mentions_proxy).
 _NAMED = re.compile(r"agent[-_]sentinel([^A-Za-z0-9_-].*)?", re.IGNORECASE | re.DOTALL)
 # The file name of a Python, with .exe or not: python3.13, python3.13t (free-threaded), pythonw, python_d and
@@ -86,6 +93,11 @@ _PYTHON = re.compile(r"((python|pypy|graalpy)[0-9.]*t?w?(d|_d|-dbg)?(-intel64)?|
 # with their value; the Windows py launcher's version, such as -3.12.
 _PYTHON_FLAGS = re.compile(r"-[IEsSBuOqb]+|-[0-9][0-9.]*(-(32|64))?")
 _PYTHON_VALUE_FLAGS = frozenset({"-X", "-W"})
+# The only -X values that leave what a Python imports and runs as it was (launcher_problem). Others need not:
+# "-X pycache_prefix=folder" makes even "python -I" run bytecode found in that folder, which may be relative to
+# the client's; "-X frozen_modules=off" and "-X presite=module" change what is imported. A -W value is harmless
+# unless its category has a dot: "-W ignore::module.Warning" imports that module when Python starts.
+_HARMLESS_X_VALUES = frozenset({"utf8", "utf8=0", "utf8=1"})
 _RUNNERS = (["uvx"], ["uv", "tool", "run"], ["pipx", "run"])
 _RUNNER_PACKAGE_OPTIONS = frozenset({"--from", "--spec"})  # uvx --from agent-sentinel==0.5.0 agent-sentinel
 _LAUNCHER_REACH = 8  # how far into the command a mention of the proxy is looked for (mentions_proxy)
@@ -128,9 +140,10 @@ _USER_SITE = (frozenset({"APPDATA", "HOME", "USERPROFILE"}), (),
 #   install it for, and which saved copy they reuse: uv reads UV_*, pipx PIPX_* and the pip it runs PIP_*,
 #   each its configuration, cache and tools from the user's folders, and its downloads trust what the
 #   certificate variables name. Any variable of theirs counts, apart from a few that change none of that.
+#   On Windows uv reads its system configuration from %SYSTEMDRIVE%\ProgramData\uv\uv.toml.
 _RUNNER = (frozenset({"PATH", "VIRTUAL_ENV", "CONDA_PREFIX", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
-                      "PROGRAMDATA", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_CACHE_HOME", "XDG_DATA_HOME",
-                      "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"}),
+                      "PROGRAMDATA", "SYSTEMDRIVE", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_CACHE_HOME",
+                      "XDG_DATA_HOME", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"}),
            ("UV_", "PIP_", "PIPX_"),
            "the package runner may get agent-sentinel from another index or folder, or run it with another "
            "Python or a saved copy")
@@ -142,6 +155,11 @@ _RUNNER_HARMLESS = frozenset({
     "PIP_PROGRESS_BAR", "PIP_TIMEOUT", "PIP_RETRIES", "PIP_NO_INPUT", "PIP_ROOT_USER_ACTION",
     "PIPX_USE_EMOJI",
 })
+#   Whatever the launcher, the proxy reads "~" in --policy and its other file options, and in the policy's paths,
+#   as the home folder these name. AGENT_SENTINEL_HOME counts only when it is not a full path (env_redirects): then
+#   the proxy's home folder is in whatever folder the client starts it in.
+_HOME = (frozenset({"HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", home.ENV_VAR}), (),
+         "the proxy takes its home folder, and \"~\" in its options and in the policy's paths, from another place")
 _PY_LAUNCHER_NAME = re.compile(r"pyw?(\.exe)?", re.IGNORECASE)
 _FLAG_LETTERS = re.compile(r"-[IEsSBuOqb]+")
 
@@ -257,10 +275,15 @@ def _after_python_options(words: list[str]) -> int | None:
 def _after_runner_options(words: list[str], index: int) -> int | None:
     """Where "proxy" must be after `uvx [--from PACKAGE] PACKAGE`; None when the runner runs anything else."""
     if words[index:index + 1] and words[index] in _RUNNER_PACKAGE_OPTIONS:
-        if not PACKAGE.fullmatch(words[index + 1] if index + 1 < len(words) else ""):
+        if not _is_package(words[index + 1] if index + 1 < len(words) else ""):
             return None
         index += 2
-    return index + 1 if index < len(words) and PACKAGE.fullmatch(words[index]) else None
+    return index + 1 if index < len(words) and _is_package(words[index]) else None
+
+
+def _is_package(word: str) -> bool:
+    """Whether a runner's word is agent-sentinel at a version (PACKAGE); a word over MAX_PACKAGE_CHARS never is."""
+    return len(word) <= MAX_PACKAGE_CHARS and PACKAGE.fullmatch(word) is not None
 
 
 def mentions_proxy(words: list[str]) -> bool:
@@ -351,6 +374,8 @@ def env_redirects(entry: Any, proxy: ProxyCommand,
     found = []
     for name, value in env.items():
         upper = str(name).upper()
+        if upper == home.ENV_VAR and isinstance(value, str) and home.is_absolute(value):
+            continue  # a full path is the same folder wherever the client starts the proxy
         for names, prefixes, changes in sets:
             if upper in names or (upper.startswith(prefixes) and upper not in _RUNNER_HARMLESS):
                 break
@@ -384,7 +409,50 @@ def _redirecting_sets(launcher: list[str]) -> list[tuple[frozenset[str], tuple[s
         sets.append(_PYTHON_IMPORTS)
     if not letters & {"I", "s", "S"}:
         sets.append(_USER_SITE)
+    sets.append(_HOME)
     return sets
+
+
+def launcher_problem(proxy: ProxyCommand) -> str | None:
+    """Why the program that starts the proxy may run something else than the entry says, or None. As doctor says it.
+
+    Clients start "command" without a shell, so a path with a folder that is
+    not a full path ("tools/python.exe", ".venv\\Scripts\\agent-sentinel.exe",
+    and "~/py/python.exe", since only a shell reads "~" as the home folder)
+    runs whatever is at that place under the folder the client starts in,
+    often the project. A bare name is looked up on PATH; a full path is what
+    it says. A Python's own -X and -W options can make it import other code
+    (_HARMLESS_X_VALUES).
+    """
+    starter = proxy.launcher[0]
+    if _program(starter) != starter and not home.is_absolute(starter):
+        return ("is a relative path: the client starts it without a shell, so it runs whatever is at that path "
+                "relative to its working folder (often the project), and \"~\" is not the home folder there. "
+                "Write its full path")
+    if not _PYTHON.fullmatch(_program(starter)):
+        return None
+    index = 1
+    while index < len(proxy.launcher) and proxy.launcher[index] != "-m":  # the Python's own options
+        flag = proxy.launcher[index]
+        if flag not in _PYTHON_VALUE_FLAGS:
+            index += 1
+            continue
+        value = proxy.launcher[index + 1] if index + 1 < len(proxy.launcher) else ""
+        if not _harmless_python_option(flag, value):
+            return (f"is started with {flag} {printable(value, limit=80)!r}, which can make Python import or run "
+                    "other code (of -X only utf8 is taken, and a -W category must not name a module). Take the "
+                    "option out")
+        index += 2
+    return None
+
+
+def _harmless_python_option(flag: str, value: str) -> bool:
+    """Whether a Python's own `-X value` or `-W value` leaves what it imports and runs as it was."""
+    if flag == "-X":
+        return value in _HARMLESS_X_VALUES
+    fields = value.split(":")  # -W action:message:category:module:lineno
+    category = fields[2] if len(fields) > 2 else ""
+    return len(fields) <= 5 and "." not in category
 
 
 def status_of(entry: Any) -> str:
@@ -395,7 +463,8 @@ def status_of(entry: Any) -> str:
     protected. A proxy option written shortened, or --policy given twice,
     is broken: the proxy refuses the first, and a reader of the entry would
     take the wrong --policy for the one that counts. So is an entry whose
-    "env" can change what starts as the proxy (env_redirects).
+    launcher may run something else (launcher_problem), or whose "env" can
+    change what starts as the proxy (env_redirects).
     """
     kind = kind_of(entry)
     if kind != "stdio":
@@ -406,7 +475,7 @@ def status_of(entry: Any) -> str:
         return "broken" if mentions_proxy(words) else "unprotected"
     if any(shortened_option(option) for option, _ in proxy.options) or len(proxy.values("--policy")) > 1:
         return "broken"
-    if env_redirects(entry, proxy):
+    if launcher_problem(proxy) or env_redirects(entry, proxy):
         return "broken"
     return "unprotected" if proxy.has("--monitor") else "protected"
 

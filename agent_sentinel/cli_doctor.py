@@ -14,9 +14,11 @@ For each configuration file (those `clients` finds, or the ones given with
                   an unreadable pins file, an env file it cannot use, a command that is
                   not found, an argument a .cmd launcher cannot take, an option value
                   the proxy refuses (checked by the proxy's own functions, such as
-                  --max-message-bytes over 1 GiB); or wrapped, but the entry's "env"
-                  can make something else start as the proxy (PYTHONPATH for a Python
-                  without -I, UV_INDEX_URL for uvx: wrapping.env_redirects)
+                  --max-message-bytes over 1 GiB); or wrapped, but something else may
+                  start as the proxy: a launcher written as a relative path, a Python
+                  option such as -X pycache_prefix (wrapping.launcher_problem), or a
+                  variable of the entry's "env" (PYTHONPATH for a Python without -I,
+                  UV_INDEX_URL for uvx, USERPROFILE for any: wrapping.env_redirects)
 
 and these are checked too: every policy loads, with its warnings; the audit
 and pins folders can be written; no two servers share a pins file; npx and
@@ -73,6 +75,7 @@ from .wrapping import (
     env_redirects,
     installed_version,
     kind_of,
+    launcher_problem,
     mentions_proxy,
     read_proxy_command,
     shortened_option,
@@ -302,6 +305,10 @@ def _check_launcher(lines: list[Line], proxy: ProxyCommand) -> None:
     if refused:
         lines.append(Line("fail", f"the program that starts the proxy, {printable(starter, limit=200)}, {refused} "
                                   "(see agent-sentinel doctor --help)"))
+        return
+    problem = launcher_problem(proxy)  # a relative path is not looked for: doctor's folder is not the client's
+    if problem:
+        lines.append(Line("fail", f"the program that starts the proxy, {printable(starter, limit=200)}, {problem}"))
         return
     if not (os.path.isfile(starter) if home.is_absolute(starter) else mcp_proxy._resolve_executable(starter)):
         lines.append(Line("fail", f"the program that starts the proxy, {printable(starter, limit=200)}, was not found"))
@@ -596,8 +603,8 @@ def _check_env_redirects(lines: list[Line], proxy: ProxyCommand, entry: dict[str
     for changes, names in named.items():
         shown = ", ".join(printable(name, limit=60) for name in names[:10]) + (" ..." if len(names) > 10 else "")
         lines.append(Line("fail", f"the entry's \"env\" sets {shown}; with that, {changes}, so what starts may not be "
-                                  "agent-sentinel. Take it out of \"env\" (an --env-file gives a variable to the "
-                                  "server alone)"))
+                                  "the proxy this entry describes. Take it out of \"env\" (an --env-file gives a "
+                                  "variable to the server alone)"))
 
 
 # ---- packages and secrets ------------------------------------------------------------------------------
