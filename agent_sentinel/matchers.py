@@ -969,3 +969,27 @@ def _schemes(value: Any, where: str) -> tuple[str, ...]:
             )
         schemes.append(scheme)
     return tuple(dict.fromkeys(schemes))
+
+
+# ---- where a value sends a call (for the person asked to approve it) --------------
+
+def destination(matcher: Matcher, text: str) -> str | None:
+    """What a typed matcher reads `text` as, for a person to see: a URL's scheme and host, an e-mail
+    address's domain, or a path made absolute. None for other matchers, or a value it cannot read.
+
+    Only shown, never used to decide: a value that cannot be read is judged
+    by the matcher itself.
+    """
+    try:
+        if isinstance(matcher, UrlMatcher):
+            url = read_url(text)
+            return None if url is None else f"{url.scheme}://{url.host}"
+        if isinstance(matcher, EmailMatcher):
+            domain = read_email_domain(text)
+            return None if domain is None else f"e-mail domain {domain}"
+        if isinstance(matcher, PathMatcher):
+            paths = [matcher._absolute(path, expand_home=True) for path in matcher._paths_in(text)]
+            return f"path {paths[0]}" if paths else None
+    except _Unreadable:
+        return None
+    return None

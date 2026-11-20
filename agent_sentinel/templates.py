@@ -157,6 +157,9 @@ def _starter() -> dict[str, Any]:
     tools["delete_*"] = "block"
     tools["run_*"] = "block"
     policy["secrets"]["in_results"] = "redact"
+    # A result that reads like instructions to the agent (a medium finding) reaches it with a notice to
+    # treat it as data. mark_at stays off: ordinary documentation pages are often written as orders.
+    policy["injection"]["warn_severity"] = "medium"
     # The "lethal trifecta": once the agent has read both web content (which can
     # carry instructions) and private files, it may no longer use a tool that
     # sends data out.
@@ -183,6 +186,10 @@ def _strict(roots: tuple[str, ...] = (STRICT_ROOT,)) -> dict[str, Any]:
     policy["server_requests"] = dict(STRICT_SERVER_REQUESTS)
     policy["client_requests"] = {"completion/complete": "block", "*": "allow"}
     policy["injection"]["block_severity"] = "medium"
+    # Content with a medium finding is withheld here; were it let through (monitor mode, a lower
+    # block_severity), it would get the notice and count as untrusted for the flow rule below.
+    policy["injection"]["warn_severity"] = "medium"
+    policy["injection"]["mark_at"] = "medium"
     policy["secrets"]["in_results"] = "block"
     policy["limits"]["max_calls_per_minute"] = 60
     # One mark is enough: after any untrusted content, nothing may be sent out.

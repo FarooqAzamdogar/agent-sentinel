@@ -1250,3 +1250,15 @@ def max_severity(findings: list[Finding]) -> str | None:
     if not findings:
         return None
     return max((f.severity for f in findings), key=SEVERITY_ORDER.__getitem__)
+
+
+def merge_findings(*groups: Iterable[Finding]) -> list[Finding]:
+    """Findings of several scans of one value as one list: per rule the strongest, minus superseded ones.
+
+    For a caller that scans an extra text on its own, such as the firewall's
+    tail scan (the end of the last result read together with the next one).
+    """
+    strongest: dict[str, Finding] = {}
+    for group in groups:
+        _keep_strongest(strongest, group)
+    return _without_superseded(strongest)

@@ -67,6 +67,9 @@ COMMAND_PREFIX = "command:"
 MAX_SHOWN_ARGUMENTS = 20
 MAX_SHOWN_NAME_CHARS = 80
 MAX_SHOWN_VALUE_CHARS = 200
+# The session's marks and the call's destinations: how many are shown, and how long each may be.
+MAX_SHOWN_CONTEXT = 10
+MAX_SHOWN_CONTEXT_CHARS = 160
 
 # A command approver approves by printing this word on its own (one line end allowed).
 APPROVE_OUTPUTS = (b"approve", b"approve\n", b"approve\r\n")
@@ -142,6 +145,11 @@ class ApprovalRequest:
     method:    the MCP request held, when it is not what `tool` suggests: a
                resources/subscribe is checked as "resources/read", but it asks
                for updates for as long as the session lasts.
+    marks:     what the session has read, "untrusted (from 'fetch')" (Firewall.approval_context).
+               Shown by the dialog and given to a command; never put in an
+               elicitation, which a client might let the model read.
+    destinations: where the call would send data, as the url, email and path
+               matchers read its arguments. Shown everywhere.
     """
 
     tool: str
@@ -150,10 +158,15 @@ class ApprovalRequest:
     ref: str
     server: str | None = None
     method: str | None = None
+    marks: tuple[str, ...] = ()
+    destinations: tuple[str, ...] = ()
 
     def as_json(self, timeout: float) -> dict[str, Any]:
-        """What a command approver reads on its standard input (one line of JSON, ASCII only)."""
-        return {
+        """What a command approver reads on its standard input (one line of JSON, ASCII only).
+
+        "marks" and "destinations" (lists of texts, added in 0.6) are there only when they list something.
+        """
+        data: dict[str, Any] = {
             "version": COMMAND_INPUT_VERSION,
             "server": self.server,
             "method": self.method,
@@ -163,6 +176,10 @@ class ApprovalRequest:
             "ref": self.ref,
             "timeout_seconds": _whole_seconds(timeout),
         }
+        for key, entries in (("marks", self.marks), ("destinations", self.destinations)):
+            if entries:
+                data[key] = [printable(entry, limit=MAX_SHOWN_CONTEXT_CHARS) for entry in entries[:MAX_SHOWN_CONTEXT]]
+        return data
 
 
 @dataclass(frozen=True)
@@ -255,7 +272,11 @@ def approval_text(request: ApprovalRequest, timeout: float, how_to_answer: str =
         arguments,
         "",
     ]
+    if request.destinations:
+        lines.append(f"Where it sends data: {_context_list(request.destinations)}")
     if not for_client:
+        if request.marks:
+            lines.append(f"What the agent has read in this session: {_context_list(request.marks)}")
         lines.append(f"Why you are asked: {printable(request.reason, limit=300)}")
     lines.append(
         f"If nobody answers within {_seconds(timeout)}, the call is refused. Reference: {request.ref}"
@@ -264,6 +285,13 @@ def approval_text(request: ApprovalRequest, timeout: float, how_to_answer: str =
         lines.append(how_to_answer)
     text = "\n".join(lines)
     return _without_markup(text) if for_client else text
+
+
+def _context_list(entries: tuple[str, ...]) -> str:
+    """The marks or destinations of a question on one line: printable, each cut short, and at most MAX_SHOWN_CONTEXT."""
+    shown = [printable(entry, limit=MAX_SHOWN_CONTEXT_CHARS) for entry in entries[:MAX_SHOWN_CONTEXT]]
+    more = len(entries) - len(shown)
+    return "; ".join(shown) + (f"; ... (+{more} more)" if more > 0 else "")
 
 
 _MARKUP = {"&": "\\u0026", "<": "\\u003c", ">": "\\u003e", "[": "\\u005b", "]": "\\u005d", "`": "\\u0060"}

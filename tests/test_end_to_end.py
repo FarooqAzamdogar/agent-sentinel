@@ -1212,8 +1212,10 @@ class TheProxyInALegacySession(EndToEndTest):
         self.assertLess(time.monotonic() - started, 9)  # refused at the timeout, not when the program ended
         self.assertEqual(proxy.stop(), 0)
         asked = [json.loads(line) for line in seen.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(sorted(asked[0]), ["arguments", "method", "reason", "ref", "server", "timeout_seconds",
-                                            "tool", "version"])
+        # 0.6: "destinations" too, where the matchers read that the call sends data.
+        self.assertEqual(sorted(asked[0]), ["arguments", "destinations", "method", "reason", "ref", "server",
+                                            "timeout_seconds", "tool", "version"])
+        self.assertEqual(asked[0]["destinations"], ["e-mail domain example.com (argument 'to')"])
         self.assertEqual((asked[0]["server"], asked[0]["arguments"]),
                          ("mail", {"to": "bob@example.com", "subject": "lunch"}))
         self.assertIn("approved tools/call 'send_email'", proxy.stderr)
@@ -1227,7 +1229,9 @@ class TheProxyInALegacySession(EndToEndTest):
         for msg_id, answer, approved in ((1, {"action": "accept", "content": {"approve": True}}, True),
                                          (2, {"action": "decline"}, False),
                                          (3, {"action": "accept", "content": {"approve": "true"}}, False)):
-            proxy.send(call(msg_id, "send_email", {"to": "bob@example.com", "body": "<!-- hidden --> [x](http://e)"}))
+            # Each call differs (0.6: a call a person refused is refused again without asking).
+            body = f"<!-- hidden --> [x](http://e) {msg_id}"
+            proxy.send(call(msg_id, "send_email", {"to": "bob@example.com", "body": body}))
             question = proxy.next_message()
             self.assertEqual(question["method"], "elicitation/create")
             self.assertRegex(question["id"], r"\Aagent-sentinel-approval-[0-9a-f]{32}\Z")
