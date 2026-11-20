@@ -337,16 +337,44 @@ class PathsOnWindows(unittest.TestCase):
         # A pattern runs only where its alias's text is.
         counters = counted_check(r"C:\Users\me\projects\app\src\main.py", denied=False)
         self.assertEqual(sum(len(counter.runs) for counter in counters), 0)
-        # Six aliases give 64 readings, the most that are followed; each runs
-        # only the six patterns whose alias it holds, not all of them.
-        names = "C:\\work\\templates\\recent\\sendto\\cookies\\nethood\\start menu\\"
+        # Five aliases give 32 readings, the most that are followed; each runs
+        # only the five patterns whose alias it holds, not all of them. A sixth
+        # alias gives 64, and the value is denied.
+        names = "C:\\work\\templates\\recent\\sendto\\cookies\\nethood\\"
         counters = counted_check(names + "x", denied=False)
-        self.assertLessEqual(sum(len(counter.runs) for counter in counters), 6 * matchers._MAX_ALIAS_READINGS)
+        self.assertLessEqual(sum(len(counter.runs) for counter in counters), 5 * matchers._MAX_ALIAS_READINGS)
+        counted_check(names + "start menu\\x", denied=True)
         # At 4000 characters the readings soon grow too long and the value is
         # denied; until then each pattern runs at most once on each reading.
         counters = counted_check(names + "\\".join(["abcdefghij"] * 360), denied=True)
         most = max(sum(counter.runs) for counter in counters)
         self.assertLessEqual(most, matchers._MAX_ALIAS_CHARS + matchers._MAX_ALIAS_READINGS)
+
+    def test_one_value_has_one_alias_budget_for_all_of_its_spellings_and_readings(self):
+        # Counted, not timed, through a policy. "~/" is read twice (the home
+        # folder and a folder named "~") and "%252541" has four spellings:
+        # eight paths, each with the 32 readings of five aliases. A budget for
+        # each path would follow all 256; one budget for the value denies it.
+        original = PathMatcher.for_roots
+        with mock.patch.object(PathMatcher, "for_roots", lambda roots, where: original(roots, where, **WINDOWS)):
+            policy = rule({"arg": "path", "type": "path", "roots": ["~/.ssh"]}, deny=True)
+
+        def evaluated(value):
+            """The verdict of one evaluate of `value`, and how often the alias patterns ran in it."""
+            patterns, counters = counting_alias_patterns()
+            with mock.patch.object(matchers, "_WINDOWS_ALIAS_PATTERNS", patterns):
+                action = verdict(policy, path=value)
+            return action, sum(len(counter.runs) for counter in counters)
+
+        action, runs = evaluated("~/w/recent/sendto/cookies/nethood/printhood/%252541")
+        self.assertLessEqual(runs, 5 * matchers._MAX_ALIAS_READINGS)
+        self.assertEqual(action, "block")
+        # Real chains, with "~/" or with several spellings, stay within the budget.
+        for value in ("~/Local Settings/Application Data/Microsoft/Windows/Temporary Internet Files/x",
+                      "file:///C:/Documents%20and%20Settings/me/Local%20Settings/Application%20Data/x",
+                      "~/Documents/My Music/%2541"):
+            with self.subTest(value=value):
+                self.assertEqual(evaluated(value)[0], "allow")
 
     def test_an_unknown_current_folder_refuses_relative_paths(self):
         def gone():
