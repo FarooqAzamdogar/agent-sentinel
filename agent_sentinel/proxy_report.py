@@ -117,6 +117,8 @@ class Startup:
     audit_signed: bool = False
     audit_required: bool = False
     audit_max_bytes: int | None = None
+    # What --contain and --sandbox give the server (containment.describe); empty when not contained.
+    containment: str = ""
 
 
 def audit_settings(start: Startup) -> str:
@@ -149,6 +151,8 @@ def startup_lines(start: Startup) -> list[str]:
     else:
         lines.append("  pins      in memory: definitions are compared with those first seen since the proxy started")
     lines.append(f"  server    {shown_server_command(start.server_command)}")
+    if start.containment:
+        lines.append(f"  contain   {start.containment}")
     if start.approvers:
         backends = ", else ".join(description for description, _ in start.approvers)
         lines.append(f"  approval  {backends}; no answer within {start.approval_timeout} s refuses the call")

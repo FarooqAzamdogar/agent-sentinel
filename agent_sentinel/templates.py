@@ -161,6 +161,9 @@ def _starter() -> dict[str, Any]:
     # carry instructions) and private files, it may no longer use a tool that
     # sends data out.
     policy["flows"] = [{"after": ["untrusted", "private"], "then": "sink", "action": "block"}]
+    # The proxy reports calls and results that do not match the server's schemas, and schemas that
+    # refer outside themselves, without refusing anything for it.
+    policy["schema_checks"] = {"arguments": "warn", "results": "warn", "remote_refs": "warn"}
     return policy
 
 
@@ -187,6 +190,10 @@ def _strict(roots: tuple[str, ...] = (STRICT_ROOT,)) -> dict[str, Any]:
     policy["limits"]["max_calls_per_minute"] = 60
     # One mark is enough: after any untrusted content, nothing may be sent out.
     policy["flows"] = [{"after": ["untrusted"], "then": "sink", "action": "block"}]
+    # The proxy refuses calls and results that do not match the server's schemas and arguments the
+    # schema does not declare, and quarantines a tool whose schema refers outside itself.
+    policy["schema_checks"] = {"arguments": "enforce", "results": "enforce", "undeclared_args": "block",
+                               "remote_refs": "quarantine"}
     return policy
 
 

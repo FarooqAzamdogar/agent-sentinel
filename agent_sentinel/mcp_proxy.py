@@ -62,6 +62,14 @@ this machine, and the client's answer to the proxy's own elicitation is
 matched by a random id that is never sent to the server, and never
 forwarded to it.
 
+Containing the server
+---------------------
+With --contain (or a --server-* limit, or --sandbox), the server is started
+inside a job object (Windows) or a process group with resource limits
+(Linux, macOS), so that it ends with the proxy, and with --sandbox behind
+bubblewrap or sandbox-exec. When what was asked for cannot be set up, the
+proxy does not start. See containment.py, including what this does not do.
+
 What the operator sees
 ----------------------
 On stderr, which MCP clients keep in their log of the server (see
@@ -134,7 +142,10 @@ resources/templates/list reply are checked one by one (_clean_items):
 * each entry is scanned (a tool's description also with the tool names the
   policy gives other servers, to catch shadowing), and tools, prompts and
   resource templates are compared with their pins (pins.py), as are the
-  server's instructions.
+  server's instructions;
+* a tool whose inputSchema or outputSchema refers outside itself (a $ref to
+  a web address or a file) is reported, or quarantined when the policy's
+  schema_checks.remote_refs says so (schema_check.remote_refs).
 
 A tool, prompt or template that fails is removed from the list and
 quarantined for as long as the proxy runs: it is left out of later lists, a
@@ -144,6 +155,21 @@ beside it for `agent-sentinel pins diff` and `pins accept`. Then, if the
 policy says hide_blocked_tools, the tools it blocks outright are hidden from
 the list (never in monitor mode); a call to a hidden tool is still checked
 and refused.
+
+Schemas and server metadata
+---------------------------
+When the policy's schema_checks ask for it, the schemas of each tool that
+passed the list's checks are kept (schema_check.SchemaStore), and a call's
+arguments are checked against its inputSchema before the policy sees the
+call, a result's structuredContent against its outputSchema before it is
+scanned: "warn" records and reports a mismatch, "enforce" refuses it (rules
+schema.arguments and schema.result). A tool not in this session's checked
+list cannot be checked, which counts as a mismatch.
+
+The serverInfo that MCP 2026-07-28 puts into every result's _meta, and that
+a client may show, has its unsafe icons and an unsafe websiteUrl dropped in
+every result and message from the server, as in the handshake; so do the
+icons of the resource_link items in a result's content (_clean_metadata).
 
 Requests other than tool calls
 ------------------------------
@@ -201,7 +227,7 @@ from dataclasses import dataclass, field
 from secrets import token_hex
 from typing import Any, BinaryIO, Callable, Iterable, Mapping, Sequence
 
-from . import __version__, audit_chain, elicitation, proxy_report
+from . import __version__, audit_chain, containment, elicitation, proxy_report, schema_check
 from . import mcp_protocol as protocol
 from . import server_env
 from .approvers import (
@@ -233,14 +259,18 @@ from .policy import (
     PROMPTS_GET,
     RULE_MALFORMED,
     RULE_QUARANTINE,
+    RULE_SCHEMA_ARGUMENTS,
+    RULE_SCHEMA_REMOTE_REFS,
+    RULE_SCHEMA_RESULT,
     RULE_SECRETS_IN_RESULTS,
     RULE_UNSCANNABLE,
     Policy,
     PolicyError,
+    SchemaChecks,
 )
 from .policy_errors import file_error_message, type_name
 from .session import SessionStateError
-from .textutil import UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable
+from .textutil import MAX_CONTAINERS, UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable
 
 # How long a tool call waits for an in-flight tools/list reply to be checked.
 TOOL_LIST_WAIT_SECONDS = 15
@@ -261,6 +291,7 @@ MAX_REPORTED = 10_000  # things reported once on stderr (see _first_report)
 MAX_LABEL_CHARS = 200
 MAX_NAME_CHARS = 256  # tool names and request ids the proxy has to remember
 MAX_WAITING_APPROVALS = 16  # calls held for a person's answer; more are refused at once
+MAX_WEBSITE_URL_CHARS = 2048  # a serverInfo websiteUrl longer than this is dropped unread
 
 # proxy --approval-timeout: how long a held call waits for an answer, in seconds.
 DEFAULT_APPROVAL_TIMEOUT = 120
@@ -324,6 +355,12 @@ _UNSUPPORTED_REQUEST = "this request is not supported"
 _UNSUPPORTED_REPLY = "the server sent a reply this proxy cannot check"
 _UNSUPPORTED_VERSION = "the server chose a protocol version this proxy does not support"
 _UNCHECKED_CONTENT = "the content could not be checked, so it was withheld"
+# A call or result refused by schema_checks. Neither says which part failed: the audit record does.
+_SCHEMA_ARGUMENTS_REFUSAL = "the arguments do not match the tool's input schema"
+_SCHEMA_RESULT_REFUSAL = "the server sent a result that does not match the tool's output schema"
+# A property name a schema problem leaves out, and why (_ShownNames).
+_NAME_NOT_SHOWN = "[name not shown]"
+_NAMES_NOT_SHOWN = " (names are not shown: they hold what looks like a secret)"
 # What a refused server is told: nothing about why.
 _SERVER_REFUSAL = "request refused"
 
@@ -343,6 +380,7 @@ class _PendingRequest:
     call_id: str | None = None  # the firewall's id for this call, so the result's record shares it
     # The request named a 2026-07-28 protocol version, so a result the proxy builds for it needs a resultType.
     modern: bool = False
+    tool: str | None = None  # tools/call only: the tool's name in full (the label may be shortened)
 
 
 @dataclass(frozen=True)
@@ -494,11 +532,80 @@ def _request_description(message: JsonObject) -> str:
     return printable(method, limit=MAX_LABEL_CHARS)
 
 
+def _content_blocks(holder: JsonObject) -> Iterable[JsonObject]:
+    """The content blocks of a result or a message's params: its `content`, that of each of its `messages`, and theirs.
+
+    A tool's result holds a list of blocks; a prompt's messages (prompts/get)
+    and a sampling request's messages each hold one block, or a list of them.
+    A block may hold blocks of its own: a sampling message's tool_result
+    (2025-11-25) has a `content` list like a tool's result. So the `content`
+    of every block is walked too, at any depth, whatever the block's type.
+    Anything that is not an object is skipped. The walk is iterative and
+    stops after textutil.MAX_CONTAINERS blocks: a message with more parts
+    than that is refused by the scan that follows.
+    """
+    holders = [holder]
+    messages = holder.get("messages")
+    if isinstance(messages, list):
+        holders += [message for message in messages if isinstance(message, dict)]
+    pending: list[Any] = [one.get("content") for one in reversed(holders)]
+    seen = 0
+    while pending and seen < MAX_CONTAINERS:
+        content = pending.pop()
+        for block in content if isinstance(content, list) else [content]:
+            if isinstance(block, dict):
+                seen += 1
+                yield block
+                if "content" in block:
+                    pending.append(block["content"])
+
+
 def _reply_description(pending: _PendingRequest) -> str:
     """The reply to a request, as the operator reads it: "the reply to tools/call 'fetch_page'"."""
     if pending.label != pending.method:
         return f"the reply to {pending.method} '{printable(pending.label, limit=MAX_LABEL_CHARS)}'"
     return f"the reply to {pending.method}"
+
+
+class _ShownNames:
+    """How the problems of a schema check show property names: of a call's arguments, or a result's structuredContent.
+
+    A schema check runs before the secret guard and the scanner, and its
+    reason names properties ("the argument 'x' is not declared"). The reason
+    goes to stderr, which the client keeps in its log and which is not
+    redacted, and to the audit log, which redacts each string alone and so
+    misses a secret split over two names, or cut in half when a long name is
+    shortened. So the problems are made twice when they name anything: first
+    with every name as it is, which records the names (`asked`); then, if
+    the policy's guard finds a secret in those names, each alone or joined
+    (Firewall.holds_a_secret), again with no name shown (`hide_if_secret`).
+    The names are read once each, in the order first asked for, so that the
+    path a parent's name repeats in every problem does not come between two
+    halves of a secret split over its members. Only the names a reason would
+    show are read, never the whole value, and a value without problems costs
+    nothing more.
+    """
+
+    def __init__(self, firewall: Firewall) -> None:
+        self._firewall = firewall
+        self.asked: dict[str, None] = {}  # bounded: names are asked for only for the few problems reported
+        self.hidden = False
+
+    def __call__(self, name: str) -> str:
+        if self.hidden:
+            return _NAME_NOT_SHOWN
+        self.asked.setdefault(name)
+        return name
+
+    def hide_if_secret(self) -> bool:
+        """Whether the names asked for so far hold a secret; if so, no name is shown from now on."""
+        if not self.hidden and self.asked and self._firewall.holds_a_secret(list(self.asked)):
+            self.hidden = True
+        return self.hidden
+
+    def note(self) -> str:
+        """What to add to a reason: why its names are missing, or nothing."""
+        return _NAMES_NOT_SHOWN if self.hidden else ""
 
 
 # ---- names that look alike ----------------------------------------------------
@@ -595,6 +702,9 @@ class Proxy:
         # Every tool name this server has listed (at most MAX_KNOWN_NAMES), so that a description that
         # names one of the server's own tools is not taken for shadowing (_foreign_tools). Guarded by `_state`.
         self._listed_tools: set[str] = set()
+        # The checked schemas of the listed tools, for the policy's schema_checks; None when no tool's
+        # calls or results are checked against them (schema_check.SchemaStore is thread-safe itself).
+        self._schemas = schema_check.SchemaStore() if firewall.policy.uses_schema_checks else None
 
         # `_state` guards the collections below. It is a Condition so that
         # tool calls can wait for tool lists to finish being checked.
@@ -1125,8 +1235,82 @@ class Proxy:
             reason = "this tool was removed from the tool list and cannot be called"
             decision = self._refusal(_label(name), reason, RULE_QUARANTINE)
         else:
+            refused = self._check_arguments_schema(message, name, arguments or {})
+            if refused is not None:
+                return refused
             return self._check_policy(message, name, arguments or {}, label=_label(name))
         return self._forward_or_refuse(message, decision, label=_label(str(name)))
+
+    # ---- client -> server: the tool's schema (the policy's schema_checks) ---------------
+
+    def _check_arguments_schema(self, message: JsonObject, name: str, arguments: JsonObject) -> _Outcome | None:
+        """Check a call's arguments against the tool's checked inputSchema; the refusal, or None to go on.
+
+        What the policy's schema_checks for the tool say (Policy.schema_checks_for):
+        `undeclared_args` "block" refuses a top-level argument that the
+        schema's properties do not name; `arguments` "enforce" refuses
+        arguments that do not match the schema (schema_check.validate), "warn"
+        reports them and lets the call go on. The schema is the one this
+        session's tools/list gave, after the tool was scanned and compared with
+        its pin; a tool with none (not listed, or too large to keep) cannot be
+        checked, which counts as a problem. Run before the policy, so that a
+        call that could never be made is not held for a person's approval.
+        A refusal is a block that monitor mode lifts. The names in a reason
+        are left out when they hold a secret (_ShownNames).
+        """
+        settings = self._firewall.policy.schema_checks_for(name)
+        if settings.arguments == "off" and settings.undeclared_args != "block":
+            return None
+        shown = _ShownNames(self._firewall)
+        blocking, warned = self._argument_problems(name, arguments, settings, shown)
+        if shown.hide_if_secret():
+            blocking, warned = self._argument_problems(name, arguments, settings, shown)
+        label = _label(name)
+        if warned:
+            self._schema_warning(label, f"the arguments of '{printable(name, limit=80)}'", warned, "schema_arguments",
+                                 note=shown.note())
+        if not blocking:
+            return None
+        reason = f"the arguments do not match the input schema of the tool: {'; '.join(blocking[:5])}{shown.note()}"
+        decision = self._firewall.block(label, reason, event="call", public_reason=_SCHEMA_ARGUMENTS_REFUSAL,
+                                        rule=RULE_SCHEMA_ARGUMENTS)
+        if decision.allowed:  # monitor mode
+            return None
+        return self._refused(message, decision)
+
+    def _argument_problems(self, name: str, arguments: JsonObject, settings: SchemaChecks,
+                           shown: _ShownNames) -> tuple[list[str], list[str]]:
+        """The problems of a call's arguments under the tool's schema_checks: (those that block, those only reported)."""
+        blocks_undeclared = settings.undeclared_args == "block"
+        blocking: list[str] = []
+        warned: list[str] = []
+        found, why = self._schemas.lookup(name) if self._schemas is not None else (None, "no schemas are kept")
+        if found is None:
+            problem = f"the arguments cannot be checked: {why}"
+            (blocking if settings.arguments == "enforce" or blocks_undeclared else warned).append(problem)
+            return blocking, warned
+        schema = found.input if isinstance(found.input, dict) else {}
+        if blocks_undeclared:
+            declared = schema.get("properties")
+            declared = declared if isinstance(declared, dict) else {}
+            undeclared = [argument for argument in arguments if argument not in declared]
+            blocking += [f"the argument '{printable(shown(argument), limit=60)}' is not declared in the input schema"
+                         for argument in undeclared[:schema_check.MAX_PROBLEMS]]
+        if settings.arguments != "off":
+            problems = schema_check.validate(arguments, schema, root="the arguments", names=shown)
+            (blocking if settings.arguments == "enforce" else warned).extend(problems)
+        return blocking, warned
+
+    def _schema_warning(self, label: str, what: str, problems: list[str], event: str,
+                        call_id: str | None = None, note: str = "") -> None:
+        """Record and report what schema_checks "warn" found: an audit note, and a stderr line once per kind.
+
+        note: added to the reason (_ShownNames.note: why names are missing).
+        """
+        reason = f"schema_checks warn: {what}: {'; '.join(problems)}{note}"
+        self._firewall.note(label, reason, event=event, call_id=call_id)
+        if self._first_report("schema", event, label, problems[0]):
+            self._report(reason, limit=1000)
 
     def _check_resource_request(self, message: JsonObject) -> _Outcome:
         """resources/read and resources/subscribe both ask the server to open a URI."""
@@ -1444,11 +1628,13 @@ class Proxy:
         if "id" not in message:
             return _Outcome(to_server=message)  # a notification: no reply will come
         modern = _is_modern_request(message)
+        params = message.get("params")
+        tool = params.get("name") if message["method"] == "tools/call" and isinstance(params, dict) else None
         with self._state:
             # A request that reuses an id still in flight never gets here (_id_in_flight).
             full = message["id"] not in self._pending and len(self._pending) >= MAX_PENDING_REQUESTS
             if not full:
-                self._pending[message["id"]] = _PendingRequest(message["method"], label, marks, call_id, modern)
+                self._pending[message["id"]] = _PendingRequest(message["method"], label, marks, call_id, modern, tool)
                 if message["method"] == "tools/list":
                     self._tool_lists_in_flight.add(message["id"])
         if full:
@@ -1600,6 +1786,7 @@ class Proxy:
             self._report_block(f"refused a '{printable(method, limit=100)}' request from the server", refusal)
             return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL, code=protocol.METHOD_NOT_FOUND))
 
+        self._clean_metadata(message.get("params"), f"the server, in a '{printable(method, limit=100)}' message")
         verdict = self._firewall.policy.server_request_verdict(method)
         decision = None
         if verdict.action == "block":
@@ -1698,6 +1885,7 @@ class Proxy:
             kind = protocol.result_type(result)
         except ShapeError as exc:
             return self._malformed_reply(pending, msg_id, str(exc))
+        self._clean_metadata(result, f"the server, in its reply to {pending.method}")
         if kind == protocol.RESULT_INPUT_REQUIRED:
             return self._checked_input_required(pending, msg_id, result)
         if kind == protocol.RESULT_TASK or (pending.method == "tools/call" and protocol.is_legacy_task(result)):
@@ -1756,6 +1944,7 @@ class Proxy:
         """The policy's answer for one entry of an input_required result, then what an elicitation asks, then a scan."""
         method = entry["method"]
         label = _label(f"server:{method}")
+        self._clean_metadata(entry.get("params"), f"the server, in a '{printable(method, limit=100)}' inside a reply")
         verdict = self._firewall.policy.server_request_verdict(method)
         decision = None
         if verdict.action == "block":
@@ -1833,7 +2022,8 @@ class Proxy:
           must keep at least one.
         * Tasks are removed from the server's capabilities, so that the client
           does not start one.
-        * Unsafe icons are removed from the serverInfo.
+        * Unsafe icons and an unsafe websiteUrl are removed from the serverInfo
+          (_clean_server_info; the one in _meta is cleaned with every result).
         * Instructions that look like an injection, or that changed since they
           were pinned, are removed.
         A server/discover result also makes the session a 2026-07-28 one,
@@ -1861,10 +2051,9 @@ class Proxy:
             return self._malformed_reply(pending, msg_id, str(exc))
         if problem is not None:
             return self._unsupported_reply(pending, msg_id, problem, _UNSUPPORTED_VERSION, code=protocol.INVALID_PARAMS)
-        meta = result.get("_meta")
-        for server_info in (result.get("serverInfo"), meta.get(_SERVER_INFO_KEY) if isinstance(meta, dict) else None):
-            if isinstance(server_info, dict) and "icons" in server_info:
-                self._clean_icons_of(server_info, f"the server, in its reply to {pending.method}")
+        # The serverInfo in _meta was cleaned with every result (_clean_metadata); this is the legacy one.
+        if isinstance(result.get("serverInfo"), dict):
+            self._clean_server_info(result["serverInfo"], f"the server, in its reply to {pending.method}")
         self._check_instructions(result, source=pending.method)
         with self._state:
             if pending.method == protocol.INITIALIZE:
@@ -1931,6 +2120,10 @@ class Proxy:
         The reply holds that checked copy, never `value` itself. The flow
         marks of the request are set just before the reply is returned.
         """
+        refusal = self._result_schema_refusal(pending, member, value)
+        if refusal is not None:
+            self._report_block(f"blocked {_reply_description(pending)}", refusal)
+            return _refusal_reply(pending.method, msg_id, refusal.public_reason, pending.modern)
         checked = self._checked_for_forwarding(pending.label, value, "result", log_clean, pending.call_id)
         decision = checked.decision
         if not decision.allowed:
@@ -1943,6 +2136,59 @@ class Proxy:
         if decision.allowed:
             return {"jsonrpc": "2.0", "id": msg_id, member: checked.content}
         return _refusal_reply(pending.method, msg_id, decision.public_reason, pending.modern)
+
+    def _result_schema_refusal(self, pending: _PendingRequest, member: str, value: Any) -> Decision | None:
+        """Check a tool's result against its checked outputSchema (schema_checks.results); a refusal, or None.
+
+        Only a complete tools/call result is checked: its structuredContent
+        must be there when the tool declares an outputSchema, and match it
+        (schema_check.validate). A result that is not an object has none. An
+        error result (isError) need not have structuredContent, but what it
+        has is checked: marking a result as an error does not get it past the
+        schema. A tool that declares no outputSchema is not checked; one whose
+        schemas this session cannot vouch for (not listed, or too large to
+        keep) counts as a problem. "warn" reports and records a problem and
+        lets the result go on; "enforce" refuses it, a block that monitor mode
+        lifts. Checked as the server sent it, before the scan; the names in a
+        reason are left out when they hold a secret (_ShownNames).
+        """
+        if pending.method != "tools/call" or member != "result" or pending.tool is None:
+            return None
+        settings = self._firewall.policy.schema_checks_for(pending.tool)
+        if settings.results == "off":
+            return None
+        is_object = isinstance(value, dict)
+        if is_object and value.get("resultType", protocol.RESULT_COMPLETE) != protocol.RESULT_COMPLETE:
+            return None  # an input_required result asks for input; the retried call's result is checked
+        if is_object and value.get("isError") is True and "structuredContent" not in value:
+            return None  # an error with nothing structured in it: nothing to check
+        found, why = self._schemas.lookup(pending.tool) if self._schemas is not None else (None, "no schemas are kept")
+        shown = _ShownNames(self._firewall)
+        if found is None:
+            problems = [f"the result cannot be checked: {why}"]
+        elif not found.has_output:
+            return None
+        elif not is_object:
+            problems = ["the result is not an object, so it has no structuredContent, although the tool declares "
+                        "an output schema"]
+        elif "structuredContent" not in value:
+            problems = ["the result has no structuredContent, although the tool declares an output schema"]
+        else:
+            problems = schema_check.validate(value["structuredContent"], found.output, root="structuredContent",
+                                             names=shown)
+            if shown.hide_if_secret():
+                problems = schema_check.validate(value["structuredContent"], found.output, root="structuredContent",
+                                                 names=shown)
+        if not problems:
+            return None
+        if settings.results == "warn":
+            what = f"the result of '{printable(pending.tool, limit=80)}'"
+            self._schema_warning(pending.label, what, problems, "schema_result", pending.call_id, note=shown.note())
+            return None
+        reason = f"the result does not match the output schema of the tool: {'; '.join(problems)}{shown.note()}"
+        decision = self._firewall.block(pending.label, reason, event="result", public_reason=_SCHEMA_RESULT_REFUSAL,
+                                        rule=RULE_SCHEMA_RESULT, call_id=pending.call_id)
+        return None if decision.allowed else decision
 
     def _checked_for_forwarding(
         self, label: str, value: Any, event: str, log_clean: bool, call_id: str | None = None,
@@ -2128,6 +2374,53 @@ class Proxy:
         if dropped and self._first_report("icons", whose):
             self._report(f"dropped {len(dropped)} icon(s) of {whose}: {dropped[0]}")
 
+    def _clean_metadata(self, holder: Any, whose: str) -> None:
+        """Clean what a result (or the params of a message from the server) says about the server and links to.
+
+        * The server's own description in `_meta` (MCP 2026-07-28 puts
+          io.modelcontextprotocol/serverInfo into every result): its unsafe
+          icons and an unsafe websiteUrl are dropped (_clean_server_info).
+        * The icons of each resource_link in its content (a tool's result, or
+          the messages of a prompt or a sampling request).
+        Only those members change, in place, before the whole is scanned; a
+        client could fetch them as soon as it shows the reply. whose: for the
+        stderr line ("the server, in its reply to tools/call").
+        """
+        if not isinstance(holder, dict):
+            return
+        meta = holder.get("_meta")
+        server_info = meta.get(_SERVER_INFO_KEY) if isinstance(meta, dict) else None
+        if isinstance(server_info, dict):
+            self._clean_server_info(server_info, whose)
+        for block in _content_blocks(holder):
+            if block.get("type") == "resource_link" and "icons" in block:
+                self._clean_icons_of(block, f"a resource link (from {whose})")
+
+    def _clean_server_info(self, server_info: JsonObject, whose: str) -> None:
+        """Drop the unsafe icons of a serverInfo (an MCP Implementation), and its websiteUrl unless a public https address.
+
+        A client shows websiteUrl as the server's web site, as a link the user
+        may open, so it gets the check an elicitation's address gets
+        (mcp_protocol.public_https_problem): no javascript:, no local network.
+        """
+        if "icons" in server_info:
+            self._clean_icons_of(server_info, whose)
+        if "websiteUrl" not in server_info:
+            return
+        url = server_info["websiteUrl"]
+        if not isinstance(url, str):
+            problem: str | None = "is not text"
+        elif len(url) > MAX_WEBSITE_URL_CHARS:
+            problem = f"is longer than {MAX_WEBSITE_URL_CHARS} characters"
+        else:
+            problem = protocol.public_https_problem(url)
+        if problem is None:
+            return
+        del server_info["websiteUrl"]
+        if self._first_report("websiteUrl", whose):
+            shown = f": {printable(url, limit=60)}" if isinstance(url, str) else ""
+            self._report(f"dropped the websiteUrl of {whose}: it {problem}{shown}")
+
     def _name_collisions(self, items: list[Any], kind: str) -> tuple[dict[str, tuple[str, str, bool]], set[int]]:
         """Find the names of a list that collide: {name: (reason, audit event, whether monitor mode may lift it)},
         and the positions of entries that repeat an earlier one exactly, to be dropped.
@@ -2194,10 +2487,15 @@ class Proxy:
             decision, forwarded = checked.decision, checked.content
         if decision.allowed and pinned:
             decision = self._check_pin(kind, item, label)
+        if decision.allowed and kind == "tools":
+            decision = self._check_remote_refs(item, label)
         if decision.allowed:
             if kind == "tools":
                 # Annotations are pinned with the rest of the tool, and they can only add flow labels.
                 self._firewall.learn_annotations(item["name"], item.get("annotations"))
+                if self._schemas is not None:
+                    # The schemas as the server sent them: scanned, and compared with the pin, above.
+                    self._schemas.remember(item["name"], item)
             return None, forwarded
         if pinned:
             # Remember the name: the agent may already know it from an
@@ -2255,6 +2553,28 @@ class Proxy:
             return self._firewall.refuse(label, f"too many {kind} to keep track of",
                                          event=f"{_ENTRY_NAME[kind]}_pins_full", rule=RULE_QUARANTINE)
         return Decision(True, "the definition is unchanged or new")
+
+    def _check_remote_refs(self, tool: JsonObject, label: str) -> Decision:
+        """The verdict on a tool whose inputSchema or outputSchema refers outside itself (schema_check.remote_refs).
+
+        Such a reference ($ref to a web address or a file, a network $id or an
+        unusual $schema) brings in schema text nobody scanned if a client
+        follows it. The policy's schema_checks.remote_refs decides: "warn" (the
+        default) reports the tool once and keeps it; "quarantine" removes it
+        (rule schema.remote_refs, a block that monitor mode lifts).
+        """
+        found = schema_check.remote_refs(tool)
+        if not found:
+            return Decision(True, "the schemas refer to nothing outside themselves")
+        reason = f"its schema refers outside itself: {', '.join(found)}"
+        if self._firewall.policy.schema_checks_for(tool["name"]).remote_refs == "quarantine":
+            return self._firewall.block(label, reason, event="tool_remote_ref", rule=RULE_SCHEMA_REMOTE_REFS)
+        if self._first_report("remote_refs", tool["name"]):
+            self._firewall.note(label, f"{reason} (kept: schema_checks.remote_refs is warn)", event="tool_remote_ref")
+            self._report(f"the tool '{label}' has a schema that refers outside itself, which a client could fetch "
+                         f"unchecked: {', '.join(found)}; it is kept (schema_checks.remote_refs \"quarantine\" would "
+                         "remove it)", limit=1000)
+        return Decision(True, reason)
 
     def _save_pins(self) -> None:
         try:
@@ -2499,6 +2819,37 @@ def _say_nothing(message: str, limit: int = 300) -> None:
     """What `_warn` becomes for notices under --quiet."""
 
 
+def _containment_value(read: Callable[[str], int], text: str) -> int:
+    try:
+        return read(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _server_memory_mb(text: str) -> int:
+    """--server-memory-mb (containment.memory_mb)."""
+    return _containment_value(containment.memory_mb, text)
+
+
+def _server_processes(text: str) -> int:
+    """--server-processes (containment.processes)."""
+    return _containment_value(containment.processes, text)
+
+
+def _server_cpu_seconds(text: str) -> int:
+    """--server-cpu-seconds (containment.cpu_seconds)."""
+    return _containment_value(containment.cpu_seconds, text)
+
+
+def _containment_settings(args: argparse.Namespace) -> containment.Settings:
+    """What the containment options ask for (containment.Settings); each of them implies --contain."""
+    return containment.Settings(
+        contain=args.contain, memory_mb=args.server_memory_mb, processes=args.server_processes,
+        cpu_seconds=args.server_cpu_seconds, sandbox=args.sandbox, allow=tuple(args.sandbox_allow),
+        read=tuple(args.sandbox_read), network=args.sandbox_network,
+    )
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     # allow_abbrev=False: "--mon" is not --monitor, and "--polic weak.json" is not another --policy. A config
     # file is read by people and by `doctor`, and both must see the options the proxy really uses.
@@ -2553,6 +2904,34 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--approval-timeout", type=_approval_timeout, default=None, metavar="SECONDS",
                         help=f"refuse a call nobody answered within this time (default {DEFAULT_APPROVAL_TIMEOUT}, "
                              f"at most {MAX_APPROVAL_TIMEOUT})")
+    # Containing the server (containment.py). Each option below implies --contain; the proxy does not start
+    # when what they ask for cannot be set up.
+    parser.add_argument("--contain", action="store_true",
+                        help="end the server and the processes it starts with the proxy (Windows: a job object; "
+                             "Linux and macOS: its own process group, no core dumps, at most "
+                             f"{containment.SERVER_OPEN_FILES} open files). This cleans up after a server; it does "
+                             "not contain a hostile one, which can still read your files and have a process "
+                             "started outside the job or group (Windows: WMI, the Task Scheduler; elsewhere: "
+                             "setsid): see --sandbox")
+    parser.add_argument("--server-memory-mb", type=_server_memory_mb, default=None, metavar="MB",
+                        help="with --contain: at most this much memory for each of the server's processes (Windows: "
+                             "committed memory; elsewhere virtual memory, which Node reserves plenty of)")
+    parser.add_argument("--server-processes", type=_server_processes, default=None, metavar="N",
+                        help="with --contain, Windows only: at most N processes of the server's at once")
+    parser.add_argument("--server-cpu-seconds", type=_server_cpu_seconds, default=None, metavar="SECONDS",
+                        help="with --contain: at most this much CPU time for each of the server's processes")
+    parser.add_argument("--sandbox", choices=containment.SANDBOXES, default=None,
+                        help="also start the server in a sandbox that is installed already: bwrap (Linux: the file "
+                             "system read-only, the home folder empty but for --sandbox-allow and --sandbox-read, "
+                             "no network) or sandbox-exec (macOS: the credential folders and agent-sentinel's own "
+                             "hidden, no network)")
+    parser.add_argument("--sandbox-allow", type=_file_path, action="append", default=[], metavar="FOLDER",
+                        help="with --sandbox bwrap: a folder the server may read and write; repeat it for more")
+    parser.add_argument("--sandbox-read", type=_file_path, action="append", default=[], metavar="FOLDER",
+                        help="with --sandbox bwrap: a folder the server may read (where its program is, for "
+                             "example); repeat it for more")
+    parser.add_argument("--sandbox-network", action="store_true",
+                        help="with --sandbox: let the sandboxed server use the network")
     loudness = parser.add_mutually_exclusive_group()
     loudness.add_argument("--quiet", action="store_true",
                           help="print only errors (the server's own stderr is still passed on)")
@@ -2693,6 +3072,7 @@ def main(argv: list[str] | None = None) -> int:
     firewall.set_secret_environment(_guarded_values(policy.secrets_known_values_from_env, environment))
 
     approval_timeout = args.approval_timeout or DEFAULT_APPROVAL_TIMEOUT
+    contain = _containment_settings(args)
     start = proxy_report.Startup(
         version=__version__, name=args.name, policy_path=args.policy, policy=policy, audit_path=args.audit,
         pins_path=args.pins, pins_enabled=not args.no_pins, server_command=[executable, *command[1:]],
@@ -2700,6 +3080,7 @@ def main(argv: list[str] | None = None) -> int:
         approval_timeout=approval_timeout, approval_timeout_given=args.approval_timeout is not None,
         monitor=args.monitor, secret_warnings=firewall.secret_warnings(),
         audit_signed=firewall.audit_signed, audit_required=args.audit_required, audit_max_bytes=args.audit_max_bytes,
+        containment=containment.describe(contain) if contain.active else "",
     )
     for line in proxy_report.startup_lines(start):
         say(line, limit=1500)
@@ -2711,13 +3092,27 @@ def main(argv: list[str] | None = None) -> int:
         _warn("not starting: the audit log cannot be written, and --audit-required was given")
         return 2
     try:
+        # On Windows the proxy joins its job object here, before the server starts (containment.py).
+        contained = containment.prepare(contain, _resolve_executable, server_executable=executable,
+                                        control_files=[path for path in (args.policy, args.pins, args.audit) if path])
+    except containment.ContainmentError as exc:
+        _warn(f"cannot contain the server as asked, so it is not started: {exc}", limit=1000)
+        return 2
+    try:
         server = subprocess.Popen(
-            [executable, *command[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=environment,
+            contained.command([executable, *command[1:]]), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=environment, **contained.popen_options(),
         )
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:  # SubprocessError: the containment setup in the child failed
         _warn(f"cannot start server: {exc}")
         firewall.provenance(audit_chain.SESSION_END, "the server could not be started")
+        return 2
+    try:
+        contained.after_start(server)
+    except containment.ContainmentError as exc:
+        _warn(f"cannot contain the server as asked, so it was stopped: {exc}", limit=1000)
+        _stop(server, time.monotonic())
+        contained.sweep(server)
         return 2
     assert server.stdin is not None and server.stdout is not None and server.stderr is not None
     if args.monitor:
@@ -2766,6 +3161,7 @@ def main(argv: list[str] | None = None) -> int:
     server_relay.join(timeout=SHUTDOWN_GRACE_SECONDS)  # let it finish answering
     proxy.close_report()  # how many lines about traffic were left out, if any
     exit_code = _stop(server, deadline)
+    contained.sweep(server)  # with --contain: whatever the server started that is still running
     server_lines.flush()  # and how many of the server's stderr lines, if its relay has not said so yet
     firewall.provenance(audit_chain.SESSION_END, "the proxy stopped", {"server_exit_code": exit_code})
     return exit_code

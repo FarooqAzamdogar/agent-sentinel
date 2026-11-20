@@ -552,21 +552,25 @@ COVERAGE = (
              f"{NEWEST_LEGACY_VERSION}. The server's copy of the client's capabilities loses sampling, elicitation "
              "and roots when server_requests blocks their request, and always loses tasks. Reply: protocolVersion "
              "must be a legacy version the proxy knows (else refused); tasks removed from the server's "
-             "capabilities; serverInfo icons cleaned; instructions scanned with the metadata rules, pinned, and "
-             "removed if either fails; the whole reply scanned."),
+             "capabilities; serverInfo icons cleaned and an unsafe websiteUrl dropped; instructions scanned with "
+             "the metadata rules, pinned, and removed if either fails; the whole reply scanned."),
     Coverage("server/discover", "client", MODERN_ONLY, (FORWARDED, SCANNED),
              "Reply: supportedVersions cut down to the versions the proxy knows (none left: refused); tasks removed; "
-             "serverInfo icons cleaned; instructions checked as for initialize. The session becomes a 2026-07-28 one."),
+             "serverInfo icons cleaned and an unsafe websiteUrl dropped; instructions checked as for initialize. The "
+             "session becomes a 2026-07-28 one."),
     Coverage("tools/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
              "Each tool: unsafe icons dropped; its name checked (MCP naming rules with --tool-names, look-alikes, a "
              "name listed twice, characters the proxy cannot forward); scanned with the metadata rules, with the "
-             "policy's other tool names for shadowing; pinned. A tool that fails is removed and quarantined. Tools "
-             "the policy blocks outright are hidden (hide_blocked_tools). Calls wait while a tools/list reply is "
-             "being checked."),
+             "policy's other tool names for shadowing; pinned; a schema that refers outside itself ($ref to a web "
+             "address) reported, or the tool quarantined (schema_checks.remote_refs). A tool that fails is removed "
+             "and quarantined. Tools the policy blocks outright are hidden (hide_blocked_tools). Calls wait while a "
+             "tools/list reply is being checked."),
     Coverage("tools/call", "client", ALL_REVISIONS, (CHECKED,),
-             "Secret guard, tool rules, flow rules, rate limits; an ask goes to --approve-with or is refused. "
+             "The arguments against the tool's checked inputSchema (schema_checks.arguments, undeclared_args); then "
+             "secret guard, tool rules, flow rules, rate limits; an ask goes to --approve-with or is refused. "
              "Refused: a reserved name (resources/read, resources/subscribe, prompts/get), a task-augmented call "
-             "(params.task), a quarantined tool. Reply: resultType checked; scanned; secrets.in_results; flow marks."),
+             "(params.task), a quarantined tool. Reply: resultType checked; structuredContent against the "
+             "outputSchema (schema_checks.results); scanned; secrets.in_results; flow marks."),
     Coverage("resources/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
              "Each resource scanned and its icons cleaned; one whose URI has characters the proxy cannot forward is "
              "removed. Not pinned."),
@@ -623,7 +627,8 @@ COVERAGE = (
     Coverage("notifications from the server", "server", ALL_REVISIONS, (CHECKED, SCANNED),
              "Progress, log messages, list_changed, resources/updated, "
              "notifications/subscriptions/acknowledged and the rest: server_requests may block them (dropped); "
-             "scanned. notifications/cancelled also forgets the server request it cancels."),
+             "the serverInfo in params._meta cleaned as in a reply; scanned. notifications/cancelled also forgets "
+             "the server request it cancels."),
     Coverage("input_required result", "server", MODERN_ONLY, (CHECKED, SCANNED),
              "Only in reply to tools/call, prompts/get or resources/read of a request that named 2026-07-28. Each "
              "inputRequests entry (elicitation/create, sampling/createMessage, roots/list) passes server_requests, "
@@ -636,9 +641,10 @@ COVERAGE = (
     Coverage("error -32042 (URLElicitationRequiredError)", "server", "2025-11-25 and later", (CHECKED, SCANNED),
              "Each URL it lists is checked as for elicitation/create; then the error is scanned."),
     Coverage("any other reply", "server", ALL_REVISIONS, (SCANNED,),
-             "Must answer a request the proxy forwarded, else dropped. Rebuilt from its result or error; scanned; "
-             "secrets.in_results (block, or redact: a copy with the secrets replaced); cleaned of escape codes, "
-             "control, tag and bidi characters; the request's flow marks set."),
+             "Must answer a request the proxy forwarded, else dropped. Rebuilt from its result or error; the "
+             "serverInfo in _meta loses unsafe icons and an unsafe websiteUrl, and resource_link items in its content "
+             "unsafe icons; scanned; secrets.in_results (block, or redact: a copy with the secrets replaced); cleaned "
+             "of escape codes, control, tag and bidi characters; the request's flow marks set."),
     # ---- from the proxy itself ----
     Coverage("elicitation/create (approval question)", "proxy", "2025-06-18 and 2025-11-25", (SENT,),
              "With --approve-with elicitation, to a client that declared forms: one yes/no field. Its id is "

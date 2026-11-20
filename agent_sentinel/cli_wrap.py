@@ -9,7 +9,8 @@ Without a server command, wrap edits a client's configuration file (the
 clients that keep plain JSON: see clients.py). Each stdio server entry gets
 the proxy in front of it (see wrapping.py), with absolute --policy, --audit,
 --pins (one file per server) and --name, and a --pass-env for each name in
-its "env". Remote servers, entries already wrapped, and Claude Desktop
+its "env" (and --contain, with wrap --contain: see containment.py). Remote
+servers, entries already wrapped, and Claude Desktop
 Extensions are listed and left alone: none of them can be wrapped. In a
 project's configuration (cli_doctor.config_scope), a Python that imports
 agent_sentinel only without -I (a pip --user install) is not written in:
@@ -88,9 +89,9 @@ examples:
   agent-sentinel wrap --client codex --policy policy.json --name files -- npx -y some-mcp-server@1.2.3
 """
 USAGE = """agent-sentinel wrap --client NAME [--config FILE | --project] --policy POLICY [--audit FILE]
-                           [--pins-dir DIR] [--server NAME ...] [--monitor] [--apply]
+                           [--pins-dir DIR] [--server NAME ...] [--monitor] [--contain] [--apply]
        agent-sentinel wrap --client NAME --policy POLICY --name NAME [--audit FILE] [--pins-dir DIR]
-                           [--monitor] -- SERVER_COMMAND ..."""
+                           [--monitor] [--contain] -- SERVER_COMMAND ..."""
 TAKES_SERVER_COMMAND = True
 HIDDEN = "<value not shown>"
 
@@ -107,6 +108,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                         help="wrap only this server (repeat for more; default: every one)")
     parser.add_argument("--monitor", action="store_true",
                         help="start the proxies in monitor mode: log what would be blocked, block nothing")
+    parser.add_argument("--contain", action="store_true",
+                        help="start the proxies with --contain: each server, and the processes it starts, end with "
+                             "its proxy (cleanup, not isolation: it still runs as you and can read your files)")
     parser.add_argument("--name", metavar="NAME", help="with a server command after '--': the server's name")
     parser.add_argument("--apply", action="store_true",
                         help="write the change (after a backup); without it, only show it")
@@ -242,6 +246,7 @@ def _settings(args: argparse.Namespace, policy_path: str, python: PythonCheck) -
         pins_folder=full_path(args.pins_dir) if args.pins_dir else str(home.pins_folder(folder)),
         monitor=args.monitor,
         isolated=python.isolated,
+        contain=args.contain,
     )
 
 
@@ -334,6 +339,9 @@ def _print_header(config: ConfigFile, client: str, settings: ProxySettings, poli
               "folder.")
     if settings.monitor:
         print("Monitor mode: the proxies will log what they would block, and block NOTHING.")
+    if settings.contain:
+        print("Contained: each server, and the processes it starts, end with its proxy (--contain; cleanup, "
+              "not isolation).")
 
 
 def print_plan(plan: list[Step]) -> None:
