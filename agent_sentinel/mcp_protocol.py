@@ -563,7 +563,8 @@ COVERAGE = (
              "name listed twice, characters the proxy cannot forward); scanned with the metadata rules, with the "
              "policy's other tool names for shadowing; pinned. A tool that fails is removed and quarantined. Tools "
              "the policy blocks outright are hidden (hide_blocked_tools). Calls wait while a tools/list reply is "
-             "being checked. A page after the first (cursor) is also scanned with the end of the page before."),
+             "being checked. A page after the first (cursor) is also scanned with the end of the page before; a "
+             "nextCursor that is not a string refuses the reply (every list)."),
     Coverage("tools/call", "client", ALL_REVISIONS, (CHECKED,),
              "Secret guard, tool rules, flow rules (a tool no checked list or pin has shown counts as untrusted "
              "and a sink), rate limits; an ask goes to --approve-with or is refused. Refused: a reserved name "

@@ -262,7 +262,9 @@ from .session import (
     GROUP_NAME_RULE, JOINED, NEW_RUN, REPLACED, GroupJoin, GroupSessionStore, SessionStateError, group_name,
 )
 from .detector import METADATA, SEVERITY_ORDER, max_severity, scan_views
-from .textutil import UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable, text_views
+from .textutil import (
+    MAX_CONTAINERS, UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable, text_views,
+)
 
 # How long a tool call waits for an in-flight tools/list reply to be checked.
 TOOL_LIST_WAIT_SECONDS = 15
@@ -292,11 +294,11 @@ PAGE_BOUNDARY_BYTES = 4096
 # The text members kept at a boundary, on each side: the five a model reads first, then others (nested
 # ones too, such as "inputSchema/properties/q/description"), the first found nearest the boundary.
 MAX_BOUNDARY_MEMBERS = 16
-MAX_BOUNDARY_DEPTH = 12  # how deep into an entry text is looked for; deeper text is not kept
 MAX_BOUNDARY_PATH_CHARS = 128  # a member's path ("annotations/title") is cut to its last this many characters
 _MEMBER_OVERHEAD = 6  # what a kept value costs besides its path and its text: quotes, colon, comma, as in JSON
 _REPEATS_KEPT = 3  # as in textutil.text_views: a run of one text says nothing more after a few copies
-MAX_OPEN_CURSORS = 8  # cursor chains kept open at once, per list
+# Ends of pages kept at once, per list, by the cursor of the page after: the one used least recently goes first.
+MAX_OPEN_CURSORS = 8
 
 # limits.call_timeout_seconds applies to these requests: the ones the policy decides like a call.
 _TIMED_METHODS = ("tools/call", "resources/read", PROMPTS_GET)
@@ -566,10 +568,16 @@ def _digest(text: str) -> str:
 
 
 def _cursor_digest(message: JsonObject) -> str | None:
-    """The digest of the cursor a list request continues from, or None for the first page."""
+    """The digest of the cursor a list request continues from, or None for the first page.
+
+    Every string is a cursor, "" too, as every string nextCursor starts a
+    chain (_remember_page_end). A list reply whose nextCursor is not a
+    string is refused, so a cursor of another type was never handed out by
+    the server through this proxy.
+    """
     params = message.get("params")
     cursor = params.get("cursor") if isinstance(params, dict) else None
-    return _digest(cursor) if isinstance(cursor, str) and cursor else None
+    return _digest(cursor) if isinstance(cursor, str) else None
 
 
 # The members of a list entry a model reads first: the boundary scan always looks for them.
@@ -668,25 +676,31 @@ def _entry_texts(entry: Mapping[str, Any]) -> _KeptEntry:
     position in a list, as textutil.text_views groups texts:
     "inputSchema/properties/q/description", "arguments/*/name". A path longer
     than MAX_BOUNDARY_PATH_CHARS is cut to its end (two paths that are then
-    the same are read as one, which only joins more). Containers deeper than
-    MAX_BOUNDARY_DEPTH are not entered. Walked without recursion.
+    the same are read as one, which only joins more). Text at any depth is
+    read, as the whole-list scan reads it: the walk is iterative, so its cost
+    is linear in the entry, and like text_views it raises UnscannableError
+    past MAX_CONTAINERS objects and arrays (an entry that large was already
+    refused by its own scan).
     """
     texts: list[tuple[str, str]] = []
-    stack: list[tuple[Any, str, int]] = [(entry, "", 0)]
+    stack: list[tuple[Any, str]] = [(entry, "")]
+    opened = 0
     while stack:
-        value, path, depth = stack.pop()
+        value, path = stack.pop()
         if isinstance(value, str):
             if path:
                 texts.append((path, value))
-        elif depth < MAX_BOUNDARY_DEPTH:
-            # Pushed in reverse, so that they come out in document order; numbers and the like are left out.
-            if isinstance(value, dict):
-                stack.extend([(child, _member_path(path, key), depth + 1) for key, child in reversed(value.items())
-                              if isinstance(key, str) and isinstance(child, _TEXT_HOLDERS)])
-            elif isinstance(value, list):
-                inner = _member_path(path, "*")
-                stack.extend([(child, inner, depth + 1) for child in reversed(value)
-                              if isinstance(child, _TEXT_HOLDERS)])
+            continue
+        opened += 1
+        if opened > MAX_CONTAINERS:
+            raise UnscannableError("the list entry has too many nested parts to read")
+        # Pushed in reverse, so that they come out in document order; numbers and the like are left out.
+        if isinstance(value, dict):
+            stack.extend([(child, _member_path(path, key)) for key, child in reversed(value.items())
+                          if isinstance(key, str) and isinstance(child, _TEXT_HOLDERS)])
+        elif isinstance(value, list):
+            inner = _member_path(path, "*")
+            stack.extend([(child, inner) for child in reversed(value) if isinstance(child, _TEXT_HOLDERS)])
     return tuple(texts)
 
 
@@ -858,7 +872,8 @@ class Proxy:
         # one of them may produce cannot be read or subscribed to. Past MAX_QUARANTINED_TEMPLATES, none can.
         self._quarantined_templates: dict[str, tuple[str, ...] | None] = {}
         self._templates_overflowed = False
-        # The end of each page whose next page is awaited, by list and by a digest of the next page's cursor.
+        # The end of each page that gave a nextCursor, by list and by a digest of that cursor, least recently
+        # used first (at most MAX_OPEN_CURSORS per list).
         self._page_tails: dict[str, dict[str, _PageTail]] = {kind: {} for kind in _LIST_ITEMS_KEY.values()}
         # limits.call_timeout_seconds: (deadline, order, request id) of forwarded calls, soonest first, and the
         # thread that answers those whose time runs out (_watch_deadlines), while there are any.
@@ -2143,6 +2158,9 @@ class Proxy:
                     # Its tools could not be checked, so none of them can be vouched for.
                     self._set_tools_unverified(True)
                 return self._malformed_reply(pending, msg_id, "a list reply must hold a list")
+            if result.get("nextCursor") is not None and not isinstance(result["nextCursor"], str):
+                # MCP's cursors are strings, and the boundary scan follows a chain by the string the client echoes.
+                return self._malformed_reply(pending, msg_id, "the nextCursor of a list reply must be a string")
             if items_key in result:
                 result[items_key] = self._clean_items(result[items_key], items_key)
                 result[items_key] = self._checked_page_boundary(pending, items_key, result[items_key])
@@ -2753,8 +2771,9 @@ class Proxy:
         A list reply is scanned whole because a phrase can be split over two
         entries; the client joins the pages of a list into one, so a phrase
         can also be split over the end of one page and the start of the next.
-        While a cursor chain is open, the text nearest the end of the page
-        before (_remember_page_end) is scanned with the text nearest the start
+        When the request's cursor is the nextCursor of a page whose end is
+        kept, the text nearest the end of that page before
+        (_remember_page_end) is scanned with the text nearest the start
         of this page (_boundary_view: for each member, nested ones included,
         the nearest entries that have text in it, PAGE_BOUNDARY_BYTES of each
         side; this side always looks for the members the end kept) with the
@@ -2768,7 +2787,10 @@ class Proxy:
         if pending.cursor is None or not entries:
             return entries
         with self._state:
-            tail = self._page_tails[items_key].get(pending.cursor)
+            tails = self._page_tails[items_key]
+            tail = tails.pop(pending.cursor, None)
+            if tail is not None:
+                tails[pending.cursor] = tail  # just used: forgotten last
         if tail is None or not tail.texts:
             return entries
         ended_with = dict.fromkeys(key for entry in reversed(tail.texts) for key, _ in reversed(entry))
@@ -2844,16 +2866,21 @@ class Proxy:
         What is kept is the text the client was sent (the delivered reply):
         _boundary_view of the page, read from its end. The end of the page
         before is read on after it, so a member this page has too little text
-        in is filled from the pages before. A page that was refused, or that
-        has no nextCursor, closes its chain. At most MAX_OPEN_CURSORS chains
-        per list are kept; the oldest is forgotten first.
+        in is filled from the pages before. Every string nextCursor, "" too,
+        is followed (_cursor_digest); _checked_reply refuses any other.
+
+        The end of a page is kept when its next page arrives, too: a client
+        may ask for that page again (a retry, after a refused page, or two
+        requests at once), and each answer is scanned with the same end. At
+        most MAX_OPEN_CURSORS ends per list are kept; the one used least
+        recently is forgotten first.
         """
         result = delivered.get("result")
         entries = result.get(items_key) if isinstance(result, dict) else None
         next_cursor = result.get("nextCursor") if isinstance(result, dict) else None
         with self._state:
-            before = self._page_tails[items_key].pop(pending.cursor, None) if pending.cursor is not None else None
-        if not isinstance(entries, list) or not isinstance(next_cursor, str) or not next_cursor:
+            before = self._page_tails[items_key].get(pending.cursor) if pending.cursor is not None else None
+        if not isinstance(entries, list) or not isinstance(next_cursor, str):
             return
         # Side by side: what to read of each entry, its name and its uriTemplate ("" when it has none).
         texts: list[Any] = list(before.texts) if before is not None else []
@@ -2871,7 +2898,9 @@ class Proxy:
                          tuple(templates[index] for index, _ in kept))
         with self._state:
             tails = self._page_tails[items_key]
-            tails[_digest(next_cursor)] = tail
+            key = _digest(next_cursor)
+            tails.pop(key, None)  # stored again as the newest
+            tails[key] = tail
             while len(tails) > MAX_OPEN_CURSORS:
                 del tails[next(iter(tails))]
 
