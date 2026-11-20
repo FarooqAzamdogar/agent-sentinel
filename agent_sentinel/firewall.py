@@ -576,6 +576,24 @@ class Firewall:
         """
         return self._secrets_in_call(None, value)
 
+    def holds_a_secret(self, value: Any) -> bool:
+        """Whether a person who reads the texts in `value` might read a secret there, even one split between two.
+
+        For a caller that puts texts it did not write into a line for the
+        operator or the log: the proxy's schema checks pass the property names
+        a reason would show. Everything the log's redaction replaces is looked
+        for, whatever secrets.in_arguments says: the built-in and custom
+        formats, the known values and the canaries. Keys and strings are read
+        as a call's arguments are, one per line and joined end to end, so a
+        secret split over two names is seen, which redacting each name alone
+        would miss. A value too deeply nested to read counts as holding one.
+        """
+        try:
+            spellings = _call_spellings(None, value)
+        except UnscannableError:
+            return True
+        return bool(self._secret_guard().find_in_texts(spellings, redaction_only=True))
+
     def secret_warnings(self) -> list[str]:
         """Why some secrets.known_values_from_env values are not guarded: for the operator, at startup.
 

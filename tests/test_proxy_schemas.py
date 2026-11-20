@@ -53,6 +53,19 @@ def read_audit(path):
     return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
 
 
+def blocks_in(value):
+    """Every object inside a JSON value, in document order."""
+    found, stack = [], [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            found.append(item)
+            stack.extend(reversed(list(item.values())))
+        elif isinstance(item, list):
+            stack.extend(reversed(item))
+    return found
+
+
 class SchemaTest(unittest.TestCase):
     def proxy(self, policy, monitor=False, **options):
         tmp = tempfile.TemporaryDirectory()
@@ -163,6 +176,62 @@ class TheArguments(SchemaTest):
         h.from_client(call(3, "count_words", {"path": "a"}))
         self.assertEqual(h.sent_to_server(), [])
 
+    def test_a_tool_left_out_of_a_later_list_keeps_the_schema_it_was_checked_with(self):
+        # PB2-4: the store forgets no tool. A tool that a later list leaves out (a server may page its list,
+        # or change it) is still checked against the schema of its latest listing, and may be called; only a
+        # tool the list's checks removed is refused, and that is the quarantine's doing.
+        h = self.proxy({"schema_checks": {"arguments": "enforce", "undeclared_args": "block"}})
+        self.listed(h, COUNT_TOOL, PLAIN_TOOL)
+        self.listed(h, PLAIN_TOOL)
+        h.from_client(call(1, "count_words", {"path": "a"}))
+        self.assertEqual(len(h.sent_to_server()), 1)
+        h.from_client(call(2, "count_words", {"path": "a", "limit": 99}))
+        self.assertEqual(h.sent_to_server(), [])
+        (record,) = self.records(action="block")
+        self.assertIn("the arguments.limit is above the maximum (10)", record["reason"])
+
+    def test_a_secret_used_as_an_argument_name_is_shown_neither_on_stderr_nor_in_the_log(self):
+        # PB2-1: the schema check runs before the secret guard, and its reason names arguments. stderr goes to
+        # the client's log unredacted; the audit log redacts each string alone, which misses a split secret.
+        tool = {"name": "t", "description": "Take x", "inputSchema": {
+            "type": "object", "properties": {"x": {"type": "string"}}, "additionalProperties": False}}
+        halves = ("ghp_Z9y8X7w6V5u4T3s2", "R1q0P1o2N3m4L5k6J7i8")
+        # Whole; after 50 characters, where shortening a name to 60 would have cut it in half; split over two.
+        for checks in ({"undeclared_args": "block"}, {"arguments": "enforce"}, {"arguments": "warn"}):
+            for arguments in ({SECRET: "v"}, {"k" * 50 + SECRET: "v"}, {halves[0]: 1, halves[1]: 2}):
+                with self.subTest(checks=checks, arguments=sorted(arguments)):
+                    h = self.proxy({"schema_checks": checks})
+                    self.listed(h, tool)
+                    h.from_client(call(1, "t", arguments))
+                    shown = h.warnings.getvalue() + self.audit.read_text(encoding="utf-8")
+                    for piece in (SECRET, *halves, "ghp_Z9y8"):
+                        self.assertNotIn(piece, shown)
+                    if "warn" not in checks.values():  # refused before the secret guard saw the call
+                        self.assertNotIn("contains what looks like a secret", shown)
+                    self.assertIn("[name not shown]", shown)
+                    self.assertIn("names are not shown: they hold what looks like a secret", shown)
+        # Split over the members of one object: its name, repeated in every problem's path, is read once.
+        nested = {"name": "n", "description": "Take options", "inputSchema": {"type": "object", "properties": {
+            "opt-in": {"type": "object", "properties": {}, "additionalProperties": False}}}}
+        h = self.proxy({"schema_checks": {"arguments": "enforce"}})
+        self.listed(h, nested)
+        h.from_client(call(1, "n", {"opt-in": {halves[0]: 1, halves[1]: 2}}))
+        shown = h.warnings.getvalue() + self.audit.read_text(encoding="utf-8")
+        self.assertIn("the arguments.[name not shown] has a property the schema does not allow", shown)
+        self.assertNotIn(halves[1], shown)
+        # The firewall reads the names whatever secrets.in_arguments says: they go to a log either way.
+        lenient = Firewall(Policy.from_dict({"default": "allow", "secrets": {"in_arguments": "allow"}}))
+        self.assertTrue(lenient.holds_a_secret([SECRET]))
+        self.assertTrue(lenient.holds_a_secret(list(halves)))
+        self.assertFalse(lenient.holds_a_secret(["path", "limit", "ghp_short"]))
+        # Names without a secret are shown, as before, even when a value holds one (values are never shown).
+        h = self.proxy({"schema_checks": {"undeclared_args": "block"}})
+        self.listed(h, tool)
+        h.from_client(call(1, "t", {"mode": SECRET}))
+        self.assertIn("the argument 'mode' is not declared", h.warnings.getvalue())
+        self.assertNotIn("not shown", h.warnings.getvalue())
+        self.assertNotIn(SECRET, h.warnings.getvalue() + self.audit.read_text(encoding="utf-8"))
+
 
 class TheResults(SchemaTest):
     def call_and_answer(self, h, msg_id, result, tool="count_words"):
@@ -244,6 +313,24 @@ class TheResults(SchemaTest):
         (record,) = self.records(action="block", rule="schema.result")
         self.assertIn("too large to check", record["reason"])
 
+    def test_a_secret_used_as_a_property_name_of_a_result_is_never_shown(self):
+        # PB2-1: the results check runs before the scanner, and its reason names properties.
+        tool = {"name": "t", "description": "Give", "inputSchema": {"type": "object"},
+                "outputSchema": {"type": "object", "properties": {"n": {"type": "integer"}},
+                                 "additionalProperties": False}}
+        key = "AKIA" + "Q3EGRZ7XK4MJP2LB"
+        for mode in ("enforce", "warn"):
+            # Whole; after 50 characters, where shortening a name to 60 would have cut the key in half; split.
+            for content in ({key: 1}, {"n": 1, "x" * 50 + " " + key: 1}, {"AKIA": 1, "Q3EGRZ7XK4MJP2LB": 2}):
+                with self.subTest(mode=mode, content=sorted(content)):
+                    h = self.proxy({"schema_checks": {"results": mode}})
+                    self.listed(h, tool)
+                    self.call_and_answer(h, 1, {"content": [], "structuredContent": content}, tool="t")
+                    shown = h.warnings.getvalue() + self.audit.read_text(encoding="utf-8")
+                    self.assertNotIn("AKIA", shown)
+                    self.assertNotIn("Q3EG", shown)
+                    self.assertIn("[name not shown]", shown)
+
 
 class RemoteReferencesInSchemas(SchemaTest):
     def test_by_default_a_remote_reference_is_reported_once_and_the_tool_kept(self):
@@ -267,6 +354,17 @@ class RemoteReferencesInSchemas(SchemaTest):
         h = self.proxy({"tools": {"fetch_*": {"action": "allow", "schema_checks": {"remote_refs": "quarantine"}}}})
         other = dict(REMOTE_TOOL, name="lookup")
         self.assertEqual([tool["name"] for tool in self.listed(h, REMOTE_TOOL, other)], ["lookup"])
+
+    def test_a_schema_keyword_that_is_not_text_does_not_lose_the_list(self):
+        # PB2-2: "$schema": [] raised TypeError in every proxy, and the client got an internal error instead of
+        # the whole list, good tools included.
+        odd = {"name": "odd", "description": "Odd", "inputSchema": {"type": "object", "$schema": []},
+               "outputSchema": {"type": "object", "$schema": {"x": 1}}}
+        for policy in ({}, {"schema_checks": {"remote_refs": "quarantine", "arguments": "enforce"}}):
+            with self.subTest(policy=policy):
+                h = self.proxy(policy)
+                self.assertEqual([tool["name"] for tool in self.listed(h, PLAIN_TOOL, odd)], ["say", "odd"])
+                self.assertNotIn("internal error", h.warnings.getvalue())
 
 
 class ServerMetadata(SchemaTest):
@@ -322,6 +420,23 @@ class ServerMetadata(SchemaTest):
         h.from_server(reply(2, {"messages": [{"role": "user", "content": dict(link, icons=BAD_ICONS)}]}))
         (prompt,) = h.sent_to_client()
         self.assertNotIn("icons", prompt["result"]["messages"][0]["content"])
+
+    def test_resource_link_icons_inside_a_sampling_tool_result_are_cleaned(self):
+        # PB2-3: a 2025-11-25 sampling message may hold a tool_result block whose own content is a list of
+        # blocks, resource links among them; they are cleaned at any depth.
+        h = self.proxy({"server_requests": {"sampling/createMessage": "allow"}})
+        link = {"type": "resource_link", "uri": "file:///a.txt", "name": "a", "icons": [*BAD_ICONS, GOOD_ICON]}
+        nested = {"type": "tool_result", "toolUseId": "u0", "content": [json.loads(json.dumps(link))]}
+        for depth in range(3):
+            nested = {"type": "tool_result", "toolUseId": f"u{depth + 1}",
+                      "content": [nested, json.loads(json.dumps(link))]}
+        h.from_server({"jsonrpc": "2.0", "id": "s1", "method": "sampling/createMessage", "params": {
+            "maxTokens": 10, "messages": [{"role": "user", "content": [nested]},
+                                          {"role": "user", "content": json.loads(json.dumps(link))}]}})
+        (forwarded,) = h.sent_to_client()
+        links = [block for block in blocks_in(forwarded) if block.get("type") == "resource_link"]
+        self.assertEqual(len(links), 5)
+        self.assertEqual([block["icons"] for block in links], [[GOOD_ICON]] * 5)
 
     def test_messages_from_the_server_are_cleaned_too(self):
         h = self.proxy({})

@@ -67,6 +67,31 @@ class TheValidator(unittest.TestCase):
         self.assertTrue(problems)
         self.assertNotIn(SECRET, " ".join(problems))
 
+    def test_the_caller_decides_how_names_are_shown_and_gets_them_whole(self):
+        # PB2-1: a name may be a secret. `names` gets each name before it is shortened, so a long one that
+        # holds a secret can be hidden whole; it is asked only for a problem, never for a value that passes.
+        long_name = "k" * 30 + SECRET + "z" * 30
+        asked = []
+
+        def hidden(name):
+            asked.append(name)
+            return "[hidden]"
+
+        self.assertEqual(validate({"path": "a"}, self.SCHEMA, names=hidden), [])
+        self.assertEqual(asked, [])
+        problems = validate({"path": "a", long_name: 1, "nested": {SECRET: 2}}, self.SCHEMA, root="the arguments",
+                            names=hidden)
+        text = " ".join(problems)
+        self.assertIn("the arguments has a property the schema does not allow: '[hidden]'", text)
+        self.assertIn("the arguments.[hidden] has a property the schema does not allow: '[hidden]'", text)
+        self.assertNotIn("ghp_", text)
+        self.assertIn(long_name, asked)  # whole, not cut at 60 characters
+        self.assertIn(SECRET, asked)
+        required = validate({}, self.SCHEMA, names=lambda name: name.upper())
+        self.assertIn("missing the required property 'PATH'", " ".join(required))
+        path = validate({"tags": ["a", 2], "path": "a"}, self.SCHEMA, root="r", names=lambda name: f"<{name}>")
+        self.assertEqual(path, ["r.<tags>[1] is an integer, not string"])
+
     def test_json_equality_tells_true_from_one(self):
         self.assertTrue(validate(1, {"enum": [True]}))
         self.assertTrue(validate(True, {"const": 1}))
@@ -212,6 +237,17 @@ class RemoteReferences(unittest.TestCase):
         later = {"inputSchema": {"$schema": "http://json-schema.org/draft-07/schema#",
                                  "default": {"id": "https://example.com/items/1"}}}
         self.assertEqual(remote_refs(later), [])  # "id" is only data there
+
+    def test_a_schema_keyword_that_is_not_text_is_read_without_error(self):
+        # PB2-2: "$schema": [] at the top made remote_refs raise TypeError (unhashable), which lost the whole list.
+        for meta in ([], {}, ["http://json-schema.org/draft-04/schema#"], {"a": 1}, 4, None, True):
+            for key in ("inputSchema", "outputSchema"):
+                tool = {"inputSchema": {"type": "object"}, key: {"type": "object", "$schema": meta,
+                                                                 "id": "https://evil.example/x.json"}}
+                with self.subTest(meta=meta, key=key):
+                    self.assertEqual(remote_refs(tool), [])  # not text: names no draft, and "id" is only data
+        nested = {"inputSchema": {"$schema": [], "properties": {"a": {"$ref": "https://x.example/a"}}}}
+        self.assertEqual(remote_refs(nested), ['$ref "https://x.example/a"'])
 
     def test_a_schema_too_large_to_look_through_is_reported_quickly(self):
         schema = {"items": [{"a": [{}] * 10} for _ in range(20_000)]}

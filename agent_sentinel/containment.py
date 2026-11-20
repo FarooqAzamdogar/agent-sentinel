@@ -303,7 +303,29 @@ def _sandbox_path_problem(path: str, homes: Sequence[str]) -> str | None:
             for credential in CREDENTIAL_PATHS:
                 place = posixpath.join(home, credential)
                 if _within(shown, place) or (_within(place, shown) and os.path.lexists(place)):
-                    return f"would show {place}, a place where credentials are kept"
+                    return (f"would show {place}, a place where credentials are kept (a server installed there, "
+                            "such as an editor extension's or a Claude Code plugin's, cannot be sandboxed)")
+    return None
+
+
+def _credential_program_problem(program: str, homes: Sequence[str],
+                                real: Callable[[str], str] = os.path.realpath) -> str | None:
+    """Why the server's program cannot run in either sandbox because it lies in a credential place, or None.
+
+    Both sandboxes hide CREDENTIAL_PATHS, which include the MCP clients' own
+    folders (~/.claude, ~/.vscode, ~/.cursor ...), where editor extensions
+    and Claude Code plugins install their servers. Such a server could not be
+    read inside the sandbox, and showing its folder would show the
+    credentials beside it, so the proxy says so before it starts anything.
+    """
+    for one in dict.fromkeys((posixpath.normpath(program), real(program))):
+        for home in homes:
+            for credential in CREDENTIAL_PATHS:
+                place = posixpath.join(home, credential)
+                if _within(one, place):
+                    return (f"the server's program {one} is inside {place}, a place where credentials are kept, "
+                            "which the sandbox never shows; a server installed there cannot be sandboxed (use "
+                            "--contain alone, or install the server elsewhere)")
     return None
 
 
@@ -569,6 +591,10 @@ def _sandbox_prefix(settings: Settings, find: Callable[[str], str | None], contr
         raise ContainmentError("the home folder is / or unknown, so the sandbox could not hide it")
     agent_home = _agent_home()
     files = [os.path.realpath(name) for name in control_files if name]
+    if server_executable is not None:
+        problem = _credential_program_problem(server_executable, homes)
+        if problem is not None:
+            raise ContainmentError(problem)
     if settings.sandbox == "sandbox-exec":
         return [SANDBOX_EXEC, "-p", sandbox_exec_profile(settings, homes, agent_home, files)]
     problem = _writable_problem(settings.allow, [*files, agent_home])

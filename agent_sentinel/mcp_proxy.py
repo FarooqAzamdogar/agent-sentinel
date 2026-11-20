@@ -253,10 +253,11 @@ from .policy import (
     RULE_UNSCANNABLE,
     Policy,
     PolicyError,
+    SchemaChecks,
 )
 from .policy_errors import file_error_message, type_name
 from .session import SessionStateError
-from .textutil import UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable
+from .textutil import MAX_CONTAINERS, UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable
 
 # How long a tool call waits for an in-flight tools/list reply to be checked.
 TOOL_LIST_WAIT_SECONDS = 15
@@ -340,6 +341,9 @@ _UNCHECKED_CONTENT = "the content could not be checked, so it was withheld"
 # A call or result refused by schema_checks. Neither says which part failed: the audit record does.
 _SCHEMA_ARGUMENTS_REFUSAL = "the arguments do not match the tool's input schema"
 _SCHEMA_RESULT_REFUSAL = "the server sent a result that does not match the tool's output schema"
+# A property name a schema problem leaves out, and why (_ShownNames).
+_NAME_NOT_SHOWN = "[name not shown]"
+_NAMES_NOT_SHOWN = " (names are not shown: they hold what looks like a secret)"
 # What a refused server is told: nothing about why.
 _SERVER_REFUSAL = "request refused"
 
@@ -512,21 +516,31 @@ def _request_description(message: JsonObject) -> str:
 
 
 def _content_blocks(holder: JsonObject) -> Iterable[JsonObject]:
-    """The content blocks of a result or a message's params: its `content`, and that of each of its `messages`.
+    """The content blocks of a result or a message's params: its `content`, that of each of its `messages`, and theirs.
 
     A tool's result holds a list of blocks; a prompt's messages (prompts/get)
     and a sampling request's messages each hold one block, or a list of them.
-    Anything that is not an object is skipped.
+    A block may hold blocks of its own: a sampling message's tool_result
+    (2025-11-25) has a `content` list like a tool's result. So the `content`
+    of every block is walked too, at any depth, whatever the block's type.
+    Anything that is not an object is skipped. The walk is iterative and
+    stops after textutil.MAX_CONTAINERS blocks: a message with more parts
+    than that is refused by the scan that follows.
     """
     holders = [holder]
     messages = holder.get("messages")
     if isinstance(messages, list):
         holders += [message for message in messages if isinstance(message, dict)]
-    for one in holders:
-        content = one.get("content")
+    pending: list[Any] = [one.get("content") for one in reversed(holders)]
+    seen = 0
+    while pending and seen < MAX_CONTAINERS:
+        content = pending.pop()
         for block in content if isinstance(content, list) else [content]:
             if isinstance(block, dict):
+                seen += 1
                 yield block
+                if "content" in block:
+                    pending.append(block["content"])
 
 
 def _reply_description(pending: _PendingRequest) -> str:
@@ -534,6 +548,47 @@ def _reply_description(pending: _PendingRequest) -> str:
     if pending.label != pending.method:
         return f"the reply to {pending.method} '{printable(pending.label, limit=MAX_LABEL_CHARS)}'"
     return f"the reply to {pending.method}"
+
+
+class _ShownNames:
+    """How the problems of a schema check show property names: of a call's arguments, or a result's structuredContent.
+
+    A schema check runs before the secret guard and the scanner, and its
+    reason names properties ("the argument 'x' is not declared"). The reason
+    goes to stderr, which the client keeps in its log and which is not
+    redacted, and to the audit log, which redacts each string alone and so
+    misses a secret split over two names, or cut in half when a long name is
+    shortened. So the problems are made twice when they name anything: first
+    with every name as it is, which records the names (`asked`); then, if
+    the policy's guard finds a secret in those names, each alone or joined
+    (Firewall.holds_a_secret), again with no name shown (`hide_if_secret`).
+    The names are read once each, in the order first asked for, so that the
+    path a parent's name repeats in every problem does not come between two
+    halves of a secret split over its members. Only the names a reason would
+    show are read, never the whole value, and a value without problems costs
+    nothing more.
+    """
+
+    def __init__(self, firewall: Firewall) -> None:
+        self._firewall = firewall
+        self.asked: dict[str, None] = {}  # bounded: names are asked for only for the few problems reported
+        self.hidden = False
+
+    def __call__(self, name: str) -> str:
+        if self.hidden:
+            return _NAME_NOT_SHOWN
+        self.asked.setdefault(name)
+        return name
+
+    def hide_if_secret(self) -> bool:
+        """Whether the names asked for so far hold a secret; if so, no name is shown from now on."""
+        if not self.hidden and self.asked and self._firewall.holds_a_secret(list(self.asked)):
+            self.hidden = True
+        return self.hidden
+
+    def note(self) -> str:
+        """What to add to a reason: why its names are missing, or nothing."""
+        return _NAMES_NOT_SHOWN if self.hidden else ""
 
 
 # ---- names that look alike ----------------------------------------------------
@@ -1166,45 +1221,59 @@ class Proxy:
         its pin; a tool with none (not listed, or too large to keep) cannot be
         checked, which counts as a problem. Run before the policy, so that a
         call that could never be made is not held for a person's approval.
-        A refusal is a block that monitor mode lifts.
+        A refusal is a block that monitor mode lifts. The names in a reason
+        are left out when they hold a secret (_ShownNames).
         """
         settings = self._firewall.policy.schema_checks_for(name)
-        blocks_undeclared = settings.undeclared_args == "block"
-        if settings.arguments == "off" and not blocks_undeclared:
+        if settings.arguments == "off" and settings.undeclared_args != "block":
             return None
-        blocking: list[str] = []
-        warned: list[str] = []
-        found, why = self._schemas.lookup(name) if self._schemas is not None else (None, "no schemas are kept")
-        if found is None:
-            problem = f"the arguments cannot be checked: {why}"
-            (blocking if settings.arguments == "enforce" or blocks_undeclared else warned).append(problem)
-        else:
-            schema = found.input if isinstance(found.input, dict) else {}
-            if blocks_undeclared:
-                declared = schema.get("properties")
-                declared = declared if isinstance(declared, dict) else {}
-                undeclared = [argument for argument in arguments if argument not in declared]
-                blocking += [f"the argument '{printable(argument, limit=60)}' is not declared in the input schema"
-                             for argument in undeclared[:schema_check.MAX_PROBLEMS]]
-            if settings.arguments != "off":
-                problems = schema_check.validate(arguments, schema, root="the arguments")
-                (blocking if settings.arguments == "enforce" else warned).extend(problems)
+        shown = _ShownNames(self._firewall)
+        blocking, warned = self._argument_problems(name, arguments, settings, shown)
+        if shown.hide_if_secret():
+            blocking, warned = self._argument_problems(name, arguments, settings, shown)
         label = _label(name)
         if warned:
-            self._schema_warning(label, f"the arguments of '{printable(name, limit=80)}'", warned, "schema_arguments")
+            self._schema_warning(label, f"the arguments of '{printable(name, limit=80)}'", warned, "schema_arguments",
+                                 note=shown.note())
         if not blocking:
             return None
-        reason = f"the arguments do not match the input schema of the tool: {'; '.join(blocking[:5])}"
+        reason = f"the arguments do not match the input schema of the tool: {'; '.join(blocking[:5])}{shown.note()}"
         decision = self._firewall.block(label, reason, event="call", public_reason=_SCHEMA_ARGUMENTS_REFUSAL,
                                         rule=RULE_SCHEMA_ARGUMENTS)
         if decision.allowed:  # monitor mode
             return None
         return self._refused(message, decision)
 
+    def _argument_problems(self, name: str, arguments: JsonObject, settings: SchemaChecks,
+                           shown: _ShownNames) -> tuple[list[str], list[str]]:
+        """The problems of a call's arguments under the tool's schema_checks: (those that block, those only reported)."""
+        blocks_undeclared = settings.undeclared_args == "block"
+        blocking: list[str] = []
+        warned: list[str] = []
+        found, why = self._schemas.lookup(name) if self._schemas is not None else (None, "no schemas are kept")
+        if found is None:
+            problem = f"the arguments cannot be checked: {why}"
+            (blocking if settings.arguments == "enforce" or blocks_undeclared else warned).append(problem)
+            return blocking, warned
+        schema = found.input if isinstance(found.input, dict) else {}
+        if blocks_undeclared:
+            declared = schema.get("properties")
+            declared = declared if isinstance(declared, dict) else {}
+            undeclared = [argument for argument in arguments if argument not in declared]
+            blocking += [f"the argument '{printable(shown(argument), limit=60)}' is not declared in the input schema"
+                         for argument in undeclared[:schema_check.MAX_PROBLEMS]]
+        if settings.arguments != "off":
+            problems = schema_check.validate(arguments, schema, root="the arguments", names=shown)
+            (blocking if settings.arguments == "enforce" else warned).extend(problems)
+        return blocking, warned
+
     def _schema_warning(self, label: str, what: str, problems: list[str], event: str,
-                        call_id: str | None = None) -> None:
-        """Record and report what schema_checks "warn" found: an audit note, and a stderr line once per kind."""
-        reason = f"schema_checks warn: {what}: {'; '.join(problems)}"
+                        call_id: str | None = None, note: str = "") -> None:
+        """Record and report what schema_checks "warn" found: an audit note, and a stderr line once per kind.
+
+        note: added to the reason (_ShownNames.note: why names are missing).
+        """
+        reason = f"schema_checks warn: {what}: {'; '.join(problems)}{note}"
         self._firewall.note(label, reason, event=event, call_id=call_id)
         if self._first_report("schema", event, label, problems[0]):
             self._report(reason, limit=1000)
@@ -2020,7 +2089,8 @@ class Proxy:
         schemas this session cannot vouch for (not listed, or too large to
         keep) counts as a problem. "warn" reports and records a problem and
         lets the result go on; "enforce" refuses it, a block that monitor mode
-        lifts. Checked as the server sent it, before the scan.
+        lifts. Checked as the server sent it, before the scan; the names in a
+        reason are left out when they hold a secret (_ShownNames).
         """
         if pending.method != "tools/call" or member != "result" or pending.tool is None:
             return None
@@ -2033,6 +2103,7 @@ class Proxy:
         if is_object and value.get("isError") is True and "structuredContent" not in value:
             return None  # an error with nothing structured in it: nothing to check
         found, why = self._schemas.lookup(pending.tool) if self._schemas is not None else (None, "no schemas are kept")
+        shown = _ShownNames(self._firewall)
         if found is None:
             problems = [f"the result cannot be checked: {why}"]
         elif not found.has_output:
@@ -2043,14 +2114,18 @@ class Proxy:
         elif "structuredContent" not in value:
             problems = ["the result has no structuredContent, although the tool declares an output schema"]
         else:
-            problems = schema_check.validate(value["structuredContent"], found.output, root="structuredContent")
+            problems = schema_check.validate(value["structuredContent"], found.output, root="structuredContent",
+                                             names=shown)
+            if shown.hide_if_secret():
+                problems = schema_check.validate(value["structuredContent"], found.output, root="structuredContent",
+                                                 names=shown)
         if not problems:
             return None
         if settings.results == "warn":
             what = f"the result of '{printable(pending.tool, limit=80)}'"
-            self._schema_warning(pending.label, what, problems, "schema_result", pending.call_id)
+            self._schema_warning(pending.label, what, problems, "schema_result", pending.call_id, note=shown.note())
             return None
-        reason = f"the result does not match the output schema of the tool: {'; '.join(problems)}"
+        reason = f"the result does not match the output schema of the tool: {'; '.join(problems)}{shown.note()}"
         decision = self._firewall.block(pending.label, reason, event="result", public_reason=_SCHEMA_RESULT_REFUSAL,
                                         rule=RULE_SCHEMA_RESULT, call_id=pending.call_id)
         return None if decision.allowed else decision

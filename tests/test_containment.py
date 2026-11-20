@@ -125,6 +125,9 @@ class WhetherItCanWorkHere(unittest.TestCase):
             self.assertIn("whole home folder", problem("/"))
             self.assertIn("credentials", problem(os.path.join(home, ".ssh")))
             self.assertIn("credentials", problem(os.path.join(home, ".config")))
+            # PB2-5: a plugin's or extension's server lives in the client's own folder, which stays hidden.
+            os.makedirs(os.path.join(home, ".claude", "plugins", "p"))
+            self.assertIn("cannot be sandboxed", problem(os.path.join(home, ".claude", "plugins", "p")))
             self.assertIn("does not exist", problem(os.path.join(home, "nope")))
             self.assertIn("not a full path", problem("work"))
             # PB-5: a folder may not show the host's sockets again.
@@ -223,6 +226,30 @@ class TheSandboxesWords(unittest.TestCase):
         self.assertIn("inside /run", problem("/run/current-system/sw/bin/node"))
         self.assertIsNone(problem("/run/current-system/sw/bin/node", read=("/run/current-system/sw/bin",)))
         self.assertIn("inside /tmp", problem("/tmp/server/run"))
+
+    def test_a_server_installed_in_a_credential_place_cannot_be_sandboxed(self):
+        # PB2-5: editor extensions and Claude Code plugins install their servers in ~/.vscode, ~/.cursor and
+        # ~/.claude, which both sandboxes hide (PROXY-8); the proxy says so before anything starts.
+        homes = ["/home/me"]
+        for program in ("/home/me/.claude/plugins/p/server", "/home/me/.vscode/extensions/e/bin/srv",
+                        "/home/me/.cursor/extensions/e/srv", "/home/me/.ssh/run"):
+            with self.subTest(program=program):
+                problem = containment._credential_program_problem(program, homes, real=same)
+                self.assertIn("a place where credentials are kept", problem)
+                self.assertIn("cannot be sandboxed", problem)
+        for program in ("/usr/bin/node", "/home/me/.nvm/bin/node", "/home/me/.claudette/srv"):
+            with self.subTest(program=program):
+                self.assertIsNone(containment._credential_program_problem(program, homes, real=same))
+        linked = containment._credential_program_problem("/usr/local/bin/srv", homes,
+                                                          real=lambda path: "/home/me/.claude/plugins/p/srv")
+        self.assertIn("inside /home/me/.claude,", linked)
+        with mock.patch.object(containment, "_homes", return_value=homes), \
+                mock.patch.object(containment, "_agent_home", return_value="/home/me/.agent-sentinel"):
+            for sandbox in ("bwrap", "sandbox-exec"):
+                with self.subTest(sandbox=sandbox), self.assertRaises(ContainmentError) as caught:
+                    containment._sandbox_prefix(Settings(sandbox=sandbox), found, [],
+                                                "/home/me/.claude/plugins/p/server")
+                self.assertIn("cannot be sandboxed", str(caught.exception))
 
     def test_a_folder_the_server_may_write_may_not_hold_the_proxys_own_files(self):
         # PB-7: whether the file exists yet or not, and the agent-sentinel home too.

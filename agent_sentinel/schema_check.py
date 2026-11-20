@@ -37,7 +37,8 @@ the value (a long "type" list, comparing objects key by key) is paid for
 from the same budget each time, so that a server's schema cannot make every
 part of a large value slow. Problems are described without the values they
 are about, since a value may be a secret; the names on their path are made
-printable.
+printable, and a caller may hide them too (validate's `names`), since a name
+may be a secret as well.
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ import json
 import re
 import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .textutil import printable
 
@@ -114,7 +115,9 @@ def remote_refs(tool: Any) -> list[str]:
     for key in ("inputSchema", "outputSchema"):
         schema = tool.get(key)
         if isinstance(schema, (dict, list)):
-            old_ids = isinstance(schema, dict) and schema.get("$schema") in _ID_DRAFT_META_SCHEMAS
+            meta = schema.get("$schema") if isinstance(schema, dict) else None
+            # Any JSON value may stand there, a list or an object too: only text can name a draft.
+            old_ids = isinstance(meta, str) and meta in _ID_DRAFT_META_SCHEMAS
             stack.append((schema, old_ids))
     nodes = 0
     while stack and len(found) < MAX_REFERENCES_REPORTED:
@@ -213,11 +216,24 @@ def _kind_of(value: Any) -> str:
     return "of an unknown kind"
 
 
-def _where(root: str, path: tuple[Any, ...]) -> str:
-    parts = [root]
-    for step in path:
-        parts.append(f"[{step}]" if isinstance(step, int) else f".{printable(step, limit=40)}")
-    return "".join(parts)
+class _Names:
+    """How the problems of one validation name the places in the value: the root, then the names on the path."""
+
+    def __init__(self, root: str, shown: Callable[[str], str] | None) -> None:
+        self.root = root
+        self._shown = shown
+
+    def name(self, name: Any, limit: int) -> str:
+        """A property name as a problem shows it: given to `shown` whole, then made printable and shortened."""
+        if self._shown is not None and isinstance(name, str):
+            name = self._shown(name)
+        return printable(name, limit=limit)
+
+    def where(self, path: tuple[Any, ...]) -> str:
+        parts = [self.root]
+        for step in path:
+            parts.append(f"[{step}]" if isinstance(step, int) else f".{self.name(step, 40)}")
+        return "".join(parts)
 
 
 def _shown_number(value: Any) -> str:
@@ -234,16 +250,21 @@ def _count(value: Any) -> int | None:
 
 
 def validate(value: Any, schema: Any, root: str = "the value", *, max_depth: int = MAX_DEPTH,
-             max_steps: int = MAX_STEPS) -> list[str]:
+             max_steps: int = MAX_STEPS, names: Callable[[str], str] | None = None) -> list[str]:
     """The problems of `value` against `schema` (see the module docstring for what is checked); empty when none.
 
-    root: how the top of the value is named in the problems ("the arguments",
-          "structuredContent"): "the arguments.count is above the maximum (10)".
+    root:  how the top of the value is named in the problems ("the arguments",
+           "structuredContent"): "the arguments.count is above the maximum (10)".
+    names: how a property name is shown in a problem. It is given the whole
+           name, before the name is made printable and shortened, and only
+           when a problem is reported, so it may hide a name that holds a
+           secret (the proxy's does). By default the name itself.
     At most MAX_PROBLEMS problems are returned. A value too large or too
     deeply nested to check is a problem too: what cannot be checked does not pass.
     """
     problems: list[str] = []
     budget = [max_steps]
+    named = _Names(root, names)
     stack: list[tuple[Any, Any, tuple[Any, ...]]] = [(value, schema, ())]
     try:
         while stack and len(problems) < MAX_PROBLEMS:
@@ -251,24 +272,24 @@ def validate(value: Any, schema: Any, root: str = "the value", *, max_depth: int
             budget[0] -= 1
             if budget[0] < 0:
                 raise _TooLarge
-            stack.extend(_check_one(item, part, path, root, problems, budget, max_depth))
+            stack.extend(_check_one(item, part, path, named, problems, budget, max_depth))
     except _TooLarge:
         problems.append(f"{root} is too large to check against the schema (more than {max_steps} checks)")
     return problems[:MAX_PROBLEMS]
 
 
-def _check_one(value: Any, schema: Any, path: tuple[Any, ...], root: str, problems: list[str], budget: list[int],
-               max_depth: int) -> list[tuple[Any, Any, tuple[Any, ...]]]:
+def _check_one(value: Any, schema: Any, path: tuple[Any, ...], named: _Names, problems: list[str],
+               budget: list[int], max_depth: int) -> list[tuple[Any, Any, tuple[Any, ...]]]:
     """Check one value against one part of the schema; return the (value, schema, path) of its parts to check next."""
     if schema is False:
-        problems.append(f"{_where(root, path)} is not allowed by the schema")
+        problems.append(f"{named.where(path)} is not allowed by the schema")
         return []
     if not isinstance(schema, dict):
         return []  # true, or not a schema at all: anything is accepted
     if len(path) > max_depth:
         # One lookup per keyword, never a walk over the schema's keys: a schema may have very many.
         if any(keyword in schema for keyword in KEYWORDS):
-            problems.append(f"{_where(root, path)} is nested more than {max_depth} levels deep, too deep to check")
+            problems.append(f"{named.where(path)} is nested more than {max_depth} levels deep, too deep to check")
         return []
     problem = _type_problem(value, schema, budget) or _value_problem(value, schema, budget)
     if problem is None:
@@ -279,10 +300,10 @@ def _check_one(value: Any, schema: Any, path: tuple[Any, ...], root: str, proble
         elif isinstance(value, list):
             problem = _length_problem(len(value), schema, "minItems", "maxItems", "items")
     if problem is not None:
-        problems.append(f"{_where(root, path)} {problem}")
+        problems.append(f"{named.where(path)} {problem}")
         return []
     if isinstance(value, dict):
-        return _object_parts(value, schema, path, root, problems, budget)
+        return _object_parts(value, schema, path, named, problems, budget)
     if isinstance(value, list):
         items = schema.get("items")
         if isinstance(items, (dict, bool)) and value:
@@ -348,7 +369,7 @@ def _length_problem(length: int, schema: dict[str, Any], low: str, high: str, un
     return None
 
 
-def _object_parts(value: dict[Any, Any], schema: dict[str, Any], path: tuple[Any, ...], root: str,
+def _object_parts(value: dict[Any, Any], schema: dict[str, Any], path: tuple[Any, ...], named: _Names,
                   problems: list[str], budget: list[int]) -> list[tuple[Any, Any, tuple[Any, ...]]]:
     """required, properties and additionalProperties of an object; return its members to check next."""
     required = schema.get("required")
@@ -358,7 +379,7 @@ def _object_parts(value: dict[Any, Any], schema: dict[str, Any], path: tuple[Any
             raise _TooLarge
         for name in required:
             if isinstance(name, str) and name not in value and len(problems) < MAX_PROBLEMS:
-                problems.append(f"{_where(root, path)} is missing the required property '{printable(name, limit=60)}'")
+                problems.append(f"{named.where(path)} is missing the required property '{named.name(name, 60)}'")
     properties = schema.get("properties")
     properties = properties if isinstance(properties, dict) else {}
     # The patterns decide which properties are additional, and the validator does not run them.
@@ -371,8 +392,8 @@ def _object_parts(value: dict[Any, Any], schema: dict[str, Any], path: tuple[Any
             parts.append((member, properties[name], (*path, name)))
         elif extra is False:
             if len(problems) < MAX_PROBLEMS:
-                problems.append(f"{_where(root, path)} has a property the schema does not allow: "
-                                f"'{printable(name, limit=60)}'")
+                problems.append(f"{named.where(path)} has a property the schema does not allow: "
+                                f"'{named.name(name, 60)}'")
         elif isinstance(extra, dict):
             parts.append((member, extra, (*path, name)))
     return parts
