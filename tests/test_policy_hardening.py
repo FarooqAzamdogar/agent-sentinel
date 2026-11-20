@@ -290,8 +290,11 @@ class AgentConfigurationIsWriteProtected(unittest.TestCase):
                      "$env:openai_base_url = 'x'", "${env:NODE_OPTIONS} = 'x'", '{"env": {"anthropic_base_url": "x"}}',
                      '{"node_options": "--require x"}', "Set-Item env:NODE_OPTIONS '--require x'",
                      "Set-Item -Path Env:\\node_options -Value x",
-                     "[Environment]::SetEnvironmentVariable('node_options', 'x', 'User')"):
-            with self.subTest(text=text):
+                     "[Environment]::SetEnvironmentVariable('node_options', 'x', 'User')",
+                     # PowerShell reads the typographic quotes as quotes.
+                     "[Environment]::SetEnvironmentVariable(\u2018NODE_OPTIONS\u2019, 'x', 'User')",
+                     "setx \u201cOPENAI_BASE_URL\u201d x", "\u201cANTHROPIC_BASE_URL\u201d: \u201chttp://x\u201d"):
+            with self.subTest(text=ascii(text)):
                 self.assertTrue(pattern.search(text))
         for text in ("api_base_url = os.environ['X']", "echo $ANTHROPIC_BASE_URL", "read NODE_OPTIONS docs",
                      "the disableAllHooks setting", "MY_BASE_URLS: x", "self.api_base_url = url",

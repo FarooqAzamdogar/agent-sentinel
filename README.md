@@ -271,7 +271,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
   "deny_args": [
     {
       "arg": "*",
-      "pattern": "(^|[\\s\\\\/:@='\\\"`<>|;&(,{])\\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\\b|id_(rsa|dsa|ecdsa|ed25519)|(^|[\\s\\\\/:@='\\\"`<>|;&(,{])(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]|(^|[\\s\\\\/:@='\\\"`<>|;&(,{])(\\.config|config~[0-9]+)[\\\\/](gh|gcloud|github-copilot)\\b|(^|[\\\\/])proc[\\\\/][^\\\\/]+[\\\\/]environ\\b|claude_desktop_config\\.json|(^|[\\s\\\\/:@='\\\"`<>|;&(,{])\\.claude\\.json\\b|(^|[\\s\\\\/:@='\\\"`<>|;&(,{])\\.(cursor|vscode)[\\\\/]mcp\\.json\\b|[\\\\/]code[\\\\/]user[\\\\/]mcp\\.json\\b"
+      "pattern": "(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])\\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\\b|id_(rsa|dsa|ecdsa|ed25519)|(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]|(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])(\\.config|config~[0-9]+)[\\\\/](gh|gcloud|github-copilot)\\b|(^|[\\\\/])proc[\\\\/][^\\\\/]+[\\\\/]environ\\b|claude_desktop_config\\.json|(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])\\.claude\\.json\\b|(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])\\.(cursor|vscode)[\\\\/]mcp\\.json\\b|[\\\\/]code[\\\\/]user[\\\\/]mcp\\.json\\b"
     },
     { "arg": "*", "contains": ".agent-sentinel" },
     { "arg": "*", "pattern": "(^|[\\\\/:])agent-~[0-9]" }
@@ -315,7 +315,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
         },
         {
           "arg": "*",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"']?(\\w*_base_url|node_options)\\b",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b",
           "action": "ask"
         }
       ]
@@ -343,7 +343,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
         },
         {
           "arg": "*",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"']?(\\w*_base_url|node_options)\\b",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b",
           "action": "ask"
         }
       ]
@@ -371,7 +371,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
         },
         {
           "arg": "*",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"']?(\\w*_base_url|node_options)\\b",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b",
           "action": "ask"
         }
       ]
@@ -399,7 +399,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
         },
         {
           "arg": "*",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"']?(\\w*_base_url|node_options)\\b",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b",
           "action": "ask"
         }
       ]
@@ -410,7 +410,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
       "deny_args": [
         {
           "arg": "command",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"']?(\\w*_base_url|node_options)\\b",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b",
           "action": "ask"
         }
       ],
@@ -426,7 +426,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
       "deny_args": [
         {
           "arg": "command",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"']?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"']?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"']?(\\w*_base_url|node_options)\\b",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b",
           "action": "ask"
         }
       ],

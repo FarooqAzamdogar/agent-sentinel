@@ -33,8 +33,12 @@ from typing import Any
 # What may come right before a credential file's name: the start of the text,
 # a path separator or a drive's ":", but also a space or a character a shell or
 # a command line puts there. So "cat .env", "curl -d @.env", "--env-file=.env"
-# and "Get-Content .env" match, as well as "~/.ssh/id_rsa".
-_NAME_START = r"(^|[\s\\/:@='\"`<>|;&(,{])"
+# and "Get-Content .env" match, as well as "~/.ssh/id_rsa". The typographic
+# quotes ‘ to „ are there because PowerShell reads them as quotes
+# (Get-Content ‘.env’).
+_NAME_START = r"(^|[\s\\/:@='\"`<>|;&(,{\u2018-\u201e])"
+# The quotes a setting's name may stand in: ' and ", and the typographic ones PowerShell also reads as quotes.
+_QUOTE = r"[\"'\u2018-\u201e]"
 
 # The credential preset of policy.example.json (a test keeps the two the same).
 CREDENTIAL_PATTERN = (
@@ -115,11 +119,11 @@ _ANY_CASE_SETTING = r"\w*_base_url|node_options"
 CONTROL_SETTING_PATTERN = (
     r"(?<![\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\w*_base_url|node_options"
     r"|chat\.tools\.(global\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)"
-    r"[\"']?\s*[:=]"
-    r"|\bsetx(\.exe)?\s+(/m\s+)?[\"']?(" + _ANY_CASE_SETTING + r")\b"
+    + _QUOTE + r"?\s*[:=]"
+    r"|\bsetx(\.exe)?\s+(/m\s+)?" + _QUOTE + r"?(" + _ANY_CASE_SETTING + r")\b"
     r"|\$\{?env:(" + _ANY_CASE_SETTING + r")\}?\s*\+?="
     r"|(?<![\w$:{])env:[\\/]?(" + _ANY_CASE_SETTING + r")\b"
-    r"|SetEnvironmentVariable\s*\(\s*[\"']?(" + _ANY_CASE_SETTING + r")\b"
+    r"|SetEnvironmentVariable\s*\(\s*" + _QUOTE + r"?(" + _ANY_CASE_SETTING + r")\b"
 )
 
 # A value that starts with "-" can be read as an option by a program the tool

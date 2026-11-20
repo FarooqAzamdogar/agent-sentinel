@@ -2,7 +2,7 @@
   "default": "block",
   "hide_blocked_tools": true,
   "deny_args": [
-    { "arg": "*", "pattern": "(^|[\\s\\\\/:@='\\\"`<>|;&(,{])\\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\\b|id_(rsa|dsa|ecdsa|ed25519)|(^|[\\s\\\\/:@='\\\"`<>|;&(,{])(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]|(^|[\\s\\\\/:@='\\\"`<>|;&(,{])(\\.config|config~[0-9]+)[\\\\/](gh|gcloud|github-copilot)\\b|(^|[\\\\/])proc[\\\\/][^\\\\/]+[\\\\/]environ\\b|claude_desktop_config\\.json|(^|[\\s\\\\/:@='\\\"`<>|;&(,{])\\.claude\\.json\\b|(^|[\\s\\\\/:@='\\\"`<>|;&(,{])\\.(cursor|vscode)[\\\\/]mcp\\.json\\b|[\\\\/]code[\\\\/]user[\\\\/]mcp\\.json\\b" }
+    { "arg": "*", "pattern": "(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])\\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\\b|id_(rsa|dsa|ecdsa|ed25519)|(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]|(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])(\\.config|config~[0-9]+)[\\\\/](gh|gcloud|github-copilot)\\b|(^|[\\\\/])proc[\\\\/][^\\\\/]+[\\\\/]environ\\b|claude_desktop_config\\.json|(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])\\.claude\\.json\\b|(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])\\.(cursor|vscode)[\\\\/]mcp\\.json\\b|[\\\\/]code[\\\\/]user[\\\\/]mcp\\.json\\b" }
   ],
   "tools": {
     "read_file": { "action": "allow", "labels": ["private"] },

