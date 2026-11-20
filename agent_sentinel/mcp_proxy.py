@@ -170,6 +170,19 @@ worked out when the call was let through), so a later call can be refused by
 a flow rule. Marks are set just before the reply is sent, and only for a
 reply that is sent; a reply that is blocked sets none. The labels implied by
 each listed tool's MCP annotations are passed to the firewall as well.
+
+The audit log
+-------------
+Every record is linked into the log's hash chain (audit_chain.py), and with
+--audit-key-file signed (HMAC-SHA256). Three session records say what
+wrote the records between them: session_start before the server is started
+(the version, the policy's SHA-256, monitor mode, the pins file's SHA-256, a
+hash of the server command with secrets masked, the OS user and the host),
+protocol once the handshake is done (the protocol version, the client's and
+the server's name and version; at most MAX_PROTOCOL_RECORDS), and
+session_end when the proxy stops. --audit-required refuses to start when
+the log cannot be written, and refuses what cannot be recorded afterwards;
+--audit-max-bytes rotates the log (FILE.1, FILE.2, ...; never deleted).
 """
 
 from __future__ import annotations
@@ -188,7 +201,7 @@ from dataclasses import dataclass, field
 from secrets import token_hex
 from typing import Any, BinaryIO, Callable, Iterable, Mapping, Sequence
 
-from . import __version__, elicitation, proxy_report
+from . import __version__, audit_chain, elicitation, proxy_report
 from . import mcp_protocol as protocol
 from . import server_env
 from .approvers import (
@@ -262,8 +275,12 @@ _RESERVED_TOOL_NAMES = (*_RESOURCE_METHODS, PROMPTS_GET)
 # The client requests the policy decides. Each must have an id: sent as a notification, it is refused.
 _POLICY_METHODS = ("tools/call", *_RESERVED_TOOL_NAMES, protocol.SUBSCRIPTIONS_LISTEN)
 COMPLETION_COMPLETE = "completion/complete"
-# Where 2026-07-28 puts the server's serverInfo (in the _meta of a server/discover result).
+# Where 2026-07-28 puts the server's serverInfo (in the _meta of a server/discover result), and the client's.
 _SERVER_INFO_KEY = "io.modelcontextprotocol/serverInfo"
+_CLIENT_INFO_KEY = "io.modelcontextprotocol/clientInfo"
+# "protocol" audit records per proxy: one per handshake, and a client that repeats it cannot fill the log.
+MAX_PROTOCOL_RECORDS = 16
+MAX_RECORDED_VERSIONS = 10
 
 # List methods and the result field that holds their items. Items are scanned
 # one by one, so a single poisoned entry does not take the whole list down.
@@ -611,6 +628,10 @@ class Proxy:
         # the client can be asked through an elicitation form. Guarded by `_state`.
         self._client_shows_forms = False
         self._negotiated_version: str | None = None
+        # For the "protocol" audit records: the client's name and version (audit_chain.peer_info),
+        # and how many such records were written. Guarded by `_state`.
+        self._client_info: dict[str, str] | None = None
+        self._protocol_records = 0
 
         # What the operator reads on stderr (proxy_report.py). `_warn` is looked up when a
         # line is written, so that output redirected or silenced around a call is respected.
@@ -961,7 +982,20 @@ class Proxy:
         except ShapeError as exc:
             return self._refuse_malformed_request(message, str(exc))
         self._note_era(method, version)
+        self._note_client_info(method, params)
         return None
+
+    def _note_client_info(self, method: str, params: Any) -> None:
+        """Keep the client's name and version from a handshake request, for the "protocol" audit record."""
+        if method not in (protocol.INITIALIZE, protocol.SERVER_DISCOVER) or not isinstance(params, dict):
+            return
+        meta = params.get("_meta")
+        info = audit_chain.peer_info(params.get("clientInfo")) or audit_chain.peer_info(
+            meta.get(_CLIENT_INFO_KEY) if isinstance(meta, dict) else None
+        )
+        if info is not None:
+            with self._state:
+                self._client_info = info
 
     def _note_era(self, method: str, version: str | None) -> None:
         with self._state:
@@ -1838,7 +1872,33 @@ class Proxy:
                 self._negotiated_version = result["protocolVersion"]
             elif pending.method == protocol.SERVER_DISCOVER and self._era is None:
                 self._era = _MODERN
+        self._record_protocol(pending.method, result)
         return None
+
+    def _record_protocol(self, method: str, result: JsonObject) -> None:
+        """Write the "protocol" audit record of a handshake the proxy let through (at most MAX_PROTOCOL_RECORDS)."""
+        with self._state:
+            if self._protocol_records >= MAX_PROTOCOL_RECORDS:
+                return
+            self._protocol_records += 1
+            client = self._client_info
+        details: dict[str, Any] = {"method": method}
+        if method == protocol.INITIALIZE:
+            details["protocol_version"] = printable(result.get("protocolVersion"), limit=40)
+            server = audit_chain.peer_info(result.get("serverInfo"))
+        else:
+            versions = result.get("supportedVersions")
+            if isinstance(versions, list):
+                details["supported_versions"] = [
+                    printable(version, limit=40) for version in versions[:MAX_RECORDED_VERSIONS]
+                ]
+            meta = result.get("_meta")
+            server = audit_chain.peer_info(meta.get(_SERVER_INFO_KEY) if isinstance(meta, dict) else None)
+        details["client_info"] = client
+        details["server_info"] = server
+        self._firewall.provenance(
+            audit_chain.PROTOCOL, f"the {method} handshake was let through", details
+        )
 
     def _malformed_reply(self, pending: _PendingRequest, msg_id: Any, reason: str) -> JsonObject:
         decision = self._firewall.refuse(
@@ -2396,6 +2456,14 @@ def _file_path(text: str) -> str:
     return os.path.expanduser(text)
 
 
+def _audit_max_bytes(text: str) -> int:
+    """--audit-max-bytes (audit_chain.parse_max_bytes)."""
+    try:
+        return audit_chain.parse_max_bytes(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def _server_name(text: str) -> str:
     if not SERVER_NAME.fullmatch(text):
         raise argparse.ArgumentTypeError("must be 1 to 64 letters, digits, '_', '-' or '.'")
@@ -2440,6 +2508,15 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy", type=_file_path, required=True, help="path to the policy JSON file")
     parser.add_argument("--audit", type=_file_path, default=None, help="path of the audit log (JSON lines)")
     parser.add_argument("--no-log-args", action="store_true", help="leave tool arguments out of the audit log")
+    parser.add_argument("--audit-key-file", type=_file_path, default=None, metavar="FILE",
+                        help="sign every audit record (HMAC-SHA256) with the key in FILE; on POSIX the file must be "
+                             "owner-only. Keep it where the agent's tools cannot read it")
+    parser.add_argument("--audit-required", action="store_true",
+                        help="do not start if the audit log cannot be written, and refuse every call whose record "
+                             "cannot be written")
+    parser.add_argument("--audit-max-bytes", type=_audit_max_bytes, default=None, metavar="BYTES",
+                        help="past about this size, move the audit log to FILE.1 (then FILE.2, ...) and start it "
+                             f"again, its chain continuing; nothing is deleted (at least {audit_chain.MIN_MAX_BYTES})")
     parser.add_argument("--name", type=_server_name, default=None, metavar="NAME",
                         help="a short name for the server (letters, digits, '_', '-', '.'; at most 64), written into "
                              "every audit record and at the start of every line the proxy prints")
@@ -2564,6 +2641,8 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("give the MCP server command after '--'")
+    if not args.audit and (args.audit_key_file or args.audit_required or args.audit_max_bytes is not None):
+        parser.error("--audit-key-file, --audit-required and --audit-max-bytes need --audit FILE")
     backends = [approver.describe() for approver in args.approve_with]
     for backend in backends:
         if backends.count(backend) > 1:
@@ -2600,9 +2679,15 @@ def main(argv: list[str] | None = None) -> int:
     if added is None:
         return 2
     environment = server_env.server_environment(os.environ, args.clean_env, args.pass_env, added)
-    firewall = Firewall(
-        policy, audit_path=args.audit, log_args=not args.no_log_args, monitor=args.monitor, server_name=args.name
-    )
+    try:
+        firewall = Firewall(
+            policy, audit_path=args.audit, log_args=not args.no_log_args, monitor=args.monitor, server_name=args.name,
+            audit_key_file=args.audit_key_file, audit_max_bytes=args.audit_max_bytes,
+            audit_required=args.audit_required,
+        )
+    except audit_chain.AuditKeyError as exc:  # its text never holds the key; the path is the operator's own
+        _warn(f"cannot use --audit-key-file {args.audit_key_file}: {exc}", limit=1000)
+        return 2
     # secrets.known_values_from_env guards the values the server is given (--clean-env, --pass-env, --env-file).
     firewall.set_secret_environment(_guarded_values(policy.secrets_known_values_from_env, environment))
 
@@ -2613,10 +2698,17 @@ def main(argv: list[str] | None = None) -> int:
         approvers=[(approver.describe(), approver.unavailable()) for approver in args.approve_with],
         approval_timeout=approval_timeout, approval_timeout_given=args.approval_timeout is not None,
         monitor=args.monitor, secret_warnings=firewall.secret_warnings(),
+        audit_signed=firewall.audit_signed, audit_required=args.audit_required, audit_max_bytes=args.audit_max_bytes,
     )
     for line in proxy_report.startup_lines(start):
         say(line, limit=1500)
     _report_server_environment(args, environment, added, say)
+    started = firewall.provenance(
+        audit_chain.SESSION_START, "the proxy started", _session_details(firewall, args, [executable, *command[1:]])
+    )
+    if not started and args.audit_required:
+        _warn("not starting: the audit log cannot be written, and --audit-required was given")
+        return 2
     try:
         server = subprocess.Popen(
             [executable, *command[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -2624,6 +2716,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except OSError as exc:
         _warn(f"cannot start server: {exc}")
+        firewall.provenance(audit_chain.SESSION_END, "the server could not be started")
         return 2
     assert server.stdin is not None and server.stdout is not None and server.stderr is not None
     if args.monitor:
@@ -2673,7 +2766,24 @@ def main(argv: list[str] | None = None) -> int:
     proxy.close_report()  # how many lines about traffic were left out, if any
     exit_code = _stop(server, deadline)
     server_lines.flush()  # and how many of the server's stderr lines, if its relay has not said so yet
+    firewall.provenance(audit_chain.SESSION_END, "the proxy stopped", {"server_exit_code": exit_code})
     return exit_code
+
+
+def _session_details(firewall: Firewall, args: argparse.Namespace, server_argv: list[str]) -> dict[str, Any]:
+    """What the session_start record says: what is running, under which policy, for whom (no secret, no path)."""
+    return {
+        "version": __version__,
+        "policy_sha256": firewall.policy_sha256,
+        "monitor": bool(args.monitor),
+        "pins_sha256": audit_chain.file_sha256(args.pins) if args.pins and not args.no_pins else None,
+        "server_program": printable(os.path.basename(server_argv[0]), limit=audit_chain.MAX_PROVENANCE_TEXT),
+        "server_argv_sha256": audit_chain.argv_sha256(server_argv, firewall.redact),
+        "signed": firewall.audit_signed,
+        "user": audit_chain.os_user(),
+        "host": audit_chain.host_name(),
+        "pid": os.getpid(),
+    }
 
 
 if __name__ == "__main__":

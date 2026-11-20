@@ -34,7 +34,7 @@ from pathlib import Path
 from unittest import mock
 
 from cli_support import run_cli
-from support import INJECTION, ROOT
+from support import INJECTION, ROOT, audit_records
 from agent_sentinel import (
     BlockedError, FileSessionStore, Firewall, MemorySessionStore, Policy, __version__, claude_sdk_hooks, guard,
 )
@@ -263,7 +263,7 @@ class EndToEndTest(unittest.TestCase):
         return ProxyProcess(self, proxy_args, server, server_args, extra_env)
 
     def records(self, audit):
-        return [json.loads(line) for line in Path(audit).read_text(encoding="utf-8").splitlines()]
+        return audit_records(Path(audit))
 
 
 # ---- the library ------------------------------------------------------------------------------------
@@ -391,7 +391,8 @@ class TheLibrary(EndToEndTest):
         records = self.records(self.audit)
         fields = {key for record in records for key in record}
         self.assertEqual(fields, {"time", "server", "session", "event", "tool", "call_id", "action", "rule",
-                                  "matched_arg", "ref", "reason", "args", "findings", "redacted"})
+                                  "matched_arg", "ref", "reason", "args", "findings", "redacted",
+                                  "seq", "prev", "hash"})  # the hash chain (audit_chain.py)
         self.assertEqual({record["action"] for record in records}, {"allow", "block", "ask", "note"})
         log = self.audit.read_text(encoding="utf-8")
         for secret in (TOKEN, "hunter2hunter2", internal):

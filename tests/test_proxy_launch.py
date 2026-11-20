@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import EXAMPLE_POLICY_PATH, ROOT
+from support import EXAMPLE_POLICY_PATH, ROOT, audit_records
 from test_proxy import call, request
 from agent_sentinel import server_env
 from agent_sentinel.server_env import (
@@ -229,7 +229,7 @@ class StartingTheProxy(unittest.TestCase):
         lines = [line for line in stderr.splitlines() if line]
         self.assertTrue(lines)
         self.assertTrue(all(line.startswith("agent-sentinel[files.v2]: ") for line in lines), stderr)
-        records = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines()]
+        records = audit_records(audit)
         self.assertEqual({record["server"] for record in records}, {"files.v2"})
 
     def test_without_a_name_the_lines_start_as_before(self):

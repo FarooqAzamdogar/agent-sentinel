@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .policy import (
+    RULE_AUDIT,
     RULE_CALLER,
     RULE_DEFAULT,
     RULE_HOOK_FAILED,
@@ -59,6 +60,7 @@ _FIXED_KINDS = {
     RULE_SESSION: "session",
     RULE_CALLER: "caller",
     RULE_HOOK_FAILED: "hook_failed",
+    RULE_AUDIT: "audit_required",
 }
 _INDEXED_KINDS = (
     (re.compile(rf"deny_args{_INDEX}"), "deny_global"),
@@ -71,7 +73,7 @@ _PART_KINDS = {"other_args": "other_args", "max_calls_per_minute": "limit_tool"}
 # policy. `suggest` never proposes to loosen them; `report` says so next to them.
 PROTECTIVE_KINDS = frozenset({
     "deny_global", "deny_tool", "secrets", "secrets_results", "canary", "known_value", "secret_pattern",
-    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "hook_failed",
+    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "hook_failed", "audit_required",
 })
 
 
@@ -324,6 +326,11 @@ _FIXED_HINTS = {
         "The Claude Code hook could not finish its checks, so it refused (the reason says why: often a policy "
         "that does not load, or a state folder that cannot be written). Fix that cause; no policy rule changes "
         "this."
+    ),
+    "audit_required": (
+        "The audit record could not be written, and the proxy or hook runs with --audit-required, which refuses "
+        "what it cannot record. Make the audit log writable again (disk space, permissions, its folder); no policy "
+        "rule changes this."
     ),
     "none": (
         "This record names no rule: it was written by agent-sentinel before 0.5, or edited. Its reason says what "

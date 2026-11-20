@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import INJECTION, POLICY
+from support import INJECTION, POLICY, audit_records
 from test_proxy import Harness, call, initialize, reply, request
 from agent_sentinel import Firewall, Policy, mcp_proxy
 from agent_sentinel import mcp_protocol as protocol
@@ -38,7 +38,7 @@ def names(entries):
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 class WithAnAuditLog(unittest.TestCase):

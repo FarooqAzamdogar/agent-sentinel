@@ -9,7 +9,9 @@ The summary has a table of tool calls (by tool, or by server), a table of the
 content checks (results, tool descriptions, ...), the most common reasons for
 blocks with a hint on how to fix each, and the last blocks. Filters choose
 which records count. --follow instead watches the log and prints one line
-for each new block, until Ctrl+C.
+for each new block, until Ctrl+C. A line at the top says whether the log's
+hash chain is intact (audit_chain.py; `audit verify` gives the detail), and
+the chain_start and session records are left out of the counts.
 
 The log is read line by line with a size limit (see auditlog.py), and every
 field from it is passed through `printable` before it is shown, in the JSON
@@ -26,8 +28,9 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from . import auditlog, fix_hints
+from .audit_chain import ChainChecker, ChainReport
 from .auditlog import BLOCK_ACTIONS, RECORD_ACTIONS, RecordFilter, field_text, text_of
-from .cli_common import EXIT_OK, CommandError, non_negative_int, print_field, shown_args
+from .cli_common import EXIT_OK, CommandError, non_negative_int, print_field, shown_args, shown_path
 from .textutil import printable
 
 HELP = "summarize an audit log (filters, top reasons with fixes, --follow, --format json)"
@@ -172,19 +175,36 @@ class Summary:
     has_ask: bool = False
     reasons: dict[str, _Reason] = field(default_factory=dict)
     blocked: deque = field(default_factory=deque)
+    meta: int = 0  # chain_start and session records: not counted in the tables (auditlog.META_EVENTS)
+    integrity: ChainReport | None = None
 
 
 def summarize(path: str, chosen: RecordFilter, by: str, last: int) -> Summary:
-    """Read the log once and count what the report shows. Memory stays bounded whatever the log holds."""
+    """Read the log once and count what the report shows, checking its hash chain in the same pass.
+
+    Memory stays bounded whatever the log holds. Only this file is read, not
+    the files a rotated log was moved to (FILE.1, ...): `audit verify` checks those.
+    """
     summary = Summary(path, chosen, by, blocked=deque(maxlen=last))
-    for record in auditlog.iter_records(path):
+    checker = ChainChecker()
+    checker.start_file()
+    for record in auditlog.iter_records(path, on_line=checker.add):
         if record is None:
             summary.unreadable += 1
+            continue
+        if auditlog.is_meta(record):
+            summary.meta += 1
             continue
         summary.total += 1
         if chosen.matches(record):
             _count(summary, record)
+    summary.integrity = checker.finish()
     return summary
+
+
+def integrity_line(path: str, report: ChainReport) -> str:
+    """The state of the log's hash chain in one line, for report and explain."""
+    return report.one_line(f"agent-sentinel audit verify {shown_path(path)}")
 
 
 def _action(record: dict[str, Any]) -> str:
@@ -253,6 +273,8 @@ def print_summary(summary: Summary, show_args: bool) -> None:
     # Said first and plainly: a line that cannot be read may be a record someone wanted hidden.
     if summary.unreadable:
         print(f"WARNING: {summary.unreadable} line(s) of the log could not be read and are not counted below.")
+    if summary.integrity is not None and summary.integrity.lines:
+        print(integrity_line(summary.path, summary.integrity))
     if not summary.total:
         print("The audit log has no readable records.")
         return
@@ -356,12 +378,25 @@ def _as_json(summary: Summary, show_args: bool) -> dict[str, Any]:
         "calls_by": summary.by,
         "calls": table(summary.calls),
         "content_checks": table(summary.checks),
+        "integrity": _integrity_json(summary),
         "top_reasons": [
             {"rule": printable(entry.rule, limit=200) if entry.rule else None, "reason": reason,
              "count": entry.count, "how_to_fix": hint}
             for entry, reason, hint in _top_reasons(summary)
         ],
         "blocked": blocked,
+    }
+
+
+def _integrity_json(summary: Summary) -> dict[str, Any] | None:
+    """The hash chain's state: intact, broken, unchained or empty, with the line `report` prints."""
+    report = summary.integrity
+    if report is None:
+        return None
+    return {
+        "state": report.state, "text": printable(integrity_line(summary.path, report), limit=1000),
+        "chained_records": report.chained, "first_seq": report.first_seq, "last_seq": report.last_seq,
+        "problems": report.problem_count, "chain_and_session_records": summary.meta,
     }
 
 

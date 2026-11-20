@@ -25,7 +25,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import ROOT
+from support import ROOT, audit_records
 from test_claude_hooks import HOOK_POLICY, HookTest, recorded
 from test_proxy import Harness, call, initialize, reply, request, text_result
 import agent_sentinel
@@ -52,7 +52,7 @@ def proxy_with(policy, **proxy_options):
 def records(harness):
     if not harness.audit.exists():
         return []
-    return [json.loads(line) for line in harness.audit.read_text(encoding="utf-8").splitlines()]
+    return audit_records(harness.audit)
 
 
 class ProxyTest(unittest.TestCase):

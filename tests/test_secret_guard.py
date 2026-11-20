@@ -5,7 +5,6 @@ Results are in test_results.py; the formats themselves in test_leaks.py.
 """
 
 import base64
-import json
 import os
 import tempfile
 import time
@@ -15,7 +14,7 @@ from unittest import mock
 from urllib.parse import quote
 
 import support  # noqa: F401  (sets up the import path)
-from support import INJECTION, without_ref
+from support import INJECTION, audit_records, without_ref
 from agent_sentinel import Firewall, Policy
 from agent_sentinel.firewall import MAX_JOINED_ARGUMENT_CHARS, shown_excerpt
 
@@ -38,7 +37,7 @@ def guarded(environ=None, audit=None, policy=None, **secrets):
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 class ArgumentsAreAlsoReadJoined(unittest.TestCase):

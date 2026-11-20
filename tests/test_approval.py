@@ -5,14 +5,13 @@ the answer arrives later, on another path. So check_call can hand back a
 pending decision, and finish_approval turns the answer into the final one.
 """
 
-import json
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import POLICY, without_ref
+from support import POLICY, audit_records, without_ref
 from agent_sentinel import Decision, Firewall, Policy
 from agent_sentinel import firewall as firewall_module
 from agent_sentinel.policy import NOT_PERMITTED
@@ -21,7 +20,7 @@ EMAIL = {"to": "a@example.com"}
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 class PendingDecisions(unittest.TestCase):

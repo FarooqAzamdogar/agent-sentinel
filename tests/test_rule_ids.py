@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import POLICY, without_ref
+from support import POLICY, audit_records, without_ref
 from test_proxy import Harness, call, reply, request, text_result
 from agent_sentinel import BlockedError, Decision, Firewall, Policy, fix_hints
 from agent_sentinel import policy as policy_module
@@ -26,7 +26,7 @@ TOKEN = "ghp_" + "a1B2c3D4e5" * 4
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 def rules(tools, **more):
@@ -266,8 +266,9 @@ class AuditRecords(unittest.TestCase):
         raw = self.audit.read_text(encoding="utf-8")
         self.assertNotIn("\x1b", raw)
         self.assertNotIn("‮", raw)
-        self.assertLess(len(raw), 1000)
-        self.assertTrue(json.loads(raw)["matched_arg"].startswith("evil"))
+        record_line = raw.splitlines()[-1]  # after the new log's chain_start
+        self.assertLess(len(record_line), 1000)
+        self.assertTrue(json.loads(record_line)["matched_arg"].startswith("evil"))
 
     def test_a_secret_in_an_argument_name_is_redacted_from_the_record(self):
         policy = Policy.from_dict({"tools": {"t": {"action": "allow", "other_args": "block"}},

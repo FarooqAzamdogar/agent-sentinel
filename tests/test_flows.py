@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from support import INJECTION, without_ref
+from support import INJECTION, audit_records, without_ref
 from test_proxy import Harness, call, request, text_result
 from agent_sentinel import BlockedError, Firewall, Policy, PolicyError
 from agent_sentinel.policy import NOT_PERMITTED, FlowRule, ToolRule
@@ -45,7 +45,7 @@ def load_error(data):
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 # ---- the policy file ----------------------------------------------------------------

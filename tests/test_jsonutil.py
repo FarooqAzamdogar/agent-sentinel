@@ -76,7 +76,8 @@ class TheAuditLogIsAlwaysJson(TempFolderTest):
         def refuse(name):
             raise ValueError(name)
 
-        (line,) = audit.read_text(encoding="utf-8").splitlines()
+        start, line = audit.read_text(encoding="utf-8").splitlines()  # the new log's chain_start, then the call
+        self.assertEqual(json.loads(start, parse_constant=refuse)["event"], "chain_start")
         record = json.loads(line, parse_constant=refuse)  # strict: NaN or Infinity would raise
         self.assertEqual(record["args"], "[arguments not logged: they hold NaN or Infinity, which JSON cannot hold]")
         self.assertEqual(record["tool"], "measure")

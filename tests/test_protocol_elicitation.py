@@ -13,7 +13,7 @@ import time
 import unittest
 from pathlib import Path
 
-from support import POLICY
+from support import POLICY, audit_records
 from test_proxy import Harness, call, request
 from test_protocol import input_required, modern_call
 from agent_sentinel import Firewall, Policy, PolicyError
@@ -42,7 +42,7 @@ def url_required_error(*urls):
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 # ---- forms ----------------------------------------------------------------------------------

@@ -8,7 +8,6 @@ look at what was sent; everything the threads print goes to a buffer of the test
 
 import contextlib
 import io
-import json
 import tempfile
 import threading
 import time
@@ -16,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import POLICY, without_ref
+from support import POLICY, audit_records, without_ref
 from test_proxy import Harness, call, initialize, reply, request, text_result
 from agent_sentinel import Firewall, Policy
 from agent_sentinel import mcp_proxy
@@ -36,7 +35,7 @@ def wait_until(condition, timeout=10.0):
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 class FakeApprover:

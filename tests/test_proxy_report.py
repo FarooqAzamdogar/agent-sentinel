@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import EXAMPLE_POLICY_PATH, INJECTION, POLICY, ROOT
+from support import EXAMPLE_POLICY_PATH, INJECTION, POLICY, ROOT, audit_records
 from test_approvers import write_program
 from test_proxy import Harness, call, reply, request, text_result
 from agent_sentinel import Firewall, Policy, __version__, mcp_proxy, proxy_report
@@ -138,7 +138,7 @@ class OneLinePerBlock(unittest.TestCase):
                 h.from_client(call(2, "read_file", {"path": "b"}))
             (refusal,) = h.sent_to_client()
             ref = refusal["result"]["content"][0]["text"][-9:-1]
-            records = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines()]
+            records = audit_records(audit)
         self.assertIn(f"too many requests are waiting for a reply [rule malformed, ref {ref}]", h.warnings.getvalue())
         self.assertEqual(records[-1]["ref"], ref)
 
@@ -340,7 +340,7 @@ class TheRealProxyReports(unittest.TestCase):
                                        [call(1, "delete_file", {"path": "x"})])
         ref = replies[1]["result"]["content"][0]["text"][-9:-1]
         self.assertIn(f"[rule tools.delete_*, ref {ref}]", stderr)
-        records = [json.loads(line) for line in Path(self.audit).read_text(encoding="utf-8").splitlines()]
+        records = audit_records(Path(self.audit))
         self.assertIn(ref, [record.get("ref") for record in records])
 
     def test_quiet_prints_nothing_when_nothing_goes_wrong(self):

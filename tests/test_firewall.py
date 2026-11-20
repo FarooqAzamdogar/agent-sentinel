@@ -7,12 +7,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import POLICY
+from support import POLICY, audit_records
 from agent_sentinel import BlockedError, Firewall, Policy
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 class CheckCall(unittest.TestCase):
@@ -119,8 +119,9 @@ class AuditLog(unittest.TestCase):
         raw = self.audit.read_text(encoding="utf-8")
         for bad in ("\x9b", "‮", " ", "\x7f", "\x85"):
             self.assertNotIn(bad, raw)
-        self.assertEqual(len(raw.splitlines()), 1)  # one record stays one line
-        self.assertEqual(json.loads(raw)["tool"], hostile)  # and nothing is lost
+        lines = raw.splitlines()
+        self.assertEqual(len(lines), 2)  # the new log's chain_start, then one record on one line
+        self.assertEqual(json.loads(lines[-1])["tool"], hostile)  # and nothing is lost
 
     def test_ordinary_non_english_text_stays_readable_in_the_file(self):
         Firewall(POLICY, audit_path=self.audit).check_call("read_file", {"path": "اردو.txt"})

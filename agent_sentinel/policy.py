@@ -44,6 +44,7 @@ Checks that are not written in the policy have the fixed names below (RULE_*).
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -98,6 +99,7 @@ RULE_QUARANTINE = "quarantine"  # a tool removed from the tool list, or one that
 RULE_CALLER = "caller"  # Firewall.block() called by the program that uses the firewall
 RULE_SESSION = "session"  # a result withheld because the session's marks could not be recorded (see session.py)
 RULE_HOOK_FAILED = "hook_failed"  # the Claude Code hook could not finish its checks (claude_hooks.py)
+RULE_AUDIT = "audit_required"  # the audit record could not be written, and audit_required refuses what is not recorded
 # Fixed ids for the parts of the secret guard, for code that wants to say which part refused
 # (RULE_SECRETS stays the id for the guard as a whole). A custom format is "secrets.patterns[<i>]".
 RULE_SECRETS_IN_RESULTS = "secrets.in_results"
@@ -412,6 +414,9 @@ class Policy:
     flows: tuple[FlowRule, ...] = ()
     classify_by_annotations: bool = True
     hide_blocked_tools: bool = False
+    # Not a field (no annotation): the SHA-256 of the file from_file read, for the audit
+    # records; None for a policy built in code or with from_dict.
+    source_sha256 = None
 
     def __post_init__(self) -> None:
         # A policy can also be built in code, without the loader. An action such
@@ -463,10 +468,15 @@ class Policy:
 
         A file that cannot be read raises OSError, as open() does;
         `policy_errors.file_error_message` words it for a person.
+
+        The policy remembers the SHA-256 of the file's bytes, in `source_sha256`,
+        so that each audit record can name the policy that decided it. A policy
+        built any other way has None there.
         """
         label = str(path)
         try:
-            text = Path(path).read_text(encoding="utf-8-sig")
+            raw = Path(path).read_bytes()
+            text = raw.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
             raise PolicyError(unicode_error_message(label, exc)) from exc
         try:
@@ -478,9 +488,11 @@ class Policy:
         except (ValueError, RecursionError) as exc:  # absurd nesting, a huge number, NaN or Infinity
             raise PolicyError(f"{label}: not valid JSON ({exc})") from exc
         try:
-            return cls.from_dict(data)
+            policy = cls.from_dict(data)
         except PolicyError as exc:
             raise PolicyError(f"{label}: {exc}") from exc
+        policy.source_sha256 = hashlib.sha256(raw).hexdigest()
+        return policy
 
     @classmethod
     def from_dict(cls, data: Any) -> "Policy":
@@ -777,6 +789,7 @@ class Policy:
             RULE_SESSION: "the session state of the flow rules could not be recorded, so the result was withheld",
             RULE_HOOK_FAILED: "the Claude Code hook could not finish its checks (a policy that does not load, or "
                               "session state that cannot be used), so it refused",
+            RULE_AUDIT: "the audit record could not be written, and --audit-required refuses what is not recorded",
         }
         if rule_id in fixed:
             return fixed[rule_id]

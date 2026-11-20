@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import EXAMPLE_POLICY_PATH, INJECTION, POLICY, ROOT
+from support import EXAMPLE_POLICY_PATH, INJECTION, POLICY, ROOT, audit_records
 from test_proxy import Harness, call, initialize, reply, request
 from agent_sentinel import Firewall, Policy
 from agent_sentinel import pins as pins_module
@@ -27,7 +27,7 @@ ICON = {"src": "https://icons.example.com/a.png", "mimeType": "image/png"}
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 def listed(h, msg_id, method, key, items):

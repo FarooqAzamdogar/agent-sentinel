@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import INJECTION, POLICY, ROOT
+from support import INJECTION, POLICY, ROOT, audit_records
 from test_proxy import Harness, ProxyEndToEndTests, call, reply, request, text_result
 from agent_sentinel import Firewall, Policy, mcp_proxy
 from agent_sentinel.mcp_proxy import ToolPins
@@ -23,7 +23,7 @@ SECRET_TOKEN = "ghp_" + "a1B2c3D4e5" * 4
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 class RepliesAreRebuilt(unittest.TestCase):

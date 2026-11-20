@@ -10,6 +10,7 @@ Module map:
     policy_errors.py  error messages that help fix a policy file
     session.py        what the agent has read this session, for flow rules (memory or file store)
     filelock.py       operating-system file locks (audit log, session files)
+    audit_chain.py    the audit log's hash chain: writing, rotation, checking (audit verify)
     firewall.py       combines the three and writes the audit log   (the public core)
     tool_guard.py     guard(): the firewall around a tool function
     textutil.py       helpers shared by the above

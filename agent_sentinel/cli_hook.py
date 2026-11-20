@@ -10,6 +10,11 @@
         shows the change to that file; with --apply as well, makes it, after a
         backup (config_file.py: the rest of the file is kept byte for byte).
 
+Both also take the audit options of the proxy: --audit-key-file FILE (sign
+every record), --audit-required (block a call whose record cannot be
+written) and --audit-max-bytes BYTES (rotate the log); install writes them
+into the hook entries.
+
 The hooks run this Python with absolute paths for the policy, the audit log
 and the state folder, in exec form (no shell), with "onFailure": "block" so
 that a hook that cannot start, crashes or times out blocks the call. That
@@ -33,7 +38,7 @@ import sys
 from pathlib import Path
 from typing import Any, TextIO
 
-from . import __version__, claude_hooks, home
+from . import __version__, audit_chain, claude_hooks, home
 from .claude_hooks import HookAnswer, HookSettings
 from .cli_common import EXIT_ERROR, EXIT_OK, INSTALL_COMMAND, CommandError, full_path, load_policy, shown_path
 from .cli_wrap import this_python
@@ -109,6 +114,21 @@ def _add_paths(parser: argparse.ArgumentParser) -> None:
                         help="the folder for each session's flow marks and rate-limit counts (default: hook-state "
                              "in the agent-sentinel home folder). Keep it out of the agent's reach")
     parser.add_argument("--no-log-args", action="store_true", help="leave tool inputs out of the audit log")
+    parser.add_argument("--audit-key-file", metavar="FILE",
+                        help="sign every audit record (HMAC-SHA256) with the key in FILE; on POSIX the file must be "
+                             "owner-only. Keep it where the agent's tools cannot read it")
+    parser.add_argument("--audit-required", action="store_true",
+                        help="block every call whose audit record cannot be written")
+    parser.add_argument("--audit-max-bytes", type=_audit_max_bytes, metavar="BYTES",
+                        help="past about this size, move the audit log to FILE.1 (then FILE.2, ...) and start it "
+                             "again, its chain continuing; nothing is deleted")
+
+
+def _audit_max_bytes(text: str) -> int:
+    try:
+        return audit_chain.parse_max_bytes(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def run(args: argparse.Namespace) -> int:
@@ -149,12 +169,17 @@ def _answer(args: argparse.Namespace) -> HookAnswer:
 
 
 def _hook_settings(args: argparse.Namespace) -> HookSettings:
+    if not args.audit and (args.audit_key_file or args.audit_required or args.audit_max_bytes is not None):
+        raise ValueError("--audit-key-file, --audit-required and --audit-max-bytes need --audit FILE")
     state_dir = args.state_dir or str(home.hook_state_folder(home.home_folder()))
     return HookSettings(
         policy=Path(os.path.abspath(args.policy)),
         audit=Path(os.path.abspath(args.audit)) if args.audit else None,
         state_dir=Path(os.path.abspath(state_dir)),
         log_args=not args.no_log_args,
+        audit_key_file=Path(full_path(args.audit_key_file)) if args.audit_key_file else None,
+        audit_required=bool(args.audit_required),
+        audit_max_bytes=args.audit_max_bytes,
     )
 
 
@@ -186,26 +211,49 @@ def install_claude_code(args: argparse.Namespace) -> int:
         if "${" in path:
             raise CommandError(f"the {what} path {printable(path, limit=200)} contains '${{', which Claude Code would "
                                "read as a placeholder; use a folder without it")
+    key_file = full_path(args.audit_key_file) if args.audit_key_file else None
+    if key_file is not None:
+        if "${" in key_file:
+            raise CommandError(f"the audit key file path {printable(key_file, limit=200)} contains '${{', which Claude "
+                               "Code would read as a placeholder; use a folder without it")
+        try:
+            audit_chain.read_key_file(key_file)  # the same checks the hook makes, so a bad key is found now
+        except audit_chain.AuditKeyError as exc:
+            raise CommandError(f"cannot use --audit-key-file {printable(key_file, limit=200)}: {exc}") from exc
     python = this_python()
     handler = hook_handler(os.path.abspath(sys.executable), python.isolated, policy_path, audit, state,
-                           log_args=not args.no_log_args)
+                           log_args=not args.no_log_args,
+                           audit_options=audit_options(key_file, args.audit_required, args.audit_max_bytes))
     hooks = hook_groups(handler, scan_all_results=args.scan_all_results)
     _print_header(policy_path, policy, audit, state, args.scan_all_results)
     if args.settings is None:
         _print_snippet(hooks, policy_path)
         _warn_about_python(handler["command"], python)
         return EXIT_OK
-    return _change_settings(Path(full_path(args.settings)), handler, args, python,
-                            {"policy": policy_path, "audit log": audit, "state folder": state})
+    files = {"policy": policy_path, "audit log": audit, "state folder": state}
+    if key_file is not None:
+        files["audit key file"] = key_file
+    return _change_settings(Path(full_path(args.settings)), handler, args, python, files)
 
 
-def hook_handler(python: str, isolated: bool, policy: str, audit: str, state: str, log_args: bool = True
-                 ) -> dict[str, Any]:
+def audit_options(key_file: str | None, required: bool, max_bytes: int | None) -> list[str]:
+    """The audit options of `hook claude-code`, as words for the hook entry (none when not used)."""
+    words = ["--audit-key-file", key_file] if key_file else []
+    if required:
+        words.append("--audit-required")
+    if max_bytes is not None:
+        words += ["--audit-max-bytes", str(max_bytes)]
+    return words
+
+
+def hook_handler(python: str, isolated: bool, policy: str, audit: str, state: str, log_args: bool = True,
+                 audit_options: list[str] | None = None) -> dict[str, Any]:
     """The hook entry that runs `agent-sentinel hook claude-code`: exec form, absolute paths, blocking on failure."""
     words = [*(ISOLATED_MODULE if isolated else PLAIN_MODULE), "hook", "claude-code",
              "--policy", policy, "--audit", audit, "--state-dir", state]
     if not log_args:
         words.append("--no-log-args")
+    words += audit_options or []
     return {"type": "command", "command": python, "args": words, "timeout": HOOK_TIMEOUT_SECONDS,
             "onFailure": "block"}
 

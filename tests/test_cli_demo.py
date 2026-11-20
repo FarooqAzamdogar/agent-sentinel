@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 from cli_support import TempFolderTest, run_cli
-from support import ROOT
+from support import ROOT, audit_records
 from agent_sentinel import Policy, demo_server
 from agent_sentinel.cli_common import CommandError
 from agent_sentinel.cli_demo import DEMO_POLICY, _ProxyProcess
@@ -48,7 +48,7 @@ class TheDemo(TempFolderTest):
         self.assertEqual(code, 0, err)
         self.assertEqual(sorted(path.name for path in kept.iterdir()), ["audit.jsonl", "policy.json"])
         Policy.from_file(kept / "policy.json")  # a policy the user can start from
-        records = [json.loads(line) for line in (kept / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
+        records = audit_records((kept / "audit.jsonl"))
         self.assertTrue(any(record.get("event") == "tool_description" for record in records))  # from the proxy
         self.assertTrue(any(record.get("tool") == "send_email" for record in records))  # from the library
         self.assertIn(f'kept at "{kept.resolve() / "policy.json"}"', out)  # the full path, ready to copy

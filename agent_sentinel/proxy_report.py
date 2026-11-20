@@ -113,6 +113,22 @@ class Startup:
     # environment holds them. When given, they replace the policy's own guess (known_value_warnings),
     # which can only look at the proxy's environment.
     secret_warnings: Sequence[str] | None = None
+    # --audit-key-file, --audit-required, --audit-max-bytes (shown after the audit log's path).
+    audit_signed: bool = False
+    audit_required: bool = False
+    audit_max_bytes: int | None = None
+
+
+def audit_settings(start: Startup) -> str:
+    """What the audit options add, after the log's path: " (records signed with a key; ...)", or nothing."""
+    parts = []
+    if start.audit_signed:
+        parts.append("records signed with a key")
+    if start.audit_required:
+        parts.append("required: calls are refused while it cannot be written")
+    if start.audit_max_bytes is not None:
+        parts.append(f"rotated past {start.audit_max_bytes} bytes, never deleted")
+    return f" ({'; '.join(parts)})" if parts else ""
 
 
 def startup_lines(start: Startup) -> list[str]:
@@ -124,7 +140,8 @@ def startup_lines(start: Startup) -> list[str]:
     else:
         lines.append("  name      none (--name NAME labels this server's lines and audit records)")
     lines.append(f"  policy    {os.path.abspath(start.policy_path)}: {policy_summary(policy)}")
-    lines.append(f"  audit     {os.path.abspath(start.audit_path)}" if start.audit_path else "  audit     none")
+    lines.append(f"  audit     {os.path.abspath(start.audit_path)}{audit_settings(start)}" if start.audit_path
+                 else "  audit     none")
     if not start.pins_enabled:
         lines.append("  pins      off (--no-pins): a tool whose definition changes is not quarantined")
     elif start.pins_path:

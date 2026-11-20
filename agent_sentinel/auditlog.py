@@ -14,7 +14,17 @@ A record, as firewall.py writes it, looks like this (keys in this order, the
 ones in brackets only when they apply):
 
     time, [server], session, event, tool, [call_id], action, [rule],
-    [matched_arg], [ref], reason, [args], [findings]
+    [matched_arg], [ref], [policy], reason, [redacted], [approval], [args],
+    [findings], seq, prev, hash, [mac]
+
+"policy" (blocks only) is the start of the policy's SHA-256. The last four
+are the integrity chain (audit_chain.py), on every record since 0.6.
+
+Some records are not about a call or a check (META_EVENTS, all with action
+"note" and no tool): "chain_start" starts a chain (a new or rotated file),
+and "session_start", "protocol" and "session_end" say who wrote what follows
+(the version, the policy's hash, the peers' names). `report` leaves them out
+of its counts.
 """
 
 from __future__ import annotations
@@ -39,6 +49,12 @@ BLOCK_ACTIONS = ("block", "would_block")
 # The "action" of an audit record (not policy.ACTIONS, which are what a rule may say): "note" is a
 # record that blocks nothing (Firewall.note), "would_block" a block that monitor mode let through.
 RECORD_ACTIONS = ("allow", "ask", "block", "would_block", "note")
+# The events of the records that are not a call or a check (see above).
+CHAIN_START = "chain_start"
+SESSION_START = "session_start"
+PROTOCOL = "protocol"
+SESSION_END = "session_end"
+META_EVENTS = frozenset({CHAIN_START, SESSION_START, PROTOCOL, SESSION_END})
 
 _RELATIVE_TIME = re.compile(r"([0-9]{1,6})\s*([mhdw])")
 _UNITS = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
@@ -88,13 +104,20 @@ def parse_record(line: bytes) -> dict[str, Any] | None:
     return record if isinstance(record, dict) else None
 
 
-def iter_records(path: str) -> Iterator[dict[str, Any] | None]:
+def iter_records(
+    path: str, on_line: Callable[[bytes | None], None] | None = None
+) -> Iterator[dict[str, Any] | None]:
     """Yield each record of the log at `path`, in order; None for each line that cannot be read.
 
     Blank lines are skipped. Raises OSError if the file cannot be opened.
+    on_line: called with every line as it was read (blank ones too), before
+    its record is yielded: for a check of the chain in the same pass
+    (audit_chain.ChainChecker.add).
     """
     with open(path, "rb") as handle:
         for line in iter_lines(handle):
+            if on_line is not None:
+                on_line(line)
             if line is None:
                 yield None
             elif line.strip():
@@ -166,6 +189,11 @@ def field_text(record: dict[str, Any], name: str, limit: int = 200, missing: str
 
 def is_block(record: dict[str, Any]) -> bool:
     return record.get("action") in BLOCK_ACTIONS
+
+
+def is_meta(record: dict[str, Any]) -> bool:
+    """Whether the record starts a chain or describes the session, rather than a call or a check (META_EVENTS)."""
+    return record.get("event") in META_EVENTS and record.get("action") == "note"
 
 
 def parse_timestamp(text: str) -> tuple[datetime, bool] | None:
