@@ -64,7 +64,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import __version__, clients, config_file, elicitation, home, mcp_proxy, server_env
+from . import __version__, clients, config_file, elicitation, home, mcp_proxy, server_env, session
 from .approvers import COMMAND_PREFIX
 from .cli_common import EXIT_FAIL, EXIT_OK, CommandError, full_path, shown_command, shown_path
 from .clients import CLIENTS
@@ -145,6 +145,8 @@ class ServerReport:
     policy: str | None = None  # full path, when the entry names one
     pins: str | None = None
     audit: str | None = None
+    proxied: bool = False  # the entry starts the proxy
+    session_group: str | None = None  # its --session-group, if any
 
 
 @dataclass
@@ -156,6 +158,7 @@ class ConfigReport:
     error: str | None = None
     servers: list[ServerReport] = field(default_factory=list)
     extensions: list[str] = field(default_factory=list)
+    lines: list[Line] = field(default_factory=list)  # about the file as a whole (session groups)
 
 
 @dataclass
@@ -262,9 +265,60 @@ def check_config(path: Path, client: str | None, scope: str, note: str) -> Confi
     project = project_of(path) if scope == "project" else None
     for name, entry in servers.items():
         report.servers.append(check_server(name, entry, client, project))
+    report.lines += session_group_lines(report.servers, _sessions_folder())
     if client == "claude-desktop":
         report.extensions = clients.desktop_extensions(path)
     return report
+
+
+def _sessions_folder() -> Path | None:
+    """Where the proxies keep the files of their session groups (<home>/sessions), or None if there is no home."""
+    try:
+        return home.sessions_folder(home.home_folder())
+    except home.HomeError:
+        return None
+
+
+def session_group_lines(servers: list[ServerReport], sessions: Path | None = None) -> list[Line]:
+    """Warnings about the --session-group of the wrapped servers of one configuration.
+
+    The proxies of one group share their flow marks: a server outside the
+    group (or in another) can send out what a server of the group delivered,
+    and a flow rule meant to stop that never sees it. So:
+
+    * the wrapped servers should all name the same group;
+    * when the group's file in `sessions` (read, never changed) shows that
+      only one of several servers of the group joined the client's latest
+      run, the others were likely started by another client process, and
+      did not share its marks (see client_run.py).
+    """
+    wrapped = [server for server in servers if server.proxied]
+    groups = {server.session_group for server in wrapped}
+    if len(groups) < 2:
+        return _lone_member_lines(wrapped, sessions)
+    named = ", ".join(f"{server.name} ({printable(server.session_group, limit=64) if server.session_group else 'none'})"
+                      for server in wrapped)
+    if None in groups:
+        what = "some wrapped servers have a --session-group and some do not"
+    else:
+        what = "the wrapped servers name different session groups"
+    return [Line("warn", f"{what}: {named}. Flow rules see only what the servers of one group delivered, so a "
+                         "server outside it can send out what another read. Give every server of this client the "
+                         "same --session-group (wrap does)")]
+
+
+def _lone_member_lines(wrapped: list[ServerReport], sessions: Path | None) -> list[Line]:
+    """A warning when only one of the servers of a group joined the latest run recorded in the group's file."""
+    group = wrapped[0].session_group if wrapped else None
+    if group is None or len(wrapped) < 2 or sessions is None or _never_opened(str(sessions)):
+        return []
+    members = session.group_members(sessions, group)
+    if members is None or len(members) != 1:
+        return []
+    return [Line("warn", f"only {printable(members[0], limit=64)} joined the latest client run of session group "
+                         f"'{printable(group, limit=64)}', of the {len(wrapped)} servers here: if the client ran "
+                         "the others too, they were started by another of its processes and did not share flow "
+                         "marks with it (or were not started)")]
 
 
 def _guess_key(document: dict[str, Any]) -> str:
@@ -340,6 +394,10 @@ def _check_wrapped(report: ServerReport, proxy: ProxyCommand, entry: dict[str, A
     report.audit = _audit_path(lines, proxy.value("--audit"))
     _check_env_file(lines, proxy.value("--env-file"))
     _check_name(lines, proxy.values("--name"))
+    report.proxied = True
+    report.session_group = proxy.value("--session-group")
+    if report.session_group is not None and not proxy.values("--name"):
+        lines.append(Line("fail", "--session-group needs --name, so the proxy will not start"))
     _check_server_command(lines, proxy.server)
     _check_passed_env(lines, proxy, entry)
     _check_env_redirects(lines, proxy, entry)
@@ -622,6 +680,7 @@ _VALUE_CHECKS: dict[str, Callable[[str], Any]] = {
     "--approve-with": mcp_proxy._approver,
     "--pass-env": mcp_proxy._pass_env_name,
     "--tool-names": _tool_names,
+    "--session-group": mcp_proxy._session_group,
 }
 
 
@@ -875,6 +934,8 @@ def _print_config(report: ConfigReport) -> None:
     for server in report.servers:
         for line in server.lines:
             print(f"  {_mark(line.level)}{server.name:{width}}  {line.text}")
+    for line in report.lines:
+        print(f"  {_mark(line.level)}{line.text}")
     if report.extensions:
         print(f"  {_mark('warn')}{len(report.extensions)} Desktop Extension(s), which cannot be wrapped, so NOT "
               f"protected: {', '.join(printable(name, limit=40) for name in report.extensions[:10])}"
@@ -900,6 +961,7 @@ def as_json(reports: list[ConfigReport], policies: dict[str, PolicyReport],
                 "audit": printable(server.audit, limit=500) if server.audit else None,
                 "findings": [{"level": line.level, "text": line.text} for line in server.lines],
             } for server in report.servers],
+            "findings": [{"level": line.level, "text": line.text} for line in report.lines],
             "desktop_extensions": [printable(name, limit=100) for name in report.extensions],
         } for report in reports],
         "policies": [{"path": printable(policy.path, limit=500), "loads": policy.loads, "summary": policy.summary,

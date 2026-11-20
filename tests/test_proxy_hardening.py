@@ -196,6 +196,7 @@ class RequestIdsInFlight(unittest.TestCase):
 
     def test_an_id_can_be_used_again_once_its_reply_came_or_it_was_cancelled(self):
         h = Harness()
+        h.list_tools("read_file")  # else, under the example policy's flow rule, read_file counts as a sink too
         h.round_trip(call(1, "read_file", {"path": "a.txt"}), text_result("one"))
         self.assertEqual(h.round_trip(call(1, "read_file", {"path": "b.txt"}), text_result("two"))["id"], 1)
         h.from_client(call(2, "read_file", {"path": "c.txt"}))

@@ -767,5 +767,52 @@ class Files(DoctorTest):
         self.assertEqual(sorted(str(entry) for entry in self.folder.rglob("*")), before)
 
 
+class SessionGroups(DoctorTest):
+    """The proxies of one client share flow marks only when every wrapped entry names the same --session-group."""
+
+    def test_one_group_for_every_server_is_fine(self):
+        path = self.config({"a": self.wrapped("a", "--session-group", "desk"),
+                            "b": self.wrapped("b", "--session-group", "desk"),
+                            "plain": {"command": "npx", "args": ["x@1.0.0"]}})
+        _, out, _ = self.doctor(path)
+        self.assertNotIn("session group", out)
+
+    def test_servers_in_different_groups_or_none_are_warned_about(self):
+        mixed = self.config({"a": self.wrapped("a", "--session-group", "desk"), "b": self.wrapped("b")})
+        code, out, err = self.doctor(mixed)
+        self.assertEqual(code, 0, out + err)  # a warning: each server is still protected
+        self.assertRegex(out, r"\[warn\]\s+some wrapped servers have a --session-group and some do not: "
+                              r"a \(desk\), b \(none\)")
+        split = self.config({"a": self.wrapped("a", "--session-group", "desk"),
+                             "b": self.wrapped("b", "--session-group", "other")}, name="split.json")
+        _, _, report = self.statuses(split)
+        (finding,) = report["configs"][0]["findings"]
+        self.assertIn("different session groups", finding["text"])
+
+    def test_a_lone_member_of_the_latest_run_is_pointed_out(self):
+        from agent_sentinel.session import GroupSessionStore
+
+        path = self.config({"a": self.wrapped("a", "--session-group", "desk"),
+                            "b": self.wrapped("b", "--session-group", "desk")})
+        GroupSessionStore(self.home / "sessions", "desk", "1@1", "a").join()
+        _, out, _ = self.doctor(path)
+        self.assertRegex(out, r"\[warn\]\s+only a joined the latest client run of session group 'desk', of the 2 "
+                              r"servers here")
+        GroupSessionStore(self.home / "sessions", "desk", "1@1", "b").join()
+        _, out, _ = self.doctor(path)
+        self.assertNotIn("joined the latest client run", out)
+
+    def test_a_group_the_proxy_refuses_is_broken(self):
+        entry = self.wrapped("a", "--session-group", "../x")
+        code, servers, _ = self.statuses(self.config({"a": entry}))
+        self.assertEqual((code, servers["a"]["status"]), (1, "broken"))
+        unnamed = self.wrapped("a", "--session-group", "desk")
+        unnamed["args"].remove("--name")
+        unnamed["args"].remove("a")
+        _, servers, _ = self.statuses(self.config({"a": unnamed}, name="unnamed.json"))
+        self.assertEqual(servers["a"]["status"], "broken")
+        self.assertIn("--session-group needs --name", json.dumps(servers["a"]["findings"]))
+
+
 if __name__ == "__main__":
     unittest.main()

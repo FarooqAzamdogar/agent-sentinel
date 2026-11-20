@@ -454,6 +454,26 @@ class ToolPins:
         with self._lock:
             return list(self._pins.lists[kind])
 
+    def definitions(self, kind: str) -> dict[str, dict[str, Any]]:
+        """The pinned definitions of one list that are kept, by name (a pin too large to keep, or carried
+        over from version 1, has none). With pins off (enabled=False), nothing: nothing is compared either.
+
+        The proxy reads the tools' annotations from them at startup, and the
+        uriTemplate of a resource template it quarantines.
+        """
+        if not self._enabled:
+            return {}
+        with self._lock:
+            return {name: pin.definition for name, pin in self._pins.lists[kind].items() if pin.definition is not None}
+
+    def definition(self, kind: str, name: str) -> dict[str, Any] | None:
+        """The pinned definition of one entry, if one is kept (see definitions); None otherwise."""
+        if not self._enabled:
+            return None
+        with self._lock:
+            pin = self._pins.lists[kind].get(name)
+            return pin.definition if pin is not None else None
+
     def save(self) -> None:
         """Write the pins file and the pending file, if there is a file and anything changed. Raises OSError.
 

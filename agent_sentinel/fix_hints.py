@@ -20,9 +20,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from .policy import (
+    RULE_CALL_TIMEOUT,
     RULE_CALLER,
     RULE_DEFAULT,
     RULE_HOOK_FAILED,
+    RULE_INCLUDE_CONTEXT,
     RULE_INDEX,
     RULE_INJECTION,
     RULE_MALFORMED,
@@ -59,6 +61,8 @@ _FIXED_KINDS = {
     RULE_SESSION: "session",
     RULE_CALLER: "caller",
     RULE_HOOK_FAILED: "hook_failed",
+    RULE_INCLUDE_CONTEXT: "include_context",
+    RULE_CALL_TIMEOUT: "call_timeout",
 }
 _INDEXED_KINDS = (
     (re.compile(rf"deny_args{_INDEX}"), "deny_global"),
@@ -71,7 +75,7 @@ _PART_KINDS = {"other_args": "other_args", "max_calls_per_minute": "limit_tool"}
 # policy. `suggest` never proposes to loosen them; `report` says so next to them.
 PROTECTIVE_KINDS = frozenset({
     "deny_global", "deny_tool", "secrets", "secrets_results", "canary", "known_value", "secret_pattern",
-    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "hook_failed",
+    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "hook_failed", "include_context",
 })
 
 
@@ -320,6 +324,15 @@ _FIXED_HINTS = {
         "state folder is writable."
     ),
     "caller": "The program that uses the firewall blocked this itself (Firewall.block). Look at that program.",
+    "include_context": (
+        "The server asked the client's model for an answer written with context included (a sampling request "
+        "whose includeContext is not 'none'), and that answer would have gone back to the server. The proxy "
+        "refuses such requests whatever the policy says; a server that needs sampling can ask without it."
+    ),
+    "call_timeout": (
+        "The server did not answer the call within limits.call_timeout_seconds, so the client was answered with an "
+        "error and the server was asked to cancel the call. Raise the limit if this tool is slow by nature."
+    ),
     "hook_failed": (
         "The Claude Code hook could not finish its checks, so it refused (the reason says why: often a policy "
         "that does not load, or a state folder that cannot be written). Fix that cause; no policy rule changes "

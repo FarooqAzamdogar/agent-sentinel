@@ -32,18 +32,46 @@ Stores
 `MemorySessionStore` keeps the marks in memory: one process is one session
 (the library, one proxy). `FileSessionStore` keeps them in a JSON file per
 session id, for hook mode, where every check runs in a new process.
+`GroupSessionStore` keeps the marks of a group of proxies (proxy
+--session-group) in one file, so that what one server delivered counts for
+the calls of another server of the same MCP client (see "Session groups").
 
-The file store fails closed. A session file that is missing, unreadable,
+The file stores fail closed. A session file that is missing, unreadable,
 malformed, written for another session, or that has lost marks this process
 saw counts as "every mark set", so every flow rule applies. Anyone who can
 write the folder can still rewrite the file consistently: keep it outside
 every folder the agent's tools can reach.
+
+Session groups
+--------------
+The proxies of one MCP client each run in a process of their own, and each
+was one session until 0.6. With --session-group NAME they share the file
+<home>/sessions/NAME.json, under the lock file NAME.lock beside it. The file
+belongs to one run of the client: the client process and the time it started
+(client_run.py). When a proxy starts (GroupSessionStore.join), under the lock:
+
+* no file: it begins a new run, with no marks;
+* a file of the same run: it joins it, and never resets it (a proxy the
+  client restarts keeps the marks the others set);
+* a file of another run: it begins a new run, replacing the old one;
+* a file that cannot be read: it begins a new run only if the file was last
+  written before this client started (so it cannot belong to this run);
+  otherwise every mark counts as set until the file is deleted.
+
+After joining, a file that is missing, damaged, too large, of another run
+or begun again since counts as every mark set. A proxy that cannot take the
+lock in time gets every mark set when it reads, and SessionStateError when
+it writes, so the call or the result is refused. Each mark records the
+member (proxy --name) whose result set it, and each member writes its name
+into the file's list of members (at most MAX_GROUP_MEMBERS).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -51,6 +79,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from secrets import token_hex
 from types import MappingProxyType
 from typing import Any, Iterable, Iterator, Mapping
 
@@ -76,6 +105,25 @@ MAX_STATE_FILE_BYTES = 256 * 1024
 FILE_FORMAT = "agent-sentinel-session"
 FILE_VERSION = 1
 LOCK_FILE_NAME = "sessions.lock"
+
+# Session groups (GroupSessionStore).
+GROUP_FILE_FORMAT = "agent-sentinel-session-group"
+GROUP_FILE_VERSION = 1
+# A group's name, as proxy --session-group takes it: it names a file, so the characters of a server name only.
+GROUP_NAME = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+MEMBER_NAME = GROUP_NAME  # a member is a proxy --name, which allows the same characters
+MAX_GROUP_MEMBERS = 64
+MAX_RUN_ID_CHARS = 200
+# How long a proxy waits for the group's lock before it refuses what it was doing.
+GROUP_LOCK_SECONDS = 5.0
+# A file written less than this many seconds before the client started may still belong to it
+# (clocks and file times are not exact), so a damaged one is not replaced.
+_MTIME_SLACK_SECONDS = 2.0
+# What GroupSessionStore.join found.
+NEW_RUN = "new"  # there was no file: a new run begins
+JOINED = "joined"  # the file belongs to this client run
+REPLACED = "replaced"  # the file belonged to another run (or was damaged and older than this run): a new run begins
+UNUSABLE = "unusable"  # the file is damaged and may belong to this run: every mark counts as set
 
 _MISSING = "the session file is missing (the session was never begun, or it was deleted)"
 
@@ -148,6 +196,7 @@ class Mark:
     label: str
     tool: str  # the tool (or, in the proxy, the resource URI) whose result set it; may be agent- or server-chosen text
     time: str  # when, as UTC ISO 8601 to the second; "" if not known
+    server: str = ""  # in a session group: the member (proxy --name) whose result set it; "" otherwise
 
 
 @dataclass(frozen=True)
@@ -394,5 +443,268 @@ def _valid_cause(cause: Any) -> bool:
         and isinstance(cause["tool"], str) and len(cause["tool"]) <= MAX_CAUSE_TOOL_CHARS + 3
         and isinstance(cause["time"], str) and len(cause["time"]) <= 40
     )
+
+
+# ---- session groups -------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class GroupJoin:
+    """What GroupSessionStore.join found and did, for the operator.
+
+    status:   NEW_RUN, JOINED, REPLACED or UNUSABLE.
+    members:  the members of the run this proxy is now in, itself included (empty for UNUSABLE).
+    replaced: for REPLACED, the members of the run that was replaced.
+    detail:   for REPLACED and UNUSABLE, why.
+    """
+
+    status: str
+    members: tuple[str, ...] = ()
+    replaced: tuple[str, ...] = ()
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class _GroupFile:
+    """The contents of a session group file (see GroupSessionStore._parse)."""
+
+    group: str
+    run: str
+    instance: str  # random, new each time a run begins: a file begun again is told apart from the one joined
+    started: str
+    members: tuple[str, ...]
+    marks: dict[str, Mark]
+
+
+class GroupSessionStore(SessionStore):
+    """The marks of a group of proxies, shared through one file (proxy --session-group; see "Session groups").
+
+    Call `join()` once, when the proxy starts. Until it has joined, and when
+    it found a file it could not use, every mark counts as set.
+    """
+
+    def __init__(
+        self,
+        directory: str | Path,
+        group: str,
+        run_id: str,
+        member: str,
+        run_started: float | None = None,
+        lock_timeout: float = GROUP_LOCK_SECONDS,
+    ) -> None:
+        """
+        directory:   the folder of the group files (<home>/sessions).
+        group:       the group's name (GROUP_NAME): the file is <directory>/<group>.json.
+        run_id:      the client run this proxy belongs to (client_run.py); "unknown" when it cannot be told.
+        member:      this proxy's --name; it marks the marks this proxy sets.
+        run_started: when the client process started (seconds since the epoch), if known: a damaged file
+                     last written before then is replaced at join.
+        """
+        if not isinstance(group, str) or not GROUP_NAME.fullmatch(group):
+            raise ValueError("the group must be 1 to 64 letters, digits, '_', '-' or '.'")
+        if not isinstance(run_id, str) or not 0 < len(run_id) <= MAX_RUN_ID_CHARS or not run_id.isprintable():
+            raise ValueError(f"the run id must be printable text of 1 to {MAX_RUN_ID_CHARS} characters")
+        if not isinstance(member, str) or not MEMBER_NAME.fullmatch(member):
+            raise ValueError("the member name must be 1 to 64 letters, digits, '_', '-' or '.'")
+        self.directory = Path(directory)
+        self.group = group
+        self.run_id = run_id
+        self.member = member
+        self.path = self.directory / f"{group}.json"
+        self._lock_path = self.directory / f"{group}.lock"
+        self._run_started = run_started
+        self._lock_timeout = lock_timeout
+        self._thread_lock = threading.Lock()
+        self._seen: dict[str, Mark] = {}  # every mark this object has read or written: for spotting lost ones
+        self._instance: str | None = None  # the instance of the run joined; None until join() has succeeded
+        self._why_unusable = "the session group was not joined"
+
+    def join(self) -> GroupJoin:
+        """Begin a new run or join the current one, following the rules in "Session groups".
+
+        Raises SessionStateError if the folder or the file cannot be written,
+        or the lock cannot be had in time.
+        """
+        try:
+            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            with self._exclusive():
+                found, problem = self._load()
+                if found is None and problem is None:
+                    return self._begin(NEW_RUN)
+                if found is None or found.group != self.group:
+                    problem = problem or "it names another group"
+                    if self._older_than_this_run():
+                        return self._begin(REPLACED, detail=f"{problem}, and it was last written before this client "
+                                                            "started")
+                    self._why_unusable = (f"the session group file is not valid ({problem}) and may belong to this "
+                                          "client run, so every mark counts as set until it is deleted")
+                    return GroupJoin(UNUSABLE, detail=self._why_unusable)
+                if found.run != self.run_id:
+                    return self._begin(REPLACED, replaced=found.members, detail="it belonged to another client run")
+                members = found.members
+                if self.member not in members and len(members) < MAX_GROUP_MEMBERS:
+                    members = (*members, self.member)
+                    self._write(dataclasses.replace(found, members=members))
+                self._instance = found.instance
+                self._seen.update(found.marks)
+                return GroupJoin(JOINED, members=members)
+        except OSError as exc:
+            raise SessionStateError(f"cannot join the session group file {self.path}: {exc}") from exc
+
+    def read(self) -> SessionMarks:
+        if self._instance is None:
+            return SessionMarks.untrusted(self._why_unusable)
+        try:
+            with self._exclusive():
+                return self._checked()[0]
+        except OSError as exc:  # includes a lock not had in time
+            return SessionMarks.untrusted(f"the session group file cannot be read ({type(exc).__name__}: {exc})")
+
+    def add(self, labels: Iterable[str], tool: str) -> SessionMarks:
+        wanted = _checked_labels(labels)
+        if self._instance is None:
+            return SessionMarks.untrusted(self._why_unusable)  # every mark counts as set: nothing to record
+        try:
+            with self._exclusive():
+                current, found = self._checked()
+                if found is None or current.everything or all(label in current.marks for label in wanted):
+                    return current  # nothing to add; and a broken file is never repaired
+                marks = dict(current.marks)
+                for label in wanted:
+                    if label not in marks:
+                        if len(marks) >= MAX_MARKS:
+                            raise SessionStateError("more marks than can be tracked")
+                        marks[label] = Mark(label, _bounded_tool(tool), _now(), self.member)
+                self._write(dataclasses.replace(found, marks=marks))
+                self._seen.update(marks)
+                return SessionMarks(marks)
+        except FileNotFoundError:
+            # The folder is gone: every mark counts as set when it is read, so nothing needs recording.
+            return SessionMarks.untrusted("the session group folder disappeared")
+        except OSError as exc:
+            raise SessionStateError(f"cannot record marks in {self.path}: {exc}") from exc
+
+    # ---- internals --------------------------------------------------------------
+
+    @contextmanager
+    def _exclusive(self) -> Iterator[None]:
+        """One thread of this process, and one process of the group, at a time; OSError if not in time."""
+        with self._thread_lock, locked(self._lock_path, timeout=self._lock_timeout):
+            yield
+
+    def _begin(self, status: str, replaced: tuple[str, ...] = (), detail: str = "") -> GroupJoin:
+        """Write a new run with no marks, and this proxy as its only member. Called with the lock held."""
+        found = _GroupFile(self.group, self.run_id, token_hex(8), _now(), (self.member,), {})
+        self._write(found)
+        self._instance = found.instance
+        self._seen = {}
+        return GroupJoin(status, members=found.members, replaced=replaced, detail=detail)
+
+    def _older_than_this_run(self) -> bool:
+        """Whether the file was last written before the client started, so it cannot hold this run's marks."""
+        if self._run_started is None:
+            return False
+        try:
+            written = os.stat(self.path).st_mtime
+        except OSError:
+            return False
+        return written < self._run_started - _MTIME_SLACK_SECONDS
+
+    def _checked(self) -> tuple[SessionMarks, _GroupFile | None]:
+        """The marks in the file, or every mark set when it is not the run this proxy joined. Lock held."""
+        found, problem = self._load()
+        if found is None:
+            return SessionMarks.untrusted(f"the session group file is not valid: {problem}" if problem
+                                          else "the session group file disappeared"), None
+        if found.group != self.group:
+            return SessionMarks.untrusted("the session group file names another group"), None
+        if found.run != self.run_id:
+            return SessionMarks.untrusted("another client run took over the session group file"), None
+        if found.instance != self._instance:
+            return SessionMarks.untrusted("the session group file was begun again after this proxy joined it"), None
+        if any(label not in found.marks for label in self._seen):
+            return SessionMarks.untrusted("marks disappeared from the session group file"), None
+        self._seen.update(found.marks)
+        return SessionMarks(found.marks), found
+
+    def _load(self) -> tuple[_GroupFile | None, str | None]:
+        """(the file's contents, None), (None, what is wrong with it), or (None, None) when there is no file."""
+        try:
+            with open(self.path, "rb") as handle:
+                data = handle.read(MAX_STATE_FILE_BYTES + 1)
+        except FileNotFoundError:
+            return None, None
+        if len(data) > MAX_STATE_FILE_BYTES:
+            return None, "it is too large"
+        return _parse_group_file(data)
+
+    def _write(self, found: _GroupFile) -> None:
+        """Replace the file. Atomic: a crash leaves the old file or the new one."""
+        document = {
+            "format": GROUP_FILE_FORMAT,
+            "version": GROUP_FILE_VERSION,
+            "group": found.group,
+            "run": found.run,
+            "instance": found.instance,
+            "started": found.started,
+            "members": list(found.members),
+            "marks": {label: {"tool": mark.tool, "time": mark.time, "server": mark.server}
+                      for label, mark in found.marks.items()},
+        }
+        replace_file(self.path, json.dumps(document, ensure_ascii=True, indent=1).encode("ascii"))
+
+
+def group_members(directory: str | Path, group: str) -> tuple[str, ...] | None:
+    """The members of the latest run in a session group's file, for doctor; None if there is no usable file.
+
+    Only reads: the file is never locked or changed, so what it says may be a moment old.
+    """
+    if not isinstance(group, str) or not GROUP_NAME.fullmatch(group):
+        return None
+    try:
+        with open(Path(directory) / f"{group}.json", "rb") as handle:
+            data = handle.read(MAX_STATE_FILE_BYTES + 1)
+    except OSError:
+        return None
+    found, _ = _parse_group_file(data) if len(data) <= MAX_STATE_FILE_BYTES else (None, None)
+    return found.members if found is not None and found.group == group else None
+
+
+_GROUP_KEYS = {"format", "version", "group", "run", "instance", "started", "members", "marks"}
+_INSTANCE = re.compile(r"[0-9a-f]{16}")
+
+
+def _parse_group_file(data: bytes) -> tuple[_GroupFile | None, str | None]:
+    """Read a session group file's bytes: (contents, None) or (None, what is wrong). Strict, like FileSessionStore."""
+    try:
+        document = jsonutil.loads(data.decode("utf-8"))
+    except (ValueError, RecursionError):  # includes UnicodeDecodeError and a repeated key
+        return None, "it is not JSON"
+    if not isinstance(document, dict) or set(document) != _GROUP_KEYS:
+        return None, "unexpected contents"
+    if document["format"] != GROUP_FILE_FORMAT or document["version"] != GROUP_FILE_VERSION:
+        return None, "unknown format or version"
+    group, run, instance = document["group"], document["run"], document["instance"]
+    started, members, entries = document["started"], document["members"], document["marks"]
+    if (not isinstance(group, str) or not GROUP_NAME.fullmatch(group)
+            or not isinstance(run, str) or not 0 < len(run) <= MAX_RUN_ID_CHARS
+            or not isinstance(instance, str) or not _INSTANCE.fullmatch(instance)
+            or not isinstance(started, str) or len(started) > 40):
+        return None, "unexpected contents"
+    if (not isinstance(members, list) or len(members) > MAX_GROUP_MEMBERS or len(set(map(str, members))) != len(members)
+            or not all(isinstance(name, str) and MEMBER_NAME.fullmatch(name) for name in members)):
+        return None, "the list of members is malformed"
+    if not isinstance(entries, dict) or len(entries) > MAX_MARKS:
+        return None, "the marks are malformed"
+    marks = {}
+    for label, cause in entries.items():
+        if (not is_label(label) or label == SINK or not isinstance(cause, dict)
+                or set(cause) != {"tool", "time", "server"}):
+            return None, "a mark is malformed"
+        server = cause["server"]
+        if not _valid_cause({"tool": cause["tool"], "time": cause["time"]}) or not (
+                isinstance(server, str) and (server == "" or MEMBER_NAME.fullmatch(server))):
+            return None, "a mark is malformed"
+        marks[label] = Mark(label, cause["tool"], cause["time"], server)
+    return _GroupFile(group, run, instance, started, tuple(members), marks), None
 
 

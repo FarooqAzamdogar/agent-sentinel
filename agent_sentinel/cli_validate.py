@@ -66,6 +66,9 @@ def _print_new_settings(policy: Policy) -> None:
         extra.append(f"Values never sent, from the environment: {', '.join(policy.secrets_known_values_from_env)}.")
     if policy.secrets_canaries:
         extra.append(f"Canaries: {len(policy.secrets_canaries)}.")
+    if policy.call_timeout_seconds is not None:
+        extra.append(f"The proxy cancels a call the server has not answered within {policy.call_timeout_seconds:g} "
+                     "seconds.")
     if extra:
         print(" ".join(extra))
     if policy.flows:

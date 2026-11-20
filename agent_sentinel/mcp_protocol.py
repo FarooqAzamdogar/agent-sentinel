@@ -562,19 +562,22 @@ COVERAGE = (
              "name listed twice, characters the proxy cannot forward); scanned with the metadata rules, with the "
              "policy's other tool names for shadowing; pinned. A tool that fails is removed and quarantined. Tools "
              "the policy blocks outright are hidden (hide_blocked_tools). Calls wait while a tools/list reply is "
-             "being checked."),
+             "being checked. A page after the first (cursor) is also scanned with the end of the page before."),
     Coverage("tools/call", "client", ALL_REVISIONS, (CHECKED,),
-             "Secret guard, tool rules, flow rules, rate limits; an ask goes to --approve-with or is refused. "
-             "Refused: a reserved name (resources/read, resources/subscribe, prompts/get), a task-augmented call "
-             "(params.task), a quarantined tool. Reply: resultType checked; scanned; secrets.in_results; flow marks."),
+             "Secret guard, tool rules, flow rules (a tool no checked list or pin has shown counts as untrusted "
+             "and a sink), rate limits; an ask goes to --approve-with or is refused. Refused: a reserved name "
+             "(resources/read, resources/subscribe, prompts/get), a task-augmented call (params.task), a "
+             "quarantined tool. Reply: resultType checked; scanned; secrets.in_results; flow marks. No reply within "
+             "limits.call_timeout_seconds: an error, and notifications/cancelled to the server."),
     Coverage("resources/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
              "Each resource scanned and its icons cleaned; one whose URI has characters the proxy cannot forward is "
              "removed. Not pinned."),
     Coverage("resources/templates/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
-             "Each template scanned and pinned; a template that fails is removed and quarantined."),
+             "Each template scanned and pinned; a template that fails is removed and quarantined, and so are the "
+             "URIs it may produce."),
     Coverage("resources/read", "client", ALL_REVISIONS, (CHECKED,),
-             "Checked like a call of a tool named 'resources/read' with the argument uri. Reply scanned; "
-             "secrets.in_results; flow marks."),
+             "Refused for a URI a quarantined template may produce. Checked like a call of a tool named "
+             "'resources/read' with the argument uri. Reply scanned; secrets.in_results; flow marks."),
     Coverage("resources/subscribe", "client", ALL_REVISIONS, (CHECKED,),
              "Checked as a resources/read of the same URI. Update notifications are scanned."),
     Coverage("subscriptions/listen", "client", MODERN_ONLY, (CHECKED,),
@@ -610,7 +613,8 @@ COVERAGE = (
              "Refused (-32600): MCP no longer uses batches."),
     # ---- from the server ----
     Coverage("sampling/createMessage", "server", LEGACY_ONLY, (CHECKED, SCANNED),
-             "server_requests decides (refused: the server is told 'request refused', the client nothing); then "
+             "server_requests decides (refused: the server is told 'request refused', the client nothing); refused "
+             "too when includeContext is not 'none', or when a block flow to a sink would refuse a call; then "
              "scanned. The client's answer passes the secret guard."),
     Coverage("elicitation/create", "server", "2025-06-18 to 2025-11-25", (CHECKED, SCANNED),
              "server_requests, then what it asks: a URL must be a public https address (and on the "
@@ -627,8 +631,8 @@ COVERAGE = (
     Coverage("input_required result", "server", MODERN_ONLY, (CHECKED, SCANNED),
              "Only in reply to tools/call, prompts/get or resources/read of a request that named 2026-07-28. Each "
              "inputRequests entry (elicitation/create, sampling/createMessage, roots/list) passes server_requests, "
-             "the elicitation checks and the scanner; one refused entry refuses the reply. Then the whole result "
-             "is scanned."),
+             "the elicitation and sampling checks and the scanner; one refused entry refuses the reply. Then the "
+             "whole result is scanned."),
     Coverage("task result (resultType task, or a 2025-11-25 task handle)", "server",
              "2025-11-25 and 2026-07-28 (extension)", (REFUSED,), "Refused: tasks are not supported."),
     Coverage("result of an unknown resultType", "server", MODERN_ONLY, (REFUSED,),
@@ -636,9 +640,10 @@ COVERAGE = (
     Coverage("error -32042 (URLElicitationRequiredError)", "server", "2025-11-25 and later", (CHECKED, SCANNED),
              "Each URL it lists is checked as for elicitation/create; then the error is scanned."),
     Coverage("any other reply", "server", ALL_REVISIONS, (SCANNED,),
-             "Must answer a request the proxy forwarded, else dropped. Rebuilt from its result or error; scanned; "
-             "secrets.in_results (block, or redact: a copy with the secrets replaced); cleaned of escape codes, "
-             "control, tag and bidi characters; the request's flow marks set."),
+             "Must answer a request the proxy forwarded, else dropped (so is a late reply to a call that timed "
+             "out). Rebuilt from its result or error; scanned; secrets.in_results (block, or redact: a copy with "
+             "the secrets replaced); cleaned of escape codes, control, tag and bidi characters; the request's flow "
+             "marks set."),
     # ---- from the proxy itself ----
     Coverage("elicitation/create (approval question)", "proxy", "2025-06-18 and 2025-11-25", (SENT,),
              "With --approve-with elicitation, to a client that declared forms: one yes/no field. Its id is "

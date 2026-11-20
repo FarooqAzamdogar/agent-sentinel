@@ -88,9 +88,10 @@ examples:
   agent-sentinel wrap --client codex --policy policy.json --name files -- npx -y some-mcp-server@1.2.3
 """
 USAGE = """agent-sentinel wrap --client NAME [--config FILE | --project] --policy POLICY [--audit FILE]
-                           [--pins-dir DIR] [--server NAME ...] [--monitor] [--apply]
+                           [--pins-dir DIR] [--server NAME ...] [--monitor]
+                           [--session-group NAME | --no-session-group] [--apply]
        agent-sentinel wrap --client NAME --policy POLICY --name NAME [--audit FILE] [--pins-dir DIR]
-                           [--monitor] -- SERVER_COMMAND ..."""
+                           [--monitor] [--session-group NAME | --no-session-group] -- SERVER_COMMAND ..."""
 TAKES_SERVER_COMMAND = True
 HIDDEN = "<value not shown>"
 
@@ -107,6 +108,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                         help="wrap only this server (repeat for more; default: every one)")
     parser.add_argument("--monitor", action="store_true",
                         help="start the proxies in monitor mode: log what would be blocked, block nothing")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--session-group", type=mcp_proxy._session_group, metavar="NAME",
+                       help="the proxies' --session-group, the same for every server, so that the flow rules see "
+                            "what each server of this client delivered (default: the client's name)")
+    group.add_argument("--no-session-group", action="store_true",
+                       help="give the proxies no session group: each server's flow marks stay its own")
     parser.add_argument("--name", metavar="NAME", help="with a server command after '--': the server's name")
     parser.add_argument("--apply", action="store_true",
                         help="write the change (after a backup); without it, only show it")
@@ -242,6 +249,7 @@ def _settings(args: argparse.Namespace, policy_path: str, python: PythonCheck) -
         pins_folder=full_path(args.pins_dir) if args.pins_dir else str(home.pins_folder(folder)),
         monitor=args.monitor,
         isolated=python.isolated,
+        session_group=None if args.no_session_group else (args.session_group or args.client),
     )
 
 
@@ -326,6 +334,9 @@ def _print_header(config: ConfigFile, client: str, settings: ProxySettings, poli
         print("  Its 'ask' rules are refused by the proxy unless it is started with an approver (--approve-with).")
     print(f"Each wrapped server logs to {shown_path(settings.audit)}")
     print(f"and keeps its tool pins in its own file in {shown_path(settings.pins_folder)}")
+    if settings.session_group is not None:
+        print(f"The servers share their flow marks as session group '{settings.session_group}' "
+              "(--no-session-group keeps each server's own)")
     exposed = clients.files_inside_project(
         config.path, {"policy": policy_path, "audit log": settings.audit, "pins folder": settings.pins_folder})
     if exposed:

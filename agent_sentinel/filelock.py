@@ -31,14 +31,15 @@ REPLACE_PAUSE_SECONDS = 0.1
 if sys.platform == "win32":
     import msvcrt
 
-    def lock_file(handle: BinaryIO) -> None:
-        """Wait for, and take, the lock on an open file. Raises OSError after LOCK_TIMEOUT_SECONDS.
+    def lock_file(handle: BinaryIO, timeout: float | None = None) -> None:
+        """Wait for, and take, the lock on an open file. Raises OSError after `timeout` seconds
+        (LOCK_TIMEOUT_SECONDS when None).
 
         Polls with short pauses instead of using LK_LOCK, which retries only
         once a second: with a few processes taking turns, a waiter could miss
         ten turns in a row and fail although each holds the lock for a moment.
         """
-        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        deadline = time.monotonic() + (LOCK_TIMEOUT_SECONDS if timeout is None else timeout)
         pause = 0.001
         while True:
             handle.seek(0)
@@ -57,24 +58,44 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-    def lock_file(handle: BinaryIO) -> None:
-        """Wait for, and take, the lock on an open file."""
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    def lock_file(handle: BinaryIO, timeout: float | None = None) -> None:
+        """Wait for, and take, the lock on an open file.
+
+        timeout: None waits as long as it takes; a number of seconds polls,
+        and raises OSError (TimeoutError) when the lock is not had by then.
+        """
+        if timeout is None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            return
+        deadline = time.monotonic() + timeout
+        pause = 0.001
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"the lock was not free within {timeout:g} seconds") from None
+            time.sleep(pause)
+            pause = min(pause * 2, 0.05)
 
     def unlock_file(handle: BinaryIO) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager
-def locked(path: str | Path) -> Iterator[None]:
+def locked(path: str | Path, timeout: float | None = None) -> Iterator[None]:
     """Hold the lock on the file at `path` (created if missing) for the duration of a `with` block.
 
     For a separate lock file next to the data it protects. The data file can
     then be replaced atomically (os.replace) while the lock is held, which is
     not possible with a lock on the data file itself.
+
+    timeout: how long to wait for the lock before OSError; None keeps each
+    system's default (LOCK_TIMEOUT_SECONDS on Windows, no limit elsewhere).
     """
     with open(path, "ab") as handle:
-        lock_file(handle)
+        lock_file(handle, timeout)
         try:
             yield
         finally:

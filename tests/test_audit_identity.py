@@ -133,6 +133,7 @@ class CallIds(AuditSetup):
 class InTheProxy(AuditSetup):
     def test_a_tool_call_and_its_result_share_a_call_id(self):
         h = Harness(Firewall(POLICY, audit_path=self.audit, server_name="files"))
+        h.list_tools("read_file", "fetch_page")  # else, under the example policy's flow rule, they count as sinks too
         h.round_trip(call(1, "read_file", {"path": "notes.txt"}), text_result("hello"))
         h.round_trip(call(2, "fetch_page", {"url": "u"}), text_result(INJECTION))
         records = self.records()

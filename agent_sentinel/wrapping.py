@@ -11,9 +11,12 @@ Wrapped, the same entry starts the proxy, which starts the program:
               "args": ["-I", "-m", "agent_sentinel", "proxy", "--policy", "C:/Users/me/.agent-sentinel/policy.json",
                        "--audit", "C:/Users/me/.agent-sentinel/audit.jsonl",
                        "--pins", "C:/Users/me/.agent-sentinel/pins/claude-desktop-files-3fa29c1b.json",
-                       "--name", "files", "--pass-env", "DEBUG",
+                       "--name", "files", "--session-group", "claude-desktop", "--pass-env", "DEBUG",
                        "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "C:/work"],
               "env": {"DEBUG": "1"}}
+
+The --session-group (the client's id unless wrap is told otherwise) is the
+same for every server of one client, so that their proxies share flow marks.
 
 Every other key of the entry, known or not, stays where it was. Unwrapping
 rebuilds "command" and "args" from what follows the "--", so no record of the
@@ -70,7 +73,7 @@ from .textutil import printable
 # contract between the proxy and the commands that write or read wrapped entries).
 VALUE_OPTIONS = frozenset({
     "--policy", "--audit", "--pins", "--name", "--pass-env", "--env-file", "--approve-with",
-    "--approval-timeout", "--max-message-bytes", "--tool-names", "--elicitation-host",
+    "--approval-timeout", "--max-message-bytes", "--tool-names", "--elicitation-host", "--session-group",
 })
 FLAG_OPTIONS = frozenset({"--no-log-args", "--no-pins", "--monitor", "--clean-env", "--quiet", "--verbose"})
 # The shapes of command that start the proxy (read_proxy_command), each followed by "proxy":
@@ -575,6 +578,9 @@ class ProxySettings:
     pins_folder: str
     monitor: bool = False
     isolated: bool = True  # start Python with -I (see the module docstring)
+    # proxy --session-group for every entry (the client's id, by default of `wrap`), so that the proxies of
+    # one client share their flow marks; None writes no group.
+    session_group: str | None = None
 
 
 def server_label(name: str, taken: set[str]) -> str:
@@ -633,6 +639,8 @@ def wrap_entry(entry: dict[str, Any], settings: ProxySettings, label: str, pins:
     module = ISOLATED_MODULE if settings.isolated else PLAIN_MODULE
     proxy_args = [*module, "proxy", "--policy", settings.policy, "--audit", settings.audit,
                   "--pins", pins, "--name", label]
+    if settings.session_group is not None:
+        proxy_args += ["--session-group", settings.session_group]
     for name in passed_variables(entry):
         proxy_args += ["--pass-env", name]
     if settings.monitor:

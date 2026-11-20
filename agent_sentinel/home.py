@@ -8,6 +8,8 @@
     <home>/audit.jsonl      the audit log that `wrap` gives every wrapped server
     <home>/pins/            one tool pins file per wrapped server
     <home>/hook-state/      the Claude Code hook's session state: flow marks and rate-limit counts
+    <home>/sessions/        the flow marks of each proxy --session-group, shared by the proxies of one
+                            client run (session.GroupSessionStore)
     <home>/backups/         backups of configuration files in a project under version control, with a
                             .gitignore that ignores them all (config_file.py)
 
@@ -17,9 +19,11 @@ started by it writes there land in the package's own folder, where `report`
 run from an ordinary terminal cannot find them. The user profile folder is
 not redirected that way.
 
-Nothing here is found implicitly. The proxy never looks in this folder by
-itself: `wrap` writes the full path of every file into each wrapped entry,
-and every command that writes here prints the full path it used.
+Nothing here is found implicitly, with one exception. `wrap` writes the full
+path of every file into each wrapped entry, and every command that writes
+here prints the full path it used. The exception is a proxy started with
+--session-group NAME: it keeps the group's marks in <home>/sessions/NAME.json,
+so that every proxy of the group finds the same file (it prints the path).
 """
 
 from __future__ import annotations
@@ -38,6 +42,7 @@ POLICY_FILE = "policy.json"
 AUDIT_FILE = "audit.jsonl"
 PINS_FOLDER = "pins"
 HOOK_STATE_FOLDER = "hook-state"
+SESSIONS_FOLDER = "sessions"
 
 
 class HomeError(CommandError):
@@ -121,6 +126,10 @@ def pins_folder(home: Path) -> Path:
 
 def hook_state_folder(home: Path) -> Path:
     return home / HOOK_STATE_FOLDER
+
+
+def sessions_folder(home: Path) -> Path:
+    return home / SESSIONS_FOLDER
 
 
 def make_folders(home: Path) -> list[Path]:

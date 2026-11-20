@@ -23,6 +23,8 @@ Module map:
     server_env.py     the environment the server is started with
     approvers.py      how the proxy asks a person to approve a call (dialog, command, elicitation)
     proxy_report.py   what the proxy tells the operator on stderr
+    client_run.py     which run of the MCP client a proxy belongs to (proxy --session-group)
+    uri_template.py   whether a URI may come from a quarantined resource template (RFC 6570)
 
   Claude Code and the Claude Agent SDK
     claude_hooks.py   the answers to Claude Code's hook events; claude_sdk_hooks() for the Agent SDK
