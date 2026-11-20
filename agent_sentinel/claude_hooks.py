@@ -59,7 +59,10 @@ Elicitation         an MCP server asks the user for input. The policy's server_r
                     URL must be a public https address; a form may not ask for a password, a
                     key or a card number), then the detector on the message, the address and
                     the form. A refusal, or an event that cannot be read, declines the request
-                    (exit 2): no dialog appears. Otherwise the dialog decides, as without the hook.
+                    (exit 2): no dialog appears. Otherwise the dialog decides, as without the hook;
+                    as in the proxy, an allowed request gives the session the mark of content at
+                    or above injection.mark_at and keeps its end for the tail scan (a request
+                    whose marks cannot be recorded is declined).
 ElicitationResult   the user's answer, before it goes to the server: the secret guard, the
                     known values and the canaries (Firewall.find_secrets), as for a call's
                     arguments. A secret, or an event that cannot be read, turns the answer
@@ -810,11 +813,31 @@ def _elicitation(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
     decision = _elicitation_refusal(firewall, label, params)
     if decision is None:
         scanned = {"message": event["message"], **params}
-        decision = firewall.scan_result(label, scanned, event="server_request")
-        decision = None if decision.allowed else decision
+        decision = _elicitation_delivered(firewall, label, firewall.scan_result(label, scanned, event="server_request"))
     if decision is not None:
         return _declined(ELICITATION, blocked_text(decision.public_reason))
     return HookAnswer()  # nothing: the dialog asks the user, as without the hook
+
+
+def _elicitation_delivered(firewall: Firewall, label: str, decision: Decision) -> Decision | None:
+    """What an allowed elicitation gives the session, as the proxy sets it for a server request; None to go on.
+
+    The mark of content at or above injection.mark_at, and the end of its
+    text for the tail scan (the "notification" channel, as in the proxy).
+    The policy's server_labels are not applied in hook mode. A refusal (the
+    request is declined) when the marks cannot be recorded: a session whose
+    marks are not known must not go on as if nothing had been read.
+    """
+    if not decision.allowed:
+        return decision
+    try:
+        firewall.mark_delivered(label, frozenset(), decision=decision, channel="server_request")
+    except SessionStateError as exc:
+        return firewall.refuse(
+            label, f"the request was declined: its marks could not be recorded: {exc}", event="server_request",
+            public_reason=_UNCHECKED_ELICITATION, rule=RULE_SESSION,
+        )
+    return None
 
 
 def _elicitation_refusal(firewall: Firewall, label: str, params: dict[str, Any]) -> Decision | None:

@@ -119,6 +119,23 @@ class PrintingTheSnippet(InstallTest):
         self.assertNotIn("whose streamed events", out)
         self.assertIn("is refused (hook.config_changes)", out)
 
+    def test_it_says_what_the_session_features_of_the_policy_do_in_hook_mode(self):
+        # The 0.6 session features: the warn notice, server_labels (proxy only), approval memory (never learns here).
+        self.policy = self.write("policy.json", {"default": "ask", "tools": {"Read": "allow"}})
+        _, out, _ = self.install()
+        self.assertIn("approval memory (approvals) does not apply", out)
+        self.assertNotIn("injection.warn_severity", out)
+        self.assertNotIn("server_labels", out)
+        self.assertIn("session limits, the end of the last output for the tail scan, and the settings snapshot", out)
+        self.policy = self.write("policy.json", {"default": "block", "tools": {"Read": "allow"},
+                                                 "injection": {"warn_severity": "medium"},
+                                                 "server_labels": {"web": ["untrusted"]},
+                                                 "flows": [{"after": ["untrusted"], "then": "sink", "action": "block"}]})
+        _, out, _ = self.install()
+        self.assertIn("at or above medium (injection.warn_severity) reaches Claude with a notice", out)
+        self.assertIn("server_labels apply in the proxy only", out)
+        self.assertNotIn("approval memory", out)
+
     def test_a_python_that_finds_the_package_only_in_user_site_packages_runs_it_without_isolation(self):
         self.python_check.return_value = PythonCheck(False, __version__)
         code, out, _ = self.install()

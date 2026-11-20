@@ -120,8 +120,9 @@ def _add_paths(parser: argparse.ArgumentParser) -> None:
                         help="the audit log (hook claude-code: none if left out; install: audit.jsonl in the "
                              "agent-sentinel home folder)")
     parser.add_argument("--state-dir", metavar="DIR",
-                        help="the folder for each session's flow marks and rate-limit counts (default: hook-state "
-                             "in the agent-sentinel home folder). Keep it out of the agent's reach")
+                        help="the folder for each session's flow marks, rate-limit counts, session limits, the end "
+                             "of the last output (tail scan) and the settings snapshot (default: hook-state in the "
+                             "agent-sentinel home folder). Keep it out of the agent's reach")
     parser.add_argument("--no-log-args", action="store_true", help="leave tool inputs out of the audit log")
 
 
@@ -325,7 +326,15 @@ def _print_header(policy_path: str, policy: Policy, audit: str, state: str, args
         auto = ("every 'ask' in auto mode (hook.treat_auto_as_non_prompting)" if policy.hook.treat_auto_as_non_prompting
                 else "an 'ask' for SubagentHandback in auto mode, which runs without a prompt")
         print("               Its 'ask' rules show Claude Code's own permission prompt; in bypassPermissions mode "
-              f"they are refused, and so is {auto}.")
+              f"they are refused, and so is {auto}. The hook never sees the answer, so approval memory "
+              "(approvals) does not apply.")
+    if policy.warn_severity is not None:
+        print(f"               Output with a finding at or above {policy.warn_severity} (injection.warn_severity) "
+              "reaches Claude with a notice to treat it as data.")
+    if policy.server_labels:
+        print("  Note: the policy's server_labels apply in the proxy only; in hook mode give the labels to the "
+              'mcp__<server>__* tool rules instead, such as "mcp__web__*": {"action": "allow", "labels": '
+              '["untrusted"]}.')
     if policy.tool_level_action("Monitor") != "block":
         print("  Note: the policy lets the agent use Monitor, whose streamed events no hook can scan. Label it "
               '"untrusted" and "sink" for the flow rules, or block it.')
@@ -333,8 +342,8 @@ def _print_header(policy_path: str, policy: Policy, audit: str, state: str, args
         print("Settings:      a change to Claude Code's settings or skills during a session is refused "
               "(hook.config_changes); the file stays changed, and the next session reads it.")
     print(f"Audit log:     {shown_path(audit)}")
-    print(f"Session state: {shown_path(state)} (flow marks, rate-limit counts and the settings snapshot; keep it out "
-          "of the agent's reach)")
+    print(f"Session state: {shown_path(state)} (flow marks, rate-limit counts, session limits, the end of the last "
+          "output for the tail scan, and the settings snapshot; keep it out of the agent's reach)")
     print('Needs Claude Code v2.1.295 or later: with "onFailure": "block", a hook that cannot start or times out '
           "blocks the call. Older versions let the call through.")
 

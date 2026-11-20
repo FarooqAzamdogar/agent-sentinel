@@ -1,8 +1,11 @@
 """State kept in files for hook mode, where every event is answered by a new process.
 
-Two kinds of state live here, next to the session's flow marks
-(session.FileSessionStore): the rate-limit counts (FileRateLimiter) and a
-snapshot of Claude Code's settings files (SettingsSnapshot, at the end).
+Two kinds of state live here, next to the session file
+(session.FileSessionStore: the flow marks and, since its format version 2,
+the tails of the tail scan, the session-limit counts and approval memory):
+the rate-limit counts (FileRateLimiter) and a snapshot of Claude Code's
+settings files (SettingsSnapshot, at the end). Each kind has its own file,
+format name and version, and all of them share the folder's lock file.
 
 Rate limits
 -----------
@@ -44,7 +47,9 @@ user's and the project's settings files, each with a salted hash of its value
 
 The snapshot only feeds the audit record. A snapshot that is missing or
 damaged makes the record say that what changed is not known; it never lets
-anything through that would otherwise be refused.
+anything through that would otherwise be refused. Its version
+(SETTINGS_FILE_VERSION) is its own: the session file's version
+(session.FILE_VERSION) can change without it, and the other way round.
 """
 
 from __future__ import annotations
