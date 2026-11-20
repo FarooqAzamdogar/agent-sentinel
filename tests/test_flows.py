@@ -200,7 +200,14 @@ class FlowVerdicts(unittest.TestCase):
 
 class FlowWarnings(unittest.TestCase):
     def test_a_clean_flow_policy_has_no_warnings(self):
-        self.assertEqual(flow_policy().warnings(), [])
+        # Since 0.6 every allowed tool says its labels, and one that fetches is also a sink.
+        tools = {**TOOLS, "fetch_page": {"action": "allow", "labels": ["untrusted", "sink"]},
+                 "search_notes": {"action": "allow", "labels": ["private"]}}
+        self.assertEqual(flow_policy(tools=tools).warnings(), [])
+        warnings = flow_policy().warnings()
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("tools.fetch_page: it is labelled 'untrusted' but not 'sink'", warnings[0])
+        self.assertIn("tools.search_notes: it is allowed but has no flow labels", warnings[1])
 
     def test_a_label_no_rule_has_is_reported_with_a_suggestion(self):
         tools = {"fetch": {"action": "allow", "labels": ["web-content"]},

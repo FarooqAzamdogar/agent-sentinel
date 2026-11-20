@@ -380,7 +380,8 @@ class Firewall:
         self._annotation_labels: dict[str, frozenset[str]] = {}
         self._annotations_overflowed = False
         # Calls waiting for finish_approval: call id -> (the pending decision, the tool, its reason).
-        self._pending_approvals: dict[str, tuple[Decision, str, str]] = {}
+        # The last item: the labels the call's command sections gave it (Policy.command_labels).
+        self._pending_approvals: dict[str, tuple[Decision, str, str, frozenset[str]]] = {}
         # The secret guard for the policy's secret settings: (settings it was built
         # for, the guard, warnings about secrets.known_values_from_env). Built now,
         # so that the values of those variables are read when the firewall starts;
@@ -444,7 +445,7 @@ class Firewall:
             )
         decision = self._decide_call(tool, args, defer_ask and not self.monitor, call_id)
         if decision.pending:
-            self._remember_pending(decision, tool)
+            self._remember_pending(decision, tool, self.policy.command_labels(tool, args))
             self._audit("call", tool, "ask", decision, args)
             return decision
         return self._finish("call", tool, decision, args=args)
@@ -495,7 +496,7 @@ class Firewall:
             what = "refused" if approved is False else "not answered with True or False"
             final = self._refused_approval(decision, f"{base}; {what} by {who}", approval)
         else:
-            final = self._approved_unless_a_flow_blocks(decision, tool, base, who)
+            final = self._approved_unless_a_flow_blocks(decision, tool, base, who, entry[3])
         self._audit("approval", tool, "allow" if final.allowed else "block", final, None)
         return final
 
@@ -720,7 +721,7 @@ class Firewall:
             blocked = self._blocked_tool_error(tool, exc, call_id)
             if blocked is None:
                 # The error's text reaches the caller, and through it, often, the agent.
-                blocked = self._deliver(tool, call_id)
+                blocked = self._deliver(tool, call_id, args)
             if blocked is None:
                 raise
         if blocked is not None:
@@ -732,7 +733,7 @@ class Firewall:
                 result.close()  # it will never be awaited; avoid a runtime warning
             reason = "the tool returned an awaitable; use run_async"
             self._require_allowed(self.refuse(tool, reason, event="result", rule=RULE_UNSCANNABLE, call_id=call_id))
-        return self._checked_result(tool, result, call_id)
+        return self._checked_result(tool, result, call_id, args)
 
     async def run_async(self, tool: str, args: dict[str, Any] | None, fn: Callable[..., Any]) -> Any:
         """Like `run`, for a tool that is an `async def` function (a plain function works too)."""
@@ -748,12 +749,12 @@ class Firewall:
         except Exception as exc:
             blocked = self._blocked_tool_error(tool, exc, call_id)
             if blocked is None:
-                blocked = self._deliver(tool, call_id)
+                blocked = self._deliver(tool, call_id, args)
             if blocked is None:
                 raise
         if blocked is not None:
             raise BlockedError(blocked)
-        return self._checked_result(tool, result, call_id)
+        return self._checked_result(tool, result, call_id, args)
 
     def foreign_tool_names(self, own_tools: Iterable[str] = ()) -> frozenset[str]:
         """The tool names the policy writes out in full, minus `own_tools`: for scan_result's `foreign_tools`.
@@ -791,11 +792,17 @@ class Firewall:
             labels |= learned or frozenset()
         return labels
 
-    def marks_for(self, tool: str) -> frozenset[str]:
-        """The marks a delivered result of `tool` gives the session: its labels except "sink"."""
-        return frozenset(label for label in self.tool_labels(tool) if label != SINK)
+    def marks_for(self, tool: str, args: Any = None) -> frozenset[str]:
+        """The marks a delivered result of `tool` gives the session: its labels except "sink".
 
-    def mark_delivered(self, tool: str, marks: Iterable[str] | None = None) -> None:
+        args: the call's arguments, when the caller has them: a command section's
+              labels_by_class add labels by what the command does ("cat .env"
+              is secret_read, which a policy may label "private").
+        """
+        labels = self.tool_labels(tool) | self.policy.command_labels(tool, args)
+        return frozenset(label for label in labels if label != SINK)
+
+    def mark_delivered(self, tool: str, marks: Iterable[str] | None = None, args: Any = None) -> None:
         """Record that a result of `tool` is reaching the agent: the session gains its marks.
 
         Call it when it is certain the result will be delivered (it passed
@@ -807,6 +814,7 @@ class Firewall:
                it need not keep the tool name). Default: marks_for(tool).
         tool:  only names the cause in the audit reason of a later flow block;
                any text (the proxy passes a resource's URI), shortened when kept.
+        args:  the call's arguments, for marks_for, when `marks` is not given.
 
         Does nothing when the policy has no flow rules. Raises
         SessionStateError when the marks cannot be recorded (a file store that
@@ -814,7 +822,7 @@ class Firewall:
         """
         if not self.policy.flows:
             return
-        wanted = self.marks_for(tool) if marks is None else frozenset(marks)
+        wanted = self.marks_for(tool, args) if marks is None else frozenset(marks)
         if wanted:
             self.session_store.add(wanted, tool)
 
@@ -963,10 +971,10 @@ class Firewall:
 
     # ---- internals: deferred approval -------------------------------------------
 
-    def _remember_pending(self, decision: Decision, tool: str) -> None:
+    def _remember_pending(self, decision: Decision, tool: str, labels: frozenset[str] = frozenset()) -> None:
         base = decision.reason[: -len(WAITING_FOR_APPROVAL)]
         with self._state_lock:
-            self._pending_approvals[decision.call_id or ""] = (decision, tool, base)
+            self._pending_approvals[decision.call_id or ""] = (decision, tool, base, labels)
             while len(self._pending_approvals) > MAX_PENDING_APPROVALS:
                 # Forget the oldest: finishing it later refuses it, which is the safe side.
                 del self._pending_approvals[next(iter(self._pending_approvals))]
@@ -978,10 +986,15 @@ class Firewall:
             ref=pending.ref, call_id=pending.call_id, approval=approval,
         )
 
-    def _approved_unless_a_flow_blocks(self, pending: Decision, tool: str, base: str, who: str) -> Decision:
-        """Approve, unless a flow rule blocks the call now (the agent may have read more while it waited)."""
+    def _approved_unless_a_flow_blocks(
+        self, pending: Decision, tool: str, base: str, who: str, labels: frozenset[str] = frozenset()
+    ) -> Decision:
+        """Approve, unless a flow rule blocks the call now (the agent may have read more while it waited).
+
+        labels: the labels the call's command gave it when it was checked (Policy.command_labels).
+        """
         if self.policy.flows:
-            flow = self.policy.flow_verdict(tool, self.session_marks(), self.tool_labels(tool))
+            flow = self.policy.flow_verdict(tool, self.session_marks(), self.tool_labels(tool) | labels)
             if flow is not None and flow.action == "block":
                 reason = f"{flow.reason} (approved by {who}, but the session changed while the call waited)"
                 return Decision(
@@ -1116,19 +1129,19 @@ class Firewall:
         reason = f"replaced what looks like a secret ({', '.join(redacted)}); {reason}"
         return Decision(True, reason, findings, rule=RULE_SECRETS_IN_RESULTS, call_id=call_id, redacted=redacted)
 
-    def _checked_result(self, tool: str, result: Any, call_id: str | None) -> Any:
+    def _checked_result(self, tool: str, result: Any, call_id: str | None, args: Any = None) -> Any:
         """The result `run` returns: checked (and, with secrets.in_results "redact", redacted), and marked delivered."""
         checked = self.check_result(tool, result, call_id=call_id)
         self._require_allowed(checked.decision)
-        refused = self._deliver(tool, call_id)
+        refused = self._deliver(tool, call_id, args)
         if refused is not None:
             raise BlockedError(refused)
         return checked.content
 
-    def _deliver(self, tool: str, call_id: str | None) -> Decision | None:
+    def _deliver(self, tool: str, call_id: str | None, args: Any = None) -> Decision | None:
         """Set the marks of a result that is about to be returned; a refusal if they cannot be recorded."""
         try:
-            self.mark_delivered(tool)
+            self.mark_delivered(tool, args=args)
         except SessionStateError as exc:
             return self.withhold(tool, exc, call_id=call_id)
         return None

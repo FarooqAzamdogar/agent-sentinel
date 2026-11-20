@@ -82,6 +82,20 @@ class ShowingAndApplying(WrapTest):
         code, out, err = run_cli("unwrap", "--client", "claude-desktop")
         self.assertNotIn(TOKEN, out + err)
 
+    def test_the_ask_note_counts_asks_from_argument_entries(self):
+        # Every rule allows, but a deny_args entry asks: without --approve-with the proxy refuses those calls.
+        self.place()
+        entry = {"arg": "path", "contains": ".claude", "action": "ask"}
+        self.policy.write_text(json.dumps({"tools": {"write_file": {"action": "allow", "deny_args": [entry]}}}),
+                               encoding="utf-8")
+        code, out, err = self.wrap()
+        self.assertEqual(code, 0, err)
+        self.assertIn("Its 'ask' rules are refused by the proxy unless it is started with an approver", out)
+        self.policy.write_text(json.dumps({"tools": {"write_file": "allow"}}), encoding="utf-8")
+        code, out, err = self.wrap()
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("Its 'ask' rules", out)
+
     def test_apply_backs_up_then_wraps_every_stdio_server_with_full_paths(self):
         self.place()
         original = self.config.read_bytes()

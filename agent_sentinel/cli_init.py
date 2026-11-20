@@ -58,10 +58,12 @@ DESCRIPTION = (
     "the agent-sentinel home folder (policy.json) unless --out names another file; an existing file is never "
     "overwritten."
 )
+_NAME_WIDTH = max(len(name) for name in templates.TEMPLATES) + 2
 EPILOG = """\
 templates:
 """ + "".join(
-    textwrap.fill(template.summary, width=100, initial_indent=f"  {name:10}", subsequent_indent=" " * 12) + "\n"
+    textwrap.fill(template.summary, width=100, initial_indent=f"  {name:{_NAME_WIDTH}}",
+                  subsequent_indent=" " * (_NAME_WIDTH + 2)) + "\n"
     for name, template in templates.TEMPLATES.items()
 ) + """
 examples:

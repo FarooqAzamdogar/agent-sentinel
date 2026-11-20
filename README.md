@@ -267,30 +267,204 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
 ```json
 {
   "default": "block",
+  "hide_blocked_tools": true,
   "deny_args": [
-    { "arg": "*", "pattern": "(^|[\\\\/:])\\.(ssh|aws|env|netrc|git-credentials)\\b|id_(rsa|ed25519)" },
-    { "arg": "*", "contains": ".agent-sentinel" }
+    {
+      "arg": "*",
+      "pattern": "(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])\\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\\b|id_(rsa|dsa|ecdsa|ed25519)|(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]|(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])(\\.config|config~[0-9]+)[\\\\/](gh|gcloud|github-copilot)\\b|(^|[\\\\/])proc[\\\\/][^\\\\/]+[\\\\/]environ\\b|claude_desktop_config\\.json|(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])\\.claude\\.json\\b|(^|[\\s\\\\/:@='\\\"`<>|;&(,{\\u2018-\\u201e])\\.(cursor|vscode)[\\\\/]mcp\\.json\\b|[\\\\/]code[\\\\/]user[\\\\/]mcp\\.json\\b"
+    },
+    { "arg": "*", "contains": ".agent-sentinel" },
+    { "arg": "*", "pattern": "(^|[\\\\/:])agent-~[0-9]" }
   ],
   "tools": {
-    "Read":            { "action": "allow", "labels": ["private"] },
-    "Glob":            "allow",
-    "Grep":            { "action": "allow", "labels": ["private"] },
-    "Edit":            "ask",
-    "Write":           "ask",
-    "NotebookEdit":    "ask",
-    "Bash":            { "action": "ask", "labels": ["sink"] },
-    "WebFetch":        { "action": "allow", "labels": ["untrusted", "sink"] },
-    "WebSearch":       { "action": "allow", "labels": ["untrusted"] },
-    "Agent":           "allow",
-    "AskUserQuestion": "allow",
-    "ExitPlanMode":    "allow",
-    "mcp__github__*":  { "action": "ask", "labels": ["untrusted", "sink"] }
+    "Read": {
+      "action": "allow",
+      "labels": ["private"],
+      "deny_args": [{ "arg": "file_path", "type": "path", "roots": ["~/.ssh", "~/.aws", "~/.agent-sentinel"] }]
+    },
+    "Grep": {
+      "action": "allow",
+      "labels": ["private"],
+      "deny_args": [{ "arg": "path", "type": "path", "roots": ["~/.ssh", "~/.aws", "~/.agent-sentinel"] }]
+    },
+    "Glob": {
+      "action": "allow",
+      "labels": ["private"],
+      "deny_args": [{ "arg": "path", "type": "path", "roots": ["~/.ssh", "~/.aws", "~/.agent-sentinel"] }]
+    },
+    "Edit": {
+      "action": "allow",
+      "labels": [],
+      "deny_args": [
+        { "arg": "file_path", "type": "path", "roots": ["~/.ssh", "~/.aws", "~/.agent-sentinel"] },
+        {
+          "arg": "file_path",
+          "pattern": "(^|[\\\\/:])\\.claude[\\\\/](settings(\\.local)?\\.json|hooks|agents|skills|commands|rules)\\b|(^|[\\\\/:])\\.mcp\\.json\\b|(^|[\\\\/:])(CLAUDE(\\.local)?|AGENTS|MEMORY|GEMINI)\\.md\\b|(^|[\\\\/:])\\.github[\\\\/]copilot-instructions\\.md\\b|(^|[\\\\/:])\\.vscode[\\\\/](settings|tasks)\\.json\\b|(^|[\\\\/:])\\.cursor[\\\\/](rules|cli\\.json|hooks\\.json)\\b|(^|[\\\\/:])\\.cursorrules\\b|(^|[\\\\/:])\\.(gemini|windsurf)([\\\\/]|$)|(^|[\\\\/:])mcp_config\\.json\\b|(^|[\\\\/:])\\.codex[\\\\/]config\\.toml\\b|(^|[\\\\/:])\\.git[\\\\/](hooks|config)\\b|(^|[\\\\/:])\\.(bashrc|bash_profile|bash_login|zshrc|zshenv|zprofile|profile)\\b|(^|[\\\\/:])([\\w.]+_)?profile\\.ps1\\b",
+          "action": "ask"
+        },
+        {
+          "arg": "file_path",
+          "type": "path",
+          "roots": ["~/.claude", "~/.cursor", "~/.codeium", "~/.gemini", "~/.codex", "~/.agent-sentinel"],
+          "action": "ask"
+        },
+        {
+          "arg": "file_path",
+          "pattern": "[^\\\\/:][\\\\/]{2,}|(^|[\\\\/:])(?!\\.\\.?[\\\\/])[^\\\\/:]+[\\\\/]+\\.\\.?([\\\\/]|$)",
+          "action": "ask"
+        },
+        {
+          "arg": "*",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])([\\w.]|\\\\(u00|U000000)[0-9a-f]{2}){0,80}[\\\"'\\u2018-\\u201e]?\\s*[:=]",
+          "action": "ask"
+        }
+      ]
+    },
+    "Write": {
+      "action": "allow",
+      "labels": [],
+      "deny_args": [
+        { "arg": "file_path", "type": "path", "roots": ["~/.ssh", "~/.aws", "~/.agent-sentinel"] },
+        {
+          "arg": "file_path",
+          "pattern": "(^|[\\\\/:])\\.claude[\\\\/](settings(\\.local)?\\.json|hooks|agents|skills|commands|rules)\\b|(^|[\\\\/:])\\.mcp\\.json\\b|(^|[\\\\/:])(CLAUDE(\\.local)?|AGENTS|MEMORY|GEMINI)\\.md\\b|(^|[\\\\/:])\\.github[\\\\/]copilot-instructions\\.md\\b|(^|[\\\\/:])\\.vscode[\\\\/](settings|tasks)\\.json\\b|(^|[\\\\/:])\\.cursor[\\\\/](rules|cli\\.json|hooks\\.json)\\b|(^|[\\\\/:])\\.cursorrules\\b|(^|[\\\\/:])\\.(gemini|windsurf)([\\\\/]|$)|(^|[\\\\/:])mcp_config\\.json\\b|(^|[\\\\/:])\\.codex[\\\\/]config\\.toml\\b|(^|[\\\\/:])\\.git[\\\\/](hooks|config)\\b|(^|[\\\\/:])\\.(bashrc|bash_profile|bash_login|zshrc|zshenv|zprofile|profile)\\b|(^|[\\\\/:])([\\w.]+_)?profile\\.ps1\\b",
+          "action": "ask"
+        },
+        {
+          "arg": "file_path",
+          "type": "path",
+          "roots": ["~/.claude", "~/.cursor", "~/.codeium", "~/.gemini", "~/.codex", "~/.agent-sentinel"],
+          "action": "ask"
+        },
+        {
+          "arg": "file_path",
+          "pattern": "[^\\\\/:][\\\\/]{2,}|(^|[\\\\/:])(?!\\.\\.?[\\\\/])[^\\\\/:]+[\\\\/]+\\.\\.?([\\\\/]|$)",
+          "action": "ask"
+        },
+        {
+          "arg": "*",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])([\\w.]|\\\\(u00|U000000)[0-9a-f]{2}){0,80}[\\\"'\\u2018-\\u201e]?\\s*[:=]",
+          "action": "ask"
+        }
+      ]
+    },
+    "MultiEdit": {
+      "action": "allow",
+      "labels": [],
+      "deny_args": [
+        { "arg": "file_path", "type": "path", "roots": ["~/.ssh", "~/.aws", "~/.agent-sentinel"] },
+        {
+          "arg": "file_path",
+          "pattern": "(^|[\\\\/:])\\.claude[\\\\/](settings(\\.local)?\\.json|hooks|agents|skills|commands|rules)\\b|(^|[\\\\/:])\\.mcp\\.json\\b|(^|[\\\\/:])(CLAUDE(\\.local)?|AGENTS|MEMORY|GEMINI)\\.md\\b|(^|[\\\\/:])\\.github[\\\\/]copilot-instructions\\.md\\b|(^|[\\\\/:])\\.vscode[\\\\/](settings|tasks)\\.json\\b|(^|[\\\\/:])\\.cursor[\\\\/](rules|cli\\.json|hooks\\.json)\\b|(^|[\\\\/:])\\.cursorrules\\b|(^|[\\\\/:])\\.(gemini|windsurf)([\\\\/]|$)|(^|[\\\\/:])mcp_config\\.json\\b|(^|[\\\\/:])\\.codex[\\\\/]config\\.toml\\b|(^|[\\\\/:])\\.git[\\\\/](hooks|config)\\b|(^|[\\\\/:])\\.(bashrc|bash_profile|bash_login|zshrc|zshenv|zprofile|profile)\\b|(^|[\\\\/:])([\\w.]+_)?profile\\.ps1\\b",
+          "action": "ask"
+        },
+        {
+          "arg": "file_path",
+          "type": "path",
+          "roots": ["~/.claude", "~/.cursor", "~/.codeium", "~/.gemini", "~/.codex", "~/.agent-sentinel"],
+          "action": "ask"
+        },
+        {
+          "arg": "file_path",
+          "pattern": "[^\\\\/:][\\\\/]{2,}|(^|[\\\\/:])(?!\\.\\.?[\\\\/])[^\\\\/:]+[\\\\/]+\\.\\.?([\\\\/]|$)",
+          "action": "ask"
+        },
+        {
+          "arg": "*",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])([\\w.]|\\\\(u00|U000000)[0-9a-f]{2}){0,80}[\\\"'\\u2018-\\u201e]?\\s*[:=]",
+          "action": "ask"
+        }
+      ]
+    },
+    "NotebookEdit": {
+      "action": "allow",
+      "labels": [],
+      "deny_args": [
+        { "arg": "notebook_path", "type": "path", "roots": ["~/.ssh", "~/.aws", "~/.agent-sentinel"] },
+        {
+          "arg": "notebook_path",
+          "pattern": "(^|[\\\\/:])\\.claude[\\\\/](settings(\\.local)?\\.json|hooks|agents|skills|commands|rules)\\b|(^|[\\\\/:])\\.mcp\\.json\\b|(^|[\\\\/:])(CLAUDE(\\.local)?|AGENTS|MEMORY|GEMINI)\\.md\\b|(^|[\\\\/:])\\.github[\\\\/]copilot-instructions\\.md\\b|(^|[\\\\/:])\\.vscode[\\\\/](settings|tasks)\\.json\\b|(^|[\\\\/:])\\.cursor[\\\\/](rules|cli\\.json|hooks\\.json)\\b|(^|[\\\\/:])\\.cursorrules\\b|(^|[\\\\/:])\\.(gemini|windsurf)([\\\\/]|$)|(^|[\\\\/:])mcp_config\\.json\\b|(^|[\\\\/:])\\.codex[\\\\/]config\\.toml\\b|(^|[\\\\/:])\\.git[\\\\/](hooks|config)\\b|(^|[\\\\/:])\\.(bashrc|bash_profile|bash_login|zshrc|zshenv|zprofile|profile)\\b|(^|[\\\\/:])([\\w.]+_)?profile\\.ps1\\b",
+          "action": "ask"
+        },
+        {
+          "arg": "notebook_path",
+          "type": "path",
+          "roots": ["~/.claude", "~/.cursor", "~/.codeium", "~/.gemini", "~/.codex", "~/.agent-sentinel"],
+          "action": "ask"
+        },
+        {
+          "arg": "notebook_path",
+          "pattern": "[^\\\\/:][\\\\/]{2,}|(^|[\\\\/:])(?!\\.\\.?[\\\\/])[^\\\\/:]+[\\\\/]+\\.\\.?([\\\\/]|$)",
+          "action": "ask"
+        },
+        {
+          "arg": "*",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])([\\w.]|\\\\(u00|U000000)[0-9a-f]{2}){0,80}[\\\"'\\u2018-\\u201e]?\\s*[:=]",
+          "action": "ask"
+        }
+      ]
+    },
+    "Bash": {
+      "action": "allow",
+      "labels": [],
+      "deny_args": [
+        {
+          "arg": "command",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])([\\w.]|\\\\(u00|U000000)[0-9a-f]{2}){0,80}[\\\"'\\u2018-\\u201e]?\\s*[:=]",
+          "action": "ask"
+        }
+      ],
+      "command": {
+        "shell": "bash",
+        "ask_classes": ["network", "install", "config_write", "obfuscation"],
+        "labels_by_class": { "network": ["sink"], "install": ["sink"], "secret_read": ["private"] }
+      }
+    },
+    "PowerShell": {
+      "action": "allow",
+      "labels": [],
+      "deny_args": [
+        {
+          "arg": "command",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])([\\w.]|\\\\(u00|U000000)[0-9a-f]{2}){0,80}[\\\"'\\u2018-\\u201e]?\\s*[:=]",
+          "action": "ask"
+        }
+      ],
+      "command": {
+        "shell": "powershell",
+        "ask_classes": ["network", "install", "config_write", "obfuscation"],
+        "labels_by_class": { "network": ["sink"], "install": ["sink"], "secret_read": ["private"] }
+      }
+    },
+    "WebFetch": {
+      "action": "allow",
+      "labels": ["untrusted", "sink"],
+      "deny_args": [
+        {
+          "arg": "url",
+          "type": "url",
+          "hosts": ["localhost", ".localhost", ".local", ".internal", ".home.arpa", "metadata.goog"]
+        },
+        { "arg": "url", "pattern": "^\\s*[a-z][a-z0-9+.-]*:/*(\\[|[0-9.]+([:/?#]|$)|[^./?#:@]+([:/?#]|$))" }
+      ]
+    },
+    "WebSearch": { "action": "allow", "labels": ["untrusted", "sink"] },
+    "ReadMcpResourceTool": { "action": "allow", "labels": ["untrusted", "sink"] },
+    "ListMcpResourcesTool": { "action": "allow", "labels": ["untrusted", "sink"] },
+    "Monitor": { "action": "ask", "labels": ["untrusted", "sink"] },
+    "Agent": { "action": "allow", "labels": [] },
+    "Task": { "action": "allow", "labels": [] },
+    "TodoWrite": { "action": "allow", "labels": [] },
+    "AskUserQuestion": { "action": "allow", "labels": [] },
+    "ExitPlanMode": { "action": "allow", "labels": [] },
+    "SubagentHandback": { "action": "allow", "labels": [] },
+    "mcp__*": { "action": "ask", "labels": ["untrusted", "sink"] }
   },
-  "flows": [
-    { "after": ["untrusted", "private"], "then": "sink", "action": "block" }
-  ],
+  "server_requests": { "sampling/createMessage": "block", "*": "allow" },
+  "injection": { "block_severity": "high" },
   "secrets": { "in_arguments": "block", "in_results": "redact" },
-  "limits": { "max_calls_per_minute": 120 }
+  "limits": { "max_calls_per_minute": 120 },
+  "flows": [{ "after": ["untrusted", "private"], "then": "sink", "action": "block" }]
 }
 ```
 
@@ -399,8 +573,8 @@ A policy is one JSON file. Anything without a rule is refused. Here is [policy.e
   ],
   "tools": {
     "read_file": { "action": "allow", "labels": ["private"] },
-    "fetch_page": { "action": "allow", "labels": ["untrusted"] },
-    "search_*": "allow",
+    "fetch_page": { "action": "allow", "labels": ["untrusted", "sink"] },
+    "search_*": { "action": "allow", "labels": ["untrusted", "sink"] },
     "send_email": {
       "action": "ask",
       "labels": ["sink"],
@@ -415,7 +589,7 @@ A policy is one JSON file. Anything without a rule is refused. Here is [policy.e
     },
     "delete_*": "block",
     "run_shell": "block",
-    "resources/read": "allow"
+    "resources/read": { "action": "allow", "labels": ["untrusted", "private"] }
   },
   "flows": [
     { "after": ["untrusted", "private"], "then": "sink", "action": "block" }
@@ -521,7 +695,7 @@ A flow rule stops a dangerous chain of calls, not one call:
 
 ```json
 "tools": {
-  "fetch_page": { "action": "allow", "labels": ["untrusted"] },
+  "fetch_page": { "action": "allow", "labels": ["untrusted", "sink"] },
   "read_file":  { "action": "allow", "labels": ["private"] },
   "send_email": { "action": "ask",   "labels": ["sink"] }
 },
@@ -565,8 +739,8 @@ Tool calls and resource reads are never decided by `client_requests`; the tool r
 - **Deny is "contains", allow is "whole value".** An allow entry for `to` accepts `boss@example.com` and refuses `attacker@evil.example, boss@example.com`. For a list, every entry must pass; objects and empty lists are refused.
 - **Deny rules also see percent-decoded spellings**, so `%2Essh` does not get round a rule for `.ssh`. A value that is still encoded after three rounds is denied.
 - **Allow rules match the value as written.** Letters that only look like a match (such as dotless `ı` for `i`) are refused.
-- **Argument names are exact.** Only tool names take `*`. In `deny_args`, `"arg": "*"` means every argument.
-- **When several wildcard rules match a tool, the strictest wins** (block over ask over allow). A rule with the exact tool name beats all wildcards. Use `default` for the fallback, not a `"*"` rule.
+- **Argument names ignore case where a server might.** A `deny_args` entry for `command` also checks `Command`; a call with two names that differ only in case is refused, and an `allow_args` name in another case is not accepted. Only tool names take `*`. In `deny_args`, `"arg": "*"` means every argument.
+- **When several wildcard rules match a tool, the strictest wins** (block over ask over allow). A rule with the exact tool name replaces the wildcards' action, `allow_args` and `other_args`; their `deny_args`, labels and rate limits still apply. Use `default` for the fallback, not a `"*"` rule.
 - **MCP resource reads and subscriptions** are checked as a tool named `resources/read` with one argument, `uri`. With `"default": "block"` they need a rule.
 - **Loading is strict.** An unknown key, a duplicate key, a wrong type or a missing `action` is an error, so a typo cannot quietly weaken a policy. The error message names the file and the setting (such as `tools.read_file.action`) and suggests the word you probably meant; a JSON syntax error also shows the line, the column and a caret.
 - **Paths are judged as text.** A deny rule for `.ssh` catches `notes/../.ssh/id_rsa` but not a symbolic link to that file. Use the tool's own access controls as well.

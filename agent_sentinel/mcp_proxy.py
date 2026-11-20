@@ -1183,7 +1183,7 @@ class Proxy:
         """
         method = message["method"]
         if method == "tools/call":
-            return self._firewall.marks_for(message["params"]["name"])
+            return self._firewall.marks_for(message["params"]["name"], message["params"].get("arguments"))
         if method in (RESOURCE_READ, PROMPTS_GET):
             return self._firewall.marks_for(method)
         return frozenset()

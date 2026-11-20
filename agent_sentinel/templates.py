@@ -17,7 +17,11 @@ Every template:
 The tool names are those of the reference MCP servers (filesystem, git,
 fetch, memory). Other servers name their tools differently: `agent-sentinel
 inspect -- <server command>` lists a server's names, and `agent-sentinel init
--- <server command>` drafts a policy from them.
+-- <server command>` drafts a policy from them. The claude-code templates are
+for the Claude Code hooks, with Claude Code's own tool names (Read, Bash ...).
+
+Templates whose tools write files keep them away from agents' configuration
+(write_protection): the starter templates ask, the strict ones refuse.
 """
 
 from __future__ import annotations
@@ -26,16 +30,26 @@ import copy
 from dataclasses import dataclass
 from typing import Any
 
+# What may come right before a credential file's name: the start of the text,
+# a path separator or a drive's ":", but also a space or a character a shell or
+# a command line puts there. So "cat .env", "curl -d @.env", "--env-file=.env"
+# and "Get-Content .env" match, as well as "~/.ssh/id_rsa". The typographic
+# quotes ‘ to „ are there because PowerShell reads them as quotes
+# (Get-Content ‘.env’).
+_NAME_START = r"(^|[\s\\/:@='\"`<>|;&(,{\u2018-\u201e])"
+# The quotes a setting's name may stand in: ' and ", and the typographic ones PowerShell also reads as quotes.
+_QUOTE = r"[\"'\u2018-\u201e]"
+
 # The credential preset of policy.example.json (a test keeps the two the same).
 CREDENTIAL_PATTERN = (
-    r"(^|[\\/:])\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\b"
+    _NAME_START + r"\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\b"
     r"|id_(rsa|dsa|ecdsa|ed25519)"
-    r"|(^|[\\/:])(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]"
-    r"|(^|[\\/:])(\.config|config~[0-9]+)[\\/](gh|gcloud|github-copilot)\b"
+    r"|" + _NAME_START + r"(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]"
+    r"|" + _NAME_START + r"(\.config|config~[0-9]+)[\\/](gh|gcloud|github-copilot)\b"
     r"|(^|[\\/])proc[\\/][^\\/]+[\\/]environ\b"
     r"|claude_desktop_config\.json"
-    r"|(^|[\\/:])\.claude\.json\b"
-    r"|(^|[\\/:])\.(cursor|vscode)[\\/]mcp\.json\b"
+    r"|" + _NAME_START + r"\.claude\.json\b"
+    r"|" + _NAME_START + r"\.(cursor|vscode)[\\/]mcp\.json\b"
     r"|[\\/]code[\\/]user[\\/]mcp\.json\b"
 )
 
@@ -43,10 +57,80 @@ CREDENTIAL_PATTERN = (
 # agent-sentinel's own folder (home.py): an agent that could rewrite the policy
 # or the pins could switch the protection off. "AGENT-~1" is the Windows short
 # name the folder can also be reached by.
+AGENT_SENTINEL_HOME_PATTERN = r"(^|[\\/:])agent-~[0-9]"
 BASELINE_DENY_ARGS: tuple[dict[str, Any], ...] = (
     {"arg": "*", "pattern": CREDENTIAL_PATTERN},
     {"arg": "*", "contains": ".agent-sentinel"},
-    {"arg": "*", "pattern": r"(^|[\\/:])agent-~[0-9]"},
+    {"arg": "*", "pattern": AGENT_SENTINEL_HOME_PATTERN},
+)
+
+# Files that tell an agent what to do, or let it run code when it or a shell
+# starts: its settings and hooks, the MCP servers it starts, its instruction and
+# memory files, git hooks, and shell start-up files. An agent that may write one
+# can switch agent-sentinel off for the next session or plant instructions.
+# Used ONLY on the arguments of tools that write (never "arg": "*"): reading
+# CLAUDE.md, or a commit message that names it, must stay possible. The Windows
+# short names of these files are refused by the path entries that go with it
+# (HOME_CONFIG_ROOTS), which refuse every short name.
+AGENT_CONFIG_PATTERN = (
+    r"(^|[\\/:])\.claude[\\/](settings(\.local)?\.json|hooks|agents|skills|commands|rules)\b"
+    r"|(^|[\\/:])\.mcp\.json\b"
+    r"|(^|[\\/:])(CLAUDE(\.local)?|AGENTS|MEMORY|GEMINI)\.md\b"
+    r"|(^|[\\/:])\.github[\\/]copilot-instructions\.md\b"
+    r"|(^|[\\/:])\.vscode[\\/](settings|tasks)\.json\b"
+    r"|(^|[\\/:])\.cursor[\\/](rules|cli\.json|hooks\.json)\b"
+    r"|(^|[\\/:])\.cursorrules\b"
+    r"|(^|[\\/:])\.(gemini|windsurf)([\\/]|$)"
+    r"|(^|[\\/:])mcp_config\.json\b"
+    r"|(^|[\\/:])\.codex[\\/]config\.toml\b"
+    r"|(^|[\\/:])\.git[\\/](hooks|config)\b"
+    r"|(^|[\\/:])\.(bashrc|bash_profile|bash_login|zshrc|zshenv|zprofile|profile)\b"
+    r"|(^|[\\/:])([\w.]+_)?profile\.ps1\b"
+)
+# A path spelled in a roundabout way: a "." or ".." part after a name, or two
+# separators in a row after a name ("app/.claude/./settings.json",
+# "app/.claude//settings.json", "app/.claude/x/../settings.json"). Every system
+# opens the plain path, but a text pattern such as AGENT_CONFIG_PATTERN does not
+# see it there, so the write tools are not given such a path at all. A leading
+# "./" or "../" is plain and still allowed; so is a trailing separator.
+ROUNDABOUT_PATH_PATTERN = (
+    r"[^\\/:][\\/]{2,}"
+    r"|(^|[\\/:])(?!\.\.?[\\/])[^\\/:]+[\\/]+\.\.?([\\/]|$)"
+)
+# The folders in the home folder that hold agents' own settings, and agent-sentinel's.
+# A "type": "path" entry with these roots also refuses every Windows short name
+# ("CLAUDE~1") and every value it cannot read with certainty.
+HOME_CONFIG_ROOTS = ("~/.claude", "~/.cursor", "~/.codeium", "~/.gemini", "~/.codex", "~/.agent-sentinel")
+# Folders of keys that no tool of an agent needs: a "type": "path" deny for the
+# arguments that name a file, beside the text pattern, because it refuses
+# short names ("SSH~1\\ID_ED2~1") and spellings such as %USERPROFILE%.
+SECRET_ROOTS = ("~/.ssh", "~/.aws", "~/.agent-sentinel")
+# Text that sets what decides where an agent sends its requests, which code
+# Node loads, or whether the agent asks before it acts.
+#   * NAME= / "NAME": / NAME: anywhere (code, settings, a shell): a *_BASE_URL in
+#     upper case (as environment variables are written; "api_base_url = ..." in
+#     ordinary code is left alone), and Anthropic's own *_BASE_URL and
+#     NODE_OPTIONS in any case, because Windows and Node on Windows read
+#     environment variable names without case;
+#   * Windows' own ways of setting a variable, where case never matters: setx,
+#     $env:NAME = ..., PowerShell's env: drive (Set-Item env:NAME) and
+#     [Environment]::SetEnvironmentVariable('NAME', ...);
+#   * a name with a plain letter, digit, "_" or "." written as an escape that
+#     the program reading the file decodes (JSON's, and YAML's and TOML's,
+#     _ or \U0000005f), right before ":" or "=": "chat.tools.autoApprove":
+#     and NODE_OPTIONS=. Ordinary files have no reason to escape those.
+_ANY_CASE_SETTING = r"\w*_base_url|node_options"
+_ESCAPED_PLAIN = r"\\(u00|U000000)"  # then two hex digits
+CONTROL_SETTING_PATTERN = (
+    r"(?<![\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\w*_base_url|node_options"
+    r"|chat\.tools\.(global\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)"
+    + _QUOTE + r"?\s*[:=]"
+    r"|\bsetx(\.exe)?\s+(/m\s+)?" + _QUOTE + r"?(" + _ANY_CASE_SETTING + r")\b"
+    r"|\$\{?env:(" + _ANY_CASE_SETTING + r")\}?\s*\+?="
+    r"|(?<![\w$:{])env:[\\/]?(" + _ANY_CASE_SETTING + r")\b"
+    r"|SetEnvironmentVariable\s*\(\s*" + _QUOTE + r"?(" + _ANY_CASE_SETTING + r")\b"
+    r"|" + _ESCAPED_PLAIN + r"(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])"
+    r"([\w.]|" + _ESCAPED_PLAIN + r"[0-9a-f]{2}){0,80}" + _QUOTE + r"?\s*[:=]"
 )
 
 # A value that starts with "-" can be read as an option by a program the tool
@@ -94,6 +178,22 @@ _PATH_ARGUMENTS: dict[str, tuple[str, ...]] = {
 # A placeholder: `init` says to change it.
 STRICT_ROOT = "~/projects"
 
+# Claude Code's own tools (hook mode), and the arguments that name the file they read or write.
+CLAUDE_CODE_READ_TOOLS: dict[str, str] = {"Read": "file_path", "Grep": "path", "Glob": "path"}
+CLAUDE_CODE_WRITE_TOOLS: dict[str, str] = {
+    "Edit": "file_path", "Write": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path",
+}
+# Tools that neither read nor send anything the flow rules care about ("labels": [] says so).
+CLAUDE_CODE_PLAIN_TOOLS = ("Agent", "Task", "TodoWrite", "AskUserQuestion", "ExitPlanMode", "SubagentHandback")
+# The command classes each template refuses or asks about (commands.py).
+COMMAND_CLASSES_ASKED = ["network", "install", "config_write", "obfuscation"]
+COMMAND_CLASSES_STRICT = ["network", "install", "secret_read", "config_write", "obfuscation", "encoded_host"]
+# What a command adds to the flow labels of a Bash or PowerShell call: one that talks to another
+# machine can carry data out, one that reads a credential file brings private data in.
+COMMAND_LABELS = {"network": ["sink"], "install": ["sink"], "secret_read": ["private"]}
+# The strict hook template keeps the parts of a fetched URL that can carry data short.
+STRICT_URL_LIMITS = {"max_label_length": 30, "max_path_segment_chars": 80, "max_query_chars": 128}
+
 # Hosts a fetch tool must never reach: this machine, names of the local network, and
 # the cloud metadata services, which hand out credentials. A deny rule of type url also
 # refuses any URL it cannot read with certainty (user names in it, backslashes, odd
@@ -139,21 +239,48 @@ def baseline_policy() -> dict[str, Any]:
     return _baseline()
 
 
+def write_protection(arguments: tuple[str, ...], action: str) -> list[dict[str, Any]]:
+    """deny_args for a tool that writes files ("ask" or "block" for what they match).
+
+    Its path arguments may not name an agent's configuration, instruction or
+    hook file (AGENT_CONFIG_PATTERN), nor anything in the home folders of
+    agents' settings (HOME_CONFIG_ROOTS: a path entry, which also refuses
+    Windows short names and values it cannot read), nor be spelled in a
+    roundabout way that the text pattern would not see through
+    (ROUNDABOUT_PATH_PATTERN: "a/./b", "a//b", "a/x/../b"). No argument may set
+    what decides where the agent's requests go or whether it asks first
+    (CONTROL_SETTING_PATTERN). Never for "arg": "*" on every tool: reading
+    CLAUDE.md must stay possible.
+    """
+    entries: list[dict[str, Any]] = []
+    for argument in arguments:
+        entries.append({"arg": argument, "pattern": AGENT_CONFIG_PATTERN})
+        entries.append({"arg": argument, "type": "path", "roots": list(HOME_CONFIG_ROOTS)})
+        entries.append({"arg": argument, "pattern": ROUNDABOUT_PATH_PATTERN})
+    entries.append({"arg": "*", "pattern": CONTROL_SETTING_PATTERN})
+    if action == "ask":
+        for entry in entries:
+            entry["action"] = "ask"
+    return entries
+
+
+def _fetch_denies(limits: dict[str, int] | None = None) -> list[dict[str, Any]]:
+    """A fetch tool's url argument: never this machine, the local network or a cloud metadata service."""
+    return [
+        {"arg": "url", "type": "url", "hosts": list(_LOCAL_HOSTS), **(limits or {})},
+        {"arg": "url", "pattern": LOCAL_NETWORK_URL},
+    ]
+
+
 def _starter() -> dict[str, Any]:
     policy = _baseline()
     tools = policy["tools"]
     tools.update(_rules(FILE_READ_TOOLS, {"action": "allow", "labels": ["private"]}))
     tools.update(_rules(GIT_READ_TOOLS, {"action": "allow", "labels": ["private"], "deny_args": [NO_OPTIONS]}))
     tools.update(_rules(MEMORY_READ_TOOLS, {"action": "allow", "labels": ["private"]}))
-    tools["fetch"] = {
-        "action": "allow",
-        "labels": ["untrusted", "sink"],
-        "deny_args": [
-            {"arg": "url", "type": "url", "hosts": list(_LOCAL_HOSTS)},
-            {"arg": "url", "pattern": LOCAL_NETWORK_URL},
-        ],
-    }
-    tools.update(_rules(FILE_WRITE_TOOLS, {"action": "ask", "labels": ["sink"]}))
+    tools["fetch"] = {"action": "allow", "labels": ["untrusted", "sink"], "deny_args": _fetch_denies()}
+    for name in FILE_WRITE_TOOLS:
+        tools[name] = {"action": "ask", "labels": ["sink"], "deny_args": write_protection(_PATH_ARGUMENTS[name], "ask")}
     tools["delete_*"] = "block"
     tools["run_*"] = "block"
     policy["secrets"]["in_results"] = "redact"
@@ -177,7 +304,11 @@ def _strict(roots: tuple[str, ...] = (STRICT_ROOT,)) -> dict[str, Any]:
             tools[name]["deny_args"] = [dict(NO_OPTIONS)]
         if name in FILE_WRITE_TOOLS:
             tools[name]["labels"] = ["sink"]
-    tools["list_allowed_directories"] = "allow"
+            # Even inside a root: a project's .claude/settings.json, .mcp.json or CLAUDE.md is refused.
+            tools[name]["deny_args"] = write_protection(arguments, "block")
+        else:
+            tools[name]["labels"] = ["private"]
+    tools["list_allowed_directories"] = {"action": "allow", "labels": ["private"]}
     # Prompts are checked like tool calls once client_requests exists; none is allowed.
     tools["prompts/get"] = "block"
     policy["server_requests"] = dict(STRICT_SERVER_REQUESTS)
@@ -205,6 +336,61 @@ def _monitor() -> dict[str, Any]:
     # rule that would have blocked it, and `suggest` turns the calls that only
     # the default blocked into exact rules.
     return _baseline()
+
+
+def _claude_code(strict: bool) -> dict[str, Any]:
+    """A policy for the Claude Code hooks (`hook install claude-code`), with Claude Code's own tool names.
+
+    "allow" lets Claude Code's own permission rules decide; "ask" shows its
+    prompt (and refuses in a mode that shows none, such as bypassPermissions).
+    """
+    policy = _baseline()
+    tools = policy["tools"]
+    action = "block" if strict else "ask"
+    for name, argument in CLAUDE_CODE_READ_TOOLS.items():
+        tools[name] = {"action": "allow", "labels": ["private"],
+                       "deny_args": [{"arg": argument, "type": "path", "roots": list(SECRET_ROOTS)}]}
+    for name, argument in CLAUDE_CODE_WRITE_TOOLS.items():
+        tools[name] = {
+            "action": "allow",
+            "labels": [],
+            "deny_args": [{"arg": argument, "type": "path", "roots": list(SECRET_ROOTS)},
+                          *write_protection((argument,), action)],
+        }
+    for name, shell in (("Bash", "bash"), ("PowerShell", "powershell")):
+        setting = {"arg": "command", "pattern": CONTROL_SETTING_PATTERN}
+        if not strict:
+            setting["action"] = "ask"
+        command: dict[str, Any] = {"shell": shell}
+        if strict:
+            command["deny_classes"] = list(COMMAND_CLASSES_STRICT)
+        else:
+            command["ask_classes"] = list(COMMAND_CLASSES_ASKED)
+        command["labels_by_class"] = copy.deepcopy(COMMAND_LABELS)
+        tools[name] = {"action": "allow", "labels": [], "deny_args": [setting], "command": command}
+    tools["WebFetch"] = {"action": "allow", "labels": ["untrusted", "sink"],
+                         "deny_args": _fetch_denies(STRICT_URL_LIMITS if strict else None)}
+    # A search query, a resource URI and a server name all leave the machine.
+    for name in ("WebSearch", "ReadMcpResourceTool", "ListMcpResourcesTool"):
+        tools[name] = {"action": "allow", "labels": ["untrusted", "sink"]}
+    tools["Monitor"] = {"action": "ask", "labels": ["untrusted", "sink"]}
+    tools.update(_rules(CLAUDE_CODE_PLAIN_TOOLS, {"action": "allow", "labels": []}))
+    tools["mcp__*"] = {"action": "ask", "labels": ["untrusted", "sink"]}
+    if strict:
+        policy["injection"]["block_severity"] = "medium"
+        policy["secrets"]["in_results"] = "block"
+        policy["limits"]["max_calls_per_minute"] = 60
+        # After untrusted content, a person approves each call that sends something out; after untrusted
+        # content and private data, nothing is sent. (A block after untrusted alone would make WebFetch
+        # refuse itself after its first page.)
+        policy["flows"] = [
+            {"after": ["untrusted"], "then": "sink", "action": "ask"},
+            {"after": ["untrusted", "private"], "then": "sink", "action": "block"},
+        ]
+    else:
+        policy["secrets"]["in_results"] = "redact"
+        policy["flows"] = [{"after": ["untrusted", "private"], "then": "sink", "action": "block"}]
+    return policy
 
 
 _NEXT_COMMON = (
@@ -248,6 +434,29 @@ TEMPLATES: dict[str, Template] = {
                 "agent-sentinel wrap --client claude-desktop --policy {policy} --monitor",
                 "After using the agent a while: agent-sentinel suggest {audit} --policy {policy}",
                 "Then unwrap and wrap again without --monitor: monitor mode protects nothing.",
+            ),
+        ),
+        Template(
+            "claude-code",
+            "For the Claude Code hooks: Claude Code's own tools, with credential folders kept out of reach, writes "
+            "to agent settings and instruction files asked about, Bash and PowerShell commands that reach the "
+            "network, install packages, write agent settings or hide what they run asked about, and nothing sent "
+            "out once web content and private files have both been read.",
+            _claude_code(strict=False),
+            (
+                "Validate it: agent-sentinel validate {policy}",
+                "Install the hooks: agent-sentinel hook install claude-code --policy {policy}",
+            ),
+        ),
+        Template(
+            "claude-code-strict",
+            "Like claude-code, but refuses what it asks about there and any command that names a credential file "
+            "or a host that looks like it carries data, keeps WebFetch URLs short, asks before anything is sent "
+            "out after untrusted content, and blocks medium injection findings.",
+            _claude_code(strict=True),
+            (
+                "Validate it: agent-sentinel validate {policy}",
+                "Install the hooks: agent-sentinel hook install claude-code --policy {policy}",
             ),
         ),
     )

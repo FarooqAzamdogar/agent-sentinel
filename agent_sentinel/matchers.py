@@ -9,7 +9,9 @@ matcher:
     starts_with  a literal beginning, case-insensitive
     ends_with    a literal ending, case-insensitive
     no_options   true: the value must not start with "-" (so it cannot be read as a command-line option)
-    type         "path" with "roots", "url" with "hosts" (and "schemes"), or "email" with "domains"
+    type         "path" with "roots", "url" with "hosts" (and "schemes", and the limits
+                 max_label_length, max_path_segment_chars, max_query_chars), "email" with
+                 "domains", or "command" with "classes" (and "shell"; see commands.py)
 
 Each matcher answers the question of the list it is in:
 
@@ -25,7 +27,9 @@ A typed matcher (path, url, email) reads the value the way a program would.
 When it cannot read a value with certainty (an ambiguous URL, a Windows short
 name, a network path), it answers "found" in deny_args and "not accepted" in
 allow_args: either way the call is refused. All checks are on the text only.
-Nothing here touches the file system or the network.
+Nothing here touches the file system or the network, except that on Windows a
+home folder spelled with short names (HOME=C:\\Users\\ALEXAN~1) is asked for
+its long name once (_long_home_name).
 """
 
 from __future__ import annotations
@@ -40,19 +44,23 @@ from types import ModuleType
 from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
+from . import commands
 from .policy_errors import PolicyError, did_you_mean, listed, quoted, type_name
 from .textutil import percent_decoded
 
 # The keys that choose a matcher. An entry has exactly one of them.
 MATCHER_KEYS = ("pattern", "contains", "one_of", "starts_with", "ends_with", "no_options", "type")
-TYPES = ("path", "url", "email")
+TYPES = ("path", "url", "email", "command")
+# The url matcher's limits on the parts of a URL that can carry data (all optional).
+URL_LIMITS = ("max_label_length", "max_path_segment_chars", "max_query_chars")
 # What each type needs, and what it may have besides.
-_TYPE_REQUIRED = {"path": "roots", "url": "hosts", "email": "domains"}
-_TYPE_OPTIONAL = {"path": (), "url": ("schemes",), "email": ()}
-TYPE_SETTINGS = ("roots", "hosts", "schemes", "domains")
+_TYPE_REQUIRED = {"path": "roots", "url": "hosts", "email": "domains", "command": "classes"}
+_TYPE_OPTIONAL = {"path": (), "url": ("schemes", *URL_LIMITS), "email": (), "command": ("shell",)}
+TYPE_SETTINGS = ("roots", "hosts", "schemes", "domains", *URL_LIMITS, "classes", "shell")
 # Every key an entry of deny_args or allow_args may have. Keys that suit only
-# one side are accepted here and refused with a specific message by `build`.
-ENTRY_KEYS = ("arg", *MATCHER_KEYS, *TYPE_SETTINGS, "optional")
+# one side are accepted here and refused with a specific message by `build`
+# (or, for "optional" and "action", by the policy loader).
+ENTRY_KEYS = ("arg", *MATCHER_KEYS, *TYPE_SETTINGS, "optional", "action")
 
 # ---- percent-decoding ----------------------------------------------------------
 
@@ -305,6 +313,27 @@ _MAX_ALIAS_CHARS = 16 * 1024
 _PROC_LINKS = re.compile(r"(?:^|/)(?:proc/[^/]+(?:/task/[^/]+)?/(?:root|cwd|fd|fdinfo|map_files|exe)|dev/fd)(?:/|$)")
 # On macOS, /etc, /tmp and /var are links into /private.
 _MACOS_PRIVATE = ("etc", "tmp", "var")
+# Spellings that a shell, os.path.expandvars or a Windows program replaces before it
+# opens the file: $NAME, ${...} and $(...), and %NAME% (cmd). A lone "$" is not one.
+_SHELL_VARIABLE = re.compile(r"\$[A-Za-z_{(]")
+# "%" then a name then "%", looked for at every "%" (the lookahead lets them overlap).
+_PERCENT_VARIABLE = re.compile(r"%(?=([A-Za-z_][^%\\/\"<>|*?\r\n]{0,63})%)")
+# cmd's batch parameters: %~dp0, %~f1, %*, and %0 to %9 when no hex digit follows (%2e is a percent escape).
+_BATCH_PARAMETER = re.compile(r"%~|%[0-9*](?![0-9A-Fa-f])")
+# cmd's delayed expansion: !NAME!.
+_DELAYED_VARIABLE = re.compile(r"!(?=[A-Za-z_][^!\\/\"<>|*?\r\n]{0,63}!)")
+# Two hex digits between "%" signs are a percent escape ("caf%C3%A9"), not a variable.
+_HEX_PAIR = re.compile(r"[0-9A-Fa-f]{2}")
+# MSYS2, Git Bash and Cygwin spellings of a Windows drive: "/c/Users", "/cygdrive/c", "/mnt/c".
+# On Windows such a path is never meant as written: those tools turn it into C:\Users.
+_MSYS_DRIVE = re.compile(r"/(cygdrive(/|$)|mnt/[A-Za-z](/|$)|[A-Za-z](/|$))")
+
+
+def _names_a_variable(path: str) -> bool:
+    """True if the path holds $NAME, ${...}, $(...), %NAME%, %~dp0, %1 or !NAME!, which some tools expand."""
+    if _SHELL_VARIABLE.search(path) or _BATCH_PARAMETER.search(path) or _DELAYED_VARIABLE.search(path):
+        return True
+    return any(not _HEX_PAIR.fullmatch(found.group(1)) for found in _PERCENT_VARIABLE.finditer(path))
 
 
 class _Unreadable(Exception):
@@ -333,7 +362,43 @@ class _AliasBudget:
 
 
 def _home_folder() -> str:
-    return os.path.expanduser("~")
+    return _long_home_name(os.path.expanduser("~"))
+
+
+# The long forms of home folders spelled with short names, once found.
+_LONG_HOME_NAMES: dict[str, str] = {}
+
+
+def _long_home_name(path: str) -> str:
+    """On Windows, the long form of a home folder spelled with short (8.3) names; otherwise the path itself.
+
+    HOME or USERPROFILE can be set to "C:\\Users\\ALEXAN~1". The home folder is
+    chosen by the person running agent-sentinel, not by the agent, so here (and
+    only here) the system is asked for its long name (GetLongPathNameW, which
+    follows no link), and "~/.ssh" stays a usable root. A value an agent sends
+    is never read this way: its short names are refused. When the system cannot
+    say (no such folder), the path is kept, and a root under it is refused as before.
+    """
+    if os.name != "nt" or not _SHORT_NAME.search(path) or len(path) > MAX_PATH_CHARS:
+        return path
+    known = _LONG_HOME_NAMES.get(path)
+    if known is not None:
+        return known
+    try:
+        import ctypes
+
+        get_long_path_name = ctypes.WinDLL("kernel32").GetLongPathNameW
+        get_long_path_name.argtypes = (ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32)
+        get_long_path_name.restype = ctypes.c_uint32
+        buffer = ctypes.create_unicode_buffer(MAX_PATH_CHARS + 1)
+        length = get_long_path_name(path, buffer, len(buffer))
+    except (AttributeError, OSError, ValueError):
+        return path
+    if not 0 < length < len(buffer) or _SHORT_NAME.search(buffer.value):
+        return path
+    if len(_LONG_HOME_NAMES) < 8:
+        _LONG_HOME_NAMES[path] = buffer.value
+    return buffer.value
 
 
 @dataclass(frozen=True)
@@ -354,7 +419,10 @@ class PathMatcher(Matcher):
     stream ("a.txt:secret"), a "\\\\?\\" or "\\\\.\\" path, a network (UNC) path, a
     device name (CON, NUL, COM1...), a name ending in a dot or a space,
     wildcards, control characters, "~user", a path through /proc/<process>/root,
-    cwd or fd or through /dev/fd, or more than MAX_PATH_CHARS characters.
+    cwd or fd or through /dev/fd, or more than MAX_PATH_CHARS characters. So is
+    one that names an environment variable ($HOME, ${HOME}, $(cmd), %USERPROFILE%;
+    a tool that expands it opens another file), and on Windows an MSYS or Cygwin
+    spelling of a drive ("/c/Users", "/cygdrive/c", "/mnt/c").
     deny_args also denies a value with more alias readings than _MAX_ALIAS_READINGS,
     or with readings longer than _MAX_ALIAS_CHARS characters in all, counted
     over all of its spellings and readings together.
@@ -470,6 +538,13 @@ class PathMatcher(Matcher):
 
     def _absolute(self, path: str, expand_home: bool) -> str:
         """The absolute, normalised form of a path, or _Unreadable."""
+        if len(path) <= MAX_PATH_CHARS and _names_a_variable(path):
+            # A tool that expands it opens another file than the text names ("%USERPROFILE%\\.ssh").
+            raise _Unreadable("it names an environment variable ($NAME, ${...}, $(...) or %NAME%), which a tool "
+                              "may expand")
+        if self._windows and _MSYS_DRIVE.match(path):
+            raise _Unreadable("on Windows, /c/..., /cygdrive/... and /mnt/c/... are MSYS or Cygwin spellings of a "
+                              "drive")
         if path.startswith("~"):
             if not self._starts_with_home(path):
                 raise _Unreadable("'~name' can mean another user's home folder")
@@ -778,10 +853,20 @@ class UrlMatcher(Matcher):
     In deny_args a URL is denied when its host is listed, whatever its
     scheme, or when it cannot be read. There is no DNS lookup: a listed name
     that resolves to a private address is not caught.
+
+    Limits (each optional) keep the parts of a URL that can carry data short,
+    so a fetch tool's request cannot hold much: max_label_length (each label
+    of the host), max_path_segment_chars (each part of the path between "/"),
+    max_query_chars (the query and the fragment together). They count the
+    characters as written, escapes included. A URL over a limit is not
+    accepted in allow_args and is denied in deny_args.
     """
 
     hosts: tuple[_Host, ...]
     schemes: tuple[str, ...] = ("https",)
+    max_label_length: int | None = None
+    max_path_segment_chars: int | None = None
+    max_query_chars: int | None = None
     key = "type"
     text_only = True
     # deny_args reads the URL as written, not its percent-decoded spellings. A
@@ -793,7 +878,7 @@ class UrlMatcher(Matcher):
 
     def accepts(self, text: str) -> bool:
         url = read_url(text)
-        if url is None or url.scheme not in self.schemes:
+        if url is None or url.scheme not in self.schemes or not self._within_limits(text):
             return False
         if url.is_address and not _is_public(ipaddress.ip_address(url.host)):
             return False
@@ -803,13 +888,60 @@ class UrlMatcher(Matcher):
 
     def found_in(self, text: str) -> bool:
         url = read_url(text)
-        if url is None:
+        if url is None or not self._within_limits(text):
             return True
         names = [(url.host, url.is_address), *((inner, True) for inner in url.also_known_as)]
         return any(host.matches(name, is_address) for host in self.hosts for name, is_address in names)
 
+    def _within_limits(self, text: str) -> bool:
+        """True if no part of the URL (one that read_url can read) is longer than its limit."""
+        if self.max_label_length is None and self.max_path_segment_chars is None and self.max_query_chars is None:
+            return True
+        parts = urlsplit(text)
+        host = (parts.hostname or "").rstrip(".")
+        if self.max_label_length is not None and any(len(label) > self.max_label_length
+                                                     for label in host.split(".")):
+            return False
+        if self.max_path_segment_chars is not None and any(len(segment) > self.max_path_segment_chars
+                                                           for segment in parts.path.split("/")):
+            return False
+        return self.max_query_chars is None or len(parts.query) + len(parts.fragment) <= self.max_query_chars
+
     def describe(self) -> str:
-        return f"a {'/'.join(self.schemes)} URL to {', '.join(str(host) for host in self.hosts)}"
+        limits = [f"{name} {value}" for name, value in (("labels at most", self.max_label_length),
+                                                         ("path segments at most", self.max_path_segment_chars),
+                                                         ("query at most", self.max_query_chars))
+                  if value is not None]
+        shown = f" ({', '.join(limits)} characters)" if limits else ""
+        return f"a {'/'.join(self.schemes)} URL to {', '.join(str(host) for host in self.hosts)}{shown}"
+
+
+@dataclass(frozen=True)
+class CommandMatcher(Matcher):
+    """"type": "command": a shell command line that falls into one of `classes` (commands.py).
+
+    In deny_args the value is denied when its command is in one of the
+    classes or cannot be read; in allow_args it is accepted only when it can
+    be read and is in none of them. For the Claude Code hook's Bash tool, a
+    tool rule's "command" section does more (ask, allow_programs, labels).
+    """
+
+    classes: frozenset[str]
+    shell: str = "bash"
+    key = "type"
+    text_only = True
+    deny_checks_decoded = False  # a command is read as the shell reads it, not percent-decoded
+
+    def found_in(self, text: str) -> bool:
+        reading = commands.read_command(text, self.shell)
+        return reading.unreadable is not None or bool(reading.kinds() & self.classes)
+
+    def accepts(self, text: str) -> bool:
+        return not self.found_in(text)
+
+    def describe(self) -> str:
+        kinds = ", ".join(kind for kind in commands.CLASSES if kind in self.classes)
+        return f"a {self.shell} command in the class(es) {kinds}, or one that cannot be read"
 
 
 def read_email_domain(text: str) -> str | None:
@@ -918,12 +1050,49 @@ def _typed(spec: dict[str, Any], where: str, deny: bool, any_arg: bool) -> Match
     if kind == "email":
         domains = _host_entries(spec["domains"], where, "domains", allow_addresses=False, allow_side=not deny)
         return EmailMatcher(domains)
+    if kind == "command":
+        return CommandMatcher(command_classes(spec["classes"], f"{where}: 'classes'"),
+                              command_shell(spec.get("shell", "bash"), f"{where}: 'shell'"))
     if "schemes" in spec and deny:
         raise PolicyError(
             f"{where}: 'schemes' is only used in allow_args; deny_args denies a listed host whatever its scheme"
         )
     hosts = _host_entries(spec["hosts"], where, "hosts", allow_addresses=True, allow_side=not deny)
-    return UrlMatcher(hosts, _schemes(spec.get("schemes", ["https"]), where))
+    limits = {name: _url_limit(spec[name], f"{where}: {quoted(name)}", 63 if name == "max_label_length"
+                               else MAX_URL_CHARS)
+              for name in URL_LIMITS if name in spec}
+    return UrlMatcher(hosts, _schemes(spec.get("schemes", ["https"]), where), **limits)
+
+
+def _url_limit(value: Any, what: str, most: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= most:
+        raise PolicyError(f"{what} must be a whole number from 1 to {most}, got {quoted(value)}")
+    return value
+
+
+def command_classes(value: Any, what: str, allow_empty: bool = False) -> frozenset[str]:
+    """A list of command classes (commands.CLASSES), each named once."""
+    if not isinstance(value, list) or (not value and not allow_empty):
+        raise PolicyError(f"{what} must be a list of command classes ({', '.join(commands.CLASSES)}), "
+                          f"got {quoted(value)}")
+    seen: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str) or entry not in commands.CLASSES:
+            hint = did_you_mean(entry, commands.CLASSES)
+            raise PolicyError(f"{what}: {quoted(entry)} is not a command class; the classes are "
+                              f"{listed(commands.CLASSES)}" + (f"; did you mean {quoted(hint)}?" if hint else ""))
+        if entry in seen:
+            raise PolicyError(f"{what}: {quoted(entry)} is listed twice")
+        seen.append(entry)
+    return frozenset(seen)
+
+
+def command_shell(value: Any, what: str) -> str:
+    if not isinstance(value, str) or value not in commands.SHELLS:
+        hint = did_you_mean(value, commands.SHELLS)
+        raise PolicyError(f"{what} must be {listed(commands.SHELLS)}, got {quoted(value)}"
+                          + (f"; did you mean {quoted(hint)}?" if hint else ""))
+    return value
 
 
 def _pattern(value: Any, where: str) -> PatternMatcher:

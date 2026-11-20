@@ -43,6 +43,8 @@ def run(args: argparse.Namespace) -> int:
             notes.append(f"{rule.max_calls_per_minute} call(s) per minute")
         if rule.labels:
             notes.append(f"labels {', '.join(rule.labels)}")
+        if rule.command is not None:
+            notes.append(f"{rule.command.shell} command checks")
         print(f"  {printable(rule.name):24} {rule.action:6} {', '.join(notes)}")
     _print_new_settings(policy)
     for warning in policy.warnings():

@@ -285,7 +285,7 @@ def _print_header(policy_path: str, policy: Policy, audit: str, state: str, scan
     if blocked:
         print(f"  Warning: the policy blocks Claude Code's own tools {', '.join(blocked)} (it has no rule that "
               'allows them). Add rules for the ones the agent should use, such as "Read": "allow" or "Bash": "ask".')
-    if any(rule.action == "ask" for rule in policy.tools) or policy.default == "ask":
+    if policy.may_ask():
         print("               Its 'ask' rules show Claude Code's own permission prompt; in bypassPermissions mode "
               "they are refused.")
     print(f"Audit log:     {shown_path(audit)}")
