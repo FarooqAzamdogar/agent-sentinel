@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -25,7 +26,13 @@ from agent_sentinel.session import (
     MemorySessionStore,
     SessionStateError,
 )
-from agent_sentinel.session_limits import call_digest, destinations, value_digests
+from agent_sentinel.session_limits import (
+    MAX_LIST_ENTRIES,
+    call_digest,
+    canonical_json,
+    destinations,
+    new_values,
+)
 
 TOOLS = {
     "fetch_page": {"action": "allow", "labels": ["untrusted"]},
@@ -256,7 +263,70 @@ class SessionLimits(unittest.TestCase):
         refused = firewall.check_call("send", {"to": ["cat@example.com"]})
         self.assertEqual((refused.allowed, refused.rule), (False, "limits.max_distinct[0]"))
         self.assertTrue(firewall.check_call("send", {"subject": "no 'to' here"}).allowed)
-        self.assertEqual(value_digests(5, 3), value_digests("5", 3))  # compared as text
+        self.assertEqual(new_values(5, (), 3), new_values("5", (), 3))  # compared as text
+
+    def test_values_already_seen_cannot_hide_new_ones_in_a_list(self):
+        # CORE-2: every entry of the list is read, not only the first max + 1.
+        firewall = Firewall(policy(limits={"max_distinct": [{"arg": "to", "max": 2}]}))
+        self.assertTrue(firewall.check_call("send", {"to": ["a@x.example"]}).allowed)
+        self.assertTrue(firewall.check_call("send", {"to": ["b@x.example"]}).allowed)
+        padded = ["a@x.example", "b@x.example", "a@x.example"] + [f"v{n}@evil.example" for n in range(50)]
+        refused = firewall.check_call("send", {"to": padded})
+        self.assertEqual((refused.allowed, refused.rule), (False, "limits.max_distinct[0]"))
+        self.assertTrue(firewall.check_call("send", {"to": ["b@x.example", "A@x.example"] * 500}).allowed)
+
+    def test_nested_lists_count_each_entry_and_a_list_too_long_is_refused(self):
+        firewall = Firewall(policy(limits={"max_distinct": [{"arg": "to", "max": 2}]}))
+        refused = firewall.check_call("send", {"to": [["a@x.example", ["b@x.example"]], "c@x.example"]})
+        self.assertEqual((refused.allowed, refused.rule), (False, "limits.max_distinct[0]"))
+        self.assertEqual(len(new_values([["a", ["b"]], "a", ("c",)], (), 10)), 3)
+        self.assertIsNone(new_values(["a"] * (MAX_LIST_ENTRIES + 1), (), 10))  # read whole or refused
+        looped = ["a"]
+        looped.append(looped)
+        self.assertIsNone(new_values(looped, (), 10))
+        long_list = Firewall(policy(limits={"max_distinct": [{"arg": "to", "max": 5}]}))
+        refused = long_list.check_call("send", {"to": ["a@x.example"] * (MAX_LIST_ENTRIES + 1)})
+        self.assertEqual((refused.allowed, refused.rule), (False, "limits.max_distinct[0]"))
+        started = time.perf_counter()
+        self.assertTrue(long_list.check_call("send", {"to": ["a@x.example"] * MAX_LIST_ENTRIES}).allowed)
+        self.assertLess(time.perf_counter() - started, 5)
+
+    def test_arguments_with_keys_that_are_not_text_are_counted_or_refused_never_an_error(self):
+        # CORE-4: a library caller can pass keys json.dumps cannot sort or write.
+        self.assertEqual(canonical_json({1: "a", "b": 2}), canonical_json({"b": 2, 1: "a"}))
+        self.assertNotEqual(canonical_json({1: "a"}), canonical_json({"<int>1": "b"}))
+        odd = {"to": {1: "a", "b": 2}, "tuple": {(1, 2): "c"}}
+        limited = Firewall(policy(limits={"max_identical_calls": 1, "max_distinct": [{"arg": "to", "max": 1}],
+                                          "max_sink_bytes_per_session": 1000}))
+        self.assertTrue(limited.check_call("send", odd).allowed)
+        refused = limited.check_call("send", odd)
+        self.assertEqual((refused.allowed, refused.rule), (False, "limits.max_identical_calls"))
+        called = []
+        limited.run("other", {"to": {1: "a", "b": 2}}, lambda **kwargs: called.append(kwargs))
+        self.assertEqual(len(called), 1)
+        looped = {"x": 1}
+        looped["self"] = looped
+        deep = current = []
+        for _ in range(5_000):
+            current.append([])
+            current = current[0]
+        for name, args in (("looped", {"to": looped}), ("deep", {"to": deep}), ("mixed", {"to": {1: "a", "d": deep}})):
+            with self.subTest(args=name):
+                refused = Firewall(policy(limits={"max_identical_calls": 3})).check_call("send", args)
+                self.assertEqual((refused.allowed, refused.rule), (False, "session"))
+                self.assertIn("cannot be written as JSON", refused.reason)
+        # Approval memory with such arguments: remembered, and a value that cannot be written is asked about.
+        asked = []
+
+        def refuse(tool, args, reason):
+            asked.append(tool)
+            return False
+
+        refusing = Firewall(policy(default="ask"), approver=refuse)
+        approvals = [refusing.check_call("send", args).approval
+                     for args in ({"to": {1: "a", "b": 2}}, {"to": {1: "a", "b": 2}}, {"to": looped}, {"to": looped})]
+        self.assertEqual(approvals, [APPROVAL_REFUSED, APPROVAL_REPEAT, APPROVAL_REFUSED, APPROVAL_REFUSED])
+        self.assertEqual(len(asked), 3)  # the second mixed-key call was refused without asking
 
     def test_sink_bytes_count_only_calls_to_sinks(self):
         firewall = Firewall(policy(tools={"post": {"action": "allow", "labels": ["sink"]}, "read": "allow"},

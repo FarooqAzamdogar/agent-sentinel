@@ -180,11 +180,11 @@ Warn notices and the tail scan
 A tools/call result whose worst finding is at or above injection.warn_severity
 (and below block_severity) gets a text item before its content: the
 firewall's notice (firewall.NOTICE), which names no rule. A client that reads
-only structuredContent does not see it. The end of each delivered
-tools/call, resources/read and prompts/get reply, and of each notification
-and request from the server, is kept (in the session store) and read
-together with the start of the next one on the same channel (Firewall's tail
-scan), so an injection cut in two at that boundary is seen whole.
+only structuredContent does not see it. The end of the text the model reads
+of each delivered tools/call, resources/read and prompts/get reply, and of
+each notification and request from the server, is kept (in the session
+store) and read together with the start of the next one on the same channel
+(tail_scan.py), so an injection cut in two at that boundary is seen whole.
 """
 
 from __future__ import annotations

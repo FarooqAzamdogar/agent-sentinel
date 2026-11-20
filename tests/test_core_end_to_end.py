@@ -71,6 +71,20 @@ class TheProxy(EndToEndTest):
         self.assertEqual(code, 0)
         self.assertIn("did not meet its exception unless_args[0]", out)
 
+    def test_padding_and_what_the_model_does_not_read_do_not_hide_a_split(self):
+        policy = self.write("policy.json", {"default": "allow"})
+        proxy = self.proxy("--policy", policy, "--no-pins", server=E2E_SERVER)
+        proxy.initialize()
+        padded = {"result": {"content": [{"type": "text", "text": PARTS[0] + " \n" * 600},
+                                         {"type": "image", "mimeType": "image/png", "data": "QUFB" * 300}],
+                             "_meta": {"note": "lorem ipsum " * 60}, "isError": False}}
+        self.assertEqual(text_of(proxy.call(1, "reply_with", padded)), padded["result"]["content"][0]["text"])
+        image_only = {"result": {"content": [{"type": "image", "mimeType": "image/png", "data": "QUFB" * 300}]}}
+        self.assertNotIn("isError", proxy.call(2, "reply_with", image_only)["result"])
+        split = proxy.call(3, "reply_with", content(PARTS[1]))
+        self.assertTrue(split["result"]["isError"])
+        self.assertEqual(proxy.stop(), 0)
+
 
 class TheHook(EndToEndTest):
     def setUp(self):
@@ -112,6 +126,13 @@ class TheHook(EndToEndTest):
         self.assertTrue(document["tails"]["result"].endswith(PARTS[0]))  # the withheld part is not kept
         self.assertEqual(sorted(document["counts"].values()), [2])
         self.assertNotIn("npm test", session_file.read_text(encoding="ascii"))  # calls are kept as hashes
+
+    def test_padding_at_the_end_of_a_result_does_not_hide_a_split(self):
+        self.assertIsNone(self.hook("session_start.json"))
+        padded = [{"type": "text", "text": PARTS[0] + "\n" * 600 + " " * 600}]
+        self.assertIsNone(self.hook("post_tool_use_mcp.json", tool_response=padded))
+        split = self.hook("post_tool_use_mcp.json", tool_response=[{"type": "text", "text": PARTS[1]}])
+        self.assertEqual(split["decision"], "block")
 
     def test_a_session_file_that_cannot_be_used_refuses_the_calls_the_limits_count(self):
         self.assertIsNone(self.hook("session_start.json"))

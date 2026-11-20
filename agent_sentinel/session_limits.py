@@ -20,10 +20,13 @@ memory for one proxy or Firewall, in the session file in hook mode); state
 that cannot be read refuses the call (fail closed).
 
 Values are compared after NFKC, case folding and trimming, and each entry of
-a list is a value of its own. Values and calls are kept as hashes (SHA-256,
-cut to 128 bits), never as text. Every count has a bound (session.py); past
-it the call is refused, except that max_identical_calls forgets the calls
-made longest ago once it counts MAX_IDENTICAL_KEYS different ones.
+a list (nested lists too) is a value of its own; every entry is read, and a
+list of more than MAX_LIST_ENTRIES is refused. Values and calls are kept as
+hashes (SHA-256, cut to 128 bits), never as text. Every count has a bound
+(session.py); past it the call is refused, except that max_identical_calls
+forgets the calls made longest ago once it counts MAX_IDENTICAL_KEYS
+different ones. Arguments that cannot be written as JSON (UnwritableValue:
+only a library caller can pass them) cannot be counted: the call is refused.
 
 Approval memory (POL-9)
 -----------------------
@@ -65,6 +68,12 @@ DISTINCT = "distinct"
 SINK_BYTES = "sink_bytes"
 IDENTICAL = "identical"
 
+# max_distinct reads every entry of a list argument (nested lists too); past this many entries and lists
+# in all, the call is refused. A list as long is far beyond any real number of recipients or hosts.
+MAX_LIST_ENTRIES = 10_000
+# How deep canonical_json writes arguments whose keys are not all text (only a library caller passes them).
+MAX_DEPTH = 200
+
 # What an approval question lists of the call's destinations, and how much it reads to find them.
 MAX_DESTINATIONS = 10
 MAX_STRINGS_READ = 200
@@ -85,7 +94,10 @@ class SessionLimit:
         if self.kind == CALLS:
             what = f"{self.limit} call(s) were already made"
         elif self.kind == DISTINCT:
-            what = f"the call would make more than {self.limit} different value(s) of argument '{self.arg}'"
+            what = (
+                f"the call would make more than {self.limit} different value(s) of argument '{self.arg}' (or the "
+                f"argument holds more than {MAX_LIST_ENTRIES} entries)"
+            )
         elif self.kind == SINK_BYTES:
             what = f"the call would send more than {self.limit} byte(s) of arguments to tools labelled 'sink'"
         else:
@@ -144,8 +156,8 @@ def charge(state: SessionState, limits: list[SessionLimit], tool: str, args: dic
             if limit.arg not in args:
                 continue
             seen = sets.get(bucket, state.distinct.get(bucket, []))
-            fresh = [value for value in value_digests(args[limit.arg], limit.limit + 1) if value not in seen]
-            if len(seen) + len(fresh) > limit.limit:
+            fresh = new_values(args[limit.arg], seen, limit.limit - len(seen))
+            if fresh is None or len(seen) + len(fresh) > limit.limit:
                 return limit
             if fresh:
                 sets[bucket] = [*seen, *fresh]
@@ -165,13 +177,51 @@ def charge(state: SessionState, limits: list[SessionLimit], tool: str, args: dic
 
 # ---- hashes ---------------------------------------------------------------------------
 
+class UnwritableValue(ValueError):
+    """Arguments that cannot be written as JSON (they hold themselves, or are nested too deeply)."""
+
+
 def canonical_json(value: Any) -> str:
-    """A value written as JSON in one fixed way: keys sorted, no spaces; anything else is named by its type."""
+    """A value written as JSON in one fixed way: keys sorted, no spaces; anything else is named by its type.
+
+    Only a library caller can pass a value json.dumps cannot write. Then keys
+    that are not text (an int beside a str cannot be sorted, a tuple cannot be
+    written at all) are written as text, "<int>1", and the value is written
+    again; UnwritableValue if it still cannot be: it holds itself, or is
+    nested more than MAX_DEPTH deep.
+    """
+    try:
+        return _dumps(value)
+    except (TypeError, ValueError, RecursionError):
+        pass
+    try:
+        return _dumps(_with_text_keys(value, MAX_DEPTH))
+    except (TypeError, ValueError, RecursionError):
+        raise UnwritableValue(
+            f"the arguments cannot be written as JSON (they hold themselves, or are nested more than {MAX_DEPTH} deep)"
+        ) from None
+
+
+def _dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=_unwritable)
 
 
 def _unwritable(value: Any) -> str:
     return f"<{type(value).__name__}>"
+
+
+def _with_text_keys(value: Any, depth: int) -> Any:
+    """A copy of `value` whose dict keys are all text, for canonical_json. ValueError past `depth` levels."""
+    if isinstance(value, (dict, list, tuple)) and depth <= 0:
+        raise ValueError("nested too deeply")
+    if isinstance(value, dict):
+        return {
+            key if isinstance(key, str) else f"<{type(key).__name__}>{key!r}": _with_text_keys(child, depth - 1)
+            for key, child in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_with_text_keys(child, depth - 1) for child in value]
+    return value
 
 
 def _digest(text: str) -> str:
@@ -191,18 +241,50 @@ def tool_digest(tool: str) -> str:
     return _digest("tool\x00" + str(tool))
 
 
-def value_digests(value: Any, most: int) -> list[str]:
-    """The hashes of an argument's values: each entry of a list, or the value itself; at most `most` of them.
+def new_values(value: Any, seen: Iterable[str], room: int) -> list[str] | None:
+    """The hashes of an argument's different values that are not in `seen`; None if there are more than `room`.
 
-    A value is compared as text: a string as it is, anything else as
-    canonical JSON; then NFKC, case folding and trimming.
+    Each entry of a list, at any depth of lists, is a value of its own;
+    anything else (a string, a number, an object) is one value. A value is
+    compared as text: a string as it is, anything else as canonical JSON;
+    then NFKC, case folding and trimming. Every entry is read, so values
+    already seen cannot hide new ones behind them. A value with more than
+    MAX_LIST_ENTRIES entries and lists in all is None too (fail closed).
     """
-    entries = list(value[:most]) if isinstance(value, (list, tuple)) else [value]
-    found: dict[str, None] = {}
+    entries = _entries(value, MAX_LIST_ENTRIES)
+    if entries is None:
+        return None
+    known = set(seen)
+    fresh: dict[str, None] = {}
     for entry in entries:
         text = entry if isinstance(entry, str) else canonical_json(entry)
-        found[_digest("value\x00" + unicodedata.normalize("NFKC", text).casefold().strip())] = None
-    return list(found)
+        digest = _digest("value\x00" + unicodedata.normalize("NFKC", text).casefold().strip())
+        if digest not in known and digest not in fresh:
+            fresh[digest] = None
+            if len(fresh) > room:
+                return None
+    return list(fresh)
+
+
+def _entries(value: Any, most: int) -> list[Any] | None:
+    """The values in `value`: the entries of its lists, flattened, in order; or None past `most` entries and lists."""
+    if not isinstance(value, (list, tuple)):
+        return [value]
+    found: list[Any] = []
+    waiting: list[Any] = [value]
+    opened = 0
+    while waiting:
+        item = waiting.pop()
+        if isinstance(item, (list, tuple)):
+            opened += 1
+            if len(item) > most:
+                return None
+            waiting.extend(reversed(item))
+        else:
+            found.append(item)
+        if opened - 1 + len(found) > most:  # the argument's own list is not counted
+            return None
+    return found
 
 
 # ---- approval memory ------------------------------------------------------------------

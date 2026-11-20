@@ -34,7 +34,7 @@ Other session state
 -------------------
 A session also keeps (`SessionState`): the end of the text last delivered on
 each channel (the "tail", at most TAIL_CHARS characters, which the next
-result is read together with, see firewall.py), the counts of the policy's
+result is read together with, see tail_scan.py), the counts of the policy's
 session limits, and the asks a person refused (approval memory). Values and
 calls are kept as hashes, never as text. Everything has a fixed bound.
 
@@ -251,8 +251,8 @@ class SessionMarks:
 class SessionState:
     """What a session keeps besides its marks. Plain data; a store hands out copies.
 
-    tails:     channel ("result" or "notification") -> the last TAIL_CHARS
-               characters of the text delivered on it (see firewall.py, the tail scan).
+    tails:     channel ("result" or "notification") -> at most TAIL_CHARS characters: the
+               end of the text the model read on it, runs of blanks as one (see tail_scan.py).
     counts:    counter of a session limit (a hash of its name) -> calls or bytes counted.
     distinct:  set of a max_distinct limit (a hash of its name) -> hashes of the values seen.
     identical: hash of a call (tool and arguments) -> how many times it was made;
