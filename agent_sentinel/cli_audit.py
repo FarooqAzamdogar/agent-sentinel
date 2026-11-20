@@ -54,6 +54,9 @@ exit codes:
 
 Without --key-file, the chain detects naive edits only: anyone who can write the log can work out every hash
 again. Records cut from the end of the log are not detected: keep the last seq and hash somewhere else.
+With several files, each must hold records, and each rotated file must continue the files given before it:
+an emptied file, or one whose records were replaced, is broken. The first file given may continue older
+files that were not given; a note says so.
 A log is only partly checked when lines at its start have no chain fields (agent-sentinel 0.5 or earlier
 wrote them, or they replace records that were removed), or when a process that could not read the log
 (an append-only log) wrote records that do not link to the ones before.

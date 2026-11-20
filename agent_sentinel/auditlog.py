@@ -105,23 +105,24 @@ def parse_record(line: bytes) -> dict[str, Any] | None:
 
 
 def iter_records(
-    path: str, on_line: Callable[[bytes | None], None] | None = None
+    path: str, on_line: Callable[[bytes | None], dict[str, Any] | None] | None = None
 ) -> Iterator[dict[str, Any] | None]:
     """Yield each record of the log at `path`, in order; None for each line that cannot be read.
 
     Blank lines are skipped. Raises OSError if the file cannot be opened.
     on_line: called with every line as it was read (blank ones too), before
     its record is yielded: for a check of the chain in the same pass
-    (audit_chain.ChainChecker.add).
+    (audit_chain.ChainChecker.add). When it returns a record, that record is
+    yielded rather than reading the line a second time; it must be the record
+    parse_record gives for the line (None: the line is read here).
     """
     with open(path, "rb") as handle:
         for line in iter_lines(handle):
-            if on_line is not None:
-                on_line(line)
+            record = on_line(line) if on_line is not None else None
             if line is None:
                 yield None
             elif line.strip():
-                yield parse_record(line)
+                yield record if record is not None else parse_record(line)
 
 
 def follow_records(

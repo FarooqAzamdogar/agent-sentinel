@@ -95,6 +95,10 @@ MAX_LISTED_ENTRIES = 100_000
 ROTATE_ATTEMPTS = 8
 # After a rotation fails, or no number is free, this process appends without rotating for this long.
 ROTATION_RETRY_SECONDS = 60.0
+# A log is rotated only once it is at least this many times the size of the record that would take it past
+# --audit-max-bytes: a record near or above that size (arguments may be 100,000 characters) never gets a
+# rotated file of its own, so records cannot use up the rotation numbers, or make a copy, one at a time.
+ROTATE_MIN_RECORDS = 4
 _MAX_PAUSED_LOGS = 64
 # A key file: 16 bytes at the least (128 bits), and small.
 MIN_KEY_BYTES = 16
@@ -199,7 +203,7 @@ def append_chained(
     start_line: makes the line of a chain_start record from its fields ("start", "reason", ...),
                 for when one is needed (see the module docstring).
     key:        the key of the MACs, or None for no MAC.
-    max_bytes:  rotate the log first when this record would take it past this size.
+    max_bytes:  rotate the log first when this record would take it past this size (see _should_rotate).
 
     Everything happens under the operating-system lock on the log, so the
     processes that share it (proxies, hook processes) never overwrite each
@@ -221,8 +225,7 @@ def append_chained(
             size = handle.seek(0, os.SEEK_END)
             tail = _read_tail(handle, size) if readable else _UNREAD if size else _Tail()
             start: dict[str, Any] | None = None
-            estimate = len(line) + 400
-            if readable and max_bytes is not None and size > 0 and size + estimate > max_bytes:
+            if readable and max_bytes is not None and _should_rotate(size, len(line) + 400, max_bytes):
                 rotated = _rotate(handle, path, size)
                 if rotated is not None:
                     size = 0
@@ -346,6 +349,16 @@ def _write_all(handle: BinaryIO, data: bytes) -> None:
         if not written:
             raise OSError("the audit log accepted no more bytes")
         view = view[written:]
+
+
+def _should_rotate(size: int, estimate: int, max_bytes: int) -> bool:
+    """Whether a log of `size` bytes is rotated before a record of about `estimate` bytes (with its chain fields).
+
+    Before the record would take it past max_bytes, but only once the log is
+    ROTATE_MIN_RECORDS times the record's size: with records that large, the
+    log grows past max_bytes (to a few records) before it is rotated.
+    """
+    return size > 0 and size + estimate > max_bytes and size >= ROTATE_MIN_RECORDS * estimate
 
 
 # Logs this process does not try to rotate for a while (see ROTATION_RETRY_SECONDS): path -> time.monotonic() deadline.
@@ -506,25 +519,26 @@ class ChainReport:
 
     @property
     def state(self) -> str:
+        if self.problem_count:  # first: an empty file among several is a problem (ChainChecker.start_file)
+            return BROKEN
         if self.lines == 0:
             return EMPTY
-        if self.problem_count:
-            return BROKEN
         if self.chained == 0:
             return UNCHAINED
         if self.unchained_prefix or self.unlinked:
             return PARTIAL
         return INTACT
 
-    def unchecked(self) -> str:
-        """What a "partial" check could not link to the chain, in words."""
+    def unchecked(self, short: bool = False) -> str:
+        """What a "partial" check could not link to the chain, in words (`short`: without the reasons)."""
         parts = []
         if self.unchained_prefix:
-            parts.append(f"the first {self.unchained_prefix} line(s) have no chain fields (agent-sentinel 0.5 or "
-                         "earlier wrote them, or they replace records that were removed)")
+            why = "" if short else (" (agent-sentinel 0.5 or earlier wrote them, or they replace records that "
+                                    "were removed)")
+            parts.append(f"the first {self.unchained_prefix} line(s) have no chain fields{why}")
         if self.unlinked:
-            parts.append(f"{self.unlinked} restart(s) were written by a process that could not read the log, so "
-                         "they do not link to the record before")
+            why = "" if short else " were written by a process that could not read the log, so they"
+            parts.append(f"{self.unlinked} restart(s){why} do not link to the record before")
         return "; ".join(parts)
 
     def one_line(self, command: str) -> str:
@@ -539,8 +553,8 @@ class ChainReport:
             more = f" (and {self.problem_count - 1} more)" if self.problem_count > 1 else ""
             return f"Integrity: BROKEN at {first}{more}. Details: {command}"
         if state == PARTIAL:
-            return (f"Integrity: PARTLY CHECKED: hash chain intact, seq {self.first_seq} to {self.last_seq}, but "
-                    f"{self.unchecked()}. Details: {command}")
+            return (f"Integrity: PARTLY CHECKED: chain intact, seq {self.first_seq} to {self.last_seq}, but "
+                    f"{self.unchecked(short=True)}. Details: {command}")
         if self.key_given:
             macs = "every MAC matches the key"
         elif self.macs_present:
@@ -554,8 +568,11 @@ class ChainChecker:
     """Checks a log line by line, as it is read: `start_file`, then `add` each raw line, then `finish`.
 
     Several files (FILE.1, FILE.2, ..., FILE) can be checked as one chain by
-    calling start_file before each, oldest first. Memory stays bounded: the
-    checker keeps the last link and a few problem texts.
+    calling start_file before each, oldest first. Then each file must hold
+    records, and a rotated file's first record must continue the last record
+    of the file given before it: the writer never leaves a rotated file, or
+    the log after a rotation, empty. Memory stays bounded: the checker keeps
+    the last link and a few problem texts.
     """
 
     def __init__(self, key: bytes | None = None) -> None:
@@ -573,33 +590,40 @@ class ChainChecker:
 
     def start_file(self, label: str = "") -> None:
         """Begin the next file; `label` names it in problems when several files are checked."""
+        if self._files and self._line == 0:  # the file before this one held nothing
+            self._empty_file()
         self._label = label
         self._line = 0
         self._files += 1
 
-    def add(self, raw: bytes | None) -> None:
-        """Check one line as the file holds it (with its newline); None for a line too long to read."""
+    def add(self, raw: bytes | None) -> dict[str, Any] | None:
+        """Check one line as the file holds it (with its newline); None for a line too long to read.
+
+        Returns the record the check read from the line (a JSON object), so
+        that a reader in the same pass (report, explain) need not read the
+        line again: it is the record auditlog.parse_record gives. None when
+        the line holds no JSON object, or one that is not strict JSON.
+        """
         self._line += 1
         self.report.lines += 1
         at_start = self._line == 1
         if raw is None:
             self._bad("it is too long to read")
-            return
+            return None
         if not raw.endswith(b"\n"):
             self._bad("it is incomplete: it has no newline at its end (a write was cut short, or the file was edited)")
-            return
+            return None
         content = raw[:-1]
         carriage_return = content.endswith(b"\r")
         if carriage_return:
             content = content[:-1]
         trailer = parse_trailer(content)
         if trailer is None:
-            self._unchained(content)
-            return
+            return self._unchained(content)
         record = self._parsed(content)
         if record is None:
             self._last_chained = (trailer.seq, trailer.digest)  # as the writer saw it when it looked for a link
-            return
+            return None
         if carriage_return:  # the record is intact, but the file is not as it was written
             self._problem("it ends with a carriage return: a program changed the file's line ends")
         self._check_hash_and_mac(trailer, record)
@@ -611,8 +635,11 @@ class ChainChecker:
         if report.first_seq is None:
             report.first_seq = trailer.seq
         report.last_seq, report.last_hash = trailer.seq, trailer.digest
+        return record
 
     def finish(self) -> ChainReport:
+        if self._files > 1 and self._line == 0:  # the last of several files held nothing
+            self._empty_file()
         if self._other_keys:
             self.report.notes.append(
                 f"{len(self._other_keys)} chain start(s) name another key (key id "
@@ -625,25 +652,33 @@ class ChainChecker:
     def _where(self) -> str:
         return f"{self._label} line {self._line}" if self._label else f"line {self._line}"
 
-    def _problem(self, text: str) -> None:
+    def _problem(self, text: str, where: str | None = None) -> None:
         report = self.report
         report.problem_count += 1
         if len(report.problems) < MAX_PROBLEMS_KEPT:
-            report.problems.append(f"{self._where()}: {text}")
+            report.problems.append(f"{where or self._where()}: {text}")
 
     def _bad(self, text: str) -> None:
         self._problem(text)
         self._previous = "bad"
 
-    def _unchained(self, content: bytes) -> None:
-        if parse_record(content) is None:  # not JSON, not an object, absurdly nested, a huge number
+    def _empty_file(self) -> None:
+        """One of several files holds nothing. The writer never leaves a rotated file empty, nor the log after a
+        rotation (the rotated chain_start is written at once): its records were removed."""
+        self._problem("it is empty, but a rotated file, and the log after a rotation, always hold records: they "
+                      "were removed", where=self._label or f"file {self._files}")
+
+    def _unchained(self, content: bytes) -> dict[str, Any] | None:
+        record = parse_record(content)
+        if record is None:  # not JSON, not an object, absurdly nested, a huge number
             self._bad("it is not a JSON object")
-            return
+            return None
         if self._seen_chain:
             self._problem("it has no chain fields: it was inserted, or written by agent-sentinel 0.5 or earlier")
         else:
             self.report.unchained_prefix += 1
         self._previous = "unchained"
+        return record
 
     def _parsed(self, content: bytes) -> dict[str, Any] | None:
         """The record on a line with chain fields, read strictly (no repeated keys); None, after a problem, if not."""
@@ -711,17 +746,7 @@ class ChainChecker:
             elif not fresh:
                 self._problem("a new chain must start at seq 0 with no previous hash")
         elif start == ROTATED:
-            if not at_start:
-                self._problem("a rotated file's first record is in the middle of a file")
-            elif isinstance(previous, tuple):
-                if trailer.prev != previous[1] or trailer.seq != previous[0] + 1:
-                    self._problem(f"it does not continue the file before it (whose last record is seq {previous[0]})")
-            elif previous is None and not fresh:
-                shown = printable(record.get("previous_file", "an older file"), limit=80)
-                self.report.notes.append(
-                    f"the first file continues {shown}, which was not checked: give the older files first, oldest "
-                    "first, to check the link"
-                )
+            self._check_rotated(trailer, record, at_start, previous)
         elif start == RESTART:
             if not fresh:
                 self._problem("a restarted chain must start at seq 0 with no previous hash")
@@ -737,6 +762,31 @@ class ChainChecker:
                 self._check_restart_follows(record)
         else:
             self._problem("it is a chain_start record of an unknown kind")
+
+    def _check_rotated(self, trailer: Trailer, record: dict[str, Any], at_start: bool, previous: Any) -> None:
+        """The first record of a file after rotation continues the last record of the file before it (seq above 0,
+        with that record's hash), or starts afresh (seq 0, no previous hash) when that file's end could not be
+        linked to (damaged, or written by agent-sentinel 0.5 or earlier)."""
+        fresh = trailer.seq == 0 and trailer.prev == GENESIS
+        if not at_start:
+            self._problem("a rotated file's first record is in the middle of a file")
+        elif isinstance(previous, tuple):
+            if trailer.prev != previous[1] or trailer.seq != previous[0] + 1:
+                self._problem(f"it does not continue the file before it (whose last record is seq {previous[0]})")
+        elif fresh or previous == "bad":
+            pass  # the file before ended in a line that cannot be linked to: unchained, or damaged (reported there)
+        elif trailer.seq == 0 or trailer.prev == GENESIS:
+            self._problem("a rotated file's first record must continue the chain (seq above 0, with the hash "
+                          "before it) or start one (seq 0, no previous hash)")
+        elif previous is None and self._files == 1:  # the first file given: the older ones were not given
+            shown = printable(record.get("previous_file", "an older file"), limit=80)
+            self.report.notes.append(
+                f"the first file continues {shown} (seq {trailer.seq - 1} and before), which was not checked: give "
+                "the older files first, oldest first, to check the link"
+            )
+        else:  # the files given before it are empty, or end in lines without chain fields
+            self._problem(f"it continues seq {trailer.seq - 1}, which is not in the files given before it: those "
+                          "records were removed")
 
     def _check_restart_follows(self, record: dict[str, Any]) -> None:
         """A restart after a damaged or unchained line names the last chained record its writer found before it
@@ -804,8 +854,9 @@ def file_sha256(path: str | Path | None) -> str | None:
 
 
 def argv_sha256(argv: Sequence[str], redact: Callable[[str], str]) -> str:
-    """SHA-256 of a command line (as JSON) with what looks like a secret masked first, so the hash cannot be
-    used to guess a short secret."""
+    """SHA-256 of a command line (as JSON) with the secrets `redact` recognises masked first, so the hash cannot
+    be used to guess one of those. A short secret it does not recognise (--pin=1234) stays in what is hashed,
+    and can be found by hashing every candidate."""
     masked = [redact(word) for word in argv]
     return hashlib.sha256(json.dumps(masked, ensure_ascii=False).encode("utf-8", "backslashreplace")).hexdigest()
 

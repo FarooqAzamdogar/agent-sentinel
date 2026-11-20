@@ -133,7 +133,7 @@ def parse_ref(text: str) -> str:
 
 
 def find_records(
-    path: str, ref: str | None, last: int, on_line: Callable[[bytes | None], None] | None = None,
+    path: str, ref: str | None, last: int, on_line: Callable[[bytes | None], dict[str, Any] | None] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     """(the records to explain, unreadable lines, how many more matched than are returned).
 

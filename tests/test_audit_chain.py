@@ -555,6 +555,94 @@ class Rotation(LogTest):
                 self.assertEqual(report.state, "broken")
                 self.assertIn("does not continue the file before it", " ".join(report.problems))
 
+    def test_an_emptied_or_replaced_file_is_broken_even_when_every_file_is_given(self):
+        # Review AUD2-1: the next file's signed first record says how many records came before it.
+        self.write_calls(80, pad=PAD, audit_key_file=self.key_file, audit_max_bytes=ROTATE_AT)
+        files = self.rotated()
+        self.assertGreater(len(files), 3)
+        old = json.dumps({"time": "2020-01-01T00:00:00+00:00", "event": "call", "tool": "read_file",
+                          "action": "allow", "reason": "r"}).encode() + b"\n"  # looks like a line from 0.5
+        cases = {
+            "the oldest emptied": (0, b"", ["audit.jsonl.1: it is empty, but a rotated file",
+                                            "audit.jsonl.2 line 1: it continues seq "]),
+            "the oldest replaced by an unchained line": (0, old, ["audit.jsonl.2 line 1: it continues seq "]),
+            "the oldest replaced by blank lines": (0, b"\n\n", ["audit.jsonl.1 line 1: it is not a JSON object"]),
+            "a middle one emptied": (1, b"", ["audit.jsonl.2: it is empty",
+                                              "it does not continue the file before it"]),
+            "the log emptied": (len(files) - 1, b"", ["audit.jsonl: it is empty"]),
+        }
+        names = [path.name for path in files]
+        for name, (index, content, words) in cases.items():
+            with self.subTest(name=name):
+                kept = files[index].read_bytes()
+                files[index].write_bytes(content)
+                try:
+                    plain, keyed = self.check(*files), self.check(*files, key=KEY)
+                    for report in (plain, keyed):
+                        self.assertEqual(report.state, "broken")
+                        problems = " | ".join(problem.replace(str(self.folder) + os.sep, "")
+                                              for problem in report.problems)
+                        for word in words:
+                            self.assertIn(word, problems)
+                    self.assertEqual(keyed.mac_mismatches, 0)  # every signed record left is genuine
+                    code, out, _ = run_cli("audit", "verify", *files, "--key-file", self.key_file,
+                                           "--allow-unchecked")
+                    self.assertEqual(code, 1, out)
+                    self.assertIn("BROKEN", out)
+                finally:
+                    files[index].write_bytes(kept)
+        self.assertEqual(self.check(*files, key=KEY).state, "intact", names)
+
+    def test_the_first_file_given_may_continue_files_that_were_not_given(self):
+        self.write_calls(80, pad=PAD, audit_max_bytes=ROTATE_AT)
+        files = self.rotated()
+        report = self.check(*files[1:])  # checked without audit.jsonl.1: said, not taken as broken
+        self.assertEqual(report.state, "intact", report.problems)
+        self.assertIn("the first file continues audit.jsonl.1 (seq ", report.notes[0])
+        self.assertIn("give the older files first", report.notes[0])
+        one_empty = self.write("empty.jsonl", "")
+        self.assertEqual(self.check(one_empty).state, "empty")  # one empty file alone: nothing to check
+        self.assertEqual(self.check(one_empty, one_empty).state, "broken")
+
+    def test_a_rotated_start_that_neither_continues_nor_starts_a_chain_is_reported(self):
+        start = json.dumps({"time": "t", "event": "chain_start", "action": "note", "start": "rotated",
+                            "reason": "r", "previous_file": "audit.jsonl.1", "chain": 1})
+        for seq, prev in ((5, GENESIS), (0, "a" * 64)):
+            with self.subTest(seq=seq):
+                self.audit.write_bytes(chained_line(start, seq, prev, None)[0])
+                report = self.check()
+                self.assertEqual(report.state, "broken")
+                self.assertIn("must continue the chain (seq above 0, with the hash before it) or start one",
+                              report.problems[0])
+
+    def test_a_log_from_0_5_is_rotated_into_a_new_chain_and_only_partly_checked(self):
+        old = {"time": "2020-01-01T00:00:00+00:00", "event": "call", "tool": "t", "action": "allow", "reason": "r"}
+        self.write_log("audit.jsonl", [{**old, "args": {"note": "o" * PAD}}] * 25)
+        self.fill(5)
+        files = self.rotated()
+        first = all_records(files[1])[0]
+        self.assertEqual((first["start"], first["seq"], first["prev"]), ("rotated", 0, GENESIS))
+        report = self.check(*files)
+        self.assertEqual((report.state, report.unchained_prefix), ("partial", 25), report.problems)
+
+    def test_records_larger_than_the_limit_do_not_each_get_a_file(self):
+        # Review AUD2-2: arguments may be 100,000 characters, more than the smallest --audit-max-bytes.
+        self.write_calls(30, pad=90_000, audit_max_bytes=ROTATE_AT)
+        files = self.rotated()
+        self.assertLessEqual(len(files) - 1, 30 // audit_chain.ROTATE_MIN_RECORDS)
+        for path in files[:-1]:
+            self.assertGreaterEqual(len(audit_records(path)), audit_chain.ROTATE_MIN_RECORDS)
+        self.assertEqual(sum(len(audit_records(path)) for path in files), 30)  # nothing was deleted
+        self.assertEqual(self.check(*files).state, "intact")
+
+    def test_a_log_is_rotated_before_the_limit_once_it_holds_a_few_records_of_that_size(self):
+        should = audit_chain._should_rotate
+        self.assertTrue(should(60_000, 6_000, ROTATE_AT))  # the next record takes it past the limit
+        self.assertFalse(should(50_000, 6_000, ROTATE_AT))  # it does not
+        self.assertFalse(should(0, 90_000, ROTATE_AT))  # an empty log is never rotated
+        self.assertFalse(should(90_400, 90_400, ROTATE_AT))  # one record of that size: it grows past the limit
+        self.assertTrue(should(4 * 90_400, 90_400, ROTATE_AT))
+
     def fill(self, count=30):
         """Enough calls to take the log past ROTATE_AT at least once, with rotation on."""
         return self.write_calls(count, pad=PAD, audit_max_bytes=ROTATE_AT)
@@ -897,12 +985,32 @@ class Readers(LogTest):
         for command in ("report", "explain"):
             with self.subTest(command=command):
                 out = run_cli(command, self.audit)[1]
-                self.assertIn("Integrity: PARTLY CHECKED: hash chain intact, seq 0 to 3, but the first 2 line(s) "
-                              "have no chain fields", out)
-                self.assertIn("Details: agent-sentinel audit verify", out)
+                line = next(line for line in out.splitlines() if line.startswith("Integrity:"))
+                self.assertIn("Integrity: PARTLY CHECKED: chain intact, seq 0 to 3, but the first 2 line(s) have no "
+                              "chain fields. Details: agent-sentinel audit verify", line)
+                self.assertLess(len(line.split(" Details: ")[0]), 110)  # review AUD2-5: one short line
         integrity = json.loads(run_cli("report", self.audit, "--format", "json")[1])["integrity"]
         self.assertEqual((integrity["state"], integrity["unchained_prefix"], integrity["unlinked_restarts"]),
                          ("partial", 2, 0))
+
+    def test_report_and_explain_read_each_line_once(self):
+        # Review AUD2-3: the record the chain check read is the one counted; the line is not parsed again.
+        self.write_calls(6)
+        for command in ("report", "explain"):
+            with self.subTest(command=command), \
+                    mock.patch.object(auditlog, "parse_record", wraps=auditlog.parse_record) as again:
+                code, out, err = run_cli(command, self.audit)
+                self.assertEqual((code, again.call_count), (0, 0), err)
+                self.assertIn("Integrity: hash chain intact, seq 0 to 6", out)
+        self.assertIn("6 records from", run_cli("report", self.audit)[1])
+        lines = raw_lines(self.audit)
+        doubled = b'{"action": "allow", ' + lines[2][1:]  # its chain fields intact, a key repeated: not strict JSON
+        self.audit.write_bytes(b"".join(lines[:2] + [doubled] + lines[3:]))
+        with mock.patch.object(auditlog, "parse_record", wraps=auditlog.parse_record) as again:
+            code, out, _ = run_cli("report", self.audit)
+        self.assertEqual(again.call_count, 1)  # read leniently, as before 0.6, and still counted
+        self.assertIn("6 records from", out)
+        self.assertIn("Integrity: BROKEN at line 3: it is not a valid JSON object (or it repeats a key)", out)
 
     def test_suggest_and_explain_read_a_log_with_every_kind_of_record(self):
         policy_file = self.write("policy.json", {"default": "block"})
