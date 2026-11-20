@@ -10,7 +10,11 @@ clients that keep plain JSON: see clients.py). Each stdio server entry gets
 the proxy in front of it (see wrapping.py), with absolute --policy, --audit,
 --pins (one file per server) and --name, and a --pass-env for each name in
 its "env". Remote servers, entries already wrapped, and Claude Desktop
-Extensions are listed and left alone: none of them can be wrapped.
+Extensions are listed and left alone: none of them can be wrapped. In a
+project's configuration (cli_doctor.config_scope), a Python that imports
+agent_sentinel only without -I (a pip --user install) is not written in:
+the client starts it in the project, which could hold an agent_sentinel
+folder of its own (wrapping.launcher_problem).
 
 By default nothing is written: wrap prints what it would change, entry by
 entry, as a diff in which env values are never shown. --apply writes, after
@@ -47,6 +51,7 @@ from .cli_common import (
     shown_command,
     shown_path,
 )
+from .cli_doctor import config_scope, project_of
 from .clients import CLIENTS
 from .config_file import ConfigFile, edited_text, read_config, write_config
 from .leaks import redact_value
@@ -59,6 +64,7 @@ from .wrapping import (
     check_python,
     command_line,
     kind_of,
+    launcher_problem,
     pins_file,
     proxy_command_of,
     server_label,
@@ -262,15 +268,17 @@ def plan_wrap(config: ConfigFile, client: str, servers: dict[str, Any], names: s
         found = proxy_command_of(entry)
         if found is not None and found.value("--name"):
             taken.add(found.value("--name").lower())
+    # A project's configuration: an entry doctor would call broken there (a Python without -I) is not written.
+    project = project_of(config.path) if config_scope(config.path) == "project" else None
     plan = []
     for name, entry in servers.items():
         if name in names:
-            plan.append(_wrap_step(config, client, name, entry, settings, taken))
+            plan.append(_wrap_step(config, client, name, entry, settings, taken, project))
     return plan
 
 
 def _wrap_step(config: ConfigFile, client: str, name: str, entry: Any, settings: ProxySettings,
-               taken: set[str]) -> Step:
+               taken: set[str], project: Path | None = None) -> Step:
     kind = kind_of(entry)
     if kind == "remote":
         return Step(name, entry, None,
@@ -296,6 +304,10 @@ def _wrap_step(config: ConfigFile, client: str, name: str, entry: Any, settings:
         new = wrap_entry(entry, settings, label, pins_file(settings, client, label, str(config.path)))
     except WrapError as exc:
         return Step(name, entry, None, f"skipped: {exc}")
+    problem = launcher_problem(proxy_command_of(new), project)
+    if problem:
+        return Step(name, entry, None, f"skipped: the program that would start the proxy, "
+                                       f"{printable(settings.python, limit=120)}, {problem}")
     says = f"will be wrapped, as --name {label}: {shown}"
     if executable is None:
         says += (f"\n      (note: '{printable(words[0], limit=60)}' is not on this terminal's PATH; the proxy looks "

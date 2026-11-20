@@ -321,10 +321,107 @@ class WhyAServerIsBroken(DoctorTest):
         self.assertEqual(status, "protected")
         self.assertIn("Python is started without -I, so a folder named agent_sentinel", text)
         self.installed_version.assert_called_with(sys.executable, False)
+        # In a user's own file, whatever harmless options come before -m: the warning, and the import check.
+        tail = self.wrapped("s")["args"][3:]
+        for options in (["-B"], ["-X", "utf8"], ["-W", "ignore"], ["-E", "-s"], ["-u"]):
+            with self.subTest(options=options):
+                self.installed_version.reset_mock()
+                status, text = self.reasons({"command": sys.executable, "args": [*options, "-m", "agent_sentinel",
+                                                                                 *tail]})
+                self.assertEqual(status, "protected", text)
+                self.assertIn("Python is started without -I, so a folder named agent_sentinel in the folder the "
+                              "client starts the server in would run instead of the proxy", text)
+                self.installed_version.assert_called_once_with(sys.executable, False)
+        for options in (["-I", "-B"], ["-X", "utf8", "-I"]):
+            with self.subTest(options=options):
+                status, text = self.reasons({"command": sys.executable, "args": [*options, "-m", "agent_sentinel",
+                                                                                 *tail]})
+                self.assertEqual(status, "protected", text)
+                self.assertNotIn("without -I", text)
         self.installed_version.return_value = None
         status, text = self.reasons(self.wrapped("s"))
         self.assertEqual(status, "broken")
         self.assertIn("started with -I cannot import agent_sentinel", text)
+        status, text = self.reasons({"command": sys.executable, "args": ["-I", "-B", "-m", "agent_sentinel", *tail]})
+        self.assertEqual(status, "broken")
+        self.assertIn("started with -I cannot import agent_sentinel", text)
+
+    NO_ISOLATION = ("runs -m agent_sentinel without -I (or -P, Python 3.11 and later) from a configuration kept in "
+                    "the project: the client starts it in the project, and Python then imports agent_sentinel from "
+                    "there first, so an agent_sentinel folder the repository puts there runs instead of the proxy")
+
+    def test_a_python_without_isolation_is_broken_in_a_projects_configuration(self):
+        # A repository can put an agent_sentinel folder in the project, where the client starts the server.
+        self.write("project/agent_sentinel/__init__.py", "")
+        self.write("project/agent_sentinel/__main__.py", "raise SystemExit('planted')\n")
+        self.write("repo/.git/HEAD", "ref: refs/heads/main\n")
+        tail = self.wrapped("s")["args"][3:]
+        files = (("project/.mcp.json", "mcpServers"), ("project/.vscode/mcp.json", "servers"),
+                 ("project/.cursor/mcp.json", "mcpServers"), ("repo/configs/servers.json", "mcpServers"))
+        for options in ([], ["-B"], ["-X", "utf8"], ["-W", "ignore"], ["-E", "-s"], ["-u"]):
+            entry = {"command": sys.executable, "args": [*options, "-m", "agent_sentinel", *tail]}
+            for name, key in files:
+                with self.subTest(options=options, config=name):
+                    _, servers, report = self.statuses(self.write(name, {key: {"s": entry}}))
+                    texts = " | ".join(finding["text"] for finding in servers["s"]["findings"])
+                    self.assertEqual((report["configs"][0]["scope"], servers["s"]["status"]), ("project", "broken"))
+                    self.assertIn(f"the program that starts the proxy, {sys.executable}, {self.NO_ISOLATION}", texts)
+                    self.assertNotIn("protected:", texts)
+            # The same file outside version control is a user's own: a warning. So is a known user file anywhere.
+            for name in ("loose/servers.json", "repo/claude_desktop_config.json", "repo/.claude.json"):
+                with self.subTest(options=options, config=name):
+                    _, servers, report = self.statuses(self.write(name, {"mcpServers": {"s": entry}}))
+                    texts = " | ".join(finding["text"] for finding in servers["s"]["findings"])
+                    self.assertEqual((report["configs"][0]["scope"], servers["s"]["status"]), ("user", "protected"))
+                    self.assertIn("Python is started without -I", texts)
+        for options in (["-I"], ["-I", "-X", "utf8"], ["-B", "-I"]):
+            entry = {"command": sys.executable, "args": [*options, "-m", "agent_sentinel", *tail]}
+            for name, key in files:
+                with self.subTest(options=options, config=name):
+                    _, servers, _ = self.statuses(self.write(name, {key: {"s": entry}}))
+                    texts = " | ".join(finding["text"] for finding in servers["s"]["findings"])
+                    self.assertEqual(servers["s"]["status"], "protected", texts)
+        # -P keeps the folder out too, from Python 3.11; an older Python does not start with it.
+        status, text = self.reasons({"command": sys.executable, "args": ["-P", "-m", "agent_sentinel", *tail]})
+        if sys.version_info >= (3, 11):
+            self.assertEqual(status, "protected", text)
+            self.assertNotIn("without -I", text)
+        else:
+            self.assertEqual(status, "broken")
+            self.assertIn("which does not know -P (Python 3.11 and later), so the proxy will not start", text)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows looks for a program in the current folder first")
+    def test_a_bare_launcher_that_the_project_folder_holds_is_broken(self):
+        for name in ("agent-sentinel", "uvx", "pipx"):
+            os.chmod(self.write(f"bin/{name}.exe", "MZ"), 0o755)
+        tail = self.wrapped("s", policy="~/.agent-sentinel/policy.json")["args"][3:]
+        servers = {"script": {"command": "agent-sentinel", "args": tail},
+                   "uvx": {"command": "uvx", "args": ["agent-sentinel@0.5.0", *tail]},
+                   "pipx": {"command": "pipx", "args": ["run", "agent-sentinel==0.5.0", *tail]}}
+        config = self.write("project/.mcp.json", {"mcpServers": servers})
+        with mock.patch.dict(os.environ, {"PATH": str(self.folder / "bin")}):
+            code, found, _ = self.statuses(config)
+            self.assertEqual((code, {name: server["status"] for name, server in found.items()}),
+                             (0, {"script": "protected", "uvx": "protected", "pipx": "protected"}))
+            self.write("project/agent-sentinel.exe", "MZ")  # as a cloned repository would hold them
+            self.write("project/uvx.cmd", "@echo off\r\n")
+            code, found, _ = self.statuses(config)
+            _, out, _ = self.doctor(config)
+        self.assertEqual((code, {name: server["status"] for name, server in found.items()}),
+                         (1, {"script": "broken", "uvx": "broken", "pipx": "protected"}))
+        for name, starter, planted in (("script", "agent-sentinel", "agent-sentinel.exe"), ("uvx", "uvx", "uvx.cmd")):
+            with self.subTest(name=name):
+                self.assertEqual([(finding["level"], finding["text"]) for finding in found[name]["findings"]][:1], [(
+                    "fail", f"the program that starts the proxy, {starter}, is written without a folder, and the "
+                            f"project folder holds {planted}: on Windows the client looks for such a program in the "
+                            "folder it starts in (here the project) before PATH, so that file would run instead. "
+                            "Write the full path of the program you mean")])
+                self.assertRegex(out, rf"\[fail\]\s+{name}\s+the program that starts the proxy, {starter}, is written "
+                                      "without a folder")
+        # A user's own file: the client is not started in this folder, which is not looked at.
+        with mock.patch.dict(os.environ, {"PATH": str(self.folder / "bin")}):
+            code, found, _ = self.statuses(self.config(servers))
+        self.assertEqual(code, 0)
 
     @unittest.skipUnless(sys.platform == "win32", "network paths of this form are a Windows matter")
     def test_a_path_on_another_machine_is_never_looked_at(self):

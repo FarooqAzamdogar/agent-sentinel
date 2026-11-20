@@ -28,7 +28,11 @@ and clients start servers in folders they choose, often the project the
 agent works on. A folder named agent_sentinel there would run instead of the
 proxy. -I leaves the current folder (and PYTHON* variables) out. It also
 leaves out the user's own site-packages, so a `pip install --user` copy is
-not found with it: then `wrap` writes the entry without -I and says why.
+not found with it: then `wrap` writes the entry without -I and says why,
+for a user's own configuration only. In a project's configuration (kept in
+the project and shared through its repository), the client starts in the
+project, whose folders the repository chooses, so a Python started there
+without -I (or -P) is broken (launcher_problem).
 
 Each name in the entry's "env" becomes a --pass-env, so that the server
 still gets its tokens when the proxy is started with --clean-env. The client
@@ -38,7 +42,9 @@ without -I, UV_INDEX_URL for uvx, __PYVENV_LAUNCHER__ for any Python) or
 where the proxy finds "~" (USERPROFILE, HOME) makes the entry broken, and
 wrap does not write such an entry (env_redirects). A launcher written as a
 relative path, or a Python option that can change what it imports, makes
-the entry broken too (launcher_problem).
+the entry broken too (launcher_problem), and so, in a project's
+configuration on Windows, does a launcher written without a folder when the
+project folder holds a program of that name: Windows looks there first.
 
 Remote entries ("url", "serverUrl", or a type such as "http") cannot be
 wrapped: the proxy speaks stdio only.
@@ -49,7 +55,9 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 import subprocess
+import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -89,9 +97,12 @@ _NAMED = re.compile(r"agent[-_]sentinel([^A-Za-z0-9_-].*)?", re.IGNORECASE | re.
 # python3.12d or python3.12-dbg (debug builds), python3.12-intel64 (macOS), pypy3.10, graalpy, and the py launcher.
 _PYTHON = re.compile(r"((python|pypy|graalpy)[0-9.]*t?w?(d|_d|-dbg)?(-intel64)?|pyw?)(\.exe)?", re.IGNORECASE)
 # Options a Python may get before "-m agent_sentinel" that cannot make it run anything else
-# (not -c, not another -m, not a script): -I, -E, -s, -S, -B, -u, -O, -q, -b; -X and -W
+# (not -c, not another -m, not a script): -I, -E, -s, -S, -B, -u, -O, -q, -b, -P; -X and -W
 # with their value; the Windows py launcher's version, such as -3.12.
-_PYTHON_FLAGS = re.compile(r"-[IEsSBuOqb]+|-[0-9][0-9.]*(-(32|64))?")
+_PYTHON_FLAGS = re.compile(r"-[IEsSBuOqbP]+|-[0-9][0-9.]*(-(32|64))?")
+# The letters that keep "python -m" from importing agent_sentinel from the folder it is started in first: -I, and
+# -P (Python 3.11 and later; an older Python does not start with it). -E and -s do not.
+_KEEPS_FOLDER_OUT = frozenset({"I", "P"})
 _PYTHON_VALUE_FLAGS = frozenset({"-X", "-W"})
 # The only -X values that leave what a Python imports and runs as it was (launcher_problem). Others need not:
 # "-X pycache_prefix=folder" makes even "python -I" run bytecode found in that folder, which may be relative to
@@ -161,7 +172,13 @@ _RUNNER_HARMLESS = frozenset({
 _HOME = (frozenset({"HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", home.ENV_VAR}), (),
          "the proxy takes its home folder, and \"~\" in its options and in the policy's paths, from another place")
 _PY_LAUNCHER_NAME = re.compile(r"pyw?(\.exe)?", re.IGNORECASE)
-_FLAG_LETTERS = re.compile(r"-[IEsSBuOqb]+")
+_FLAG_LETTERS = re.compile(r"-[IEsSBuOqbP]+")
+# On Windows, a program written without a folder is looked for in the folder the client starts in before PATH
+# (CreateProcess does, and so do libuv and cross-spawn, which Node clients use), as it is or with one of these
+# endings added (launcher_problem). cross-spawn also tries every ending of PATHEXT (.js, .vbs, .py ...), and has
+# cmd.exe open what it finds; those of this terminal's PATHEXT are looked for too.
+_FOUND_FIRST_ENDINGS = ("", ".exe", ".com", ".bat", ".cmd")
+_PATHEXT_ENDING = re.compile(r"\.[a-z0-9]{1,16}")
 
 
 class WrapError(ValueError):
@@ -214,21 +231,40 @@ class ProxyCommand:
         return any(name == flag for name, _ in self.options)
 
     def python_module(self) -> tuple[str, bool] | None:
-        """(the Python, whether it runs isolated) when the launcher is `PYTHON [-I] -m agent_sentinel proxy`.
+        """(the Python, whether it has -I) when the launcher is `PYTHON [options] -m agent_sentinel proxy`.
 
-        None for any other launcher (an agent-sentinel script, uvx, a shell).
+        Found the same way whatever harmless options of its own come before
+        -m (-B, -X utf8, -E -s, -IB ...). None for any other launcher (an
+        agent-sentinel script, uvx, a shell).
         """
-        middle = self.launcher[1:-1]
-        if middle == ISOLATED_MODULE:
-            return self.launcher[0], True
-        if middle == PLAIN_MODULE:
-            return self.launcher[0], False
-        return None
+        if not _PYTHON.fullmatch(_program(self.launcher[0])) or self.launcher[-3:-1] != PLAIN_MODULE:
+            return None
+        return self.launcher[0], "I" in python_letters(self.launcher)
+
+    def imports_from_its_folder(self) -> bool:
+        """Whether a Python launcher imports agent_sentinel from the folder the client starts it in first.
+
+        `python -m` puts that folder first on its import path unless it is
+        started with -I or -P (_KEEPS_FOLDER_OUT), so an agent_sentinel folder
+        there runs instead of the proxy. False for any other launcher.
+        """
+        return self.python_module() is not None and not python_letters(self.launcher) & _KEEPS_FOLDER_OUT
 
 
 def _program(word: str) -> str:
     """The file name of a program, whichever slash its path uses: "C:\\py\\python.exe" -> "python.exe"."""
     return os.path.basename(word.replace("\\", "/"))
+
+
+def python_letters(launcher: list[str]) -> set[str]:
+    """The letters of a Python launcher's own one-letter options before -m: {"I", "B"} for "-I -B" or "-IB"."""
+    letters: set[str] = set()
+    index = 1
+    while index < len(launcher) and launcher[index] != "-m":  # the Python's own options (see _PYTHON_FLAGS)
+        if _FLAG_LETTERS.fullmatch(launcher[index]):
+            letters.update(launcher[index][1:])
+        index += 2 if launcher[index] in _PYTHON_VALUE_FLAGS else 1
+    return letters
 
 
 def _launcher_length(words: list[str]) -> int | None:
@@ -398,11 +434,7 @@ def _redirecting_sets(launcher: list[str]) -> list[tuple[frozenset[str], tuple[s
     if _PYTHON.fullmatch(program):
         if _PY_LAUNCHER_NAME.fullmatch(program):
             sets.append(_PY_LAUNCHER)
-        index = 1
-        while index < len(launcher) and launcher[index] != "-m":  # the Python's own options (see _PYTHON_FLAGS)
-            if _FLAG_LETTERS.fullmatch(launcher[index]):
-                letters.update(launcher[index][1:])
-            index += 2 if launcher[index] in _PYTHON_VALUE_FLAGS else 1
+        letters = python_letters(launcher)
     elif not SCRIPT.fullmatch(program):
         sets.append(_RUNNER)
     if not letters & {"I", "E"}:
@@ -413,7 +445,7 @@ def _redirecting_sets(launcher: list[str]) -> list[tuple[frozenset[str], tuple[s
     return sets
 
 
-def launcher_problem(proxy: ProxyCommand) -> str | None:
+def launcher_problem(proxy: ProxyCommand, project: str | os.PathLike[str] | None = None) -> str | None:
     """Why the program that starts the proxy may run something else than the entry says, or None. As doctor says it.
 
     Clients start "command" without a shell, so a path with a folder that is
@@ -423,12 +455,24 @@ def launcher_problem(proxy: ProxyCommand) -> str | None:
     often the project. A bare name is looked up on PATH; a full path is what
     it says. A Python's own -X and -W options can make it import other code
     (_HARMLESS_X_VALUES).
+
+    `project` is the project folder of a project's configuration (one kept
+    in the project and shared through its repository), None for a user's
+    own. The client then likely starts in that folder, which the repository
+    fills: a Python without -I or -P imports agent_sentinel from it first,
+    and on Windows a bare name is looked for in it before PATH
+    (_found_first_in). Only that folder is looked at, and only when it is on
+    a drive of this machine.
     """
     starter = proxy.launcher[0]
     if _program(starter) != starter and not home.is_absolute(starter):
         return ("is a relative path: the client starts it without a shell, so it runs whatever is at that path "
                 "relative to its working folder (often the project), and \"~\" is not the home folder there. "
                 "Write its full path")
+    if project is not None and sys.platform == "win32" and _program(starter) == starter:
+        found = _found_first_in(os.fspath(project), starter)
+        if found:
+            return found
     if not _PYTHON.fullmatch(_program(starter)):
         return None
     index = 1
@@ -443,6 +487,43 @@ def launcher_problem(proxy: ProxyCommand) -> str | None:
                     "other code (of -X only utf8 is taken, and a -W category must not name a module). Take the "
                     "option out")
         index += 2
+    if project is not None and proxy.imports_from_its_folder():
+        return ("runs -m agent_sentinel without -I (or -P, Python 3.11 and later) from a configuration kept in the "
+                "project: the client starts it in the project, and Python then imports agent_sentinel from there "
+                "first, so an agent_sentinel folder the repository puts there runs instead of the proxy. Start it "
+                "with -I, with agent-sentinel installed for all users or in a virtual environment (-I leaves out a "
+                "pip --user install)")
+    return None
+
+
+def _found_first_in(folder: str, name: str) -> str | None:
+    """Why the Windows client may run a program of the project folder for the bare launcher `name`, or None.
+
+    It looks in the folder it starts in before PATH, for `name` as it is and
+    with .exe, .com, .bat or .cmd added (and the PATHEXT endings, see
+    _FOUND_FIRST_ENDINGS). Nothing outside `folder` is looked at. A folder
+    on another machine (\\\\server\\share, or a device path) is not looked
+    at either, since merely looking signs in to that machine (see
+    cli_doctor._never_opened); the launcher is then taken as found there.
+    A link is not followed: whatever it points to would run.
+    """
+    drive = os.path.splitdrive(folder)[0]
+    if not (len(drive) == 2 and drive[1] == ":" and home.is_absolute(folder)):
+        return ("is written without a folder, and the project folder is not on a drive of this machine, so it was "
+                "not looked at: on Windows the client looks for such a program in the folder it starts in (here the "
+                "project) before PATH. Write its full path")
+    endings = list(_FOUND_FIRST_ENDINGS)
+    endings += sorted({ending for ending in os.environ.get("PATHEXT", "").lower().split(";")
+                       if _PATHEXT_ENDING.fullmatch(ending)} - set(endings))
+    for ending in endings:
+        try:
+            found = os.lstat(os.path.join(folder, name + ending))
+        except (OSError, ValueError):
+            continue
+        if not stat.S_ISDIR(found.st_mode):
+            return (f"is written without a folder, and the project folder holds {printable(name + ending, limit=80)}: "
+                    "on Windows the client looks for such a program in the folder it starts in (here the project) "
+                    "before PATH, so that file would run instead. Write the full path of the program you mean")
     return None
 
 
@@ -455,8 +536,8 @@ def _harmless_python_option(flag: str, value: str) -> bool:
     return len(fields) <= 5 and "." not in category
 
 
-def status_of(entry: Any) -> str:
-    """"protected", "unprotected", "remote" or "broken", from the entry alone (no file is looked at).
+def status_of(entry: Any, project: str | os.PathLike[str] | None = None) -> str:
+    """"protected", "unprotected", "remote" or "broken", from the entry alone.
 
     What `clients` counts; doctor checks the same and more (does the policy
     load, does the program exist). Monitor mode blocks nothing, so it is not
@@ -464,7 +545,9 @@ def status_of(entry: Any) -> str:
     is broken: the proxy refuses the first, and a reader of the entry would
     take the wrong --policy for the one that counts. So is an entry whose
     launcher may run something else (launcher_problem), or whose "env" can
-    change what starts as the proxy (env_redirects).
+    change what starts as the proxy (env_redirects). `project` is the
+    project folder of a project's configuration (see launcher_problem); no
+    file is looked at but, on Windows, a bare launcher's name in that folder.
     """
     kind = kind_of(entry)
     if kind != "stdio":
@@ -475,7 +558,7 @@ def status_of(entry: Any) -> str:
         return "broken" if mentions_proxy(words) else "unprotected"
     if any(shortened_option(option) for option, _ in proxy.options) or len(proxy.values("--policy")) > 1:
         return "broken"
-    if launcher_problem(proxy) or env_redirects(entry, proxy):
+    if launcher_problem(proxy, project) or env_redirects(entry, proxy):
         return "broken"
     return "unprotected" if proxy.has("--monitor") else "protected"
 

@@ -333,6 +333,30 @@ class Refusals(WrapTest):
         self.assertIn("Nothing to wrap.", out)
         self.assertEqual(self.config.read_bytes(), before)
 
+    def test_a_python_without_isolation_is_not_written_into_a_projects_configuration(self):
+        # A pip --user install is found only without -I. In a project's file the client starts the proxy in the
+        # project, where the repository can put an agent_sentinel folder: doctor would call that entry broken.
+        self.check_python.return_value = PythonCheck(False, __version__)
+        self.write("repo/.git/HEAD", "ref: refs/heads/main\n")
+        mcp = self.write("project/.mcp.json", {"mcpServers": {"a": {"command": "npx", "args": ["x"]}}})
+        shared = self.write("repo/configs/servers.json", {"mcpServers": {"a": {"command": "npx", "args": ["x"]}}})
+        for args, path in ((["--client", "claude-code"], mcp),
+                           (["--client", "claude-desktop", "--config", shared], shared)):
+            before = path.read_bytes()
+            with self.subTest(path=path):
+                code, out, err = run_cli("wrap", *args, "--policy", self.policy, "--apply")
+                self.assertEqual(code, 0, err)
+                self.assertRegex(out, r"a\s+skipped: the program that would start the proxy, .+, runs -m "
+                                      r"agent_sentinel without -I \(or -P, Python 3\.11 and later\) from a "
+                                      r"configuration kept in the project")
+                self.assertIn("Nothing to wrap.", out)
+                self.assertEqual(path.read_bytes(), before)
+        # With -I it is written; a user's own file gets the entry without -I (see the --user install test above).
+        self.check_python.return_value = PythonCheck(True, __version__)
+        self.assertEqual(run_cli("wrap", "--client", "claude-code", "--policy", self.policy, "--apply")[0], 0)
+        self.assertEqual(json.loads(mcp.read_text(encoding="utf-8"))["mcpServers"]["a"]["args"][:3],
+                         ["-I", "-m", "agent_sentinel"])
+
     def test_options_that_do_not_go_together(self):
         self.place()
         code, _, err = self.wrap("--name", "x")
@@ -515,6 +539,25 @@ class ListingClients(WrapTest):
             "fine": {"command": sys.executable, "args": ["-I", "-X", "utf8", "-m", "agent_sentinel", *proxy]}}})
         _, out, _ = run_cli("clients")
         self.assertIn("4 server(s): 1 protected, 3 broken", out)
+
+    def test_a_projects_configuration_is_counted_with_its_project_folder(self):
+        # The client starts the servers of a project's file in the project, which the repository fills.
+        proxy = ["proxy", "--policy", str(self.policy), "--", "x"]
+        servers = {
+            "plain": {"command": sys.executable, "args": ["-m", "agent_sentinel", *proxy]},
+            "options": {"command": sys.executable, "args": ["-B", "-X", "utf8", "-m", "agent_sentinel", *proxy]},
+            "isolated": {"command": sys.executable, "args": ["-I", "-X", "utf8", "-m", "agent_sentinel", *proxy]},
+            "uvx": {"command": "uvx", "args": ["agent-sentinel@0.5.0", *proxy]}}
+        self.write("project/.mcp.json", {"mcpServers": servers})
+        self.place({"mcpServers": servers})  # a user's own file: Python without -I is a warning there (doctor)
+        _, out, _ = run_cli("clients")
+        self.assertIn("4 server(s): 2 protected, 2 broken", out)
+        self.assertIn("4 server(s): 4 protected", out)
+        if sys.platform == "win32":  # Windows looks in the folder the client starts in before PATH
+            self.write("project/uvx.exe", "MZ")
+            _, out, _ = run_cli("clients")
+            self.assertIn("4 server(s): 1 protected, 3 broken", out)
+            self.assertIn("4 server(s): 4 protected", out)
 
     def test_nothing_found(self):
         code, out, _ = run_cli("clients")

@@ -2,6 +2,7 @@
 
 import os
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -69,7 +70,24 @@ class Wrapping(unittest.TestCase):
         self.assertEqual(wrapping.proxy_command_of(plain).python_module(), (SETTINGS.python, False))
         self.assertEqual(wrapping.proxy_command_of(wrapped({"command": "x"})).python_module(), (SETTINGS.python, True))
         self.assertIsNone(read_proxy_command(["agent-sentinel", "proxy", "--", "x"]).python_module())
-        self.assertIsNone(read_proxy_command(["py", "-X", "utf8", "-m", "agent_sentinel", "proxy"]).python_module())
+        self.assertIsNone(read_proxy_command(["uvx", "agent-sentinel@0.5.0", "proxy", "--", "x"]).python_module())
+        self.assertEqual(read_proxy_command(["py", "-X", "utf8", "-m", "agent_sentinel", "proxy"]).python_module(),
+                         ("py", False))
+
+    def test_the_python_is_found_whatever_harmless_options_come_before_m(self):
+        # Doctor's -I check runs on what python_module finds: -B or -X utf8 before -m must not hide the Python.
+        for options, isolated, keeps_folder_out in (
+                ([], False, False), (["-B"], False, False), (["-X", "utf8"], False, False),
+                (["-W", "ignore"], False, False), (["-E", "-s"], False, False), (["-u"], False, False),
+                (["-3.12", "-O"], False, False), (["-P"], False, True), (["-I"], True, True),
+                (["-B", "-I"], True, True), (["-IB"], True, True), (["-sI"], True, True),
+                (["-X", "utf8", "-I"], True, True), (["-3.12", "-I", "-W", "ignore"], True, True)):
+            for python in ("py", os.path.join(ROOT, "python.exe"), "python3.12"):
+                found = read_proxy_command([python, *options, "-m", "agent_sentinel", "proxy", "--", "x"])
+                with self.subTest(python=python, options=options):
+                    self.assertEqual(found.python_module(), (python, isolated))
+                    self.assertEqual(found.imports_from_its_folder(), not keeps_folder_out)
+        self.assertFalse(read_proxy_command(["agent-sentinel", "proxy", "--", "x"]).imports_from_its_folder())
 
     def test_the_python_check_prefers_isolation_and_falls_back_only_when_it_must(self):
         def answers(isolated_version, plain_version):
@@ -327,10 +345,10 @@ class StatusFromTheEntryAlone(unittest.TestCase):
 
     TAIL = ["proxy", "--policy", os.path.join(ROOT, "policy.json"), "--", "npx", "server"]
 
-    def status_and_problem(self, launcher):
+    def status_and_problem(self, launcher, project=None):
         words = [*launcher, *self.TAIL]
-        return wrapping.status_of({"command": words[0], "args": words[1:]}), \
-            wrapping.launcher_problem(read_proxy_command(words))
+        return wrapping.status_of({"command": words[0], "args": words[1:]}, project), \
+            wrapping.launcher_problem(read_proxy_command(words), project)
 
     def test_a_launcher_written_as_a_relative_path_is_broken(self):
         # The client starts "command" without a shell, in a folder of its choosing (often the project).
@@ -370,6 +388,90 @@ class StatusFromTheEntryAlone(unittest.TestCase):
                 self.assertEqual(status, "broken")
                 self.assertIn("which can make Python import or run other code", problem)
                 self.assertIn(repr(options[-1]), problem)
+
+    NO_ISOLATION = ("runs -m agent_sentinel without -I (or -P, Python 3.11 and later) from a configuration kept in "
+                    "the project: the client starts it in the project, and Python then imports agent_sentinel from "
+                    "there first, so an agent_sentinel folder the repository puts there runs instead of the proxy")
+
+    def test_a_python_without_isolation_is_broken_in_a_projects_configuration(self):
+        # The client starts it in the project, where the repository can put an agent_sentinel folder that
+        # "python -m" imports first. -E and -s do not keep that folder out; -I and -P do.
+        with tempfile.TemporaryDirectory() as project:
+            for starter in ([os.path.join(ROOT, "python.exe")], ["python"], ["py", "-3.12"]):
+                for options in ([], ["-B"], ["-X", "utf8"], ["-W", "ignore"], ["-E"], ["-s"], ["-u"], ["-E", "-s"],
+                                ["-O", "-B"]):
+                    launcher = [*starter, *options, "-m", "agent_sentinel"]
+                    with self.subTest(launcher=launcher):
+                        self.assertEqual(self.status_and_problem(launcher), ("protected", None))  # a user's own file
+                        status, problem = self.status_and_problem(launcher, project)
+                        self.assertEqual(status, "broken")
+                        self.assertIn(self.NO_ISOLATION, problem)
+                for options in (["-I"], ["-IB"], ["-B", "-I"], ["-I", "-X", "utf8"], ["-P"], ["-P", "-E", "-s"]):
+                    launcher = [*starter, *options, "-m", "agent_sentinel"]
+                    with self.subTest(launcher=launcher):
+                        self.assertEqual(self.status_and_problem(launcher, project), ("protected", None))
+            # The script and the package runners do not import from the folder they are started in.
+            for launcher in (["agent-sentinel"], [os.path.join(ROOT, "Scripts", "agent-sentinel.exe")],
+                             ["uvx", "agent-sentinel@0.5.0"], ["pipx", "run", "agent-sentinel==0.5.0"]):
+                with self.subTest(launcher=launcher):
+                    self.assertEqual(self.status_and_problem(launcher, project), ("protected", None))
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows looks for a program in the current folder first")
+    def test_a_bare_launcher_that_the_project_folder_holds_is_broken(self):
+        # Clients look in the folder they start in (the project) before PATH, as it is and with these endings.
+        for launcher in (["agent-sentinel"], ["agent-sentinel.exe"], ["uvx", "agent-sentinel@0.5.0"],
+                         ["uv", "tool", "run", "agent-sentinel==0.5.0"], ["pipx", "run", "agent-sentinel==0.5.0"],
+                         ["py", "-3.12", "-I", "-m", "agent_sentinel"], ["python", "-I", "-m", "agent_sentinel"]):
+            for ending in ("", ".exe", ".com", ".bat", ".cmd"):
+                with tempfile.TemporaryDirectory() as project, self.subTest(launcher=launcher, ending=ending):
+                    open(os.path.join(project, launcher[0] + ending), "w").close()
+                    self.assertEqual(self.status_and_problem(launcher), ("protected", None))  # a user's own file
+                    status, problem = self.status_and_problem(launcher, project)
+                    self.assertEqual(status, "broken")
+                    self.assertIn(f"is written without a folder, and the project folder holds {launcher[0] + ending}: "
+                                  "on Windows the client looks for such a program in the folder it starts in (here "
+                                  "the project) before PATH, so that file would run instead", problem)
+        # cross-spawn (Node clients) tries every PATHEXT ending, and has cmd.exe open a .js or .vbs it finds.
+        with tempfile.TemporaryDirectory() as project, \
+                mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT;.CMD;.VBS;.JS;bad;.a\\b"}):
+            open(os.path.join(project, "uvx.js"), "w").close()
+            status, problem = self.status_and_problem(["uvx", "agent-sentinel@0.5.0"], project)
+            self.assertEqual(status, "broken")
+            self.assertIn("the project folder holds uvx.js: on Windows", problem)
+        # Only a file in that very folder counts: not a folder of that name, nor a file beside it or below it. A
+        # full path is what it says, whatever the project holds.
+        with tempfile.TemporaryDirectory() as top:
+            project = os.path.join(top, "project")
+            for folder in ("uvx.exe", "python", "tools"):
+                os.makedirs(os.path.join(project, folder))
+            for path in (os.path.join(top, "uvx.exe"), os.path.join(project, "tools", "uvx.exe"),
+                         os.path.join(project, "agent-sentinel.ps1"), os.path.join(project, "python.exe")):
+                open(path, "w").close()
+            for launcher in (["uvx", "agent-sentinel@0.5.0"], ["agent-sentinel"],
+                             [os.path.join(ROOT, "python.exe"), "-I", "-m", "agent_sentinel"]):
+                with self.subTest(launcher=launcher):
+                    self.assertEqual(self.status_and_problem(launcher, project), ("protected", None))
+
+    @unittest.skipUnless(sys.platform == "win32", "network and device paths of this form are a Windows matter")
+    def test_a_project_folder_on_another_machine_is_never_looked_at(self):
+        # Merely looking at \\server\share signs in to that machine; the bare launcher is then not taken as safe.
+        looked_at = []
+        real = os.lstat
+
+        def look(path, *args, **kwargs):
+            looked_at.append(str(path))
+            return real(path, *args, **kwargs)
+
+        for project in (r"\\attacker.example\share\project", "//attacker.example/share/project",
+                        r"\\?\UNC\attacker.example\share\project", r"\\.\UNC\attacker.example\share\project"):
+            with self.subTest(project=project), mock.patch.object(os, "lstat", look):
+                status, problem = self.status_and_problem(["uvx", "agent-sentinel@0.5.0"], project)
+                self.assertEqual(status, "broken")
+                self.assertIn("is written without a folder, and the project folder is not on a drive of this "
+                              "machine, so it was not looked at", problem)
+                self.assertEqual(self.status_and_problem([os.path.join(ROOT, "python.exe"), "-I", "-m",
+                                                          "agent_sentinel"], project), ("protected", None))
+        self.assertEqual(looked_at, [])
 
 
 class EnvThatChangesWhatStarts(unittest.TestCase):

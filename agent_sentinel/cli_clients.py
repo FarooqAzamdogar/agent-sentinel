@@ -2,7 +2,8 @@
 
 Read-only. For each configuration file that exists: the client, the path,
 and how many of its servers are protected (wrapped), not protected, remote
-(which the proxy cannot protect) or broken. For Claude Desktop, the Desktop
+(which the proxy cannot protect) or broken (wrapping.status_of; for a
+project's configuration, with its project folder). For Claude Desktop, the Desktop
 Extensions beside it, which cannot be wrapped, and a warning when there are
 two configuration files and it is not clear which one the app reads.
 """
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from pathlib import Path
 from typing import Any
 
 from . import clients
@@ -31,9 +33,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     pass
 
 
-def server_counts(servers: Any) -> Counter:
-    """How many entries are protected, unprotected (monitor mode included), remote and broken (wrapping.status_of)."""
-    return Counter(status_of(entry) for entry in (servers.values() if isinstance(servers, dict) else ()))
+def server_counts(servers: Any, project: Path | None = None) -> Counter:
+    """How many entries are protected, unprotected (monitor mode included), remote and broken (wrapping.status_of).
+
+    `project` is the project folder of a project's configuration, None for a user's own.
+    """
+    return Counter(status_of(entry, project) for entry in (servers.values() if isinstance(servers, dict) else ()))
 
 
 def describe_counts(counts: Counter) -> str:
@@ -90,7 +95,8 @@ def _print_location(location: Location) -> None:
     if not isinstance(servers, dict):
         print(f"  {'':24} \"{key}\" is not an object")
         return
-    print(f"  {'':24} {describe_counts(server_counts(servers))}")
+    project = clients.project_folder(location.path) if location.scope == "project" else None
+    print(f"  {'':24} {describe_counts(server_counts(servers, project))}")
     if location.client == "claude-desktop":
         extensions = clients.desktop_extensions(location.path)
         if extensions:

@@ -18,7 +18,15 @@ For each configuration file (those `clients` finds, or the ones given with
                   start as the proxy: a launcher written as a relative path, a Python
                   option such as -X pycache_prefix (wrapping.launcher_problem), or a
                   variable of the entry's "env" (PYTHONPATH for a Python without -I,
-                  UV_INDEX_URL for uvx, USERPROFILE for any: wrapping.env_redirects)
+                  UV_INDEX_URL for uvx, USERPROFILE for any: wrapping.env_redirects);
+                  in a project's configuration, also a Python started without -I,
+                  and on Windows a launcher written without a folder when the project
+                  folder holds a program of that name
+
+A project's configuration is one kept in a project and shared through its
+repository: .mcp.json, .vscode/mcp.json, a project's .cursor/mcp.json, and
+any other --config file inside a folder under version control (config_scope).
+The client is likely started in that project (project_of).
 
 and these are checked too: every policy loads, with its warnings; the audit
 and pins folders can be written; no two servers share a pins file; npx and
@@ -56,7 +64,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import __version__, clients, elicitation, home, mcp_proxy, server_env
+from . import __version__, clients, config_file, elicitation, home, mcp_proxy, server_env
 from .approvers import COMMAND_PREFIX
 from .cli_common import EXIT_FAIL, EXIT_OK, CommandError, full_path, shown_command, shown_path
 from .clients import CLIENTS
@@ -77,6 +85,7 @@ from .wrapping import (
     kind_of,
     launcher_problem,
     mentions_proxy,
+    python_letters,
     read_proxy_command,
     shortened_option,
 )
@@ -187,10 +196,53 @@ def _configs(given: list[str]) -> list[tuple[Path, str | None, str, str]]:
             path = Path(full_path(path_text))
             if not path.exists():
                 raise CommandError(f"there is no file at {path}")
-            found.append((path, clients.client_for_file(path), clients.scope_of(path), ""))
+            found.append((path, clients.client_for_file(path), config_scope(path), ""))
         return found
     return [(location.path, location.client, location.scope, location.note)
             for location in clients.all_locations() if location.path.is_file()]
+
+
+def config_scope(path: Path) -> str:
+    """"project" or "user" for a configuration file given by its path (doctor --config, wrap --config).
+
+    clients.scope_of knows the project files by name (.mcp.json,
+    .vscode/mcp.json, a project's .cursor/mcp.json). Any other file of no
+    known client is a project's too when it is inside a folder under version
+    control: the repository shares it, and decides what is in the folder a
+    client given it is started in. So is one on another machine, which is
+    not looked into (_never_opened). A known user file (Claude Desktop's,
+    the user's Cursor or Windsurf file, Claude Code's ~/.claude.json) stays
+    the user's, even in a home folder kept under version control.
+    """
+    scope = clients.scope_of(path)
+    if scope == "user" and clients.client_for_file(path) is None and not clients.is_app_state(path) and (
+            _never_opened(str(path)) or _work_tree_top(path) is not None):
+        return "project"
+    return scope
+
+
+def project_of(path: Path) -> Path:
+    """The folder a client of a project configuration is likely started in: its project's root.
+
+    The folder that holds .mcp.json, .vscode/ or .cursor/; for any other
+    file, the top of its work tree (else the file's own folder).
+    """
+    if clients.scope_of(path) == "project":
+        return clients.project_folder(path)
+    return _work_tree_top(path) or path.parent
+
+
+def _work_tree_top(path: Path) -> Path | None:
+    """The nearest folder above `path` that holds .git, .hg, .svn or .jj (as config_file looks), or None.
+
+    Nothing on another machine is looked at.
+    """
+    if _never_opened(str(path)):
+        return None
+    for folder in list(path.parents)[:config_file.MAX_FOLDER_DEPTH]:
+        if any(os.path.lexists(folder / marker) for marker in config_file._WORK_TREE_MARKERS):
+            return folder
+    return None
 
 
 # ---- one configuration ----------------------------------------------------------------------------
@@ -207,9 +259,9 @@ def check_config(path: Path, client: str | None, scope: str, note: str) -> Confi
     if not isinstance(servers, dict):
         report.error = f"\"{key}\" is not an object"
         return report
-    project = clients.project_folder(path)
+    project = project_of(path) if scope == "project" else None
     for name, entry in servers.items():
-        report.servers.append(check_server(name, entry, client, project if scope == "project" else None))
+        report.servers.append(check_server(name, entry, client, project))
     if client == "claude-desktop":
         report.extensions = clients.desktop_extensions(path)
     return report
@@ -267,7 +319,7 @@ def _shown(words: list[str]) -> str:
 
 def _check_wrapped(report: ServerReport, proxy: ProxyCommand, entry: dict[str, Any], project: Path | None) -> None:
     lines = report.lines
-    _check_launcher(lines, proxy)
+    _check_launcher(lines, proxy, project)
     for option, _ in proxy.options:
         if option in VALUE_OPTIONS or option in FLAG_OPTIONS:
             continue
@@ -298,31 +350,38 @@ def _check_wrapped(report: ServerReport, proxy: ProxyCommand, entry: dict[str, A
                                           "be able to change it; keep it in the agent-sentinel home folder"))
 
 
-def _check_launcher(lines: list[Line], proxy: ProxyCommand) -> None:
-    """The program that starts the proxy exists, and a Python started with -m agent_sentinel can import it."""
+def _check_launcher(lines: list[Line], proxy: ProxyCommand, project: Path | None) -> None:
+    """The program that starts the proxy exists, and a Python started with -m agent_sentinel can import it.
+
+    `project`: the project folder of a project's configuration, None for a user's own (launcher_problem).
+    """
     starter = proxy.launcher[0]
     refused = _never_opened(starter)
     if refused:
         lines.append(Line("fail", f"the program that starts the proxy, {printable(starter, limit=200)}, {refused} "
                                   "(see agent-sentinel doctor --help)"))
         return
-    problem = launcher_problem(proxy)  # a relative path is not looked for: doctor's folder is not the client's
+    problem = launcher_problem(proxy, project)  # a relative path is not looked for: doctor's folder is not the client's
     if problem:
         lines.append(Line("fail", f"the program that starts the proxy, {printable(starter, limit=200)}, {problem}"))
         return
     if not (os.path.isfile(starter) if home.is_absolute(starter) else mcp_proxy._resolve_executable(starter)):
         lines.append(Line("fail", f"the program that starts the proxy, {printable(starter, limit=200)}, was not found"))
         return
-    module = proxy.python_module()
+    module = proxy.python_module()  # whatever harmless options come before -m
     if module is None:
         return
     python, isolated = module
-    if not isolated:
+    if proxy.imports_from_its_folder():  # a user's own configuration: a project's has failed above
         lines.append(Line("warn", "Python is started without -I, so a folder named agent_sentinel in the folder the "
                                   "client starts the server in would run instead of the proxy. To fix: unwrap, then "
                                   "wrap again"))
     if not _is_this_python(python):
         return  # never run a program a configuration names: it could be anything
+    if "P" in python_letters(proxy.launcher) and sys.version_info < (3, 11):
+        lines.append(Line("fail", f"{printable(python, limit=200)} is Python {sys.version.split()[0]}, which does not "
+                                  "know -P (Python 3.11 and later), so the proxy will not start. Use -I instead"))
+        return
     if (python, isolated) not in _versions:  # one check per Python, however many servers it starts
         _versions[python, isolated] = installed_version(python, isolated)
     version = _versions[python, isolated]
