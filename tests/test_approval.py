@@ -138,6 +138,16 @@ class FinishingAnApproval(unittest.TestCase):
         self.assertFalse(final.allowed)
         self.assertEqual(final.ref, self.pending.ref)
 
+    def test_a_refusal_says_whether_anyone_was_asked(self):
+        # "refused": a person or program said no, or let the time run out. "unavailable": nobody could be asked.
+        refused = self.firewall.finish_approval(self.pending, False, "dialog (no answer within 120 seconds)")
+        nobody = Firewall(POLICY)
+        pending = nobody.check_call("send_email", EMAIL, defer_ask=True)
+        unavailable = nobody.finish_approval(pending, False, "nobody (dialog: no display)", asked=False)
+        self.assertEqual((refused.allowed, refused.approval), (False, "refused"))
+        self.assertEqual((unavailable.allowed, unavailable.approval, unavailable.ref),
+                         (False, "unavailable", pending.ref))
+
     def test_a_hostile_approver_label_is_made_printable_and_short(self):
         final = self.firewall.finish_approval(self.pending, False, "dia\x1b[2Jlog" + "x" * 1000)
         self.assertNotIn("\x1b", final.reason)

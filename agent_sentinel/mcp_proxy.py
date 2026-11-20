@@ -843,7 +843,7 @@ class Proxy:
         if ("result" in message) != ("error" in message):
             answer = ElicitationApprover.answer(message)
         else:
-            answer = Answer(False, "an answer that is neither a result nor an error")
+            answer = Answer(False, "an answer that is neither a result nor an error", asked=False)
         self._take_answer(waiting, answer)
         return _DROP
 
@@ -1209,7 +1209,7 @@ class Proxy:
                 self._waiting[pending.call_id or ""] = waiting
         if not room:
             who = f"the proxy ({MAX_WAITING_APPROVALS} calls were already waiting)"
-            return self._refused(message, self._firewall.finish_approval(pending, False, who))
+            return self._refused(message, self._firewall.finish_approval(pending, False, who, asked=False))
         self._report(f"waiting for approval: {waiting.description} {proxy_report.rule_and_ref(pending)}", limit=1000)
         threading.Thread(target=self._approval_worker, args=(waiting,), name="agent-sentinel approval",
                          daemon=True).start()
@@ -1226,11 +1226,15 @@ class Proxy:
             try:
                 answer, who = self._ask_someone(waiting)
                 approved = answer.approved is True
-                final = self._firewall.finish_approval(waiting.pending, approved, f"{who} ({answer.detail})")
+                final = self._firewall.finish_approval(
+                    waiting.pending, approved, f"{who} ({answer.detail})", asked=answer.asked
+                )
                 outcome = self._released(waiting, final)
             except Exception as exc:  # a bug must not let the call through
                 _warn(f"refused a call that waited for approval, after an internal error: {exc!r}")
-                final = self._firewall.finish_approval(waiting.pending, False, "the proxy, after an internal error")
+                final = self._firewall.finish_approval(
+                    waiting.pending, False, "the proxy, after an internal error", asked=False
+                )
                 outcome = self._refused(waiting.message, final)
             if not waiting.cancelled:
                 self._send(outcome)
@@ -1255,12 +1259,12 @@ class Proxy:
         try:
             check_showable(waiting.request.arguments)
         except NotShowable as exc:
-            return Answer(False, str(exc)), "the proxy"
+            return Answer(False, str(exc), asked=False), "the proxy"
         approver, why_nobody = self._choose_approver()
         if approver is None:
             if self._first_report("nobody to ask", why_nobody):
                 self._report(f"a call needs approval, but nobody can be asked: {why_nobody}", limit=1000)
-            return Answer(False, why_nobody), "nobody"
+            return Answer(False, why_nobody, asked=False), "nobody"
         if not self._approval_turn.acquire(timeout=max(0.0, waiting.deadline - time.monotonic())):
             return Answer(False, "no answer in time: other calls were being asked about"), approver.name
         try:
@@ -1319,7 +1323,7 @@ class Proxy:
             try:
                 answer = approver.ask(waiting.request, timeout)
             except Exception as exc:  # a broken approver refuses
-                answer = Answer(False, f"it failed: {printable(exc, limit=100)}")
+                answer = Answer(False, f"it failed: {printable(exc, limit=100)}", asked=False)
             self._take_answer(waiting, answer)
 
         threading.Thread(target=ask, name="agent-sentinel approver", daemon=True).start()
@@ -2383,6 +2387,15 @@ def _message_bytes(text: str) -> int:
     return value
 
 
+def _file_path(text: str) -> str:
+    """A file named by an option, with a leading "~" read as the home folder.
+
+    MCP clients start the proxy without a shell, so nothing else expands it:
+    "~/policy.json" would name a folder called "~" in the client's own folder.
+    """
+    return os.path.expanduser(text)
+
+
 def _server_name(text: str) -> str:
     if not SERVER_NAME.fullmatch(text):
         raise argparse.ArgumentTypeError("must be 1 to 64 letters, digits, '_', '-' or '.'")
@@ -2423,13 +2436,14 @@ def _argument_parser() -> argparse.ArgumentParser:
     # file is read by people and by `doctor`, and both must see the options the proxy really uses.
     parser = argparse.ArgumentParser(prog="agent-sentinel proxy", description="Run an MCP server behind the firewall.",
                                      allow_abbrev=False)
-    parser.add_argument("--policy", required=True, help="path to the policy JSON file")
-    parser.add_argument("--audit", default=None, help="path of the audit log (JSON lines)")
+    # File paths: a leading "~" is the home folder (_file_path), as a shell would read it.
+    parser.add_argument("--policy", type=_file_path, required=True, help="path to the policy JSON file")
+    parser.add_argument("--audit", type=_file_path, default=None, help="path of the audit log (JSON lines)")
     parser.add_argument("--no-log-args", action="store_true", help="leave tool arguments out of the audit log")
     parser.add_argument("--name", type=_server_name, default=None, metavar="NAME",
                         help="a short name for the server (letters, digits, '_', '-', '.'; at most 64), written into "
                              "every audit record and at the start of every line the proxy prints")
-    parser.add_argument("--pins", default=None, metavar="FILE",
+    parser.add_argument("--pins", type=_file_path, default=None, metavar="FILE",
                         help="remember tool, prompt and template definitions in FILE, and quarantine one that "
                              "changes later")
     parser.add_argument("--no-pins", action="store_true",
@@ -2451,7 +2465,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pass-env", type=_pass_env_name, action="append", default=[], metavar="NAME",
                         help="also give the server this variable with --clean-env; repeat it for more, "
                              "NAME* for every variable starting with NAME")
-    parser.add_argument("--env-file", default=None, metavar="FILE",
+    parser.add_argument("--env-file", type=_file_path, default=None, metavar="FILE",
                         help="add the NAME=VALUE lines of FILE to the server's environment (values are never printed)")
     parser.add_argument("--approve-with", type=_approver, action="append", default=[], metavar="BACKEND",
                         help="ask a person about calls the policy says \"ask\" for: dialog (a window on this machine), "

@@ -9,13 +9,15 @@ except the few marked as using this machine's own rules.
 import ntpath
 import os
 import posixpath
+import re
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from support import ROOT  # noqa: F401  (puts the package on the path)
-from agent_sentinel import Policy, PolicyError
+from agent_sentinel import Policy, PolicyError, matchers
 from agent_sentinel.matchers import PathMatcher, read_email_domain, read_url
 
 
@@ -45,6 +47,31 @@ def entry_rejected(test, entry, *fragments, deny=False):
 
 WINDOWS = {"flavour": ntpath, "current_folder": lambda: r"C:\work\app", "home_folder": lambda: r"C:\Users\me"}
 POSIX = {"flavour": posixpath, "current_folder": lambda: "/work/app", "home_folder": lambda: "/home/me"}
+
+
+class CountingPattern:
+    """A compiled pattern that records the length of each text it runs on."""
+
+    def __init__(self, pattern):
+        self.pattern = pattern
+        self.runs = []
+
+    def sub(self, replacement, text):
+        self.runs.append(len(text))
+        return self.pattern.sub(replacement, text)
+
+
+def counting_alias_patterns():
+    """matchers._WINDOWS_ALIAS_PATTERNS with each pattern in a CountingPattern, and the list of those."""
+    counters = []
+
+    def counted(part):
+        if not isinstance(part, re.Pattern):
+            return part
+        counters.append(CountingPattern(part))
+        return counters[-1]
+
+    return tuple(tuple(map(counted, entry)) for entry in matchers._WINDOWS_ALIAS_PATTERNS), counters
 
 
 # ---- the simple matchers -----------------------------------------------------------
@@ -254,6 +281,100 @@ class PathsOnWindows(unittest.TestCase):
                 self.assertTrue(deny.found_in(value))
         self.assertFalse(deny.found_in(r"C:\Documents and Settings\me\notes.txt"))
         self.assertFalse(deny.found_in(r"C:\Users\me\Application Data\Other\x"))
+
+    def test_deny_sees_through_the_other_junctions_of_a_profile_programdata_and_documents(self):
+        # `dir /AL` of C:\Users\Default (copied for every new user), C:\ProgramData and Documents lists these.
+        roots = ["~/AppData", "~/Pictures", "~/Music", "C:/Users/Public", "C:/ProgramData/Microsoft"]
+        deny = PathMatcher.for_roots(roots, **WINDOWS)
+        history = PathMatcher.for_roots([r"C:\Users\me\AppData\Local\Microsoft\Windows\History",
+                                         r"C:\Users\me\AppData\Local\Microsoft\Windows\INetCache"], **WINDOWS)
+        for value in (r"C:\Users\me\Start Menu\Programs\Startup\evil.cmd", "~/Start Menu/Programs/Startup/evil.cmd",
+                      r"C:\Users\me\SendTo\evil.lnk", r"C:\Users\me\Recent\report.lnk",
+                      r"C:\Users\me\Templates\Normal.dotm", r"C:\Users\me\NetHood\x", r"C:\Users\me\PrintHood\x",
+                      r"C:\Users\me\Cookies\x", r"C:\Documents and Settings\me\Start Menu\Programs\Startup\evil.cmd",
+                      r"C:\ProgramData\Start Menu\Programs\StartUp\evil.cmd", r"C:\ProgramData\Templates\x",
+                      r"C:\ProgramData\Desktop\evil.lnk", r"C:\ProgramData\Documents\x.txt",
+                      r"C:\Users\All Users\Documents\x.txt", r"C:\Users\me\Documents\My Pictures\passport.jpg",
+                      r"C:\Users\me\My Documents\My Music\song.mp3"):
+            with self.subTest(value=value):
+                self.assertTrue(deny.found_in(value))
+        for value in (r"C:\Users\me\Local Settings\History\x", r"C:\Users\me\AppData\Local\Temporary Internet Files\x",
+                      r"C:\Users\me\AppData\Local\Microsoft\Windows\Temporary Internet Files\x"):
+            with self.subTest(value=value):
+                self.assertTrue(history.found_in(value))
+        # A folder of the same name elsewhere is no junction, and the real folders are not aliases of themselves.
+        for value in (r"C:\work\app\templates\index.html", r"C:\work\Microsoft\Windows\Start Menu\Programs\x",
+                      r"C:\Users\me\Documents\notes.txt", r"C:\Users\me\Desktop\x"):
+            with self.subTest(value=value):
+                self.assertFalse(deny.found_in(value))
+
+    def test_deny_denies_a_value_with_more_alias_readings_than_it_follows(self):
+        deny = PathMatcher.for_roots(["~/AppData"], **WINDOWS)
+        names = ["templates", "recent", "sendto", "cookies", "nethood", "printhood", "start menu"]
+        self.assertFalse(deny.found_in("C:\\work\\" + "\\".join(names[:4]) + "\\x"))
+        self.assertTrue(deny.found_in("C:\\work\\" + "\\".join(names) + "\\x"))  # denied rather than read in part
+
+    def test_deny_denies_a_value_whose_readings_are_too_long_to_follow(self):
+        # Three alias names give 8 readings, well under the cap; at 4000 characters
+        # each, they are more text than is searched for one value.
+        deny = PathMatcher.for_roots(["~/AppData"], **WINDOWS)
+        filler = "\\".join(["abcdefghij"] * 360)
+        self.assertFalse(deny.found_in(r"C:\work\templates\recent\sendto\x"))
+        self.assertTrue(deny.found_in("C:\\work\\templates\\recent\\sendto\\" + filler))
+        self.assertFalse(deny.found_in("C:\\work\\templates\\" + filler))  # a long value with one alias is read
+
+    def test_the_work_of_reading_aliases_is_bounded(self):
+        # Counted, not timed: how often the alias patterns run, and on how much text.
+        deny = PathMatcher.for_roots(["~/AppData"], **WINDOWS)
+
+        def counted_check(value, denied):
+            """The CountingPatterns after deny.found_in(value), which must answer `denied`."""
+            patterns, counters = counting_alias_patterns()
+            with mock.patch.object(matchers, "_WINDOWS_ALIAS_PATTERNS", patterns):
+                self.assertEqual(deny.found_in(value), denied)
+            return counters
+
+        # A pattern runs only where its alias's text is.
+        counters = counted_check(r"C:\Users\me\projects\app\src\main.py", denied=False)
+        self.assertEqual(sum(len(counter.runs) for counter in counters), 0)
+        # Five aliases give 32 readings, the most that are followed; each runs
+        # only the five patterns whose alias it holds, not all of them. A sixth
+        # alias gives 64, and the value is denied.
+        names = "C:\\work\\templates\\recent\\sendto\\cookies\\nethood\\"
+        counters = counted_check(names + "x", denied=False)
+        self.assertLessEqual(sum(len(counter.runs) for counter in counters), 5 * matchers._MAX_ALIAS_READINGS)
+        counted_check(names + "start menu\\x", denied=True)
+        # At 4000 characters the readings soon grow too long and the value is
+        # denied; until then each pattern runs at most once on each reading.
+        counters = counted_check(names + "\\".join(["abcdefghij"] * 360), denied=True)
+        most = max(sum(counter.runs) for counter in counters)
+        self.assertLessEqual(most, matchers._MAX_ALIAS_CHARS + matchers._MAX_ALIAS_READINGS)
+
+    def test_one_value_has_one_alias_budget_for_all_of_its_spellings_and_readings(self):
+        # Counted, not timed, through a policy. "~/" is read twice (the home
+        # folder and a folder named "~") and "%252541" has four spellings:
+        # eight paths, each with the 32 readings of five aliases. A budget for
+        # each path would follow all 256; one budget for the value denies it.
+        original = PathMatcher.for_roots
+        with mock.patch.object(PathMatcher, "for_roots", lambda roots, where: original(roots, where, **WINDOWS)):
+            policy = rule({"arg": "path", "type": "path", "roots": ["~/.ssh"]}, deny=True)
+
+        def evaluated(value):
+            """The verdict of one evaluate of `value`, and how often the alias patterns ran in it."""
+            patterns, counters = counting_alias_patterns()
+            with mock.patch.object(matchers, "_WINDOWS_ALIAS_PATTERNS", patterns):
+                action = verdict(policy, path=value)
+            return action, sum(len(counter.runs) for counter in counters)
+
+        action, runs = evaluated("~/w/recent/sendto/cookies/nethood/printhood/%252541")
+        self.assertLessEqual(runs, 5 * matchers._MAX_ALIAS_READINGS)
+        self.assertEqual(action, "block")
+        # Real chains, with "~/" or with several spellings, stay within the budget.
+        for value in ("~/Local Settings/Application Data/Microsoft/Windows/Temporary Internet Files/x",
+                      "file:///C:/Documents%20and%20Settings/me/Local%20Settings/Application%20Data/x",
+                      "~/Documents/My Music/%2541"):
+            with self.subTest(value=value):
+                self.assertEqual(evaluated(value)[0], "allow")
 
     def test_an_unknown_current_folder_refuses_relative_paths(self):
         def gone():

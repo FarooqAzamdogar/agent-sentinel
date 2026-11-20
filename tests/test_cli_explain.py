@@ -69,6 +69,35 @@ class ExplainingARealLog(TempFolderTest):
         self.assertIn("it was refused there", out)
         self.assertNotIn('"allow"', out.split("to allow:")[1])
 
+    def test_an_ask_nobody_could_be_asked_about_does_not_say_a_person_refused_it(self):
+        # The Claude Code hook in bypassPermissions mode, or a proxy whose approver cannot ask, asks nobody.
+        pending = self.firewall.check_call("send_email", {"to": "bob@example.com"}, defer_ask=True)
+        self.firewall.finish_approval(pending, False, "the hook: permission mode bypassPermissions would not show "
+                                                      "the prompt", asked=False)
+        _, out, _ = run_cli("explain", self.audit, "--ref", pending.ref)
+        self.assertIn("REFUSED: nobody could be asked", out)
+        hint = out.split("to allow:")[1]
+        self.assertIn("nobody could be asked", hint)
+        self.assertIn("bypassPermissions", hint)
+        self.assertNotIn("refused there", out)
+        self.assertNotIn("when a person was asked", out)
+
+    def test_an_approved_call_that_a_flow_then_blocked_is_explained_by_its_flow_rule(self):
+        policy = Policy.from_dict({
+            "tools": {"fetch_page": {"action": "allow", "labels": ["untrusted"]},
+                      "send_email": {"action": "ask", "labels": ["sink"]}},
+            "flows": [{"after": ["untrusted"], "action": "block"}],
+        })
+        firewall = Firewall(policy, audit_path=self.audit)
+        pending = firewall.check_call("send_email", {"to": "bob@example.com"}, defer_ask=True)
+        firewall.run("fetch_page", {"url": "https://example.com"}, lambda url: "a page")
+        self.assertFalse(firewall.finish_approval(pending, True, "dialog").allowed)
+        _, out, _ = run_cli("explain", self.audit, "--ref", pending.ref)
+        self.assertIn("BLOCKED after it was approved", out)
+        self.assertIn("decided by:  flows[0]", out)
+        self.assertNotIn("REFUSED", out)
+        self.assertNotIn("refused there", out)
+
     def test_an_ask_refused_by_the_default_is_not_explained_as_a_missing_rule(self):
         audit = self.folder / "ask.jsonl"
         Firewall(Policy.from_dict({"default": "ask"}), audit_path=audit,

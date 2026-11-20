@@ -26,7 +26,10 @@ repeated; for each call the first backend that can ask at that moment is used):
   the question and reads the answer.
 
 Whatever the backend, only an explicit yes approves. A timeout, an error, a
-window that is closed, or an answer in any other form refuses the call.
+window that is closed, or an answer in any other form refuses the call. The
+audit log tells the two kinds of refusal apart (Answer.asked): a person or
+program said no or did not answer in time, or nobody could be asked because
+the backend failed.
 
 What the person is shown: the tool and every argument, quoted as JSON and
 passed through `printable`. A long value is cut, with a note that says how
@@ -164,10 +167,17 @@ class ApprovalRequest:
 
 @dataclass(frozen=True)
 class Answer:
-    """What came back. Only `approved is True` lets the call through; `detail` is for the audit log."""
+    """What came back. Only `approved is True` lets the call through; `detail` is for the audit log.
+
+    `asked` is False when nobody was asked after all: the dialog could not be
+    shown, the client answered the form with an error. The audit log then
+    says nobody could be asked (approval "unavailable"), not that a person
+    said no or let the time run out (approval "refused").
+    """
 
     approved: bool
     detail: str
+    asked: bool = True
 
 
 def _whole_seconds(timeout: float) -> int:
@@ -403,7 +413,7 @@ class DialogApprover:
             return Answer(False, "Cancel")
         if code == _MB_TIMEDOUT:
             return Answer(False, f"no answer within {_seconds(timeout)}")
-        return Answer(False, f"the dialog could not be shown (answer code {code})")
+        return Answer(False, f"the dialog could not be shown (answer code {code})", asked=False)
 
     def _ask_macos(self, request: ApprovalRequest, timeout: float) -> Answer:
         text = approval_text(request, timeout, "Choose Allow to allow this call, or Refuse to refuse it.")
@@ -414,12 +424,15 @@ class DialogApprover:
         code, out, err = self._run(argv, b"", timeout + _GRACE_SECONDS)
         if code == 0 and out.strip() == _OSASCRIPT_ALLOWED:
             return Answer(True, "Allow")
-        return Answer(False, _program_detail("osascript", code, out, err, timeout))
+        # Exit 0 without Allow: the dialog gave up. "Refuse" is the cancel button, which ends osascript
+        # with error -128 ("User canceled"). Any other error means the dialog was not shown.
+        asked = code is None or code == 0 or b"(-128)" in err
+        return Answer(False, _program_detail("osascript", code, out, err, timeout), asked=asked)
 
     def _ask_zenity(self, request: ApprovalRequest, timeout: float) -> Answer:
         zenity = self._find("zenity")
         if zenity is None:
-            return Answer(False, "zenity was not found")
+            return Answer(False, "zenity was not found", asked=False)
         text = approval_text(request, timeout, "Choose Allow to allow this call, or Refuse to refuse it.")
         argv = [
             zenity, "--question", "--title", _title(request),
@@ -433,7 +446,8 @@ class DialogApprover:
         code, out, err = self._run(argv, b"", timeout + _GRACE_SECONDS)
         if code == 0:
             return Answer(True, "Allow")
-        return Answer(False, _program_detail("zenity", code, out, err, timeout))
+        # zenity exits with 1 for Refuse or a closed window and 5 when its timeout passed; other codes are errors.
+        return Answer(False, _program_detail("zenity", code, out, err, timeout), asked=code in (None, 1, 5))
 
 
 def _program_detail(program: str, code: int | None, out: bytes, err: bytes, timeout: float) -> str:
@@ -546,10 +560,14 @@ class ElicitationApprover:
 
     @staticmethod
     def answer(reply: Mapping[str, Any]) -> Answer:
-        """Read the client's reply. Only action "accept" with the field exactly true approves."""
+        """Read the client's reply. Only action "accept" with the field exactly true approves.
+
+        An error, or an answer that is not one of the three actions, means the
+        form did not reach the person as it should: nobody was asked (Answer.asked).
+        """
         result = reply.get("result")
         if "error" in reply or not isinstance(result, dict):
-            return Answer(False, "the client answered with an error")
+            return Answer(False, "the client answered with an error", asked=False)
         action = result.get("action")
         content = result.get("content")
         if action == "accept" and isinstance(content, dict) and content.get(APPROVE_FIELD) is True:
@@ -558,7 +576,7 @@ class ElicitationApprover:
             return Answer(False, f"{action}d")  # "declined", "cancelled"
         if action == "accept":
             return Answer(False, "accepted without approving")
-        return Answer(False, "an answer the proxy cannot read")
+        return Answer(False, "an answer the proxy cannot read", asked=False)
 
 
 # One of the proxy's ways to ask a person (--approve-with). Not firewall.Approver, which is the
@@ -587,14 +605,15 @@ def parse_backend(text: str, resolve: Callable[[str], str | None]) -> ApprovalBa
 
     A command must be a full path, or a name found on PATH: a relative path
     would depend on the folder the client starts the proxy in, and could
-    point into a folder the agent can write to.
+    point into a folder the agent can write to. A leading "~" is the home
+    folder, as a shell would read it (MCP clients start the proxy without one).
     """
     if text == DIALOG:
         return DialogApprover()
     if text == ELICITATION:
         return ElicitationApprover()
     if text.startswith(COMMAND_PREFIX):
-        program = text[len(COMMAND_PREFIX):]
+        program = os.path.expanduser(text[len(COMMAND_PREFIX):])
         if not program:
             raise ValueError("write the program after 'command:', for example command:/usr/local/bin/approve")
         if os.path.dirname(program) and not os.path.isabs(program):

@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from support import POLICY, without_ref
 from test_proxy import Harness, call, initialize, reply, request, text_result
@@ -384,12 +385,16 @@ def accepted(question_id, approve=True):
     return reply(question_id, {"action": "accept", "content": {"approve": approve}})
 
 
+def client_question(h):
+    """The approval question the proxy sent to the client."""
+    wait_until(lambda: h.to_client.getvalue())
+    (question,) = h.sent_to_client()
+    return question
+
+
 class AskingThroughTheClient(ApprovalTest):
     def question(self, h):
-        """The approval question the proxy sent to the client."""
-        wait_until(lambda: h.to_client.getvalue())
-        (question,) = h.sent_to_client()
-        return question
+        return client_question(h)
 
     def test_a_client_that_can_show_forms_is_asked_and_an_accepted_yes_forwards_the_call(self):
         h = self.proxy(ElicitationApprover())
@@ -496,6 +501,67 @@ class AskingThroughTheClient(ApprovalTest):
         question = self.question(h)
         h.from_client(accepted(question["id"]))
         self.assertEqual(len(self.settled(h)[0]), 1)
+
+
+# ---- what the audit log says of a refusal ---------------------------------------------------------------
+
+class TheApprovalOfARefusal(ApprovalTest):
+    """approval "refused": a person or program said no or let the time run out; "unavailable": nobody was asked."""
+
+    def approvals(self):
+        """The "approval" of each refused answer in the log, oldest first."""
+        answers = [r for r in read_audit(self.audit) if r["event"] == "approval"]
+        return [r.get("approval") for r in answers if r["action"] == "block"]
+
+    def test_a_no_and_a_timeout_are_refusals(self):
+        h = self.proxy(FakeApprover(approved=False))
+        h.from_client(call(1, "send_email", EMAIL))
+        self.settled(h)
+        h = self.proxy(FakeApprover(gate=self.gate()), timeout=0.3)
+        h.from_client(call(1, "send_email", EMAIL))
+        self.settled(h)
+        h = self.proxy(ElicitationApprover())
+        open_session(h, {"elicitation": {}})
+        h.from_client(call(2, "send_email", EMAIL))
+        h.from_client(reply(client_question(h)["id"], {"action": "decline"}))
+        self.settled(h)
+        self.assertEqual(self.approvals(), ["refused", "refused", "refused"])
+
+    def test_a_call_nobody_could_be_asked_about_is_unavailable(self):
+        for name, approver, message in (
+            ("no approver can ask", FakeApprover(unavailable="no display"), call(1, "send_email", EMAIL)),
+            ("the approver failed", FakeApprover(error=OSError("no display")), call(1, "send_email", EMAIL)),
+            ("too many arguments to show", FakeApprover(), call(1, "send_email", {f"a{n}": n for n in range(21)})),
+        ):
+            with self.subTest(name):
+                h = self.proxy(approver, policy=Policy.from_dict({"tools": {"send_email": "ask"}}))
+                h.from_client(message)
+                self.settled(h)
+                self.assertEqual(self.approvals()[-1], "unavailable")
+
+    def test_a_client_that_answers_the_form_with_an_error_was_not_asked(self):
+        h = self.proxy(ElicitationApprover())
+        open_session(h, {"elicitation": {}})
+        h.from_client(call(2, "send_email", EMAIL))
+        question = client_question(h)
+        h.from_client({"jsonrpc": "2.0", "id": question["id"], "error": {"code": -1, "message": "no form here"}})
+        self.settled(h)
+        self.assertEqual(self.approvals(), ["unavailable"])
+
+    def test_a_call_that_cannot_wait_or_meets_an_internal_error_is_unavailable(self):
+        gate = self.gate()
+        h = self.proxy(FakeApprover(gate=gate), policy=Policy.from_dict({"tools": {"send_*": "ask"}}))
+        for n in range(mcp_proxy.MAX_WAITING_APPROVALS + 1):
+            h.from_client(call(n, "send_email", EMAIL))
+        gate.set()
+        self.settled(h)
+        self.assertEqual(self.approvals(), ["unavailable"])  # only the call that found no room to wait
+        h = self.proxy(FakeApprover())
+        h.proxy._ask_someone = mock.Mock(side_effect=RuntimeError("a bug"))
+        h.from_client(call(1, "send_email", EMAIL))
+        self.settled(h)
+        self.assertEqual(self.approvals(), ["unavailable", "unavailable"])
+        self.assertIn("internal error", self.output(h))
 
 
 # ---- what the operator reads ----------------------------------------------------------------------------

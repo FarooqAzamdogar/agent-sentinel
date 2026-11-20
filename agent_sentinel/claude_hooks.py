@@ -359,7 +359,7 @@ def _pre_tool_use(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
         if mode not in PROMPTING_MODES:
             shown = printable(mode, limit=40) if isinstance(mode, str) else "unknown"
             decision = firewall.finish_approval(
-                decision, False, f"the hook: permission mode {shown} would not show the prompt"
+                decision, False, f"the hook: permission mode {shown} would not show the prompt", asked=False
             )
     if decision.allowed or decision.pending:
         decision = _marked_before_the_call(firewall, tool, decision)
@@ -388,7 +388,7 @@ def _marked_before_the_call(firewall: Firewall, tool: str, decision: Decision) -
     except SessionStateError as exc:
         reason = f"the call was refused: its flow marks could not be recorded: {exc}"
         if decision.pending:
-            return firewall.finish_approval(decision, False, f"the hook: {reason}")
+            return firewall.finish_approval(decision, False, f"the hook: {reason}", asked=False)
         return firewall.refuse(tool, reason, public_reason=_UNCHECKED_CALL, rule=RULE_SESSION,
                                call_id=decision.call_id)
     return decision

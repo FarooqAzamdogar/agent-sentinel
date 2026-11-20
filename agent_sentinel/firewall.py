@@ -159,8 +159,10 @@ _LONG_RUN = re.compile(r"[A-Za-z0-9_+/=-]{20,}")
 # A piece of 6 or more characters with a digit, or with a capital letter
 # after its first character, is treated as part of a key (_cut_piece).
 _EDGE_RUN = re.compile(r"^[A-Za-z0-9_+/=-]{6,}|[A-Za-z0-9_+/=-]{6,}$")
-# The marker of the view an excerpt was found in, such as "[base64] " (detector._marked).
-_VIEW_MARKER = re.compile(r"\[[a-z0-9]+\] ")
+# The marker of the view an excerpt was found in: "[tags] ", "[base64] " or "[hex] "
+# (detector._marked). Only these: other text in brackets at the start of an
+# excerpt, such as "[7c4a8d09ca3762af61e59520] ", came from the text and is masked like the rest.
+_VIEW_MARKER = re.compile(r"\[(?:tags|base64|hex)\] ")
 # What the log keeps of an excerpt that may show a known value or canary (see _logged_excerpt).
 _EXCERPT_LEFT_OUT = "[excerpt not logged: it may show a value the policy guards]"
 
@@ -429,13 +431,20 @@ class Firewall:
             return decision
         return self._finish("call", tool, decision, args=args)
 
-    def finish_approval(self, decision: Decision, approved: bool, answered_by: str) -> Decision:
+    def finish_approval(
+        self, decision: Decision, approved: bool, answered_by: str, *, asked: bool = True
+    ) -> Decision:
         """Turn a human's answer to a pending call into the final Decision, and log it.
 
         decision: the pending Decision that check_call(..., defer_ask=True) returned.
         approved: the answer. Only exactly True approves; anything else refuses.
         answered_by: who or what answered, for the audit log, e.g. "dialog",
                   "elicitation" or "timeout". Shortened and made printable.
+        asked:    False when nobody could be asked after all: no approver could
+                  ask (the Claude Code hook in a mode that shows no prompt), it
+                  failed, or the call could not wait. The refusal is then
+                  recorded as approval "unavailable", not "refused" (which means
+                  a person or program said no, or did not answer in time).
 
         An approved call is allowed (rule: the rule that said ask). A refused one
         is blocked and keeps the pending decision's ref, so the agent's text and
@@ -460,12 +469,13 @@ class Firewall:
                 entry = None
         tool = entry[1] if entry is not None else "?"
         base = entry[2] if entry is not None else decision.reason
+        approval = APPROVAL_REFUSED if asked else APPROVAL_UNAVAILABLE
         if entry is None:
             reason = f"{base}; an answer from {who} came for a call that is not waiting"
-            final = self._refused_approval(decision, reason)
+            final = self._refused_approval(decision, reason, approval)
         elif approved is not True:
             what = "refused" if approved is False else "not answered with True or False"
-            final = self._refused_approval(decision, f"{base}; {what} by {who}")
+            final = self._refused_approval(decision, f"{base}; {what} by {who}", approval)
         else:
             final = self._approved_unless_a_flow_blocks(decision, tool, base, who)
         self._audit("approval", tool, "allow" if final.allowed else "block", final, None)
@@ -920,10 +930,10 @@ class Firewall:
                 del self._pending_approvals[next(iter(self._pending_approvals))]
 
     @staticmethod
-    def _refused_approval(pending: Decision, reason: str) -> Decision:
+    def _refused_approval(pending: Decision, reason: str, approval: str) -> Decision:
         return Decision(
             False, reason, public_reason=pending.public_reason, rule=pending.rule, matched_arg=pending.matched_arg,
-            ref=pending.ref, call_id=pending.call_id, approval=APPROVAL_REFUSED,
+            ref=pending.ref, call_id=pending.call_id, approval=approval,
         )
 
     def _approved_unless_a_flow_blocks(self, pending: Decision, tool: str, base: str, who: str) -> Decision:
