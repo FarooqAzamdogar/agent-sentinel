@@ -5,10 +5,14 @@
         the answer (see claude_hooks.py). Exits 0, or 2 to block; never anything else.
 
     agent-sentinel hook install claude-code --policy FILE [--settings FILE] [--audit FILE] [--state-dir DIR]
-                                            [--scan-all-results] [--no-log-args] [--apply]
+                                            [--scan-all-results | --scan-subagent-reports] [--no-log-args] [--apply]
         Prints the hooks to add to a Claude Code settings file. With --settings,
         shows the change to that file; with --apply as well, makes it, after a
         backup (config_file.py: the rest of the file is kept byte for byte).
+        The hooks: SessionStart, PreToolUse, PostToolUse and PostToolUseFailure
+        (the tool calls), Elicitation and ElicitationResult (what an MCP server
+        asks the user, and the answer), and ConfigChange (settings files and
+        skills changed during a session).
 
 The hooks run this Python with absolute paths for the policy, the audit log
 and the state folder, in exec form (no shell), with "onFailure": "block" so
@@ -47,9 +51,9 @@ from .wrapping import ISOLATED_MODULE, PACKAGE, PLAIN_MODULE, SCRIPT, PythonChec
 
 HELP = "enforce the policy inside Claude Code through its hooks (hook claude-code, hook install claude-code)"
 DESCRIPTION = (
-    "Enforce the policy inside Claude Code, through its PreToolUse and PostToolUse hooks. 'hook install "
-    "claude-code' prints the settings to add (and with --settings FILE --apply, adds them); 'hook claude-code' "
-    "is what Claude Code runs for each event."
+    "Enforce the policy inside Claude Code, through its hooks: tool calls and what they return, what MCP servers "
+    "ask the user (elicitation), and changes to its settings. 'hook install claude-code' prints the settings to "
+    "add (and with --settings FILE --apply, adds them); 'hook claude-code' is what Claude Code runs for each event."
 )
 EPILOG = """\
 examples:
@@ -63,15 +67,20 @@ Codex, Cursor, VS Code (Copilot) and the Antigravity CLI are not supported yet.
 
 # How long Claude Code waits for one hook run, in seconds. A timeout blocks the call ("onFailure": "block").
 HOOK_TIMEOUT_SECONDS = 60
-# What the PostToolUse hooks scan by default: what comes from the web and from MCP servers (see
-# claude_hooks.RESULTS_MATCHER). The PreToolUse hook sets the flow marks of the other tools itself.
+# What the PostToolUse hooks scan by default: what comes from the web and from MCP servers, MCP resources
+# included (see claude_hooks.RESULTS_MATCHER). The PreToolUse hook sets the flow marks of the other tools itself.
 RESULTS_MATCHER = claude_hooks.RESULTS_MATCHER
+# With --scan-subagent-reports: the default, and the tools that hand Claude a subagent's report.
+SUBAGENT_RESULTS_MATCHER = "|".join((RESULTS_MATCHER, *claude_hooks.SUBAGENT_REPORT_TOOLS))
+# ConfigChange: every source Claude Code reports. Letters, "_" and "|" only, so an exact list, not a pattern.
+CONFIG_MATCHER = "|".join(claude_hooks.CONFIG_SOURCES)
 ALL = "*"
 # Some of Claude Code's own tools. A policy written for MCP servers blocks them all when its default is
-# "block", including the ones Claude uses to ask the user something or to leave plan mode.
+# "block", including the ones Claude uses to ask the user something or to leave plan mode, to read MCP
+# resources, or to hand back a subagent's report in auto mode.
 BUILT_IN_TOOLS = (
     "Read", "Glob", "Grep", "Edit", "Write", "NotebookEdit", "Bash", "WebFetch", "WebSearch", "Agent",
-    "AskUserQuestion", "ExitPlanMode",
+    "AskUserQuestion", "ExitPlanMode", "SubagentHandback", "ReadMcpResourceTool", "ListMcpResourcesTool", "Monitor",
 )
 
 
@@ -95,8 +104,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     install.add_argument("--settings", metavar="FILE",
                          help="the Claude Code settings file to change, e.g. ~/.claude/settings.json "
                               "(without it, the hooks are only printed)")
-    install.add_argument("--scan-all-results", action="store_true",
-                         help="scan what every tool returns, not only WebFetch, WebSearch and MCP tools")
+    results = install.add_mutually_exclusive_group()
+    results.add_argument("--scan-all-results", action="store_true",
+                         help="scan what every tool returns, not only WebFetch, WebSearch, MCP tools and MCP "
+                              "resources")
+    results.add_argument("--scan-subagent-reports", action="store_true",
+                         help="also scan a subagent's report (Agent, SubagentHandback). A flagged report stops the "
+                              "whole agent, so this is off by default")
     install.add_argument("--apply", action="store_true", help="write the change (after a backup); needs --settings")
 
 
@@ -106,8 +120,9 @@ def _add_paths(parser: argparse.ArgumentParser) -> None:
                         help="the audit log (hook claude-code: none if left out; install: audit.jsonl in the "
                              "agent-sentinel home folder)")
     parser.add_argument("--state-dir", metavar="DIR",
-                        help="the folder for each session's flow marks and rate-limit counts (default: hook-state "
-                             "in the agent-sentinel home folder). Keep it out of the agent's reach")
+                        help="the folder for each session's flow marks, rate-limit counts, session limits, the end "
+                             "of the last output (tail scan) and the settings snapshot (default: hook-state in the "
+                             "agent-sentinel home folder). Keep it out of the agent's reach")
     parser.add_argument("--no-log-args", action="store_true", help="leave tool inputs out of the audit log")
 
 
@@ -189,8 +204,9 @@ def install_claude_code(args: argparse.Namespace) -> int:
     python = this_python()
     handler = hook_handler(os.path.abspath(sys.executable), python.isolated, policy_path, audit, state,
                            log_args=not args.no_log_args)
-    hooks = hook_groups(handler, scan_all_results=args.scan_all_results)
-    _print_header(policy_path, policy, audit, state, args.scan_all_results)
+    hooks = hook_groups(handler, scan_all_results=args.scan_all_results,
+                        scan_subagent_reports=args.scan_subagent_reports)
+    _print_header(policy_path, policy, audit, state, args)
     if args.settings is None:
         _print_snippet(hooks, policy_path)
         _warn_about_python(handler["command"], python)
@@ -210,14 +226,29 @@ def hook_handler(python: str, isolated: bool, policy: str, audit: str, state: st
             "onFailure": "block"}
 
 
-def hook_groups(handler: dict[str, Any], scan_all_results: bool = False) -> dict[str, list[dict[str, Any]]]:
-    """The "hooks" section with only agent-sentinel's entries: event -> matcher groups."""
-    results = ALL if scan_all_results else RESULTS_MATCHER
+def hook_groups(handler: dict[str, Any], scan_all_results: bool = False, scan_subagent_reports: bool = False
+                ) -> dict[str, list[dict[str, Any]]]:
+    """The "hooks" section with only agent-sentinel's entries: event -> matcher groups.
+
+    The tool events, SessionStart, both elicitation events (every MCP server)
+    and ConfigChange (every source Claude Code reports). The PostToolUse
+    hooks run for RESULTS_MATCHER; for every tool with scan_all_results; and
+    for subagent reports too with scan_subagent_reports.
+    """
+    if scan_all_results:
+        results = ALL
+    elif scan_subagent_reports:
+        results = SUBAGENT_RESULTS_MATCHER
+    else:
+        results = RESULTS_MATCHER
     matchers = {
         claude_hooks.SESSION_START: ALL,
         claude_hooks.PRE_TOOL_USE: ALL,
         claude_hooks.POST_TOOL_USE: results,
         claude_hooks.POST_TOOL_USE_FAILURE: results,
+        claude_hooks.ELICITATION: ALL,
+        claude_hooks.ELICITATION_RESULT: ALL,
+        claude_hooks.CONFIG_CHANGE: CONFIG_MATCHER,
     }
     return {event: [{"matcher": matcher, "hooks": [handler]}] for event, matcher in matchers.items()}
 
@@ -273,9 +304,15 @@ def is_our_handler(handler: Any) -> bool:
     return False
 
 
-def _print_header(policy_path: str, policy: Policy, audit: str, state: str, scan_all: bool) -> None:
-    print("Claude Code hooks: agent-sentinel checks every tool call before it runs, and what "
-          + ("every tool returns." if scan_all else "web and MCP tools return (WebFetch, WebSearch, mcp__*)."))
+def _print_header(policy_path: str, policy: Policy, audit: str, state: str, args: argparse.Namespace) -> None:
+    if args.scan_all_results:
+        scanned = "every tool returns."
+    else:
+        scanned = ("web and MCP tools return (WebFetch, WebSearch, mcp__*, MCP resources"
+                   + (" and subagent reports)." if args.scan_subagent_reports else ")."))
+    print("Claude Code hooks: agent-sentinel checks every tool call before it runs, and what " + scanned)
+    print("                   It also checks what MCP servers ask the user (elicitation) and the answer, and "
+          "records changes to Claude Code's settings during a session.")
     warnings = policy.warnings()
     note = f"; {len(warnings)} warning(s): agent-sentinel validate {shown_path(policy_path)}" if warnings else ""
     rules = f"default {policy.default}, {len(policy.tools)} tool rule(s){note}"
@@ -286,10 +323,27 @@ def _print_header(policy_path: str, policy: Policy, audit: str, state: str, scan
         print(f"  Warning: the policy blocks Claude Code's own tools {', '.join(blocked)} (it has no rule that "
               'allows them). Add rules for the ones the agent should use, such as "Read": "allow" or "Bash": "ask".')
     if policy.may_ask():
+        auto = ("every 'ask' in auto mode (hook.treat_auto_as_non_prompting)" if policy.hook.treat_auto_as_non_prompting
+                else "an 'ask' for SubagentHandback in auto mode, which runs without a prompt")
         print("               Its 'ask' rules show Claude Code's own permission prompt; in bypassPermissions mode "
-              "they are refused.")
+              f"they are refused, and so is {auto}. The hook never sees the answer, so approval memory "
+              "(approvals) does not apply.")
+    if policy.warn_severity is not None:
+        print(f"               Output with a finding at or above {policy.warn_severity} (injection.warn_severity) "
+              "reaches Claude with a notice to treat it as data.")
+    if policy.server_labels:
+        print("  Note: the policy's server_labels apply in the proxy only; in hook mode give the labels to the "
+              'mcp__<server>__* tool rules instead, such as "mcp__web__*": {"action": "allow", "labels": '
+              '["untrusted"]}.')
+    if policy.tool_level_action("Monitor") != "block":
+        print("  Note: the policy lets the agent use Monitor, whose streamed events no hook can scan. Label it "
+              '"untrusted" and "sink" for the flow rules, or block it.')
+    if policy.hook.config_changes == "block":
+        print("Settings:      a change to Claude Code's settings or skills during a session is refused "
+              "(hook.config_changes); the file stays changed, and the next session reads it.")
     print(f"Audit log:     {shown_path(audit)}")
-    print(f"Session state: {shown_path(state)} (flow marks and rate-limit counts; keep it out of the agent's reach)")
+    print(f"Session state: {shown_path(state)} (flow marks, rate-limit counts, session limits, the end of the last "
+          "output for the tail scan, and the settings snapshot; keep it out of the agent's reach)")
     print('Needs Claude Code v2.1.295 or later: with "onFailure": "block", a hook that cannot start or times out '
           "blocks the call. Older versions let the call through.")
 
@@ -322,7 +376,8 @@ def _change_settings(path: Path, handler: dict[str, Any], args: argparse.Namespa
         raise CommandError(f"the folder {path.parent} does not exist; create it first, or give another --settings")
     else:
         old = None
-    new = merged_hooks(old, hook_groups(handler, scan_all_results=args.scan_all_results))
+    new = merged_hooks(old, hook_groups(handler, scan_all_results=args.scan_all_results,
+                                        scan_subagent_reports=args.scan_subagent_reports))
     print(f"\nSettings file: {shown_path(path)}" + ("" if config is not None else " (does not exist yet; it would be "
                                                                               "created)"))
     _warn_about_project(path, files)

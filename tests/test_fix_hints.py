@@ -101,6 +101,16 @@ class HookHints(unittest.TestCase):
         self.assertIn("per Claude Code session", fix_hint("tools.Bash.max_calls_per_minute"))
         policy = Policy.from_dict({"tools": {"Bash": "ask"}})
         self.assertIn("bypassPermissions", fix_hint("tools.Bash", tool="Bash", policy=policy))
+        self.assertIn("SubagentHandback in auto mode", fix_hint("tools.Bash", approval="unavailable"))
+
+    def test_settings_changes_and_elicitations_are_explained_and_protective(self):
+        self.assertEqual(classify("hook.config_changes").kind, "config_change")
+        self.assertIn("the file itself stays changed", fix_hint("hook.config_changes"))
+        for rule in ("elicitation.url", "elicitation.form"):
+            with self.subTest(rule=rule):
+                self.assertEqual(classify(rule).kind, "elicitation")
+                self.assertIn("declined", fix_hint(rule))
+        self.assertTrue({"config_change", "elicitation"} <= PROTECTIVE_KINDS)
 
 
 if __name__ == "__main__":

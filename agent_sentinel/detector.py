@@ -1892,3 +1892,101 @@ def max_severity(findings: list[Finding]) -> str | None:
     if not findings:
         return None
     return max((f.severity for f in findings), key=SEVERITY_ORDER.__getitem__)
+
+
+def merge_findings(*groups: Iterable[Finding]) -> list[Finding]:
+    """Findings of several scans of one value as one list: per rule the strongest, minus superseded ones.
+
+    For a caller that scans an extra text on its own, such as the firewall's
+    tail scan (the end of the last result read together with the next one).
+    """
+    strongest: dict[str, Finding] = {}
+    for group in groups:
+        _keep_strongest(strongest, group)
+    return _without_superseded(strongest)
+
+
+# --------------------------------------------------------------------------
+# The matching views, piece by piece (for the tail scan)
+# --------------------------------------------------------------------------
+# The kinds of matching view `_matching_views` builds, in a fixed order (all
+# but the decoded base64 and hex runs, which are read on their own). Each is
+# made in two steps. Its source needs the whole text (`view_sources`):
+# decoding, removing HTML tags and comments, and spelling out tag characters
+# can each reach far. The view itself is then made from any piece of that
+# source (`view_of`): normalising reads each character with its neighbours
+# only. So a caller that needs only the ends of a text in each view (the tail
+# scan) cuts the source and normalises the pieces. Keep these in step with
+# `_matching_views`.
+VIEW_KINDS = ("plain", "spaced", "decoded", "decoded spaced", "without tags", "tag characters")
+_VIEW_STEPS: dict[str, tuple[str, "_Table | None", bool]] = {  # kind -> (source, table, unglued)
+    "plain": ("text", None, False),
+    "spaced": ("text", _FOLD_SPACED, False),
+    "decoded": ("decoded", None, True),
+    "decoded spaced": ("decoded", _FOLD_SPACED, True),
+    "without tags": ("without tags", None, True),
+    "tag characters": ("tag characters", None, True),
+}
+
+
+def view_sources(text: str) -> dict[str, str]:
+    """The source of each kind of view of `text` (VIEW_KINDS -> text): the steps that need the whole text.
+
+    The text as `scan` reads it (a FIELD_BREAK read as a space); decoded
+    (`_decode`); decoded, without HTML tags and comments; and with its tag
+    characters spelled out. A text whose HTML character references cannot
+    be decoded is its own decoded text (its scan reports
+    unscannable_content). Sources that do not differ are the same object.
+    """
+    text = without_field_breaks(text)
+    try:
+        decoded = _decode(text)
+    except _Unscannable:
+        decoded = text
+    by_source = {
+        "text": text,
+        "decoded": decoded,
+        "without tags": _TAG_RE.sub("", decoded) if "<" in decoded else decoded,
+        "tag characters": decode_tags(text) if TAG_CHARACTERS.search(text) else text,
+    }
+    return {kind: by_source[_VIEW_STEPS[kind][0]] for kind in VIEW_KINDS}
+
+
+def views_of(source: str, kinds: Iterable[str]) -> dict[str, str]:
+    """The matching views of these kinds (VIEW_KINDS) of `source` (from view_sources), or of any piece of it.
+
+    All the kinds must be read from that source. Each step is made once:
+    kinds that differ only in the last steps share the first.
+    """
+    decomposed = None
+    normalized: dict[tuple[bool, bool], str] = {}  # (spaced, unglued) -> view
+    views: dict[str, str] = {}
+    for kind in kinds:
+        _, table, unglued = _VIEW_STEPS[kind]
+        spaced = table is _FOLD_SPACED
+        if (spaced, False) not in normalized:
+            if decomposed is None:  # as _normalize does it, once for both tables
+                decomposed = source if source.isascii() else _decompose(source.replace(_ACUTE_ACCENT, "'"))
+            normalized[spaced, False] = " ".join(decomposed.translate(_FOLD_SPACED if spaced else _FOLD).split())
+        if unglued and (spaced, True) not in normalized:
+            normalized[spaced, True] = _unglue(normalized[spaced, False])
+        views[kind] = normalized[spaced, unglued]
+    return views
+
+
+def view_of(kind: str, source: str) -> str:
+    """The matching view of kind `kind` (VIEW_KINDS) of `source` (from view_sources), or of any piece of it."""
+    return views_of(source, (kind,))[kind]
+
+
+def reads_as(char: str) -> tuple[str, str]:
+    """What one character becomes in the views that delete invisible characters, and in those that space them.
+
+    Before runs of whitespace are joined: "\\u00a8" (a diaeresis) reads as a
+    space in both, a zero-width space as nothing and as a space, a
+    combining mark as nothing in both.
+    """
+    if char == _ACUTE_ACCENT:
+        return "'", "'"
+    parts = unicodedata.normalize("NFKD", char)[: _MAX_EXPANSION]
+    return parts.translate(_FOLD), parts.translate(_FOLD_SPACED)
