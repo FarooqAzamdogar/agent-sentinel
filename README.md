@@ -205,7 +205,7 @@ It also looks at things around the servers. Each of these is a `[warn]` line unl
 - **Session groups**: a warning when the wrapped servers of one file name different groups, when only some have one, or when the group's file shows that only one of several servers joined the client's latest run.
 - **Control plane**: can the agent reach agent-sentinel's own files? `doctor` reports a server that is given a folder holding the policy, the pins, the audit log or its key, and a policy that would let a write tool change them. In a project's configuration, an approver program or `--env-file` inside the project folder is a `[fail]`.
 - **Permissions**: on macOS and Linux, a policy, pins file, key or state folder that other users can read or change. On Windows, a home folder outside your user profile.
-- **Baseline**: with `--baseline FILE`, anything added, changed or removed since you saved that file (see below).
+- **Baseline**: with `--baseline FILE`, anything added, changed or removed since you saved that file is a `[fail]` (see below).
 
 Lines you may see:
 
@@ -220,7 +220,7 @@ An entry counts as broken, with a line that says why, when for example:
 
 - the proxy would refuse one of its options (a shortened option, a value out of range), or its `--policy`, `--env-file` or approver program is missing or written as a relative path. A leading `~` counts as your home folder, as the proxy reads it;
 - the program that starts the proxy is written as a relative path (`tools/python.exe`, `~/py/python.exe`): clients start it without a shell, relative to their working folder;
-- a package runner does not run agent-sentinel at a version: only `uvx agent-sentinel@0.5.0`, `@latest` (lowercase), `==0.5.0` and the like count, not a URL, a path, extras or a word such as `@0.5.0-evil`;
+- a package runner does not run agent-sentinel at a version: only `uvx agent-sentinel@0.6.0`, `@latest` (lowercase), `==0.6.0` and the like count, not a URL, a path, extras or a word such as `@0.6.0-evil`;
 - the entry's own `"env"` changes what starts: for example `PYTHONPATH` for a Python without `-I`, `UV_INDEX_URL`, `PIP_INDEX_URL` or `SYSTEMDRIVE` for a runner, or `HOME`/`USERPROFILE` set to another folder (the proxy would read `~` from there). A variable set to the value your terminal has does not count;
 - a Python launcher has an option that changes what it runs (`-X` other than `utf8`, a `-W` that names a module);
 - in a project's configuration: a Python started without `-I` (or `-P`, Python 3.11 and later), whatever its other options, because an `agent_sentinel` folder in the project would run instead; and on Windows, a launcher written without a folder (`agent-sentinel`, `uvx`, `python` ...) when the project folder holds a file of that name, because Windows looks there before `PATH`.
