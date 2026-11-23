@@ -1565,21 +1565,30 @@ _SHORT_LINES_FIRST = re.compile(_LINES)
 
 
 _MAX_BLOCKS = 256  # blocks of pieces gathered from one text: more than the attempts of any decoder
+# How long a block of pieces gets: far more than the bytes of one run that are decoded (max_run_bytes). A
+# longer one is read as blocks of this length.
+_MAX_BLOCK_CHARS = 32 * 1024
 
 
-def _follows_as_a_piece(text: str, end: int, match: re.Match[str]) -> bool:
-    """Whether the run `match` is the next piece of the one that ends at `end`: only a break between them."""
-    gap = text[end:match.start()] if match.start() - end <= 10 else ""
+_COMMON_BREAKS = frozenset({" ", "\n", "\r\n", "\t", "  "})
+
+
+def _breaks_pieces(text: str, end: int, start: int) -> bool:
+    """Whether what stands between a piece that ends at `end` and a run that starts at `start` is a break."""
+    if start - end > 10:
+        return False
+    gap = text[end:start]
+    if gap in _COMMON_BREAKS:
+        return True
     if gap in _WRITTEN_OUT_BREAK:
-        return match.group().startswith("n")
+        return text.startswith("n", start)
     return _PIECE_BREAK.fullmatch(gap) is not None
 
 
-def _block_of(text: str, pieces: list[re.Match[str]]) -> str:
-    """The text of pieces that follow each other, and of a shorter last piece on the next line."""
-    end = pieces[-1].end()
+def _block_of(text: str, start: int, end: int) -> tuple[int, int]:
+    """Where a block of pieces from `start` to `end` stands in `text`, with a shorter last piece on the next line."""
     last = _LAST_PIECE.match(text, end)
-    return text[pieces[0].start():last.end() if last else end]
+    return start, last.end() if last else end
 
 
 def _joined_up(run: str) -> str:
@@ -1702,7 +1711,9 @@ class EncodedRuns:
                 if unmet_left <= 0:
                     break
                 unmet_left -= 1
-                if run in read_before:
+                # Only its start can be decoded (max_run_bytes): a long run is not copied and read whole.
+                run = run[: 2 * self._max_run_bytes + 4]
+                if run in read_before or run in self._seen:
                     continue
             self._seen.add(run)
             compact = _joined_up(run)
@@ -1740,23 +1751,30 @@ class EncodedRuns:
         The blocks of pieces are gathered from the runs as they are found
         (at most _MAX_BLOCKS of them), and come after the hex runs.
         """
-        blocks: list[str] = []
-        pieces: list[re.Match[str]] = []
+        blocks: list[tuple[int, int]] = []
+        shortest = self._shortest
+        first = last = -1  # where the block of pieces being gathered starts and ends
+        pieces = 0
         for match in self._run_pattern.finditer(text):
-            if match.end() - match.start() >= self._shortest:
+            start, end = match.span()
+            if end - start >= shortest:
                 yield match.group()
-            if len(blocks) >= _MAX_BLOCKS or not _MIN_PIECE_CHARS <= match.end() - match.start() <= _MAX_PIECE_CHARS:
+            if not _MIN_PIECE_CHARS <= end - start <= _MAX_PIECE_CHARS or len(blocks) >= _MAX_BLOCKS:
                 continue
-            if not pieces or not _follows_as_a_piece(text, pieces[-1].end(), match):
-                if len(pieces) > 1:
-                    blocks.append(_block_of(text, pieces))
-                pieces = []
-            pieces.append(match)
-        if len(pieces) > 1 and len(blocks) < _MAX_BLOCKS:
-            blocks.append(_block_of(text, pieces))
+            if pieces and end - first <= _MAX_BLOCK_CHARS and (
+                text[last:start] in _COMMON_BREAKS or _breaks_pieces(text, last, start)
+            ):
+                last, pieces = end, pieces + 1
+                continue
+            if pieces > 1:
+                blocks.append(_block_of(text, first, last))
+            first, last, pieces = start, end, 1
+        if pieces > 1 and len(blocks) < _MAX_BLOCKS:
+            blocks.append(_block_of(text, first, last))
         for match in self._hex_pattern.finditer(text):
             yield match.group()
-        yield from blocks
+        for start, end in blocks:
+            yield text[start:end]
         if "\n" in text:
             first = _SHORT_LINES_FIRST.match(text)
             if first is not None:
@@ -1952,15 +1970,18 @@ def _realigned(
     the shifted run and what `_decode` knows of it (its sample, how many
     characters that took, whether that is all of it, where its text starts).
     """
+    sample_chars = 2 * _SAMPLE_BYTES + 4  # characters enough for a sample of either kind
     for skipped in range(1, 2 if kind == "hex" else 4):
-        shifted = _whole_groups(bare[skipped:], kind)
-        sample, cut = _raw_bytes(shifted, kind, min(limit, _SAMPLE_BYTES))
+        # The sample is read from the start of the shifted run only: the run itself may be long.
+        head = bare[skipped : skipped + sample_chars]
+        sample, cut = _raw_bytes(_whole_groups(head, kind), kind, min(limit, _SAMPLE_BYTES))
         if sample is None or len(sample) < _MIN_TEXT_CHARS:
             continue
-        whole = cut >= len(shifted)
+        shifted_chars = len(bare) - skipped
+        whole = cut >= (shifted_chars - shifted_chars % 2 if kind == "hex" else shifted_chars)
         found = _text_of(sample, truncated=not whole)
         if found is not None and found[1]:
-            return shifted, sample, cut, whole, (0, True)
+            return _whole_groups(bare[skipped:], kind), sample, cut, whole, (0, True)
     return None
 
 
