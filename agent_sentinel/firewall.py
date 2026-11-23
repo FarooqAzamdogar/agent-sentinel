@@ -61,6 +61,7 @@ Added in 0.6 (see session_limits.py for the session limits and approval memory):
 from __future__ import annotations
 
 import inspect
+import itertools
 import json
 import math
 import os
@@ -77,6 +78,7 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from . import session_limits, tail_scan
 from .detector import (
+    MAX_PARAMETER_NAMES,
     METADATA,
     RESULT,
     SEVERITY_ORDER,
@@ -1142,9 +1144,14 @@ class Firewall:
         """Count the call in its session limits; the limit that is full (nothing counted), or None.
 
         _Uncheckable when the session state cannot be read or kept, or the
-        arguments cannot be written as JSON: the call is then refused.
+        arguments cannot be written as JSON: the call is then refused. A call
+        is a sink (max_sink_bytes_per_session) by its tool's labels or by what
+        its command does (a command section's labels_by_class).
         """
-        limits = session_limits.limits_for(self.policy, tool, self.tool_labels(tool))
+        labels = self.tool_labels(tool)
+        if self.policy.max_sink_bytes_per_session is not None and SINK not in labels:
+            labels |= self.policy.command_labels(tool, args)
+        limits = session_limits.limits_for(self.policy, tool, labels)
         if not limits:
             return None
         try:
@@ -1294,12 +1301,13 @@ class Firewall:
 
         # The detector reads what will be passed on: after redaction, the copy.
         metadata = event in METADATA_EVENTS
+        names = () if metadata else _parameter_names(parameter_names)
         findings = scan_views(
             views,
             profile=METADATA if metadata else RESULT,
             parameters=tool_parameters(content) if event == "tool_description" else None,
             foreign_tools=foreign_tools if metadata else (),
-            parameter_names=() if metadata else parameter_names,
+            parameter_names=names,
             undecoded=media,
         )
         tail = None
@@ -1308,7 +1316,8 @@ class Firewall:
             # The tail is kept as text (in hook mode, in the session file), so its secrets are replaced first,
             # whatever secrets.in_results says, and content refused for a secret keeps none.
             joined, kept = tail_scan.read_with_tail(
-                self._kept_tail(channel), _reading_text(content, event), findings, redact=self._secret_guard().redact
+                self._kept_tail(channel), _reading_text(content, event), findings,
+                redact=self._secret_guard().redact, parameter_names=names,
             )
             findings = merge_findings(findings, joined)
             tail = (channel, kept) if secret_problem is None else None
@@ -1546,6 +1555,13 @@ def _views_of(content: Any) -> tuple[list[str], list[str]]:
         return [without_field_breaks(content)], []  # as text_views reads the strings of a structured value
     media: list[str] = []
     return text_views(content, strict=True, media=media), media
+
+
+def _parameter_names(names: Iterable[str]) -> tuple[str, ...]:
+    """The parameter names a caller gave for content, read once: its own scan and the tail scan both use them."""
+    if isinstance(names, (str, bytes)):
+        raise TypeError("parameter_names must be a collection of names, not one text")
+    return tuple(itertools.islice(names, MAX_PARAMETER_NAMES))
 
 
 def _reading_text(content: Any, event: str) -> str:

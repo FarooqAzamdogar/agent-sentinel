@@ -19,6 +19,11 @@ person then refuses stays counted. The counts live in the session store (in
 memory for one proxy or Firewall, in the session file in hook mode); state
 that cannot be read refuses the call (fail closed).
 
+The arguments counted are the JSON copy the firewall checks
+(textutil.normalised_arguments): a path, an Enum or a pydantic model is
+counted as the text or object the policy read. max_distinct finds its
+argument by name ignoring case, as deny_args do.
+
 Values are compared after NFKC, case folding and trimming, and each entry of
 a list (nested lists too) is a value of its own; every entry is read, and a
 list of more than MAX_LIST_ENTRIES is refused. Values and calls are kept as
@@ -153,10 +158,11 @@ def charge(state: SessionState, limits: list[SessionLimit], tool: str, args: dic
                 return limit
             counts[bucket] = total
         elif limit.kind == DISTINCT:
-            if limit.arg not in args:
+            given = _values_of(args, limit.arg)
+            if not given:
                 continue
             seen = sets.get(bucket, state.distinct.get(bucket, []))
-            fresh = new_values(args[limit.arg], seen, limit.limit - len(seen))
+            fresh = new_values(given[0] if len(given) == 1 else given, seen, limit.limit - len(seen))
             if fresh is None or len(seen) + len(fresh) > limit.limit:
                 return limit
             if fresh:
@@ -173,6 +179,17 @@ def charge(state: SessionState, limits: list[SessionLimit], tool: str, args: dic
         while len(state.identical) > MAX_IDENTICAL_KEYS:
             del state.identical[next(iter(state.identical))]  # forget the call made longest ago
     return None
+
+
+def _values_of(args: dict[str, Any], arg: str) -> list[Any]:
+    """The values of every top-level argument whose name is `arg` ignoring case, as deny_args read names.
+
+    Some servers read argument names that way ("To" for "to"), so a value
+    under another spelling of the name is counted too. (The policy refuses
+    a call that has two such names at once.)
+    """
+    wanted = arg.casefold()
+    return [value for name, value in args.items() if isinstance(name, str) and name.casefold() == wanted]
 
 
 # ---- hashes ---------------------------------------------------------------------------

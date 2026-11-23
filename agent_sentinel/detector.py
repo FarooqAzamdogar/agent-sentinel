@@ -1910,15 +1910,19 @@ def merge_findings(*groups: Iterable[Finding]) -> list[Finding]:
 # The matching views, piece by piece (for the tail scan)
 # --------------------------------------------------------------------------
 # The kinds of matching view `_matching_views` builds, in a fixed order (all
-# but the decoded base64 and hex runs, which are read on their own). Each is
-# made in two steps. Its source needs the whole text (`view_sources`):
-# decoding, removing HTML tags and comments, and spelling out tag characters
-# can each reach far. The view itself is then made from any piece of that
-# source (`view_of`): normalising reads each character with its neighbours
-# only. So a caller that needs only the ends of a text in each view (the tail
-# scan) cuts the source and normalises the pieces. Keep these in step with
-# `_matching_views`.
-VIEW_KINDS = ("plain", "spaced", "decoded", "decoded spaced", "without tags", "tag characters")
+# but the decoded base64 and hex runs and the text that invisible carriers
+# spell, which are read on their own). Each is made in two steps. Its source
+# needs the whole text (`view_sources`): decoding, removing HTML tags and
+# comments, and spelling out tag characters can each reach far. The view
+# itself is then made from any piece of that source (`view_of`): closing up
+# the punctuation inside words and normalising read each character with its
+# neighbours only. So a caller that needs only the ends of a text in each
+# view (the tail scan) cuts the source and makes the views of the pieces.
+# Keep these in step with `_matching_views`. New kinds go at the end: a kept
+# tail has one text per kind, in this order.
+VIEW_KINDS = (
+    "plain", "spaced", "decoded", "decoded spaced", "without tags", "tag characters", "joined words",
+)
 _VIEW_STEPS: dict[str, tuple[str, "_Table | None", bool]] = {  # kind -> (source, table, unglued)
     "plain": ("text", None, False),
     "spaced": ("text", _FOLD_SPACED, False),
@@ -1926,7 +1930,12 @@ _VIEW_STEPS: dict[str, tuple[str, "_Table | None", bool]] = {  # kind -> (source
     "decoded spaced": ("decoded", _FOLD_SPACED, True),
     "without tags": ("without tags", None, True),
     "tag characters": ("tag characters", None, True),
+    "joined words": ("decoded", None, True),
 }
+# The kinds whose view is made of the source with its words closed up first (`_joined_words`). That is a
+# step of the view, not of the source: it takes the "_" out of "ghp_A1b2...", and a caller that replaces
+# secrets in a piece of the source (the tail scan) must do so before the words are joined.
+_JOINS_WORDS = frozenset({"joined words"})
 
 
 def view_sources(text: str) -> dict[str, str]:
@@ -1956,8 +1965,22 @@ def views_of(source: str, kinds: Iterable[str]) -> dict[str, str]:
     """The matching views of these kinds (VIEW_KINDS) of `source` (from view_sources), or of any piece of it.
 
     All the kinds must be read from that source. Each step is made once:
-    kinds that differ only in the last steps share the first.
+    kinds that differ only in the last steps share the first. The kinds that
+    close up words (`_joined_words`: "ig**no**re", "i g n o r e") do so here,
+    in the piece they are given.
     """
+    kinds = tuple(kinds)
+    joining = [kind for kind in kinds if kind in _JOINS_WORDS]
+    joined = _joined_words(source) if joining else source
+    if joined == source:
+        return _normalized_views(source, kinds)
+    views = _normalized_views(source, [kind for kind in kinds if kind not in _JOINS_WORDS])
+    views.update(_normalized_views(joined, joining))
+    return views
+
+
+def _normalized_views(text: str, kinds: Iterable[str]) -> dict[str, str]:
+    """views_of, once the words of `text` are closed up for the kinds that want it: normalise, then unglue."""
     decomposed = None
     normalized: dict[tuple[bool, bool], str] = {}  # (spaced, unglued) -> view
     views: dict[str, str] = {}
@@ -1966,7 +1989,7 @@ def views_of(source: str, kinds: Iterable[str]) -> dict[str, str]:
         spaced = table is _FOLD_SPACED
         if (spaced, False) not in normalized:
             if decomposed is None:  # as _normalize does it, once for both tables
-                decomposed = source if source.isascii() else _decompose(source.replace(_ACUTE_ACCENT, "'"))
+                decomposed = text if text.isascii() else _decompose(text.replace(_ACUTE_ACCENT, "'"))
             normalized[spaced, False] = " ".join(decomposed.translate(_FOLD_SPACED if spaced else _FOLD).split())
         if unglued and (spaced, True) not in normalized:
             normalized[spaced, True] = _unglue(normalized[spaced, False])

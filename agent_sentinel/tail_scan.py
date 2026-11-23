@@ -17,15 +17,22 @@ The detector does not match a text as it arrived but in several matching
 views (detector.VIEW_KINDS): normalised, with invisible characters deleted
 or read as spaces, decoded (terminal escapes, percent-encoding and HTML
 character references undone, "_" and a written-out \\n read as spaces), with
-and without HTML tags and comments, with tag characters spelled out. What
+and without HTML tags and comments, with the punctuation inside words taken
+out ("ig**no**re"), with tag characters spelled out. What
 one view drops is padding an attacker can put between two halves: an HTML
 comment is gone from the view without tags, but it is text in the others.
 So a tail is kept for each kind of view: the last TAIL_CHARS characters of
 that view of the text. The next text is read in each kind with that kind's
 tail: the first HEAD_CHARS characters of its own view of the same kind. Two
 halves are then seen whenever the detector would see them in one message,
-in any of those views (the decoded base64 and hex runs aside: the detector
-reads each of those on its own).
+in any of those views (the decoded base64 and hex runs and the text that
+invisible carriers spell aside: the detector reads each of those on its
+own, and reports hidden text of any length that matters by itself).
+
+The joined text is scanned with the names of the call's parameters the
+caller gave for the content (read_with_tail's parameter_names), so that an
+order to put a credential file into one of them is as severe split in two
+as it is whole.
 
 How the two are put together (_readings)
 ----------------------------------------
@@ -78,9 +85,9 @@ where the last to write keeps its tail).
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
-from .detector import VIEW_KINDS, Finding, reads_as, scan, view_of, view_sources, views_of
+from .detector import VIEW_KINDS, Finding, reads_as, scan_views, view_of, view_sources, views_of
 from .session import TAIL_CHARS
 from .textutil import MAX_CONTAINERS, texts_in
 
@@ -358,7 +365,8 @@ def _blank_at(piece: str, kind: str, at_end: bool) -> bool:
 # ---- the scan -------------------------------------------------------------------------------
 
 def read_with_tail(
-    tail: Sequence[str], text: str, known: list[Finding], redact: Callable[[str], str] | None = None
+    tail: Sequence[str], text: str, known: list[Finding], redact: Callable[[str], str] | None = None,
+    parameter_names: Iterable[str] = (),
 ) -> tuple[list[Finding], Tail]:
     """The tail scan of `text`, whose own findings are `known`, after the kept `tail` (a Tail, or () for none).
 
@@ -366,8 +374,11 @@ def read_with_tail(
     text (_joined_findings), in any kind of view and either reading of the
     boundary (_readings), and the tail to keep once the text is delivered
     (_next_tail). `redact` replaces the secrets in the end that the new tail
-    is cut from (see the module docstring).
+    is cut from (see the module docstring). `parameter_names` are the names
+    the text's own scan was given (detector.scan_views): the joined text is
+    read with them too.
     """
+    names = _names(parameter_names)
     ends = _Ends(text, redact)
     before = [entry if isinstance(entry, str) else "" for entry in tuple(tail)[: len(VIEW_KINDS)]]
     before += [""] * (len(VIEW_KINDS) - len(before))
@@ -379,7 +390,7 @@ def read_with_tail(
             for pair in _readings(kept, ends.start(kind)):
                 if pair not in read:  # most texts read the same in several kinds of view
                     read.add(pair)
-                    found += _joined_findings(*pair, known)
+                    found += _joined_findings(*pair, known, names)
         after.append(_next_tail(kept, *ends.end(kind), redact))
     return found, tuple(after)
 
@@ -421,7 +432,19 @@ def _next_tail(tail: str, end: str, whole: bool, redact: Callable[[str], str] | 
     return rolled[-TAIL_CHARS:]
 
 
-def _joined_findings(tail: str, head: str, known: list[Finding]) -> list[Finding]:
+def _names(parameter_names: Iterable[str]) -> tuple[str, ...]:
+    """The parameter names as a tuple, read once: the joined texts are scanned several times with them."""
+    if isinstance(parameter_names, (str, bytes)):
+        raise TypeError("parameter_names must be a collection of names, not one text")
+    return tuple(name for name in parameter_names if isinstance(name, str))
+
+
+def _scan(text: str, names: tuple[str, ...]) -> list[Finding]:
+    """The detector's findings in one text of view ends, read as a result with these parameter names."""
+    return scan_views([text], parameter_names=names)
+
+
+def _joined_findings(tail: str, head: str, known: list[Finding], names: tuple[str, ...] = ()) -> list[Finding]:
     """The findings of a match that starts in `tail` and ends in `head`, read as one text: `tail + head`.
 
     (A pair from _readings: `head` starts with the space between them, if any.)
@@ -435,18 +458,18 @@ def _joined_findings(tail: str, head: str, known: list[Finding]) -> list[Finding
     if not head.strip():
         return []
     have = {finding.rule for finding in known}
-    joined = [finding for finding in scan(tail + head) if finding.rule not in have]
+    joined = [finding for finding in _scan(tail + head, names) if finding.rule not in have]
     if not joined:
         return []
-    alone = {finding.rule for finding in scan(tail)}
+    alone = {finding.rule for finding in _scan(tail, names)}
     found = [finding for finding in joined if finding.rule not in alone]
     for rule in sorted({finding.rule for finding in joined} & alone):
-        rest = _after_own_match(tail, rule)
-        found += [finding for finding in scan(rest + head) if finding.rule == rule]
+        rest = _after_own_match(tail, rule, names)
+        found += [finding for finding in _scan(rest + head, names) if finding.rule == rule]
     return [Finding(finding.rule, finding.severity, JOINED + finding.excerpt) for finding in found]
 
 
-def _after_own_match(tail: str, rule: str) -> str:
+def _after_own_match(tail: str, rule: str, names: tuple[str, ...] = ()) -> str:
     """The longest end of `tail` that `rule` does not match on its own: what follows the start of its last match.
 
     Found by halving: about ten scans of at most TAIL_CHARS characters.
@@ -454,7 +477,7 @@ def _after_own_match(tail: str, rule: str) -> str:
     matched, clean = 0, len(tail)  # tail[matched:] matches the rule; tail[clean:] does not
     while clean - matched > 1:
         middle = (matched + clean) // 2
-        if any(finding.rule == rule for finding in scan(tail[middle:])):
+        if any(finding.rule == rule for finding in _scan(tail[middle:], names)):
             matched = middle
         else:
             clean = middle

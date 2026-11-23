@@ -28,6 +28,7 @@ from agent_sentinel.session import (
 )
 from agent_sentinel.session_limits import (
     MAX_LIST_ENTRIES,
+    UnwritableValue,
     call_digest,
     canonical_json,
     destinations,
@@ -321,27 +322,41 @@ class SessionLimits(unittest.TestCase):
         # CORE-4: a library caller can pass keys json.dumps cannot sort or write.
         self.assertEqual(canonical_json({1: "a", "b": 2}), canonical_json({"b": 2, 1: "a"}))
         self.assertNotEqual(canonical_json({1: "a"}), canonical_json({"<int>1": "b"}))
-        odd = {"to": {1: "a", "b": 2}, "tuple": {(1, 2): "c"}}
+        # Since the merge with the argument normalisation (R1), check_call counts the JSON copy of the arguments:
+        # a key that is a number is counted as its text, and arguments that cannot be made JSON are refused
+        # before any limit is counted (rule "unscannable"), where the session limits alone said "session".
+        odd = {"to": {1: "a", "b": 2}, "more": {2.5: "c", None: "d"}}
         limited = Firewall(policy(limits={"max_identical_calls": 1, "max_distinct": [{"arg": "to", "max": 1}],
                                           "max_sink_bytes_per_session": 1000}))
         self.assertTrue(limited.check_call("send", odd).allowed)
         refused = limited.check_call("send", odd)
         self.assertEqual((refused.allowed, refused.rule), (False, "limits.max_identical_calls"))
+        as_json = limited.check_call("send", json.loads(json.dumps(odd)))  # the same call, written as JSON
+        self.assertEqual((as_json.allowed, as_json.rule), (False, "limits.max_identical_calls"))
         called = []
         limited.run("other", {"to": {1: "a", "b": 2}}, lambda **kwargs: called.append(kwargs))
         self.assertEqual(len(called), 1)
+        self.assertEqual(list(called[0]["to"]), [1, "b"])  # the tool still gets its own objects
         looped = {"x": 1}
         looped["self"] = looped
         deep = current = []
         for _ in range(5_000):
             current.append([])
             current = current[0]
-        for name, args in (("looped", {"to": looped}), ("deep", {"to": deep}), ("mixed", {"to": {1: "a", "d": deep}})):
+        unreadable = (("looped", {"to": looped}), ("deep", {"to": deep}), ("mixed", {"to": {1: "a", "d": deep}}),
+                      ("a tuple as a key", {"to": {(1, 2): "c"}}))
+        for name, args in unreadable:
             with self.subTest(args=name):
-                refused = Firewall(policy(limits={"max_identical_calls": 3})).check_call("send", args)
-                self.assertEqual((refused.allowed, refused.rule), (False, "session"))
-                self.assertIn("cannot be written as JSON", refused.reason)
-        # Approval memory with such arguments: remembered, and a value that cannot be written is asked about.
+                firewall = Firewall(policy(limits={"max_identical_calls": 3}))
+                refused = firewall.check_call("send", args)
+                self.assertEqual((refused.allowed, refused.rule), (False, "unscannable"))
+                self.assertEqual(firewall.session_store.read_state().identical, {})  # refused, so not counted
+        # The session limits' own refusal of what cannot be written, for a caller that counts without check_call.
+        for name, args in unreadable[:3]:
+            with self.subTest(written=name), self.assertRaises(UnwritableValue):
+                canonical_json(args)
+        # Approval memory with such arguments: remembered by their JSON copy; arguments that cannot be made JSON
+        # are refused before anyone is asked.
         asked = []
 
         def refuse(tool, args, reason):
@@ -349,10 +364,11 @@ class SessionLimits(unittest.TestCase):
             return False
 
         refusing = Firewall(policy(default="ask"), approver=refuse)
-        approvals = [refusing.check_call("send", args).approval
-                     for args in ({"to": {1: "a", "b": 2}}, {"to": {1: "a", "b": 2}}, {"to": looped}, {"to": looped})]
-        self.assertEqual(approvals, [APPROVAL_REFUSED, APPROVAL_REPEAT, APPROVAL_REFUSED, APPROVAL_REFUSED])
-        self.assertEqual(len(asked), 3)  # the second mixed-key call was refused without asking
+        calls = ({"to": {1: "a", "b": 2}}, {"to": {"1": "a", "b": 2}}, {"to": looped}, {"to": looped})
+        decisions = [refusing.check_call("send", args) for args in calls]
+        self.assertEqual([decision.approval for decision in decisions], [APPROVAL_REFUSED, APPROVAL_REPEAT, None, None])
+        self.assertEqual([decision.rule for decision in decisions[2:]], ["unscannable", "unscannable"])
+        self.assertEqual(len(asked), 1)  # the same call as JSON was refused without asking; the others never asked
 
     def test_sink_bytes_count_only_calls_to_sinks(self):
         firewall = Firewall(policy(tools={"post": {"action": "allow", "labels": ["sink"]}, "read": "allow"},
