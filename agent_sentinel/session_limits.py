@@ -14,10 +14,13 @@ under them, so a policy can also limit a whole session:
 
 A call is counted when it is decided, after the policy, the flow rules and
 the rate limits let it through or send it to a person, and only if no limit
-is full: the call that a limit refuses is not counted, and an ask that a
-person then refuses stays counted. The counts live in the session store (in
-memory for one proxy or Firewall, in the session file in hook mode); state
-that cannot be read refuses the call (fail closed).
+is full: the call that a limit refuses is not counted (nor in the rate
+limits), and an ask that a person then refuses stays counted. An ask that
+nobody could be asked about (approval "unavailable") is given back (refund):
+its calls, bytes and identical-call count, but not the values it added to a
+max_distinct set, which another call may share. The counts live in the
+session store (in memory for one proxy or Firewall, in the session file in
+hook mode); state that cannot be read refuses the call (fail closed).
 
 The arguments counted are the JSON copy the firewall checks
 (textutil.normalised_arguments): a path, an Enum or a pydantic model is
@@ -43,8 +46,11 @@ after approvals.max_refusals_per_tool (3) refusals of one tool within that
 time, every ask for that tool is refused until the oldest of them is that
 old. Such a refusal is recorded with approval "refused (repeat)". A call that
 differs by one character is a new call: the pause per tool is what stops
-variations. Approval memory never approves anything; when the session state
-cannot be read, the person is asked as before. A new session forgets it.
+variations. A refusal is kept under the server's name and the policy file's
+hash too, when the Firewall knows them, so it is never reused for another
+server that shares the session, nor after the policy changed. Approval memory
+never approves anything; when the session state cannot be read, the person is
+asked as before. A new session forgets it.
 """
 
 from __future__ import annotations
@@ -181,6 +187,32 @@ def charge(state: SessionState, limits: list[SessionLimit], tool: str, args: dic
     return None
 
 
+def refund(state: SessionState, limits: list[SessionLimit], tool: str, args: dict[str, Any]) -> None:
+    """Take back what `charge` counted for a call that was not made after all: nobody could be asked about it.
+
+    The calls, the bytes sent to sinks and the identical-call count are taken
+    back exactly (never below nothing). The values the call added to a
+    max_distinct set stay: another call with the same value may have been let
+    through because it was counted already, and taking it out would let one
+    value too many through later.
+    """
+    for limit in limits:
+        if limit.kind in (CALLS, SINK_BYTES):
+            bucket = _digest("limit\x00" + limit.rule)
+            left = state.counts.get(bucket, 0) - (1 if limit.kind == CALLS else _size(args))
+            if left > 0:
+                state.counts[bucket] = left
+            else:
+                state.counts.pop(bucket, None)
+        elif limit.kind == IDENTICAL:
+            key = call_digest(tool, args)
+            count = state.identical.get(key, 0)
+            if count > 1:
+                state.identical[key] = count - 1
+            else:
+                state.identical.pop(key, None)
+
+
 def _values_of(args: dict[str, Any], arg: str) -> list[Any]:
     """The values of every top-level argument whose name is `arg` ignoring case, as deny_args read names.
 
@@ -307,12 +339,17 @@ def _entries(value: Any, most: int) -> list[Any] | None:
 # ---- approval memory ------------------------------------------------------------------
 
 def repeat_refusal(
-    state: SessionState, tool: str, args: dict[str, Any], now: float, window: int, most_per_tool: int
+    state: SessionState, tool: str, args: dict[str, Any], now: float, window: int, most_per_tool: int,
+    scope: str = "",
 ) -> str | None:
-    """Why this ask is refused without asking (approval memory), or None to ask the person."""
+    """Why this ask is refused without asking (approval memory), or None to ask the person.
+
+    scope: what else a refusal is kept under (the Firewall's server name and policy hash), as remember_refusal had it.
+    """
     if window <= 0:
         return None
     recent = _recent(state.refusals, now, window)
+    tool = _scoped(tool, scope)
     call = call_digest(tool, args)
     same = [when for _, digest, when in recent if digest == call]
     if same:
@@ -332,13 +369,21 @@ def repeat_refusal(
     return None
 
 
-def remember_refusal(state: SessionState, tool: str, args: dict[str, Any], now: float, window: int) -> None:
-    """Remember that a person refused this call now. Refusals older than the window are dropped."""
+def remember_refusal(
+    state: SessionState, tool: str, args: dict[str, Any], now: float, window: int, scope: str = ""
+) -> None:
+    """Remember that a person refused this call now, under `scope` too. Refusals older than the window are dropped."""
     if window <= 0:
         return
     kept = _recent(state.refusals, now, window)
+    tool = _scoped(tool, scope)
     kept.append([tool_digest(tool), call_digest(tool, args), round(max(now, 0.0), 3)])
     state.refusals[:] = kept[-MAX_REFUSALS:]
+
+
+def _scoped(tool: str, scope: str) -> str:
+    """The name approval memory keys a tool by: the tool's own, after the scope when there is one."""
+    return f"{scope}\x00{tool}" if scope else tool
 
 
 def _recent(entries: list[list[Any]], now: float, window: int) -> list[list[Any]]:

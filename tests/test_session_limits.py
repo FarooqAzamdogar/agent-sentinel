@@ -437,10 +437,91 @@ class SessionLimits(unittest.TestCase):
         refused = firewall.check_call("send", {}, defer_ask=True)
         self.assertEqual((refused.pending, refused.rule), (False, "limits.max_calls_per_session"))
 
+    def test_a_call_a_session_limit_refuses_takes_no_place_in_the_rate_limit(self):
+        # The rate limiter counted the call before the session limits refused it: repeating a refused call
+        # filled max_calls_per_minute, and then allowed tools were refused too.
+        firewall = Firewall(policy(default="block", limits={"max_calls_per_minute": 5},
+                                   tools={"export": {"action": "allow", "max_calls_per_session": 1}, "read": "allow"}))
+        self.assertTrue(firewall.check_call("export", {}).allowed)
+        for _ in range(10):
+            refused = firewall.check_call("export", {})
+            self.assertEqual((refused.allowed, refused.rule), (False, "tools.export.max_calls_per_session"))
+        for _ in range(4):  # the rate limit still counts every call it let through: 1 + 4 = 5
+            self.assertTrue(firewall.check_call("read", {}).allowed)
+        self.assertEqual(firewall.check_call("read", {}).rule, "limits.max_calls_per_minute")
+        # Nor does a call whose session limits cannot be kept (rule "session"), nor a call the rate limit
+        # refuses take a place in the session limits.
+        store = MemorySessionStore()
+        store.update_state(lambda state: state.distinct.update({f"{n:032x}": [f"{n * 10_000 + v:032x}" for v in range(
+            MAX_DISTINCT_VALUES // 4)] for n in range(4)}))
+        full = Firewall(policy(limits={"max_calls_per_minute": 1, "max_distinct": [{"arg": "to", "max": 5}]}),
+                        session_store=store)
+        self.assertEqual(full.check_call("send", {"to": "a"}).rule, "session")
+        self.assertTrue(full.check_call("send", {}).allowed)  # no "to": nothing to keep, and the minute was free
+        limited = Firewall(policy(limits={"max_calls_per_minute": 1, "max_calls_per_session": 2}))
+        self.assertTrue(limited.check_call("t", {}).allowed)
+        self.assertEqual(limited.check_call("t", {}).rule, "limits.max_calls_per_minute")
+        self.assertEqual(sum(limited.session_store.read_state().counts.values()), 1)
+
+    def test_an_ask_nobody_could_be_asked_about_uses_up_no_session_budget(self):
+        # finish_approval(asked=False) left the ask counted: a hook in a mode that shows no prompt used up
+        # max_calls_per_session with refused asks, and the allowed tools were refused after them.
+        limits = {"max_calls_per_session": 2, "max_identical_calls": 1, "max_sink_bytes_per_session": 30,
+                  "max_distinct": [{"arg": "to", "max": 2}]}
+        firewall = Firewall(policy(tools={"send": {"action": "ask", "labels": ["sink"]}, "read": "allow"},
+                                   limits=limits))
+        for _ in range(3):
+            pending = firewall.check_call("send", {"to": "bob@example.com"}, defer_ask=True)
+            self.assertTrue(pending.pending)
+            final = firewall.finish_approval(pending, False, "nobody", asked=False)
+            self.assertEqual((final.allowed, final.approval), (False, APPROVAL_UNAVAILABLE))
+        state = firewall.session_store.read_state()
+        self.assertEqual((state.counts, state.identical), ({}, {}))
+        self.assertEqual([len(values) for values in state.distinct.values()], [1])  # a value it added stays
+        self.assertTrue(firewall.check_call("read", {}).allowed)
+        # An answer that is neither True nor False is no answer either: given back, not remembered as a refusal.
+        odd = firewall.check_call("send", {"to": "bob@example.com"}, defer_ask=True)
+        final = firewall.finish_approval(odd, "yes", "a program")
+        self.assertEqual((final.allowed, final.approval), (False, APPROVAL_UNAVAILABLE))
+        self.assertEqual(firewall.session_store.read_state().refusals, [])
+        self.assertTrue(firewall.check_call("send", {"to": "bob@example.com"}, defer_ask=True).pending)
+        # A person's "no" stays counted, as before.
+        counted = Firewall(policy(tools={"send": "ask"}, limits={"max_calls_per_session": 1}))
+        counted.finish_approval(counted.check_call("send", {"n": 1}, defer_ask=True), False, "dialog")
+        self.assertEqual(counted.check_call("send", {"n": 2}, defer_ask=True).rule, "limits.max_calls_per_session")
+
+    def test_a_library_approver_that_cannot_answer_uses_up_no_session_budget(self):
+        def failing(tool, args, reason):
+            raise RuntimeError("no display")
+
+        for approver in (failing, lambda tool, args, reason: "yes"):
+            with self.subTest(approver=approver):
+                firewall = Firewall(policy(tools={"send": "ask", "read": "allow"},
+                                           limits={"max_calls_per_session": 1}), approver=approver)
+                for _ in range(3):
+                    self.assertEqual(firewall.check_call("send", {}).approval, APPROVAL_UNAVAILABLE)
+                self.assertTrue(firewall.check_call("read", {}).allowed)
+
     def test_monitor_mode_lets_a_full_limit_through(self):
         firewall = Firewall(policy(limits={"max_calls_per_session": 1}), monitor=True)
         firewall.check_call("t", {})
         self.assertTrue(firewall.check_call("t", {}).would_block)
+
+    def test_monitor_mode_counts_what_a_real_run_counts(self):
+        # A call the policy blocks is not counted in a real run, nor in monitor mode; an ask that a caller with
+        # someone to ask (defer_ask) would send to a person is counted in both, so the monitor log shows where
+        # the limits would refuse.
+        sections = {"default": "block", "tools": {"send": "ask", "read": "allow"},
+                    "limits": {"max_calls_per_session": 2}}
+        steps = [("blocked", {}), ("send", {"n": 1}), ("read", {}), ("read", {})]
+        real, monitor = Firewall(policy(**sections)), Firewall(policy(**sections), monitor=True)
+        seen = {}
+        for name, firewall in (("real", real), ("monitor", monitor)):
+            decisions = [firewall.check_call(tool, args, defer_ask=True) for tool, args in steps]
+            seen[name] = [decision.rule for decision in decisions]
+        self.assertEqual(seen["real"], ["default", "tools.send", "tools.read", "limits.max_calls_per_session"])
+        self.assertEqual(seen["monitor"], seen["real"])
+        self.assertTrue(monitor.check_call("read", {}, defer_ask=True).would_block)  # let through, as monitor does
 
     def test_the_hook_keeps_the_counts_in_the_session_file(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -549,6 +630,29 @@ class ApprovalMemory(unittest.TestCase):
         firewall.finish_approval(refused, False, "dialog")
         again = firewall.check_call("send", args, defer_ask=True)
         self.assertEqual((again.pending, again.approval), (False, APPROVAL_REPEAT))
+
+    def test_a_refusal_is_not_reused_for_another_server_or_a_changed_policy(self):
+        # Refusals were kept by tool and arguments only: two proxies that share a session (a session group),
+        # or a policy edited during a session, reused a refusal made for another server or another policy.
+        folder = Path(self.tmp.name)
+        first, second = folder / "first.json", folder / "second.json"
+        first.write_text(json.dumps({"tools": {"send": "ask"}}), encoding="utf-8")
+        second.write_text(json.dumps({"tools": {"send": "ask"}, "limits": {"max_calls_per_minute": 99}}),
+                          encoding="utf-8")
+        store = MemorySessionStore()
+
+        def ask(path, server):
+            firewall = Firewall(Policy.from_file(path), server_name=server, session_store=store)
+            pending = firewall.check_call("send", {"to": "eve@evil.example"}, defer_ask=True)
+            if pending.pending:
+                firewall.finish_approval(pending, False, "dialog")
+            return pending.pending
+
+        self.assertTrue(ask(first, "mail"))  # asked, and refused
+        self.assertFalse(ask(first, "mail"))  # the same server and policy: refused without asking
+        self.assertTrue(ask(first, "chat"))  # another server is asked
+        self.assertTrue(ask(second, "mail"))  # so is the same server once the policy has changed
+        self.assertEqual(len(store.read_state().refusals), 3)
 
     def test_a_session_whose_state_cannot_be_read_asks_as_before(self):
         class Unreadable(MemorySessionStore):

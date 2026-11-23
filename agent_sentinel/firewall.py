@@ -491,9 +491,12 @@ class Firewall:
         self._presume_unlisted = False
         self._unlisted_exempt: frozenset[str] = frozenset()
         # Calls waiting for finish_approval: call id -> (the pending decision, the tool, its reason, its
-        # arguments, the labels the call's command sections gave it (Policy.command_labels)). The arguments
-        # are the JSON copy that was checked (textutil.normalised_arguments).
-        self._pending_approvals: dict[str, tuple[Decision, str, str, dict[str, Any], frozenset[str]]] = {}
+        # arguments, the labels the call's command sections gave it (Policy.command_labels), the session
+        # limits it was counted in). The arguments are the JSON copy that was checked
+        # (textutil.normalised_arguments).
+        self._pending_approvals: dict[
+            str, tuple[Decision, str, str, dict[str, Any], frozenset[str], tuple[session_limits.SessionLimit, ...]]
+        ] = {}
         # The secret guard for the policy's secret settings: (settings it was built
         # for, the guard, warnings about secrets.known_values_from_env). Built now,
         # so that the values of those variables are read when the firewall starts;
@@ -516,9 +519,11 @@ class Firewall:
         """Decide whether the agent may call `tool` with `args`.
 
         In order: the secret guard, the policy (rules, then flow rules), for
-        an "ask" the approval memory, the rate limits, the session limits
-        (counted here), then, for an "ask", the approver. A call whose session
-        limits cannot be counted is refused (rule "session"), even in monitor mode.
+        an "ask" the approval memory, the session limits (a call one of them
+        refuses is refused here, before the rate limits count it), the rate
+        limits, then the session limits are counted, then, for an "ask", the
+        approver. A call whose session limits cannot be counted is refused
+        (rule "session"), even in monitor mode.
 
         defer_ask: for a caller that asks the human itself, later (the proxy,
                    a hook). A call that needs approval then gets a pending
@@ -527,7 +532,9 @@ class Firewall:
                    and the approver is NOT called. Show the human
                    `decision.reason` and every argument (through `printable`),
                    then call `finish_approval`. Without defer_ask, nothing
-                   changes. In monitor mode defer_ask is ignored: nothing waits.
+                   changes. In monitor mode nothing waits: with no approver,
+                   such a call is counted in the limits as a real run would
+                   count it, then let through as would_block.
         call_id:   the id that links this call's audit records, when the caller
                    has one (a hook gets the client's tool_use_id). Default: a new
                    random id. Either way it is in `decision.call_id`; pass it to
@@ -560,12 +567,11 @@ class Firewall:
         # From here on `args` is the JSON copy: the session limits (their counts, max_distinct values and
         # identical-call hashes) and approval memory read it too, so a Path and its text are one value.
         try:
-            decision = self._decide_call(tool, args, defer_ask and not self.monitor, call_id)
+            decision = self._decide_call(tool, args, defer_ask, call_id)
         except _Uncheckable as exc:
             return self.refuse(tool, str(exc), public_reason=_UNCHECKED_CALL_REFUSAL, rule=RULE_SESSION,
                                call_id=call_id)
-        if decision.pending:
-            self._remember_pending(decision, tool, args, self.policy.command_labels(tool, args))
+        if decision.pending:  # _decide_call has filed it for finish_approval
             if not self._audit("call", tool, "ask", decision, args) and self.audit_required:
                 with self._state_lock:  # nobody is asked about a call that left no record
                     self._pending_approvals.pop(decision.call_id or "", None)
@@ -581,13 +587,18 @@ class Firewall:
 
         decision: the pending Decision that check_call(..., defer_ask=True) returned.
         approved: the answer. Only exactly True approves; anything else refuses.
+                  An answer that is neither True nor False is treated as no
+                  answer: approval "unavailable", as for `asked` False.
         answered_by: who or what answered, for the audit log, e.g. "dialog",
                   "elicitation" or "timeout". Shortened and made printable.
         asked:    False when nobody could be asked after all: no approver could
                   ask (the Claude Code hook in a mode that shows no prompt), it
                   failed, or the call could not wait. The refusal is then
                   recorded as approval "unavailable", not "refused" (which means
-                  a person or program said no, or did not answer in time).
+                  a person or program said no, or did not answer in time), and
+                  the call's session-limit counts are given back
+                  (session_limits.refund): a call nobody could be asked about
+                  uses up no session budget.
         remember_refusal: False when the "no" is not a person's (the client
                   withdrew the call): approval memory leaves it out. A refusal
                   by a person (asked, not approved) is remembered: see
@@ -621,10 +632,16 @@ class Firewall:
             reason = f"{base}; an answer from {who} came for a call that is not waiting"
             final = self._refused_approval(decision, reason, approval)
         elif approved is not True:
+            # Like the library approver's, an answer that is neither True nor False is no answer: nobody refused.
+            answered = asked and approved is False
             what = "refused" if approved is False else "not answered with True or False"
-            final = self._refused_approval(decision, f"{base}; {what} by {who}", approval)
-            if asked and remember_refusal:
+            final = self._refused_approval(
+                decision, f"{base}; {what} by {who}", APPROVAL_REFUSED if answered else APPROVAL_UNAVAILABLE
+            )
+            if answered and remember_refusal:
                 self._remember_refusal(tool, entry[3])
+            if not answered:
+                self._refund_session_limits(entry[5], tool, entry[3])
         else:
             final = self._approved_unless_a_flow_blocks(decision, tool, entry[3], base, who, entry[4])
         written = self._audit("approval", tool, "allow" if final.allowed else "block", final, None)
@@ -1187,24 +1204,35 @@ class Firewall:
             if repeated is not None:  # also before the rate limit, for the same reason
                 return self._refused_ask(verdict, repeated, call_id, APPROVAL_REPEAT)
 
-        now = time.monotonic() if self._rate_clock is None else self._rate_clock()
-        bucket = self._limiter.over_limit(self.policy.call_limits(tool), now)
-        if bucket is not None:
-            reason = f"rate limit reached for '{bucket}'"
-            return Decision(False, reason, public_reason=_RATE_REFUSAL, rule=limit_rule(bucket), call_id=call_id)
-
-        full = self._charge_session_limits(tool, args)
+        # A call a session limit refuses is refused before the rate limits count it: a refused call takes no
+        # place in them, so repeating it cannot crowd out the calls that are allowed. Counted on a copy here;
+        # the counts are kept below, once the rate limits have let the call through too.
+        limits = self._session_limits(tool, args)
+        full = self._full_session_limit(limits, tool, args)
+        if full is None:
+            now = time.monotonic() if self._rate_clock is None else self._rate_clock()
+            bucket = self._limiter.over_limit(self.policy.call_limits(tool), now)
+            if bucket is not None:
+                reason = f"rate limit reached for '{bucket}'"
+                return Decision(False, reason, public_reason=_RATE_REFUSAL, rule=limit_rule(bucket), call_id=call_id)
+            full = self._charge_session_limits(limits, tool, args)
         if full is not None:
             # The agent learns only that the call is not permitted: not that its session is counted.
             return Decision(False, full.reason(), public_reason=NOT_PERMITTED, rule=full.rule, call_id=call_id)
 
         if verdict.action == "ask":
-            if defer_ask:
-                return Decision(
+            if defer_ask and not self.monitor:
+                pending = Decision(
                     False, verdict.reason + WAITING_FOR_APPROVAL, public_reason=verdict.public,
                     rule=verdict.rule, matched_arg=verdict.matched_arg, call_id=call_id, pending=True,
                 )
-            return self._ask_human(tool, args, verdict, call_id)
+                self._remember_pending(pending, tool, args, self.policy.command_labels(tool, args), tuple(limits))
+                return pending
+            if self.approver is None:
+                # Monitor mode, for a caller that would have asked a person: nothing waits, but the call is
+                # counted as a real run counts an ask, so that the monitor log predicts the limits.
+                return self._refused_ask(verdict, "approval required; monitor mode asks nobody", call_id)
+            return self._ask_human(tool, args, verdict, call_id, tuple(limits))
         return Decision(True, verdict.reason, rule=verdict.rule, call_id=call_id)
 
     def _secret_guard(self) -> SecretGuard:
@@ -1270,24 +1298,72 @@ class Firewall:
             return self.policy.evaluate(tool, args)
         return self.policy.evaluate(tool, args, marks=self.session_marks(), extra_labels=labels)
 
-    def _charge_session_limits(self, tool: str, args: dict[str, Any]) -> session_limits.SessionLimit | None:
-        """Count the call in its session limits; the limit that is full (nothing counted), or None.
+    def _session_limits(self, tool: str, args: dict[str, Any]) -> list[session_limits.SessionLimit]:
+        """The session limits that count this call.
 
-        _Uncheckable when the session state cannot be read or kept, or the
-        arguments cannot be written as JSON: the call is then refused. A call
-        is a sink (max_sink_bytes_per_session) by its tool's labels or by what
-        its command does (a command section's labels_by_class).
+        A call is a sink (max_sink_bytes_per_session) by its tool's labels or
+        by what its command does (a command section's labels_by_class).
         """
         labels = self.tool_labels(tool)
         if self.policy.max_sink_bytes_per_session is not None and SINK not in labels:
             labels |= self.policy.command_labels(tool, args)
-        limits = session_limits.limits_for(self.policy, tool, labels)
+        return session_limits.limits_for(self.policy, tool, labels)
+
+    def _full_session_limit(
+        self, limits: list[session_limits.SessionLimit], tool: str, args: dict[str, Any]
+    ) -> session_limits.SessionLimit | None:
+        """The limit that would refuse this call, counted on a copy of the session state (nothing is kept), or None.
+
+        _Uncheckable as for _charge_session_limits, also when counting the
+        call would take the state past the bounds of session.py.
+        """
+        if not limits:
+            return None
+        try:
+            state = self.session_store.read_state()
+            full = session_limits.charge(state, limits, tool, args)
+            problem = state.problem() if full is None else None
+            if problem is not None:
+                raise SessionStateError(f"the session state cannot be kept: {problem}")
+            return full
+        except (SessionStateError, session_limits.UnwritableValue) as exc:
+            raise _Uncheckable(f"the session limits could not be counted: {exc}") from exc
+
+    def _charge_session_limits(
+        self, limits: list[session_limits.SessionLimit], tool: str, args: dict[str, Any]
+    ) -> session_limits.SessionLimit | None:
+        """Count the call in its session limits; the limit that is full (nothing counted), or None.
+
+        _Uncheckable when the session state cannot be read or kept, or the
+        arguments cannot be written as JSON: the call is then refused.
+        """
         if not limits:
             return None
         try:
             return self.session_store.update_state(lambda state: session_limits.charge(state, limits, tool, args))
         except (SessionStateError, session_limits.UnwritableValue) as exc:
             raise _Uncheckable(f"the session limits could not be counted: {exc}") from exc
+
+    def _refund_session_limits(
+        self, limits: tuple[session_limits.SessionLimit, ...], tool: str, args: dict[str, Any]
+    ) -> None:
+        """Give back what a call nobody could be asked about was counted in (session_limits.refund). Best effort."""
+        if not limits:
+            return
+        try:
+            self.session_store.update_state(lambda state: session_limits.refund(state, list(limits), tool, args))
+        except (SessionStateError, session_limits.UnwritableValue):
+            pass  # the counts stay: the strict side
+
+    def _approval_scope(self) -> str:
+        """What approval memory keeps a refusal under besides the call: the server's name and the policy's hash.
+
+        So a refusal is never reused for another server that shares the
+        session (a session group), nor once the policy file has changed.
+        Empty when neither is known (a library Firewall with a policy built in code).
+        """
+        server, policy = self.server_name, self.policy_sha256
+        return "" if server is None and policy is None else f"{server or ''}\x00{policy or ''}"
 
     def _repeated_refusal(self, tool: str, args: dict[str, Any]) -> str | None:
         """Why approval memory refuses this ask without asking, or None (then the person is asked)."""
@@ -1297,7 +1373,7 @@ class Firewall:
         try:
             state = self.session_store.read_state()
             return session_limits.repeat_refusal(
-                state, tool, args, self._clock(), window, self.policy.max_refusals_per_tool
+                state, tool, args, self._clock(), window, self.policy.max_refusals_per_tool, self._approval_scope()
             )
         except (SessionStateError, session_limits.UnwritableValue):
             return None  # nothing can be remembered: the person is asked, as before 0.6
@@ -1307,10 +1383,10 @@ class Firewall:
         window = self.policy.refusal_window_seconds
         if window <= 0 or not isinstance(tool, str) or not isinstance(args, dict):
             return
-        now = self._clock()
+        now, scope = self._clock(), self._approval_scope()
         try:
             self.session_store.update_state(
-                lambda state: session_limits.remember_refusal(state, tool, args, now, window)
+                lambda state: session_limits.remember_refusal(state, tool, args, now, window, scope)
             )
         except (SessionStateError, session_limits.UnwritableValue):
             pass
@@ -1334,32 +1410,40 @@ class Firewall:
             approval=approval,
         )
 
-    def _ask_human(self, tool: str, args: dict[str, Any], verdict: Verdict, call_id: str) -> Decision:
+    def _ask_human(
+        self, tool: str, args: dict[str, Any], verdict: Verdict, call_id: str,
+        limits: tuple[session_limits.SessionLimit, ...] = (),
+    ) -> Decision:
+        """Ask the library approver. `limits`: the session limits the call was counted in, given back when
+        nobody could be asked (the approver failed, or gave neither True nor False)."""
         assert self.approver is not None
         try:
             answer = self.approver(tool, args, self._question(tool, args, verdict.reason))
         except Exception as exc:  # a broken approver must not approve anything
-            return self._refused_ask(verdict, f"the approver failed ({type(exc).__name__})", call_id)
-        if inspect.iscoroutine(answer):
-            answer.close()
-            return self._refused_ask(
-                verdict, "the approver is async, which is not supported, so nobody was asked", call_id
-            )
-        if answer is True:  # exactly True: a truthy "no" or an un-awaited coroutine must not approve
-            return Decision(True, f"{verdict.reason}; approved by a human", rule=verdict.rule, call_id=call_id)
-        if answer is False:
-            self._remember_refusal(tool, args)
-            return self._refused_ask(verdict, "rejected by a human", call_id, APPROVAL_REFUSED)
-        return self._refused_ask(verdict, "the approver did not return True or False", call_id)
+            why = f"the approver failed ({type(exc).__name__})"
+        else:
+            if inspect.iscoroutine(answer):
+                answer.close()
+                why = "the approver is async, which is not supported, so nobody was asked"
+            elif answer is True:  # exactly True: a truthy "no" or an un-awaited coroutine must not approve
+                return Decision(True, f"{verdict.reason}; approved by a human", rule=verdict.rule, call_id=call_id)
+            elif answer is False:
+                self._remember_refusal(tool, args)
+                return self._refused_ask(verdict, "rejected by a human", call_id, APPROVAL_REFUSED)
+            else:
+                why = "the approver did not return True or False"
+        self._refund_session_limits(limits, tool, args)
+        return self._refused_ask(verdict, why, call_id)
 
     # ---- internals: deferred approval -------------------------------------------
 
     def _remember_pending(
-        self, decision: Decision, tool: str, args: dict[str, Any], labels: frozenset[str] = frozenset()
+        self, decision: Decision, tool: str, args: dict[str, Any], labels: frozenset[str] = frozenset(),
+        limits: tuple[session_limits.SessionLimit, ...] = (),
     ) -> None:
         base = decision.reason[: -len(WAITING_FOR_APPROVAL)]
         with self._state_lock:
-            self._pending_approvals[decision.call_id or ""] = (decision, tool, base, args, labels)
+            self._pending_approvals[decision.call_id or ""] = (decision, tool, base, args, labels, limits)
             while len(self._pending_approvals) > MAX_PENDING_APPROVALS:
                 # Forget the oldest: finishing it later refuses it, which is the safe side.
                 del self._pending_approvals[next(iter(self._pending_approvals))]
