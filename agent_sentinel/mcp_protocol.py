@@ -571,10 +571,13 @@ COVERAGE = (
     Coverage("tools/call", "client", ALL_REVISIONS, (CHECKED,),
              "The arguments against the tool's checked inputSchema (schema_checks.arguments, undeclared_args); then "
              "secret guard, tool rules, flow rules (a tool no checked list or pin has shown counts as untrusted "
-             "and a sink), rate limits; an ask goes to --approve-with or is refused. Refused: a reserved name "
+             "and a sink), rate limits, session limits; an ask goes to --approve-with or is refused (at once, if "
+             "a person refused the same call a short while ago). Refused: a reserved name "
              "(resources/read, resources/subscribe, prompts/get), a task-augmented call (params.task), a "
              "quarantined tool. Reply: resultType checked; structuredContent against the outputSchema "
-             "(schema_checks.results); scanned; secrets.in_results; flow marks. No reply within "
+             "(schema_checks.results); scanned, also together with the end of the reply before it; "
+             "secrets.in_results; a notice put before its content at injection.warn_severity; flow marks (the "
+             "tool's, the server's server_labels, the content's at injection.mark_at). No reply within "
              "limits.call_timeout_seconds: an error, and notifications/cancelled to the server."),
     Coverage("resources/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
              "Each resource scanned and its icons cleaned; one whose URI has characters the proxy cannot forward is "
@@ -585,7 +588,8 @@ COVERAGE = (
     Coverage("resources/read", "client", ALL_REVISIONS, (CHECKED,),
              "Refused for a URI a quarantined template may produce, and for every URI of a server quarantined by "
              "--pin-server. Checked like a call of a tool named 'resources/read' with the argument uri. Reply "
-             "scanned; secrets.in_results; flow marks."),
+             "scanned, also together with the end of the reply before it; secrets.in_results; flow marks (as "
+             "for tools/call)."),
     Coverage("resources/subscribe", "client", ALL_REVISIONS, (CHECKED,),
              "Checked as a resources/read of the same URI. Update notifications are scanned."),
     Coverage("subscriptions/listen", "client", MODERN_ONLY, (CHECKED,),
@@ -596,7 +600,8 @@ COVERAGE = (
              "quarantined."),
     Coverage("prompts/get", "client", ALL_REVISIONS, (CHECKED,),
              "A quarantined prompt is refused. When the policy opts in (a client_requests section, or a tools rule "
-             "named 'prompts/get'), checked like a call of 'prompts/get' with {name, arguments}. Reply scanned."),
+             "named 'prompts/get'), checked like a call of 'prompts/get' with {name, arguments}. Reply scanned, "
+             "also together with the end of the reply before it."),
     Coverage("completion/complete", "client", "2025-03-26 and later", (CHECKED,),
              "Its params (what the user is typing) pass the secret guard, then client_requests. Refused to a "
              "server quarantined by --pin-server."),
@@ -640,7 +645,9 @@ COVERAGE = (
     Coverage("notifications from the server", "server", ALL_REVISIONS, (CHECKED, SCANNED),
              "Progress, log messages, list_changed, resources/updated, "
              "notifications/subscriptions/acknowledged and the rest: server_requests may block them (dropped); "
-             "the serverInfo in params._meta cleaned as in a reply; scanned. notifications/cancelled also forgets "
+             "the serverInfo in params._meta cleaned as in a reply; scanned, also together with the end of the "
+             "notification or request before it; one that is delivered sets the server's server_labels marks "
+             "and the content's (injection.mark_at). notifications/cancelled also forgets "
              "the server request it cancels. A server quarantined by --pin-server has every notification but "
              "notifications/cancelled dropped."),
     Coverage("input_required result", "server", MODERN_ONLY, (CHECKED, SCANNED),
@@ -659,7 +666,8 @@ COVERAGE = (
              "out). Rebuilt from its result or error; the serverInfo in _meta loses unsafe icons and an unsafe "
              "websiteUrl, and resource_link items in its content unsafe icons; scanned; secrets.in_results (block, "
              "or redact: a copy with the secrets replaced); cleaned of escape codes, control, tag and bidi "
-             "characters; the request's flow marks set."),
+             "characters; the request's flow marks set, with the server's server_labels marks and the "
+             "content's (injection.mark_at). With --session-group the marks are those of the group."),
     # ---- from the proxy itself ----
     Coverage("elicitation/create (approval question)", "proxy", "2025-06-18 and 2025-11-25", (SENT,),
              "With --approve-with elicitation, to a client that declared forms: one yes/no field. Its id is "
