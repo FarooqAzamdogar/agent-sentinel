@@ -430,6 +430,18 @@ class TailScan(unittest.TestCase):
         self.assertEqual(tail_scan.compacted("ig\u200b\u200b\u200bnore"), "ig\u200bnore")  # read whole and in two
         self.assertEqual(tail_scan.compacted("\u0301" * 5 + "a\u0301\u0302b"), "\u0301a\u0301b")
         self.assertEqual(tail_scan.compacted("a\u200b\u00a8\u0301b"), "a\u00a8b")  # a diaeresis reads as a space
+
+    def test_the_table_of_shapes_shared_by_all_texts_stays_small(self):
+        # A table filled in as characters are met: one holding every character of Unicode would stay for
+        # the life of the process. A text that could take it past its bound gets a table of its own.
+        codes = [code for code in range(0x80, 0x30000) if not 0xD800 <= code <= 0xDFFF]
+        every_character = "".join(map(chr, codes))
+        first = tail_scan.compacted(every_character)
+        for start in range(0, len(codes), 20_000):
+            tail_scan.compacted("".join(map(chr, codes[start:start + 20_000])))
+        self.assertLessEqual(len(tail_scan._SHAPES), tail_scan._MAX_SHAPES)
+        self.assertEqual(tail_scan.compacted(every_character), first)
+        self.assertEqual(tail_scan.compacted("ig\u200b\u200b\u200bnore"), "ig\u200bnore")
         self.assertEqual(tail_scan.compacted("a\u2800\u2800b c__d"), "a\u2800b c__d")  # "_" is text where not unglued
         self.assertEqual(tail_scan.end_of("word" + " \u200b\n" * 1_000 + "end  "), "word end ")  # a blank at the end
         self.assertEqual(tail_scan.end_of("ig\u200b\u200bnore", "spaced"), "ig nore")

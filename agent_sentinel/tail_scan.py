@@ -126,8 +126,9 @@ class _Shapes(dict[int, str]):
     """A str.translate table that writes each character as its shape (see above).
 
     A text's shape has its length, so a position in one is the same in the
-    other. Filled in as characters are met, as the detector's tables are
-    (detector._Table): at most one entry per code point, ever.
+    other. Filled in as characters are met. The table all texts share holds
+    at most _MAX_SHAPES characters: a text that could take it past that gets
+    a table of its own, which goes with it (`compacted`).
     """
 
     def __missing__(self, code: int) -> str:
@@ -146,6 +147,9 @@ def _shape_of(char: str) -> str:
 
 
 _SHAPES = _Shapes()
+# How many characters the shared table may hold: far more than texts use, and a few megabytes at most.
+# Without a bound, texts holding every character of Unicode would leave a table of tens of megabytes behind.
+_MAX_SHAPES = 65_536
 
 
 # ---- what the model reads -------------------------------------------------------------------
@@ -225,7 +229,7 @@ def compacted(text: str) -> str:
     reads whole where those are deleted and in two where they are spaced;
     else (combining marks only) the first.
     """
-    shape = text.translate(_SHAPES)
+    shape = text.translate(_SHAPES if len(_SHAPES) + len(text) <= _MAX_SHAPES else _Shapes())
     pieces: list[str] = []
     at = 0
     for run in _BLANK_RUN.finditer(shape):
