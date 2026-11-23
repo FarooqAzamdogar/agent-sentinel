@@ -83,6 +83,16 @@ class Harness:
         (delivered,) = self.sent_to_client()
         return delivered
 
+    def list_tools(self, *names, msg_id="tools"):
+        """Have the server list these tools, without annotations, as a client does before it calls them.
+
+        With flow rules, a tool no checked list has shown counts as untrusted
+        and a sink (Firewall.presume_unlisted_tools).
+        """
+        tools = [{"name": name, "description": f"The {name} tool.", "inputSchema": {"type": "object"}}
+                 for name in names]
+        return self.round_trip(request(msg_id, "tools/list"), {"tools": tools})
+
 
 class ProxyUnitTests(unittest.TestCase):
     def setUp(self):

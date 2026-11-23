@@ -80,12 +80,57 @@ scans it again. The changed entry stays removed until the proxy restarts.
 A running proxy writes the pins file whole when it pins something new. It
 writes the file as it is on disk plus what it pinned since its last write,
 so a pin that `pins accept` or `pins forget` changed meanwhile is not put back.
+
+The server itself (proxy --pin-server, opt-in)
+----------------------------------------------
+A server's code can change behind tool definitions that stay the same. With
+--pin-server the proxy also pins the server, in an optional "server"
+section of the same file:
+
+    "server": {
+      "first_seen": "2026-11-20T12:00:00Z",
+      "launch": {"executable": "C:\\\\nodejs\\\\npx.cmd", "package": "npx mcp-remote@0.1.16",
+                 "script": null, "script_sha256": null},
+      "info": {"name": "mcp-remote", "version": "0.1.16"}
+    }
+
+* "launch" (launch.LAUNCH_FIELDS) is taken before the server starts: the
+  program found for the command, the package a runner (npx, uvx, ...) runs
+  as written, and the local script it starts with that file's SHA-256 (or
+  the program file itself, when it is no interpreter). Each may be null.
+* "info" is the name and version of the serverInfo the server sends in its
+  handshake; absent until it has answered once. A value longer than
+  MAX_SERVER_INFO_CHARS is kept as "sha256:<64 hex>" of it.
+
+A launch that differs from its pin makes the proxy refuse to start (or, with
+--on-server-change quarantine, start with every tool, prompt and template
+quarantined); serverInfo that differs refuses the handshake (or quarantines).
+The new identity waits in the pending file's "server" section for `pins
+diff --server` and `pins accept --server`. An agent-sentinel older than 0.6
+refuses a pins file with this section (it does not know it), which fails closed.
+
+One format for both uses
+------------------------
+The "server" section is an optional part of version 2: the version number
+stays 2, a file without the section reads as before, and a version 1 file
+(which has neither definitions nor a server pin) is written back as version
+2, with the section once --pin-server pins the server.
+
+The proxy also reads the stored tool definitions at startup (definitions):
+the annotations of each pinned tool give it its flow labels before any list
+has shown it, and the pinned uriTemplate of a quarantined resource template
+is refused as well as the one listed now. A tool whose definition was not
+kept (too large, or carried over from version 1) seeds no labels. A server
+quarantined for differing from its own pin still seeds them, from the
+definitions pinned while it was trusted, but none of its tools can be
+called, so they decide nothing.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import threading
 from dataclasses import dataclass, field
@@ -109,6 +154,12 @@ PINNED_FIELDS = {
 }
 PINNED_LISTS = tuple(PINNED_FIELDS)
 INSTRUCTIONS = "instructions"
+SERVER = "server"
+# What the "server" section pins (see "The server itself"), and how long one value may be.
+LAUNCH_FIELDS = ("executable", "package", "script", "script_sha256")
+INFO_FIELDS = ("name", "version")
+MAX_SERVER_VALUE_CHARS = 4096
+MAX_SERVER_INFO_CHARS = 256
 # How the pins command names each section (agent-sentinel pins ... --kind WORD).
 KIND_WORDS = {"tools": "tool", "prompts": "prompt", "resourceTemplates": "template", INSTRUCTIONS: INSTRUCTIONS}
 
@@ -150,13 +201,54 @@ class Pin:
     definition: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class ServerPin:
+    """The server itself, pinned with proxy --pin-server (see "The server itself").
+
+    launch:     LAUNCH_FIELDS -> value or None.
+    info:       INFO_FIELDS -> value or None, once the server has answered a handshake; None before.
+    first_seen: when it was pinned.
+    """
+
+    launch: dict[str, str | None]
+    info: dict[str, str | None] | None = None
+    first_seen: str | None = None
+
+
+def server_info_value(value: Any) -> str | None:
+    """A serverInfo name or version as the pin keeps it: text as it is, a long one as its SHA-256, else None."""
+    if not isinstance(value, str):
+        return None
+    if len(value) <= MAX_SERVER_INFO_CHARS:
+        return value
+    return "sha256:" + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def server_changes(pinned: dict[str, str | None] | None, seen: dict[str, str | None] | None) -> list[str]:
+    """The fields of a launch or an info that differ; paths are compared as the system compares them."""
+    if pinned is None or seen is None:
+        return [] if pinned is seen else ["(all)"]
+    changed = []
+    for name in sorted(set(pinned) | set(seen)):
+        old, new = pinned.get(name), seen.get(name)
+        if name in ("executable", "script") and isinstance(old, str) and isinstance(new, str):
+            old, new = os.path.normcase(old), os.path.normcase(new)
+        if old != new:
+            changed.append(name)
+    return changed
+
+
 @dataclass
 class PinsFile:
-    """What a pins file holds: one section per list (PINNED_LISTS), each name -> Pin, and the instructions' pin."""
+    """What a pins file holds: one section per list (PINNED_LISTS), each name -> Pin, and the instructions' pin.
+
+    `server`: the server's own pin (proxy --pin-server), or None.
+    """
 
     lists: dict[str, dict[str, Pin]] = field(default_factory=lambda: {kind: {} for kind in PINNED_LISTS})
     instructions: Pin | None = None
     version: int = PINS_VERSION  # the version the file had when it was read
+    server: ServerPin | None = None
 
 
 # ---- fingerprints -----------------------------------------------------------------------
@@ -215,6 +307,18 @@ def pins_document(pins: PinsFile) -> dict[str, Any]:
         document[kind] = {name: _pin_document(pin) for name, pin in pins.lists[kind].items()}
     if pins.instructions is not None:
         document[INSTRUCTIONS] = _pin_document(pins.instructions)
+    if pins.server is not None:
+        document[SERVER] = _server_document(pins.server)
+    return document
+
+
+def _server_document(pin: ServerPin) -> dict[str, Any]:
+    document: dict[str, Any] = {}
+    if pin.first_seen is not None:
+        document["first_seen"] = pin.first_seen
+    document["launch"] = {name: pin.launch.get(name) for name in LAUNCH_FIELDS}
+    if pin.info is not None:
+        document["info"] = {name: pin.info.get(name) for name in INFO_FIELDS}
     return document
 
 
@@ -254,14 +358,49 @@ def _pins_from_version_1(data: dict[str, Any]) -> PinsFile:
 
 
 def _pins_from_version_2(data: dict[str, Any]) -> PinsFile:
-    _expect_keys(data, ("version", *PINNED_LISTS, INSTRUCTIONS), "a pins file")
+    _expect_keys(data, ("version", *PINNED_LISTS, INSTRUCTIONS, SERVER), "a pins file")
     pins = PinsFile(version=PINS_VERSION)
     for kind in PINNED_LISTS:
         for name, entry in _section(data.get(kind, {}), kind).items():
             pins.lists[kind][name] = _pin_from(entry, kind, name)
     if INSTRUCTIONS in data:
         pins.instructions = _pin_from(data[INSTRUCTIONS], INSTRUCTIONS, None)
+    if SERVER in data:
+        pins.server = _server_pin_from(data[SERVER])
     return pins
+
+
+def _server_pin_from(entry: Any) -> ServerPin:
+    """Read the "server" section: every member known, every value text of bounded length or null."""
+    if not isinstance(entry, dict):
+        raise PinsFileError("\"server\" must be an object")
+    _expect_keys(entry, ("first_seen", "launch", "info"), "\"server\"")
+    first_seen = entry.get("first_seen")
+    if first_seen is not None and (not isinstance(first_seen, str) or len(first_seen) > MAX_FIRST_SEEN_CHARS):
+        raise PinsFileError("\"server\": \"first_seen\" must be a time written as text")
+    if "launch" not in entry:
+        raise PinsFileError("\"server\" needs a \"launch\"")
+    launch = _server_values(entry["launch"], LAUNCH_FIELDS, "server.launch", MAX_SERVER_VALUE_CHARS)
+    sha = launch.get("script_sha256")
+    if sha is not None and not _SHA256.fullmatch(sha):
+        raise PinsFileError("\"server.launch\": \"script_sha256\" must be 64 lowercase hex digits or null")
+    info = None
+    if "info" in entry:
+        info = _server_values(entry["info"], INFO_FIELDS, "server.info", len("sha256:") + 64)
+    return ServerPin(launch=launch, info=info, first_seen=first_seen)
+
+
+def _server_values(value: Any, fields: tuple[str, ...], where: str, longest: int) -> dict[str, str | None]:
+    if not isinstance(value, dict):
+        raise PinsFileError(f"\"{where}\" must be an object")
+    _expect_keys(value, fields, f"\"{where}\"")
+    found: dict[str, str | None] = {}
+    for name in fields:
+        item = value.get(name)
+        if item is not None and (not isinstance(item, str) or len(item) > longest):
+            raise PinsFileError(f"\"{where}\": \"{name}\" must be text of at most {longest} characters, or null")
+        found[name] = item
+    return found
 
 
 def _section(value: Any, kind: str) -> dict[str, Any]:
@@ -389,6 +528,10 @@ class ToolPins:
         self._pending = PinsFile()
         self._pending_chars = 0
         self._pending_unsaved = False
+        # The server's own pin (see "The server itself"): whether this process made or completed it, and whether
+        # the launch it saw differs from the pin (its serverInfo is then never written into the pin).
+        self._server_added = False
+        self._server_launch_changed = False
 
     @property
     def path(self) -> Path | None:
@@ -454,6 +597,99 @@ class ToolPins:
         with self._lock:
             return list(self._pins.lists[kind])
 
+    def definitions(self, kind: str) -> dict[str, dict[str, Any]]:
+        """The pinned definitions of one list that are kept, by name (a pin too large to keep, or carried
+        over from version 1, has none). With pins off (enabled=False), nothing: nothing is compared either.
+
+        The proxy reads the tools' annotations from them at startup, and the
+        uriTemplate of a resource template it quarantines.
+        """
+        if not self._enabled:
+            return {}
+        with self._lock:
+            return {name: pin.definition for name, pin in self._pins.lists[kind].items() if pin.definition is not None}
+
+    def definition(self, kind: str, name: str) -> dict[str, Any] | None:
+        """The pinned definition of one entry, if one is kept (see definitions); None otherwise."""
+        if not self._enabled:
+            return None
+        with self._lock:
+            pin = self._pins.lists[kind].get(name)
+            return pin.definition if pin is not None else None
+
+    @property
+    def server_pin(self) -> ServerPin | None:
+        """The server's own pin (proxy --pin-server), or None."""
+        with self._lock:
+            return self._pins.server
+
+    def check_server_launch(self, launch: dict[str, str | None]) -> tuple[str, list[str]]:
+        """Compare how the server is launched (launch.launch_identity) with its pin.
+
+        (NEW, []) pins it, (SAME, []), or (CHANGED, the fields that differ):
+        the launch seen then waits in the pending file for `pins accept --server`.
+        """
+        if not self._enabled:
+            return SAME, []
+        with self._lock:
+            pin = self._pins.server
+            if pin is None:
+                self._pins.server = ServerPin(launch=dict(launch), first_seen=now())
+                self._server_added = self._unsaved = True
+                return NEW, []
+            changed = server_changes(pin.launch, launch)
+            if not changed:
+                return SAME, []
+            self._server_launch_changed = True
+            self._note_server_pending(launch=launch)
+            return CHANGED, changed
+
+    def check_server_info(self, info: dict[str, str | None]) -> tuple[str, list[str]]:
+        """Compare the serverInfo of a handshake ({"name", "version"}, see server_info_value) with the pin.
+
+        (NEW, []) when none was pinned yet (it is now, unless the launch
+        differed from its pin), (SAME, []), or (CHANGED, the fields): the
+        identity seen then waits in the pending file.
+        """
+        if not self._enabled:
+            return SAME, []
+        with self._lock:
+            pin = self._pins.server
+            if self._server_launch_changed:
+                self._note_server_pending(info=info)  # with the launch seen, for `pins accept --server`
+            if pin is None or pin.info is None:
+                if self._server_launch_changed:
+                    return SAME, []  # the server is held back for its launch already; nothing new is trusted
+                launch = pin.launch if pin is not None else {name: None for name in LAUNCH_FIELDS}
+                self._pins.server = ServerPin(launch=dict(launch), info=dict(info),
+                                              first_seen=pin.first_seen if pin is not None else now())
+                self._server_added = self._unsaved = True
+                return NEW, []
+            changed = server_changes(pin.info, info)
+            if not changed:
+                return SAME, []
+            self._note_server_pending(info=info)
+            return CHANGED, changed
+
+    def _note_server_pending(self, launch: dict[str, str | None] | None = None,
+                             info: dict[str, str | None] | None = None) -> None:
+        """Keep the server identity seen for the pending file: the pin with what differed put in. Lock held.
+
+        After a changed launch, the pinned serverInfo is not carried over: a
+        new launch (a new version) is expected to say something new, and once
+        accepted the proxy pins what it says at its next start.
+        """
+        if self._path is None:
+            return
+        pinned = self._pins.server
+        waiting = self._pending.server or ServerPin(
+            launch=dict(pinned.launch) if pinned is not None else {name: None for name in LAUNCH_FIELDS},
+            info=dict(pinned.info) if pinned is not None and pinned.info is not None
+            and not self._server_launch_changed else None)
+        self._pending.server = ServerPin(launch=dict(launch) if launch is not None else waiting.launch,
+                                         info=dict(info) if info is not None else waiting.info, first_seen=now())
+        self._pending_unsaved = True
+
     def save(self) -> None:
         """Write the pins file and the pending file, if there is a file and anything changed. Raises OSError.
 
@@ -472,6 +708,7 @@ class ToolPins:
                 # Written: from now on the file on disk is the operator's to change. A pin missing from it
                 # later was forgotten on purpose, and must not be put back by the next save.
                 self._added.clear()
+                self._server_added = False
             if self._pending_unsaved:
                 write_pins_file(pending_path(self._path), self._pending_merged_with_disk())
                 self._pending_unsaved = False
@@ -525,6 +762,12 @@ class ToolPins:
                 merged.instructions = ours
             elif len(merged.lists[kind]) < MAX_PINS_PER_LIST or theirs is not None:
                 merged.lists[kind][name or ""] = ours
+        ours_server, theirs_server = self._pins.server, merged.server
+        # The server pin this process made, or completed with its serverInfo, goes in where the disk has none,
+        # or has the same launch without an info yet; one the operator accepted meanwhile is kept.
+        if self._server_added and ours_server is not None and (theirs_server is None or (
+                theirs_server.info is None and not server_changes(theirs_server.launch, ours_server.launch))):
+            merged.server = ours_server
         return merged
 
     def _pending_merged_with_disk(self) -> PinsFile:
@@ -540,4 +783,6 @@ class ToolPins:
                     merged.lists[kind][name] = pin
         if self._pending.instructions is not None:
             merged.instructions = self._pending.instructions
+        if self._pending.server is not None:
+            merged.server = self._pending.server
         return merged

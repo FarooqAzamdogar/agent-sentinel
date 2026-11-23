@@ -21,9 +21,11 @@ from typing import Any
 
 from .policy import (
     RULE_AUDIT,
+    RULE_CALL_TIMEOUT,
     RULE_CALLER,
     RULE_DEFAULT,
     RULE_HOOK_FAILED,
+    RULE_INCLUDE_CONTEXT,
     RULE_INDEX,
     RULE_INJECTION,
     RULE_MALFORMED,
@@ -67,6 +69,8 @@ _FIXED_KINDS = {
     RULE_SCHEMA_ARGUMENTS: "schema_arguments",
     RULE_SCHEMA_RESULT: "schema_result",
     RULE_SCHEMA_REMOTE_REFS: "schema_remote_refs",
+    RULE_INCLUDE_CONTEXT: "include_context",
+    RULE_CALL_TIMEOUT: "call_timeout",
 }
 _INDEXED_KINDS = (
     (re.compile(rf"deny_args{_INDEX}"), "deny_global"),
@@ -80,7 +84,7 @@ _PART_KINDS = {"other_args": "other_args", "max_calls_per_minute": "limit_tool"}
 PROTECTIVE_KINDS = frozenset({
     "deny_global", "deny_tool", "secrets", "secrets_results", "canary", "known_value", "secret_pattern",
     "injection", "unscannable", "malformed", "quarantine", "session", "flow", "hook_failed", "audit_required",
-    "schema_arguments", "schema_result", "schema_remote_refs",
+    "schema_arguments", "schema_result", "schema_remote_refs", "include_context",
 })
 
 
@@ -329,6 +333,15 @@ _FIXED_HINTS = {
         "state folder is writable."
     ),
     "caller": "The program that uses the firewall blocked this itself (Firewall.block). Look at that program.",
+    "include_context": (
+        "The server asked the client's model for an answer written with context included (a sampling request "
+        "whose includeContext is not 'none'), and that answer would have gone back to the server. The proxy "
+        "refuses such requests whatever the policy says; a server that needs sampling can ask without it."
+    ),
+    "call_timeout": (
+        "The server did not answer the call within limits.call_timeout_seconds, so the client was answered with an "
+        "error and the server was asked to cancel the call. Raise the limit if this tool is slow by nature."
+    ),
     "hook_failed": (
         "The Claude Code hook could not finish its checks, so it refused (the reason says why: often a policy "
         "that does not load, or a state folder that cannot be written). Fix that cause; no policy rule changes "

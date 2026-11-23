@@ -8,6 +8,8 @@
     <home>/audit.jsonl      the audit log that `wrap` gives every wrapped server
     <home>/pins/            one tool pins file per wrapped server
     <home>/hook-state/      the Claude Code hook's session state: flow marks and rate-limit counts
+    <home>/sessions/        the flow marks of each proxy --session-group, shared by the proxies of one
+                            client run (session.GroupSessionStore)
     <home>/backups/         backups of configuration files in a project under version control, with a
                             .gitignore that ignores them all (config_file.py)
 
@@ -17,9 +19,18 @@ started by it writes there land in the package's own folder, where `report`
 run from an ordinary terminal cannot find them. The user profile folder is
 not redirected that way.
 
-Nothing here is found implicitly. The proxy never looks in this folder by
-itself: `wrap` writes the full path of every file into each wrapped entry,
-and every command that writes here prints the full path it used.
+Nothing here is found implicitly, with one exception. `wrap` writes the full
+path of every file into each wrapped entry, and every command that writes
+here prints the full path it used. The exception is a proxy started with
+--session-group NAME: it keeps the group's marks in <home>/sessions/NAME.json,
+so that every proxy of the group finds the same file (it prints the path).
+
+Permissions. The folders agent-sentinel creates here (the home folder, pins,
+hook-state, sessions, backups) are its owner's only: mode 0700 on POSIX
+(make_private_folder), and `init` writes the policy with 0600. On Windows,
+Python 3.13 and later give a folder made that way an owner-only access list;
+earlier versions leave it to the user profile's inherited permissions, which
+is why `doctor` warns about a home folder outside the profile.
 """
 
 from __future__ import annotations
@@ -31,6 +42,9 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from .cli_common import CommandError
+# Owner-only folders (see "Permissions" above). They live in filelock, which the session and hook-state stores
+# import too (this module cannot be: it imports what imports them).
+from .filelock import MAX_FOLDERS_CREATED, PRIVATE_FOLDER_MODE, make_private_folder  # noqa: F401
 
 ENV_VAR = "AGENT_SENTINEL_HOME"
 FOLDER_NAME = ".agent-sentinel"
@@ -38,6 +52,10 @@ POLICY_FILE = "policy.json"
 AUDIT_FILE = "audit.jsonl"
 PINS_FOLDER = "pins"
 HOOK_STATE_FOLDER = "hook-state"
+SESSIONS_FOLDER = "sessions"
+BACKUPS_FOLDER = "backups"
+# Owner-only: the policy `init` writes (see "Permissions" above).
+PRIVATE_FILE_MODE = 0o600
 
 
 class HomeError(CommandError):
@@ -123,13 +141,17 @@ def hook_state_folder(home: Path) -> Path:
     return home / HOOK_STATE_FOLDER
 
 
+def sessions_folder(home: Path) -> Path:
+    return home / SESSIONS_FOLDER
+
+
 def make_folders(home: Path) -> list[Path]:
-    """Create the home folder and its pins folder if they are missing; return the folders that were created."""
+    """Create the home folder and its pins folder (owner-only) if they are missing; return those created."""
     created = []
     for folder in (home, pins_folder(home)):
         if not folder.is_dir():
             try:
-                folder.mkdir(parents=True, exist_ok=True)
+                make_private_folder(folder)
             except OSError as exc:
                 raise HomeError(f"cannot create the folder {folder}: {exc.strerror or exc}") from exc
             created.append(folder)

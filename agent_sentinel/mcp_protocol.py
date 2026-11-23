@@ -64,6 +64,7 @@ TASKS_METHOD_PREFIX = "tasks/"
 
 # ---- JSON-RPC error codes ---------------------------------------------------------
 
+INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 UNSUPPORTED_PROTOCOL_VERSION = -32022  # defined by 2026-07-28; clients retry with a listed version
@@ -553,7 +554,8 @@ COVERAGE = (
              "and roots when server_requests blocks their request, and always loses tasks. Reply: protocolVersion "
              "must be a legacy version the proxy knows (else refused); tasks removed from the server's "
              "capabilities; serverInfo icons cleaned and an unsafe websiteUrl dropped; instructions scanned with "
-             "the metadata rules, pinned, and removed if either fails; the whole reply scanned."),
+             "the metadata rules, pinned, and removed if either fails (or, unpinned, if the server is quarantined "
+             "by --pin-server); the whole reply scanned."),
     Coverage("server/discover", "client", MODERN_ONLY, (FORWARDED, SCANNED),
              "Reply: supportedVersions cut down to the versions the proxy knows (none left: refused); tasks removed; "
              "serverInfo icons cleaned and an unsafe websiteUrl dropped; instructions checked as for initialize. The "
@@ -564,21 +566,26 @@ COVERAGE = (
              "policy's other tool names for shadowing; pinned; a schema that refers outside itself ($ref to a web "
              "address) reported, or the tool quarantined (schema_checks.remote_refs). A tool that fails is removed "
              "and quarantined. Tools the policy blocks outright are hidden (hide_blocked_tools). Calls wait while a "
-             "tools/list reply is being checked."),
+             "tools/list reply is being checked. A page after the first (cursor) is also scanned with the end of "
+             "the page before; a nextCursor that is not a string refuses the reply (every list)."),
     Coverage("tools/call", "client", ALL_REVISIONS, (CHECKED,),
              "The arguments against the tool's checked inputSchema (schema_checks.arguments, undeclared_args); then "
-             "secret guard, tool rules, flow rules, rate limits; an ask goes to --approve-with or is refused. "
-             "Refused: a reserved name (resources/read, resources/subscribe, prompts/get), a task-augmented call "
-             "(params.task), a quarantined tool. Reply: resultType checked; structuredContent against the "
-             "outputSchema (schema_checks.results); scanned; secrets.in_results; flow marks."),
+             "secret guard, tool rules, flow rules (a tool no checked list or pin has shown counts as untrusted "
+             "and a sink), rate limits; an ask goes to --approve-with or is refused. Refused: a reserved name "
+             "(resources/read, resources/subscribe, prompts/get), a task-augmented call (params.task), a "
+             "quarantined tool. Reply: resultType checked; structuredContent against the outputSchema "
+             "(schema_checks.results); scanned; secrets.in_results; flow marks. No reply within "
+             "limits.call_timeout_seconds: an error, and notifications/cancelled to the server."),
     Coverage("resources/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
              "Each resource scanned and its icons cleaned; one whose URI has characters the proxy cannot forward is "
-             "removed. Not pinned."),
+             "removed. Not pinned. Empty from a server quarantined by --pin-server."),
     Coverage("resources/templates/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
-             "Each template scanned and pinned; a template that fails is removed and quarantined."),
+             "Each template scanned and pinned; a template that fails is removed and quarantined, and so are the "
+             "URIs it may produce."),
     Coverage("resources/read", "client", ALL_REVISIONS, (CHECKED,),
-             "Checked like a call of a tool named 'resources/read' with the argument uri. Reply scanned; "
-             "secrets.in_results; flow marks."),
+             "Refused for a URI a quarantined template may produce, and for every URI of a server quarantined by "
+             "--pin-server. Checked like a call of a tool named 'resources/read' with the argument uri. Reply "
+             "scanned; secrets.in_results; flow marks."),
     Coverage("resources/subscribe", "client", ALL_REVISIONS, (CHECKED,),
              "Checked as a resources/read of the same URI. Update notifications are scanned."),
     Coverage("subscriptions/listen", "client", MODERN_ONLY, (CHECKED,),
@@ -591,15 +598,20 @@ COVERAGE = (
              "A quarantined prompt is refused. When the policy opts in (a client_requests section, or a tools rule "
              "named 'prompts/get'), checked like a call of 'prompts/get' with {name, arguments}. Reply scanned."),
     Coverage("completion/complete", "client", "2025-03-26 and later", (CHECKED,),
-             "Its params (what the user is typing) pass the secret guard, then client_requests."),
+             "Its params (what the user is typing) pass the secret guard, then client_requests. Refused to a "
+             "server quarantined by --pin-server."),
     Coverage("tasks/*", "client", "2025-11-25 and 2026-07-28 (extension)", (REFUSED,),
              "Answered 'method not found' (-32601): tasks are not supported."),
     Coverage("notifications/cancelled", "client", ALL_REVISIONS, (FORWARDED,),
              "One that cancels a call held for approval refuses that call and is not forwarded (the server never "
              "saw the call); otherwise forwarded."),
+    Coverage("logging/setLevel", "client", ALL_REVISIONS, (FORWARDED,),
+             "The policy's client_requests may refuse it ('method not found'). With the handshake, ping and the "
+             "lists, the only request a server quarantined by --pin-server is still sent."),
     Coverage("any other request or notification", "client", ALL_REVISIONS, (FORWARDED,),
-             "ping, logging/setLevel, resources/unsubscribe, notifications/initialized and the rest: the policy's "
-             "client_requests may refuse them ('method not found'; a notification is dropped). Replies are scanned."),
+             "ping, resources/unsubscribe, notifications/initialized and the rest: the policy's client_requests may "
+             "refuse them ('method not found'; a notification is dropped). Replies are scanned. A server quarantined "
+             "by --pin-server is sent none of these requests but ping (refused, with a reference)."),
     Coverage("reply to a server request", "client", LEGACY_ONLY, (CHECKED, REWRITTEN),
              "Must answer a request the server made, else dropped. Rebuilt from its result or error; passes the "
              "secret guard (refused: the server is told 'request refused'). The answer to one of the proxy's own "
@@ -614,7 +626,8 @@ COVERAGE = (
              "Refused (-32600): MCP no longer uses batches."),
     # ---- from the server ----
     Coverage("sampling/createMessage", "server", LEGACY_ONLY, (CHECKED, SCANNED),
-             "server_requests decides (refused: the server is told 'request refused', the client nothing); then "
+             "server_requests decides (refused: the server is told 'request refused', the client nothing); refused "
+             "too when includeContext is not 'none', or when a block flow to a sink would refuse a call; then "
              "scanned. The client's answer passes the secret guard."),
     Coverage("elicitation/create", "server", "2025-06-18 to 2025-11-25", (CHECKED, SCANNED),
              "server_requests, then what it asks: a URL must be a public https address (and on the "
@@ -628,12 +641,13 @@ COVERAGE = (
              "Progress, log messages, list_changed, resources/updated, "
              "notifications/subscriptions/acknowledged and the rest: server_requests may block them (dropped); "
              "the serverInfo in params._meta cleaned as in a reply; scanned. notifications/cancelled also forgets "
-             "the server request it cancels."),
+             "the server request it cancels. A server quarantined by --pin-server has every notification but "
+             "notifications/cancelled dropped."),
     Coverage("input_required result", "server", MODERN_ONLY, (CHECKED, SCANNED),
              "Only in reply to tools/call, prompts/get or resources/read of a request that named 2026-07-28. Each "
              "inputRequests entry (elicitation/create, sampling/createMessage, roots/list) passes server_requests, "
-             "the elicitation checks and the scanner; one refused entry refuses the reply. Then the whole result "
-             "is scanned."),
+             "the elicitation and sampling checks and the scanner; one refused entry refuses the reply. Then the "
+             "whole result is scanned."),
     Coverage("task result (resultType task, or a 2025-11-25 task handle)", "server",
              "2025-11-25 and 2026-07-28 (extension)", (REFUSED,), "Refused: tasks are not supported."),
     Coverage("result of an unknown resultType", "server", MODERN_ONLY, (REFUSED,),
@@ -641,10 +655,11 @@ COVERAGE = (
     Coverage("error -32042 (URLElicitationRequiredError)", "server", "2025-11-25 and later", (CHECKED, SCANNED),
              "Each URL it lists is checked as for elicitation/create; then the error is scanned."),
     Coverage("any other reply", "server", ALL_REVISIONS, (SCANNED,),
-             "Must answer a request the proxy forwarded, else dropped. Rebuilt from its result or error; the "
-             "serverInfo in _meta loses unsafe icons and an unsafe websiteUrl, and resource_link items in its content "
-             "unsafe icons; scanned; secrets.in_results (block, or redact: a copy with the secrets replaced); cleaned "
-             "of escape codes, control, tag and bidi characters; the request's flow marks set."),
+             "Must answer a request the proxy forwarded, else dropped (so is a late reply to a call that timed "
+             "out). Rebuilt from its result or error; the serverInfo in _meta loses unsafe icons and an unsafe "
+             "websiteUrl, and resource_link items in its content unsafe icons; scanned; secrets.in_results (block, "
+             "or redact: a copy with the secrets replaced); cleaned of escape codes, control, tag and bidi "
+             "characters; the request's flow marks set."),
     # ---- from the proxy itself ----
     Coverage("elicitation/create (approval question)", "proxy", "2025-06-18 and 2025-11-25", (SENT,),
              "With --approve-with elicitation, to a client that declared forms: one yes/no field. Its id is "

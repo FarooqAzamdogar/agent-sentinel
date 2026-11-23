@@ -26,6 +26,8 @@ Module map:
     schema_check.py   tool arguments and results against the server's schemas; references outside a schema
     approvers.py      how the proxy asks a person to approve a call (dialog, command, elicitation)
     proxy_report.py   what the proxy tells the operator on stderr
+    client_run.py     which run of the MCP client a proxy belongs to (proxy --session-group)
+    uri_template.py   whether a URI may come from a quarantined resource template (RFC 6570)
 
   Claude Code and the Claude Agent SDK
     claude_hooks.py   the answers to Claude Code's hook events; claude_sdk_hooks() for the Agent SDK
@@ -43,6 +45,10 @@ Module map:
     clients.py        the MCP clients and where their configurations are
     config_file.py    reading and editing a client's configuration file safely
     wrapping.py       putting the proxy in front of one server entry, and taking it out
+    launch.py         what a server's launch command runs, and what is risky about it (doctor, wrap, pins)
+    advisories.py     known-bad MCP packages and popular names, as dated data (goes stale between releases)
+    control_plane.py  whether the agent can reach agent-sentinel's own files (doctor)
+    doctor_baseline.py  doctor --save-baseline / --baseline: what was added or changed since
     demo_server.py    the deliberately poisoned server of `agent-sentinel demo`
 """
 

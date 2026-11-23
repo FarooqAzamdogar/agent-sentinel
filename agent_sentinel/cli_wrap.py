@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from . import __version__, clients, home, mcp_proxy
+from . import __version__, clients, control_plane, home, mcp_proxy
 from .cli_common import (
     EXIT_ERROR,
     EXIT_OK,
@@ -52,7 +52,7 @@ from .cli_common import (
     shown_command,
     shown_path,
 )
-from .cli_doctor import config_scope, project_of
+from .cli_doctor import config_scope, launch_lines, project_of
 from .clients import CLIENTS
 from .config_file import ConfigFile, edited_text, read_config, write_config
 from .leaks import redact_value
@@ -89,9 +89,11 @@ examples:
   agent-sentinel wrap --client codex --policy policy.json --name files -- npx -y some-mcp-server@1.2.3
 """
 USAGE = """agent-sentinel wrap --client NAME [--config FILE | --project] --policy POLICY [--audit FILE]
-                           [--pins-dir DIR] [--server NAME ...] [--monitor] [--contain] [--apply]
+                           [--pins-dir DIR] [--server NAME ...] [--monitor] [--contain]
+                           [--session-group NAME | --no-session-group] [--apply]
        agent-sentinel wrap --client NAME --policy POLICY --name NAME [--audit FILE] [--pins-dir DIR]
-                           [--monitor] [--contain] -- SERVER_COMMAND ..."""
+                           [--monitor] [--contain] [--session-group NAME | --no-session-group]
+                           -- SERVER_COMMAND ..."""
 TAKES_SERVER_COMMAND = True
 HIDDEN = "<value not shown>"
 
@@ -111,6 +113,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--contain", action="store_true",
                         help="start the proxies with --contain: each server, and the processes it starts, end with "
                              "its proxy (cleanup, not isolation: it still runs as you and can read your files)")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--session-group", type=mcp_proxy._session_group, metavar="NAME",
+                       help="the proxies' --session-group, the same for every server, so that the flow rules see "
+                            "what each server of this client delivered (default: the client's name)")
+    group.add_argument("--no-session-group", action="store_true",
+                       help="give the proxies no session group: each server's flow marks stay its own")
     parser.add_argument("--name", metavar="NAME", help="with a server command after '--': the server's name")
     parser.add_argument("--apply", action="store_true",
                         help="write the change (after a backup); without it, only show it")
@@ -138,6 +146,9 @@ def run(args: argparse.Namespace) -> int:
     settings = _settings(args, loaded[0], python)
     plan = plan_wrap(config, args.client, servers, names, settings)
     _print_header(config, args.client, settings, *loaded)
+    exposed = control_plane.writable_warning(loaded[1], config.path, "this configuration file")
+    if exposed:
+        print(f"Warning: {exposed}")
     print_plan(plan)
     if args.client == "claude-desktop":
         _print_extensions(config.path)
@@ -247,16 +258,17 @@ def _settings(args: argparse.Namespace, policy_path: str, python: PythonCheck) -
         monitor=args.monitor,
         isolated=python.isolated,
         contain=args.contain,
+        session_group=None if args.no_session_group else (args.session_group or args.client),
     )
 
 
 def make_folders(settings: ProxySettings) -> list[Path]:
-    """Create the audit log's folder and the pins folder if they are missing; return those created."""
+    """Create the audit log's folder and the pins folder (owner-only) if they are missing; return those created."""
     created = []
     for folder in (Path(settings.audit).parent, Path(settings.pins_folder)):
         if not folder.is_dir():
             try:
-                folder.mkdir(parents=True, exist_ok=True)
+                home.make_private_folder(folder)
             except OSError as exc:
                 raise CommandError(
                     f"cannot create the folder {folder}: {exc.strerror or exc}; nothing was changed"
@@ -317,7 +329,14 @@ def _wrap_step(config: ConfigFile, client: str, name: str, entry: Any, settings:
     if executable is None:
         says += (f"\n      (note: '{printable(words[0], limit=60)}' is not on this terminal's PATH; the proxy looks "
                  "for it on the PATH the client gives it, never in the current folder)")
+    says += "".join(f"\n      {line}" for line in launch_warnings(words))
     return Step(name, entry, new, says)
+
+
+def launch_warnings(words: list[str]) -> list[str]:
+    """doctor's launch checks of a server command, as warnings: wrap protects a server, not how it starts."""
+    return [("WARNING (doctor fails this): " if line.level == "fail" else "warning: ") + line.text
+            for line in launch_lines(words)]
 
 
 # ---- showing ---------------------------------------------------------------------------------------
@@ -331,6 +350,9 @@ def _print_header(config: ConfigFile, client: str, settings: ProxySettings, poli
         print("  Its 'ask' rules are refused by the proxy unless it is started with an approver (--approve-with).")
     print(f"Each wrapped server logs to {shown_path(settings.audit)}")
     print(f"and keeps its tool pins in its own file in {shown_path(settings.pins_folder)}")
+    if settings.session_group is not None:
+        print(f"The servers share their flow marks as session group '{settings.session_group}' "
+              "(--no-session-group keeps each server's own)")
     exposed = clients.files_inside_project(
         config.path, {"policy": policy_path, "audit log": settings.audit, "pins folder": settings.pins_folder})
     if exposed:
@@ -434,6 +456,8 @@ def _print_snippet(args: argparse.Namespace) -> int:
     for line in clients.snippet(args.client, args.name, wrapped).splitlines():
         print(printable(line, limit=5000))
     print("If the server needs environment variables, keep them in the entry's env as before.")
+    for warning in launch_warnings(command):
+        print(warning[0].upper() + warning[1:])
     for folder in make_folders(settings):
         print(f"Created the folder {shown_path(folder)}")
     _warn_about_python(settings.python, python)

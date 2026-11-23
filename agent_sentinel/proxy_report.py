@@ -45,7 +45,7 @@ from typing import Any, Callable, Sequence
 
 from .firewall import WOULD_BLOCK_PREFIX
 from .leaks import redact
-from .policy import ACTIONS, Policy, known_value_warnings
+from .policy import ACTIONS, SAMPLING_CREATE, Policy, known_value_warnings
 from .textutil import printable
 
 QUIET = "quiet"
@@ -119,6 +119,9 @@ class Startup:
     audit_max_bytes: int | None = None
     # What --contain and --sandbox give the server (containment.describe); empty when not contained.
     containment: str = ""
+    # proxy --session-group, and the file the group's marks are kept in (None when it was not joined).
+    session_group: str | None = None
+    session_file: str | None = None
 
 
 def audit_settings(start: Startup) -> str:
@@ -156,6 +159,12 @@ def startup_lines(start: Startup) -> list[str]:
     if start.approvers:
         backends = ", else ".join(description for description, _ in start.approvers)
         lines.append(f"  approval  {backends}; no answer within {start.approval_timeout} s refuses the call")
+    if start.session_group and start.session_file:
+        lines.append(f"  session   group '{start.session_group}': flow marks shared with the other proxies of this "
+                     f"client run, in {start.session_file}")
+    elif start.session_group:
+        lines.append(f"  session   group '{start.session_group}' not joined: the policy has no flow rules, so there "
+                     "are no marks to share")
     hidden = hidden_tools(policy)
     if hidden and not start.monitor:
         lines.append(f"  hidden    left out of the tool list, as the policy blocks them outright: {', '.join(hidden)}")
@@ -190,6 +199,12 @@ def startup_warnings(start: Startup) -> list[str]:
         found.append("injection.block_severity is null: text with injection findings is logged, never blocked")
     if policy.secrets_in_arguments == "allow":
         found.append("secrets.in_arguments is \"allow\": calls that carry keys or tokens are not refused")
+    if policy.flows and policy.server_request_action(SAMPLING_CREATE) != "block":
+        found.append(
+            "the policy has flow rules, but server_requests does not block sampling/createMessage: the server can ask "
+            "the client's model to write text and get it back, which flow rules see only as a call to a sink once "
+            "a \"block\" flow's marks are set. Add \"sampling/createMessage\": \"block\" to server_requests"
+        )
     policy_warnings = policy.warnings()
     if start.secret_warnings is not None:
         guessed = set(known_value_warnings(policy))
@@ -217,6 +232,8 @@ def policy_summary(policy: Policy) -> str:
         parts.append(f"{len(policy.flows)} flow rule(s)")
     if policy.max_calls_per_minute:
         parts.append(f"at most {policy.max_calls_per_minute} calls a minute")
+    if policy.call_timeout_seconds is not None:
+        parts.append(f"calls time out after {policy.call_timeout_seconds:g} s")
     if policy.block_severity is not None:
         parts.append(f"injections blocked from {policy.block_severity}")
     return ", ".join(parts)

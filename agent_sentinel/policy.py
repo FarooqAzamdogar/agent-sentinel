@@ -47,6 +47,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -101,6 +102,14 @@ RULE_CALLER = "caller"  # Firewall.block() called by the program that uses the f
 RULE_SESSION = "session"  # a result withheld because the session's marks could not be recorded (see session.py)
 RULE_HOOK_FAILED = "hook_failed"  # the Claude Code hook could not finish its checks (claude_hooks.py)
 RULE_AUDIT = "audit_required"  # the audit record could not be written, and audit_required refuses what is not recorded
+# A sampling request (sampling/createMessage) that asks the client to include context from the
+# conversation or other servers (includeContext other than "none"); the proxy refuses it.
+RULE_INCLUDE_CONTEXT = "include_context"
+# limits.call_timeout_seconds: the server did not answer a call in time (the proxy).
+RULE_CALL_TIMEOUT = "limits.call_timeout_seconds"
+SAMPLING_CREATE = "sampling/createMessage"
+# The longest limits.call_timeout_seconds may be: a day.
+MAX_CALL_TIMEOUT_SECONDS = 86_400
 # Fixed ids for the parts of the secret guard, for code that wants to say which part refused
 # (RULE_SECRETS stays the id for the guard as a whole). A custom format is "secrets.patterns[<i>]".
 RULE_SECRETS_IN_RESULTS = "secrets.in_results"
@@ -448,6 +457,10 @@ class Policy:
     Added in 0.6:
 
     schema_checks                    the top-level SchemaChecks (proxy only); see schema_checks_for.
+    call_timeout_seconds             limits.call_timeout_seconds: how long the proxy waits for the server
+                                     to answer a call (tools/call, resources/read, prompts/get) before it
+                                     answers the client with an error and cancels the call; None (the
+                                     default) waits as long as it takes.
     """
 
     default: str = "block"
@@ -476,6 +489,7 @@ class Policy:
     # Not a field (no annotation): the SHA-256 of the file from_file read, for the audit
     # records; None for a policy built in code or with from_dict.
     source_sha256 = None
+    call_timeout_seconds: int | float | None = None
 
     def __post_init__(self) -> None:
         # A policy can also be built in code, without the loader. An action such
@@ -499,6 +513,8 @@ class Policy:
         _check_code_arg_rules(self.deny_args, "deny_args", deny=True)
         if self.max_calls_per_minute is not None:
             _expect_calls_per_minute(self.max_calls_per_minute, "limits")
+        if self.call_timeout_seconds is not None:
+            _expect_call_timeout(self.call_timeout_seconds)
         for request in self.server_requests:
             _expect_choice(request.action, f"server_requests.{request.name}", ("allow", "block"))
         for request in self.client_requests or ():
@@ -581,7 +597,10 @@ class Policy:
         _expect_in_results(in_results)
 
         limits = data.get("limits", {})
-        _expect_object(limits, "limits", allowed_keys=("max_calls_per_minute",))
+        _expect_object(limits, "limits", allowed_keys=("max_calls_per_minute", "call_timeout_seconds"))
+        call_timeout = limits.get("call_timeout_seconds")
+        if "call_timeout_seconds" in limits:
+            _expect_call_timeout(call_timeout)
 
         classify = data.get("classify_by_annotations", True)
         _expect_bool(classify, "classify_by_annotations")
@@ -609,6 +628,7 @@ class Policy:
             classify_by_annotations=classify,
             hide_blocked_tools=hide,
             schema_checks=_schema_checks(data.get("schema_checks", {}), "schema_checks"),
+            call_timeout_seconds=call_timeout,
         )
 
     # ---- evaluating ---------------------------------------------------------
@@ -820,6 +840,27 @@ class Policy:
         index, flow = chosen
         return Verdict(flow.action, _flow_reason(index, flow, tool, marks), NOT_PERMITTED, f"flows[{index}]")
 
+    def sampling_flow_verdict(self, marks: SessionMarks | Iterable[str]) -> Verdict | None:
+        """The verdict on a sampling request (sampling/createMessage) in a session with these marks, or None.
+
+        The answer to a sampling request is text the client's model writes
+        from the conversation, sent to the server: data leaves as it would
+        through a tool labelled "sink". So the first "block" flow whose
+        "then" is "sink" and whose "after" marks the session holds refuses
+        it, as it would refuse such a call. An "ask" flow does not apply:
+        a sampling request is not a call anyone is asked about.
+        """
+        if not self.flows:
+            return None
+        if not isinstance(marks, SessionMarks):
+            marks = SessionMarks.of(marks)
+        for index, flow in enumerate(self.flows):
+            if flow.action == "block" and flow.then == SINK and marks.has_all(flow.after):
+                reason = _flow_reason(index, flow, SAMPLING_CREATE, marks)
+                return Verdict("block", f"{reason} (a sampling request is judged as a call to a sink)", NOT_PERMITTED,
+                               f"flows[{index}]")
+        return None
+
     def call_limits(self, tool: str) -> list[tuple[str, int]]:
         """Return the (bucket name, calls per minute) limits that apply to a call of `tool`.
 
@@ -887,6 +928,8 @@ class Policy:
                                 "server declared for the tool (schema_checks.results)",
             RULE_SCHEMA_REMOTE_REFS: "the tool's schema refers to something outside itself, such as a $ref to a "
                                      "web address, so the tool was quarantined (schema_checks.remote_refs)",
+            RULE_INCLUDE_CONTEXT: "a sampling request that asks the client to include context (includeContext other "
+                                  "than 'none') is refused by the proxy",
         }
         if rule_id in fixed:
             return fixed[rule_id]
@@ -895,6 +938,11 @@ class Policy:
             return secret_part
         if rule_id == "limits.max_calls_per_minute" and self.max_calls_per_minute is not None:
             return f"at most {self.max_calls_per_minute} call(s) per minute for all tools together"
+        if rule_id == RULE_CALL_TIMEOUT:
+            if self.call_timeout_seconds is None:
+                return "limits.call_timeout_seconds: a call the server does not answer in time is cancelled (not set)"
+            return (f"a call the server does not answer within {self.call_timeout_seconds:g} seconds is answered "
+                    "with an error and cancelled (limits.call_timeout_seconds)")
         indexed = re.fullmatch(rf"deny_args{_INDEX}", rule_id)
         if indexed:
             entry = _entry(self.deny_args, indexed.group(1))
@@ -967,6 +1015,8 @@ def _flow_reason(index: int, flow: FlowRule, tool: str, marks: SessionMarks) -> 
         for label in flow.after:
             cause = marks.marks.get(label)
             source = f" from '{printable(cause.tool, limit=80)}'" if cause is not None and cause.tool else ""
+            if source and cause is not None and cause.server:  # a session group: the member that delivered it
+                source = f" from '{printable(cause.server, limit=64)}/{printable(cause.tool, limit=80)}'"
             when = f" at {cause.time}" if cause is not None and cause.time else ""
             parts.append(f"'{label}' content{source}{when}")
         seen = "the agent has read " + " and ".join(parts)
@@ -1571,6 +1621,14 @@ def _expect_calls_per_minute(value: Any, where: str) -> None:
     # bool is a subclass of int in Python, and `true` is not a number of calls.
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise PolicyError(f"{where}.max_calls_per_minute must be a whole number of 1 or more, got {quoted(value)}")
+
+
+def _expect_call_timeout(value: Any) -> None:
+    """Refuse a limits.call_timeout_seconds that is not a number of seconds above 0 and at most a day."""
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or not 0 < value <= MAX_CALL_TIMEOUT_SECONDS):
+        raise PolicyError(f"limits.call_timeout_seconds must be a number of seconds above 0 and at most "
+                          f"{MAX_CALL_TIMEOUT_SECONDS}, got {quoted(value)}")
 
 
 def _check_code_arg_rules(rules: Sequence[ArgRule], where: str, deny: bool) -> None:

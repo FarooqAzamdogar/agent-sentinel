@@ -409,9 +409,14 @@ class Firewall:
         self._audit_failed = False
         # Guards the two collections below; each check takes it only briefly.
         self._state_lock = threading.Lock()
-        # Labels learned from MCP tool annotations: tool name -> labels. Only ever grows.
+        # Labels learned from MCP tool annotations: tool name -> labels (empty for a tool whose annotations
+        # imply none). Every tool whose annotations were read is here. Only ever grows.
         self._annotation_labels: dict[str, frozenset[str]] = {}
         self._annotations_overflowed = False
+        # presume_unlisted_tools: a tool whose annotations were never read counts as untrusted and a sink,
+        # except these names (requests the policy checks under a tool's name, such as "resources/read").
+        self._presume_unlisted = False
+        self._unlisted_exempt: frozenset[str] = frozenset()
         # Calls waiting for finish_approval: call id -> (the pending decision, the tool, its reason).
         self._pending_approvals: dict[str, tuple[Decision, str, str]] = {}
         # The secret guard for the policy's secret settings: (settings it was built
@@ -837,16 +842,37 @@ class Firewall:
         Annotation labels count only when the policy's classify_by_annotations
         is on (the default). When more tools were annotated than can be
         remembered, a tool whose annotations were not kept counts as both
-        untrusted and a sink.
+        untrusted and a sink. So does, after presume_unlisted_tools and when
+        the policy has flow rules, a tool whose annotations were never read.
         """
         labels = self.policy.tool_labels(tool)
         if self.policy.classify_by_annotations and isinstance(tool, str):
             with self._state_lock:
                 learned = self._annotation_labels.get(tool)
-                if learned is None and self._annotations_overflowed:
+                unknown = self._annotations_overflowed or (
+                    self._presume_unlisted and bool(self.policy.flows) and tool not in self._unlisted_exempt
+                )
+                if learned is None and unknown:
                     learned = labels_from_annotations({"openWorldHint": True})
             labels |= learned or frozenset()
         return labels
+
+    def presume_unlisted_tools(self, exempt: Iterable[str] = ()) -> None:
+        """From now on, a tool whose annotations were never read (learn_annotations) counts as untrusted and a sink.
+
+        For the proxy, which reads annotations from the tool lists it checks:
+        a call to a tool no checked list has shown (a client that reuses a
+        tool list it cached in an earlier process, or calls a name it knows)
+        could otherwise be a sink the flow rules do not see. It applies only
+        while the policy has flow rules and classify_by_annotations is on.
+        `exempt`: names that are no tool (the requests the policy checks
+        under a tool's name, such as "resources/read").
+        """
+        if isinstance(exempt, (str, bytes)):
+            raise TypeError("exempt must be a collection of names, not one text")
+        with self._state_lock:
+            self._presume_unlisted = True
+            self._unlisted_exempt = frozenset(name for name in exempt if isinstance(name, str))
 
     def marks_for(self, tool: str) -> frozenset[str]:
         """The marks a delivered result of `tool` gives the session: its labels except "sink"."""
@@ -886,18 +912,19 @@ class Firewall:
         """Remember the flow labels an MCP tool's annotations imply (see session.labels_from_annotations).
 
         The proxy calls this for each tool of a tools/list reply that it lets
-        through. Labels only add up: annotations that later drop a hint do not
-        remove a label learned earlier.
+        through, and at startup for each pinned tool. Labels only add up:
+        annotations that later drop a hint do not remove a label learned
+        earlier. A tool whose annotations imply no label is remembered too, as
+        one whose annotations were read (see presume_unlisted_tools).
         """
         if not isinstance(tool, str):
             return
         labels = labels_from_annotations(annotations)
-        if not labels:
-            return
         with self._state_lock:
             known = self._annotation_labels.get(tool)
             if known is not None:
-                self._annotation_labels[tool] = known | labels
+                if labels:
+                    self._annotation_labels[tool] = known | labels
             elif len(self._annotation_labels) < MAX_ANNOTATED_TOOLS:
                 self._annotation_labels[tool] = labels
             else:
@@ -977,10 +1004,19 @@ class Firewall:
         return guard.find_in_texts(_call_spellings(tool, args), formats=formats)
 
     def _verdict(self, tool: str, args: dict[str, Any]) -> Verdict:
-        """The policy's verdict, with the flow rules applied when the policy has any."""
+        """The policy's verdict, with the flow rules applied when the policy has any.
+
+        The session's marks are read only for a call that a flow rule can
+        apply to (the tool has the label of some rule's "then"): for any
+        other call they cannot change the verdict, and a store kept in a
+        file shared by several processes (session groups) costs a lock to read.
+        """
         if not self.policy.flows:
             return self.policy.evaluate(tool, args)
-        return self.policy.evaluate(tool, args, marks=self.session_marks(), extra_labels=self.tool_labels(tool))
+        labels = self.tool_labels(tool)
+        if not any(flow.then in labels for flow in self.policy.flows):
+            return self.policy.evaluate(tool, args)
+        return self.policy.evaluate(tool, args, marks=self.session_marks(), extra_labels=labels)
 
     @staticmethod
     def _refused_ask(

@@ -5,8 +5,14 @@
     agent-sentinel pins diff   --pins FILE [--kind KIND] [--policy POLICY] [NAME ...]
     agent-sentinel pins accept --pins FILE [--kind KIND] [--policy POLICY] [--force] [NAME ...]
     agent-sentinel pins forget --pins FILE [--kind KIND] [NAME ...]
+    agent-sentinel pins diff|accept|forget --pins FILE --server
 
 KIND is tool (the default), prompt, template or instructions (which takes no NAME).
+
+--server is about the server itself, pinned by proxy --pin-server (pins.py,
+"The server itself"): how it is launched and the name and version it
+reports. diff shows what differs, accept makes what the proxy last saw the
+pin, forget removes the pin (the proxy pins the server again at its next start).
 
 The proxy pins each tool, prompt, resource template and the server's
 instructions the first time it sees them (pins.py). When a pinned
@@ -49,16 +55,20 @@ from typing import Any
 from .cli_common import EXIT_ERROR, EXIT_FAIL, EXIT_OK, CommandError, load_policy, shell_line, shown_path
 from .firewall import Firewall
 from .pins import (
+    INFO_FIELDS,
     INSTRUCTIONS,
     KIND_WORDS,
+    LAUNCH_FIELDS,
     PINNED_LISTS,
     Pin,
     PinsFile,
     PinsFileError,
+    ServerPin,
     fingerprint,
     now,
     pending_path,
     read_pins_file,
+    server_changes,
     write_pins_file,
 )
 from .policy import Policy
@@ -76,6 +86,7 @@ examples:
   agent-sentinel pins accept --pins PINS create_issue       on a terminal: look, then answer y
   agent-sentinel pins accept --pins PINS --kind instructions
   agent-sentinel pins forget --pins PINS --kind prompt summarize
+  agent-sentinel pins diff --pins PINS --server                how the server changed (proxy --pin-server)
 
 After accept or forget, restart the proxy (restart the MCP client): a running proxy keeps its pins.
 """
@@ -113,6 +124,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         if action == "accept":
             sub.add_argument("--force", action="store_true",
                              help="accept a definition even if the scanner finds what the policy would block")
+        if action in ("diff", "accept", "forget"):
+            sub.add_argument("--server", action="store_true",
+                             help="the server itself (pinned by proxy --pin-server): how it is launched and what it "
+                                  "says it is; takes no NAME")
         many = "*" if action in ("diff", "accept", "forget") else "?"
         sub.add_argument("names", nargs=many, metavar="NAME", help="the name of the tool, prompt or template")
 
@@ -121,6 +136,8 @@ def run(args: argparse.Namespace) -> int:
     path = Path(args.pins)
     if args.pins_action == "list":
         return _list(path)
+    if getattr(args, "server", False):
+        return _server_command(path, args)
     targets = _targets(args)
     if args.pins_action == "show":
         return _show(path, targets)
@@ -251,8 +268,14 @@ def _list(path: Path) -> int:
         print(f"\ninstructions\n  {_pin_line(None, pins.instructions, (INSTRUCTIONS, None) in waiting)}")
     else:
         print("\ninstructions: none pinned")
+    server_waits = _server_waiting(pins, pending) is not None
+    if pins.server is not None or server_waits:
+        _print_server_summary(pins.server, server_waits)
     if waiting:
         print(f"\n{len(waiting)} change(s) wait: {shell_line(['agent-sentinel', 'pins', 'diff', '--pins', str(path)])}")
+    if server_waits:
+        command = shell_line(["agent-sentinel", "pins", "diff", "--server", "--pins", str(path)])
+        print(f"\nThe server changed: {command}")
     return EXIT_OK
 
 
@@ -523,13 +546,125 @@ def _write_pending(path: Path, pending: PinsFile) -> None:
     """Write what still waits, or remove the pending file when nothing does."""
     waiting = pending_path(path)
     try:
-        if _entries(pending):
+        if _entries(pending) or pending.server is not None:
             write_pins_file(waiting, pending)
         elif waiting.exists():
             waiting.unlink()
     except OSError as exc:
         print(f"agent-sentinel: could not update {printable(str(waiting), limit=300)}: "
               f"{exc.strerror or type(exc).__name__}", file=sys.stderr)
+
+
+# ---- the server itself (--server) ----------------------------------------------------------------
+
+def _server_command(path: Path, args: argparse.Namespace) -> int:
+    """pins diff|accept|forget --server: the server's own pin (proxy --pin-server)."""
+    if args.names or args.kind:
+        raise CommandError("--server is about the server itself: it takes no NAME and no --kind")
+    if args.pins_action == "diff":
+        return _diff_server(path)
+    if not on_a_terminal():
+        raise CommandError(f"pins {args.pins_action} asks a person for a yes, so it runs only on a terminal "
+                           "(an agent or a script cannot change pins)")
+    if args.pins_action == "accept":
+        return _accept_server(path)
+    return _forget_server(path)
+
+
+def _server_waiting(pins: PinsFile, pending: PinsFile) -> ServerPin | None:
+    """The server identity that waits in the pending file and is not the pin already; None when none does."""
+    new = pending.server
+    if new is None:
+        return None
+    old = pins.server
+    if old is not None and not server_changes(old.launch, new.launch) and (
+            new.info is None or (old.info is not None and not server_changes(old.info, new.info))):
+        return None  # accepted already
+    return new
+
+
+def _shown_value(value: str | None) -> str:
+    return "(none)" if value is None else repr(printable(value, limit=1000))
+
+
+def _print_server_summary(pin: ServerPin | None, changed: bool) -> None:
+    print("\nserver (proxy --pin-server)")
+    if pin is None:
+        print("  not pinned; a new identity waits (pins diff --server)")
+        return
+    launch = pin.launch.get("package") or pin.launch.get("script") or pin.launch.get("executable")
+    says = (f", reports {_shown_value(pin.info.get('name'))} {_shown_value(pin.info.get('version'))}"
+            if pin.info is not None else ", has not answered a handshake yet")
+    print(f"  first seen {printable(pin.first_seen or '?', limit=40)}: launched as {_shown_value(launch)}{says}"
+          + ("  CHANGED: a new identity waits (pins diff --server)" if changed else ""))
+
+
+def _print_server_change(old: ServerPin | None, new: ServerPin) -> None:
+    """The pinned identity beside the one seen, field by field (names and values printable)."""
+    print(f"the server: changed (seen {printable(new.first_seen or '?', limit=40)})")
+    for section, fields, pinned, seen in (("launch", LAUNCH_FIELDS, old.launch if old else None, new.launch),
+                                          ("info", INFO_FIELDS, old.info if old else None, new.info)):
+        if seen is None:
+            print(f"  {section}: not seen yet (the proxy pins it at the next start once this is accepted)")
+            continue
+        changed = set(server_changes(pinned, seen)) if pinned is not None else set(fields)
+        for name in fields:
+            after = _shown_value(seen.get(name))
+            if name in changed:
+                before = _shown_value(pinned.get(name)) if pinned is not None else "(not pinned)"
+                print(f"  {section}.{name}: CHANGED  pinned {before}  now {after}")
+            else:
+                print(f"  {section}.{name}: {after}")
+
+
+def _diff_server(path: Path) -> int:
+    pins, _ = _read_pins(path)
+    new = _server_waiting(pins, _read_pending(path))
+    if new is None:
+        print("No change of the server waits." + ("" if pins.server is not None else
+                                                  " (The server is not pinned: the proxy pins it with --pin-server.)"))
+        return EXIT_OK
+    _print_server_change(pins.server, new)
+    print(f"\nTo accept it, on a terminal: agent-sentinel pins accept --server --pins {shown_path(path)}")
+    return EXIT_FAIL
+
+
+def _accept_server(path: Path) -> int:
+    pins, original = _read_pins(path)
+    pending = _read_pending(path)
+    new = _server_waiting(pins, pending)
+    if new is None:
+        raise CommandError(f"no new identity of the server waits in {pending_path(path)}. The proxy keeps one there "
+                           "when a server pinned with --pin-server changes")
+    _print_server_change(pins.server, new)
+    if not _yes("Accept this as the pinned server?"):
+        print("  Not accepted.")
+        return EXIT_FAIL
+    pins.server = ServerPin(launch=dict(new.launch), info=dict(new.info) if new.info is not None else None,
+                            first_seen=now())
+    pending.server = None
+    backup = _write(path, pins, original)
+    _write_pending(path, pending)
+    print("Accepted the server as it is now.")
+    _print_after(path, backup)
+    return EXIT_OK
+
+
+def _forget_server(path: Path) -> int:
+    pins, original = _read_pins(path)
+    pending = _read_pending(path)
+    if pins.server is None:
+        raise CommandError(f"the server is not pinned in {path}")
+    if not _yes("Forget the server's pin? The proxy pins the server as it finds it at its next start."):
+        print("  Kept.")
+        return EXIT_FAIL
+    pins.server = None
+    pending.server = None
+    backup = _write(path, pins, original)
+    _write_pending(path, pending)
+    print("Forgot the server's pin.")
+    _print_after(path, backup)
+    return EXIT_OK
 
 
 def _print_after(path: Path, backup: Path) -> None:

@@ -111,9 +111,10 @@ def text_of(reply):
 class ProxyProcess:
     """A real `agent-sentinel proxy` in front of a server, driven over stdio as an MCP client drives it."""
 
-    def __init__(self, test, proxy_args, server=FAKE_SERVER, server_args=(), extra_env=None):
+    def __init__(self, test, proxy_args, server=FAKE_SERVER, server_args=(), extra_env=None, through=()):
+        """through: a command that starts the proxy in its place (the proxy's command is added to it)."""
         environment = {**test.environment, **(extra_env or {})}
-        command = [sys.executable, "-m", "agent_sentinel", "proxy", *map(str, proxy_args),
+        command = [*through, sys.executable, "-m", "agent_sentinel", "proxy", *map(str, proxy_args),
                    "--", sys.executable, str(server), *server_args]
         self.process = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1580,6 +1581,110 @@ class StartingTheProxy(EndToEndTest):
                                      r"\ABlocked by agent-sentinel: internal error while checking the (request|reply) "
                                      + REF)
                 self.assertNotIn(b"a fault injected", proc.stdout)
+
+
+class TheProxiesOfOneClient(EndToEndTest):
+    """Several real proxies started by one client (this test): --session-group, and limits.call_timeout_seconds."""
+
+    def test_what_one_server_delivered_counts_for_the_calls_of_another_in_the_same_group(self):
+        policy = self.write("policy.json", {
+            "default": "block",
+            "tools": {"echo": {"action": "allow", "labels": ["untrusted", "private"]},
+                      "reply_with": {"action": "allow", "labels": ["sink"]}},
+            "flows": [{"after": ["untrusted", "private"], "then": "sink", "action": "block"}],
+            "server_requests": {"sampling/createMessage": "block"},
+        })
+        audit = self.folder / "audit.jsonl"
+        files = self.proxy("--policy", policy, "--audit", audit, "--name", "files", "--session-group", "desk",
+                           server=E2E_SERVER)
+        mail = self.proxy("--policy", policy, "--audit", audit, "--name", "mail", "--session-group", "desk",
+                          server=E2E_SERVER)
+        alone = self.proxy("--policy", policy, "--name", "alone", server=E2E_SERVER)  # no group: a session of its own
+        for proxy in (files, mail, alone):
+            proxy.initialize()
+            proxy.request(1, "tools/list")
+        sent = {"result": {"content": [{"type": "text", "text": "sent"}]}}
+        self.assertEqual(text_of(mail.call(2, "reply_with", sent)), "sent")  # nothing read yet
+        self.assertEqual(text_of(files.call(2, "echo", {"text": "the memo"})), "the memo")  # another server reads
+        refused = mail.call(3, "reply_with", sent)
+        self.assertRegex(text_of(refused), r"\ABlocked by agent-sentinel: this call is not permitted by the policy "
+                         + REF + r"\Z")
+        self.assertEqual(text_of(alone.call(3, "reply_with", sent)), "sent")
+
+        (group,) = json.loads((self.home / ".agent-sentinel" / "sessions" / "desk.json").read_text(
+            encoding="ascii"))["runs"]
+        self.assertEqual(sorted(group["members"]), ["files", "mail"])
+        self.assertEqual((group["marks"]["private"]["server"], group["marks"]["private"]["tool"]), ("files", "echo"))
+        self.assertRegex(group["run"], rf"\A{os.getpid()}@")  # this test is the client that started both
+        record = next(r for r in self.records(audit) if r.get("server") == "mail" and r["action"] == "block")
+        self.assertEqual(record["rule"], "flows[0]")
+        self.assertIn("from 'files/echo'", record["reason"])
+        notes = [r for r in self.records(audit) if r["event"] == "session_group"]
+        self.assertEqual(sorted(r["server"] for r in notes), ["files", "mail"])
+        for proxy in (files, mail):
+            self.assertIn("session   group 'desk': flow marks shared", proxy.stderr)
+            self.assertIn("session group 'desk': ", proxy.stderr)
+
+    def test_a_second_client_run_in_the_group_has_a_session_of_its_own(self):
+        # Two windows of one client: each starts its own proxies, with the same group. The second window's
+        # proxies used to take the group file over, and every sink call of the first was then refused.
+        policy = self.write("policy.json", {
+            "default": "block",
+            "tools": {"echo": {"action": "allow", "labels": ["untrusted", "private"]},
+                      "reply_with": {"action": "allow", "labels": ["sink"]}},
+            "flows": [{"after": ["untrusted", "private"], "then": "sink", "action": "block"}],
+            "server_requests": {"sampling/createMessage": "block"},
+        })
+        group = ("--session-group", "desk")
+        mail = self.proxy("--policy", policy, "--name", "mail", *group, server=E2E_SERVER)
+        mail.initialize()
+        mail.request(1, "tools/list")
+        sent = {"result": {"content": [{"type": "text", "text": "sent"}]}}
+        self.assertEqual(text_of(mail.call(2, "reply_with", sent)), "sent")
+        # The second window: a Python process in between is the client the proxy finds.
+        window = (sys.executable, "-c", "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))")
+        files = ProxyProcess(self, ["--policy", policy, "--name", "files", *group], E2E_SERVER, through=window)
+        files.initialize()
+        files.request(1, "tools/list")
+        self.assertIn("began the flow session of client run", files.stderr)
+        self.assertIn("1 other client run(s)", files.stderr)
+        self.assertEqual(text_of(mail.call(3, "reply_with", sent)), "sent")  # the first window still works
+        self.assertEqual(text_of(files.call(2, "echo", {"text": "the memo"})), "the memo")
+        self.assertEqual(text_of(mail.call(4, "reply_with", sent)), "sent")  # and the second one's marks are its own
+        runs = json.loads((self.home / ".agent-sentinel" / "sessions" / "desk.json").read_text(encoding="ascii"))["runs"]
+        self.assertEqual([run["members"] for run in runs], [["mail"], ["files"]])
+        self.assertEqual([sorted(run["marks"]) for run in runs], [[], ["private", "untrusted"]])
+        self.assertRegex(runs[0]["run"], rf"\A{os.getpid()}@")
+        self.assertNotRegex(runs[1]["run"], rf"\A{os.getpid()}@")
+        self.assertEqual(files.stop(), 0)
+
+    def test_a_call_the_server_does_not_answer_in_time_is_answered_and_cancelled(self):
+        policy = self.write("policy.json", {"default": "allow", "limits": {"call_timeout_seconds": 1}})
+        audit = self.folder / "audit.jsonl"
+        proxy = self.proxy("--policy", policy, "--audit", audit, "--name", "slow", server=E2E_SERVER)
+        proxy.initialize()
+        # The server asks the client a question and waits for the answer before it answers the call.
+        proxy.send(call(5, "ask_client", {"request": {"method": "roots/list"}}))
+        question = proxy.next_message()
+        self.assertEqual(question["method"], "roots/list")
+        started = time.monotonic()
+        answer = proxy.reply_to(5)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertEqual(answer["error"]["code"], -32001)
+        self.assertRegex(answer["error"]["message"],
+                         r"\ABlocked by agent-sentinel: the server did not answer in time, so the request was "
+                         r"cancelled " + REF + r"\Z")
+        proxy.send({"jsonrpc": "2.0", "id": question["id"], "result": {"roots": []}})  # the server answers, too late
+        heard = json.loads(text_of(proxy.call(6, "heard")))
+        self.assertIn("notifications/cancelled", heard)  # the server was told
+        self.assertEqual(proxy.unsolicited, [])  # the late reply to 5 never reached the client
+        self.assertEqual(proxy.stop(), 0)
+        records = self.records(audit)
+        timeout = next(r for r in records if r["event"] == "timeout")
+        self.assertEqual((timeout["action"], timeout["rule"], timeout["tool"]),
+                         ("block", "limits.call_timeout_seconds", "ask_client"))
+        self.assertIn(timeout["ref"], answer["error"]["message"])
+        self.assertTrue(any(r["event"] == "dropped" and "late server reply" in r["reason"] for r in records))
 
 
 if __name__ == "__main__":

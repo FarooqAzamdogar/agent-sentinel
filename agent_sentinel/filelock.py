@@ -7,6 +7,10 @@ whatever the file's length, so a lock file may be empty.
 
 `replace_file` is how every file agent-sentinel rewrites is written (pins,
 session state, rate-limit counts, client configurations).
+
+`make_private_folder` is how every folder agent-sentinel creates is made:
+readable by its owner only (mode 0700 on POSIX), the missing folders above
+it too.
 """
 
 from __future__ import annotations
@@ -27,18 +31,46 @@ LOCK_TIMEOUT_SECONDS = 10.0
 # scanner, a file indexer, a reader of the file) has the file open.
 REPLACE_ATTEMPTS = 5
 REPLACE_PAUSE_SECONDS = 0.1
+# The folders agent-sentinel creates are its owner's only; and how many missing ones above it are created at most.
+PRIVATE_FOLDER_MODE = 0o700
+MAX_FOLDERS_CREATED = 64
+
+
+def make_private_folder(folder: str | Path) -> list[Path]:
+    """Create a folder, and each missing folder above it, readable by its owner only. Returns those created.
+
+    Mode 0700 on POSIX, whatever the umask leaves (it only takes bits away).
+    Path.mkdir(parents=True) would give the folders above it the default mode
+    instead. A folder that exists is left as it is. Raises OSError.
+    """
+    missing: list[Path] = []
+    current = Path(folder)
+    while not current.is_dir() and current.parent != current and len(missing) < MAX_FOLDERS_CREATED:
+        missing.append(current)
+        current = current.parent
+    created = []
+    for path in reversed(missing):
+        try:
+            path.mkdir(mode=PRIVATE_FOLDER_MODE)
+        except FileExistsError:
+            if not path.is_dir():
+                raise
+            continue
+        created.append(path)
+    return created
 
 if sys.platform == "win32":
     import msvcrt
 
-    def lock_file(handle: BinaryIO) -> None:
-        """Wait for, and take, the lock on an open file. Raises OSError after LOCK_TIMEOUT_SECONDS.
+    def lock_file(handle: BinaryIO, timeout: float | None = None) -> None:
+        """Wait for, and take, the lock on an open file. Raises OSError after `timeout` seconds
+        (LOCK_TIMEOUT_SECONDS when None).
 
         Polls with short pauses instead of using LK_LOCK, which retries only
         once a second: with a few processes taking turns, a waiter could miss
         ten turns in a row and fail although each holds the lock for a moment.
         """
-        deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        deadline = time.monotonic() + (LOCK_TIMEOUT_SECONDS if timeout is None else timeout)
         pause = 0.001
         while True:
             handle.seek(0)
@@ -57,24 +89,44 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-    def lock_file(handle: BinaryIO) -> None:
-        """Wait for, and take, the lock on an open file."""
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    def lock_file(handle: BinaryIO, timeout: float | None = None) -> None:
+        """Wait for, and take, the lock on an open file.
+
+        timeout: None waits as long as it takes; a number of seconds polls,
+        and raises OSError (TimeoutError) when the lock is not had by then.
+        """
+        if timeout is None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            return
+        deadline = time.monotonic() + timeout
+        pause = 0.001
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"the lock was not free within {timeout:g} seconds") from None
+            time.sleep(pause)
+            pause = min(pause * 2, 0.05)
 
     def unlock_file(handle: BinaryIO) -> None:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 @contextmanager
-def locked(path: str | Path) -> Iterator[None]:
+def locked(path: str | Path, timeout: float | None = None) -> Iterator[None]:
     """Hold the lock on the file at `path` (created if missing) for the duration of a `with` block.
 
     For a separate lock file next to the data it protects. The data file can
     then be replaced atomically (os.replace) while the lock is held, which is
     not possible with a lock on the data file itself.
+
+    timeout: how long to wait for the lock before OSError; None keeps each
+    system's default (LOCK_TIMEOUT_SECONDS on Windows, no limit elsewhere).
     """
     with open(path, "ab") as handle:
-        lock_file(handle)
+        lock_file(handle, timeout)
         try:
             yield
         finally:
