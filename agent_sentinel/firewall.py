@@ -1256,14 +1256,17 @@ class Firewall:
         """The policy's verdict, with the flow rules applied when the policy has any.
 
         The session's marks are read only for a call that a flow rule can
-        apply to (the tool has the label of some rule's "then"): for any
-        other call they cannot change the verdict, and a store kept in a
-        file shared by several processes (session groups) costs a lock to read.
+        apply to: the tool has the label of some rule's "then", or the
+        call's command gives it one (a command section's labels_by_class,
+        which Policy.evaluate adds to the tool's labels). For any other call
+        the marks cannot change the verdict, and a store kept in a file
+        shared by several processes (session groups) costs a lock to read.
         """
         if not self.policy.flows:
             return self.policy.evaluate(tool, args)
         labels = self.tool_labels(tool)
-        if not any(flow.then in labels for flow in self.policy.flows):
+        reached = labels | self.policy.command_labels(tool, args)
+        if not any(flow.then in reached for flow in self.policy.flows):
             return self.policy.evaluate(tool, args)
         return self.policy.evaluate(tool, args, marks=self.session_marks(), extra_labels=labels)
 

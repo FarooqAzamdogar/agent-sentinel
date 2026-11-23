@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from cli_support import TempFolderTest, run_cli
+from support import audit_records
 from test_proxy import Harness, call
 from test_proxy_approvals import FakeApprover, wait_until
 from agent_sentinel import Firewall, Policy, PolicyError, fix_hints
@@ -56,7 +57,7 @@ def load_error(data):
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))  # without the records that start the chain and describe the session
 
 
 def untrusted_firewall(flows=NARROWED, **options):

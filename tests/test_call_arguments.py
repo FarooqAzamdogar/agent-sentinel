@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from unittest import mock
 
 from cli_support import TempFolderTest
-from support import REF_SUFFIX
+from support import REF_SUFFIX, audit_records
 from agent_sentinel import BlockedError, Firewall, Policy, textutil
 from agent_sentinel.leaks import SecretGuard
 from agent_sentinel.textutil import UnscannableError, normalised_arguments, numbers_in
@@ -345,7 +345,7 @@ class TheFirewallChecksTheCopy(TempFolderTest):
         line = audit.read_text(encoding="utf-8")
         self.assertNotIn(PIN, line)
         self.assertNotIn(ACCOUNT_CANARY, line)
-        record = json.loads(line)
+        (record,) = audit_records(audit)  # the one record after the log's chain_start
         self.assertEqual(record["args"]["amount"], "[redacted value of BANK_PIN]")
         self.assertEqual(record["args"]["ref"], "[redacted canary]")
         self.assertEqual(record["args"]["count"], 3)
@@ -379,7 +379,7 @@ class TheFirewallChecksTheCopy(TempFolderTest):
         guarded = Firewall(policy, audit, approver=lambda tool, args, reason: asked.append(args) or True)
         self.assertTrue(guarded.check_call("read", {"path": PurePosixPath("/srv/a")}).allowed)
         self.assertEqual(asked, [{"path": "/srv/a"}])
-        self.assertEqual(json.loads(audit.read_text(encoding="utf-8"))["args"], {"path": "/srv/a"})
+        self.assertEqual([record["args"] for record in audit_records(audit)], [{"path": "/srv/a"}])
 
     def test_guard_checks_a_nested_dataclass_and_an_enum(self):
         guarded = firewall()

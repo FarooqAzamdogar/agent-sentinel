@@ -20,7 +20,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import INJECTION
+from support import INJECTION, audit_records
 from test_proxy import Harness, call, request, text_result
 from agent_sentinel import BlockedError, Firewall, Policy, PolicyError, detector, tail_scan, templates
 from agent_sentinel.claude_hooks import answer_with, checked_event
@@ -59,7 +59,7 @@ def mcp(text):
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))  # without the records that start the chain and describe the session
 
 
 def load_error(data):

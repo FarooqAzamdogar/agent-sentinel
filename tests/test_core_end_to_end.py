@@ -39,6 +39,9 @@ class TheProxy(EndToEndTest):
         audit = self.folder / "audit.jsonl"
         proxy = self.proxy("--policy", policy, "--audit", audit, "--name", "e2e", "--no-pins", server=E2E_SERVER)
         proxy.initialize()  # the reply comes from server "e2e": the session is now untrusted
+        # A client lists the tools before it calls one. With flow rules, a tool no checked list has shown
+        # counts as untrusted and a sink, and reply_with would be refused by the flow below.
+        self.assertEqual(len(proxy.request(100, "tools/list")["result"]["tools"]), 11)
 
         warned = proxy.call(1, "reply_with", content(MEDIUM))  # 1st counted call
         self.assertRegex(text_of(warned), "\\A" + NOTICE_RE + "\\Z")
