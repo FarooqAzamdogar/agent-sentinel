@@ -158,8 +158,11 @@ def _notes_path(policy: Path) -> Path:
 
 
 def _write_new(path: Path, text: str) -> None:
+    """Write a new file, readable by its owner only (0600 on POSIX): a policy may list canaries."""
+    # O_EXCL: a file that appeared meanwhile is not replaced.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     try:
-        with open(path, "x", encoding="utf-8") as handle:  # "x": a file that appeared meanwhile is not replaced
+        with os.fdopen(os.open(path, flags, home.PRIVATE_FILE_MODE), "w", encoding="utf-8") as handle:
             handle.write(text)
     except FileExistsError as exc:
         raise CommandError(f"{path} already exists, and init never overwrites a file") from exc

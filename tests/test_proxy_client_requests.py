@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from support import INJECTION, POLICY, without_ref
+from support import INJECTION, POLICY, audit_records, without_ref
 from test_proxy import Harness, call, reply, request
 from agent_sentinel import Firewall, Policy
 
@@ -18,7 +18,7 @@ SECRET_TOKEN = "ghp_" + "a1B2c3D4e5" * 4
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 def completion(msg_id, value, context=None):

@@ -37,6 +37,7 @@ in the policy file:
     tools.send_email.max_calls_per_session, limits.max_calls_per_session  session limits on calls
     tools.send_email.max_distinct[0], limits.max_distinct[0]             session limits on different values
     limits.max_sink_bytes_per_session, limits.max_identical_calls        the other session limits
+    schema.arguments, schema.result, schema.remote_refs   the proxy's schema_checks (fixed ids, below)
     server_requests.sampling/createMessage
     client_requests.completion/complete
     flows[0]                             the first flow rule
@@ -51,7 +52,9 @@ Checks that are not written in the policy have the fixed names below (RULE_*).
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -108,12 +111,25 @@ RULE_QUARANTINE = "quarantine"  # a tool removed from the tool list, or one that
 RULE_CALLER = "caller"  # Firewall.block() called by the program that uses the firewall
 RULE_SESSION = "session"  # a result withheld because the session's marks could not be recorded (see session.py)
 RULE_HOOK_FAILED = "hook_failed"  # the Claude Code hook could not finish its checks (claude_hooks.py)
+RULE_AUDIT = "audit_required"  # the audit record could not be written, and audit_required refuses what is not recorded
+# A sampling request (sampling/createMessage) that asks the client to include context from the
+# conversation or other servers (includeContext other than "none"); the proxy refuses it.
+RULE_INCLUDE_CONTEXT = "include_context"
+# limits.call_timeout_seconds: the server did not answer a call in time (the proxy).
+RULE_CALL_TIMEOUT = "limits.call_timeout_seconds"
+SAMPLING_CREATE = "sampling/createMessage"
+# The longest limits.call_timeout_seconds may be: a day.
+MAX_CALL_TIMEOUT_SECONDS = 86_400
 # Fixed ids for the parts of the secret guard, for code that wants to say which part refused
 # (RULE_SECRETS stays the id for the guard as a whole). A custom format is "secrets.patterns[<i>]".
 RULE_SECRETS_IN_RESULTS = "secrets.in_results"
 RULE_SECRETS_CANARIES = "secrets.canaries"
 RULE_SECRETS_KNOWN_VALUES = "secrets.known_values_from_env"
 RULE_HOOK_CONFIG_CHANGES = "hook.config_changes"  # the Claude Code hook refused a settings change (hook section)
+# The proxy's checks against the schemas a server declared (schema_checks; schema_check.py).
+RULE_SCHEMA_ARGUMENTS = "schema.arguments"  # a call's arguments do not match the tool's inputSchema
+RULE_SCHEMA_RESULT = "schema.result"  # a result's structuredContent does not match the tool's outputSchema
+RULE_SCHEMA_REMOTE_REFS = "schema.remote_refs"  # a tool's schema refers outside itself (quarantined)
 
 # An argument name is chosen by the agent; `matched_arg` keeps at most this much of it.
 MAX_MATCHED_ARG_CHARS = 200
@@ -185,15 +201,31 @@ MAX_SERVER_LABEL_RULES = 1_000
 # Higher is stricter. When several wildcard rules match, the strictest verdict wins.
 _STRICTNESS = {"allow": 0, "ask": 1, "block": 2}
 
+# ---- schema checks (the proxy only) ------------------------------------------------------
+#
+# "schema_checks", at the top of a policy and in a tool rule: what the proxy does with a tool's
+# arguments and results that do not match the schemas the server declared in its tool list, with
+# arguments that schema does not declare, and with a schema that refers outside itself.
+SCHEMA_CHECK_MODES = ("off", "warn", "enforce")
+SCHEMA_CHECK_CHOICES = {
+    "arguments": SCHEMA_CHECK_MODES,
+    "results": SCHEMA_CHECK_MODES,
+    "undeclared_args": ("allow", "block"),
+    "remote_refs": ("warn", "quarantine"),
+}
+# What applies when neither the tool rule nor the top of the policy says. Remote references are reported.
+SCHEMA_CHECK_DEFAULTS = {"arguments": "off", "results": "off", "undeclared_args": "allow", "remote_refs": "warn"}
+
 # The keys a policy file may have, at the top, in "secrets" and in "hook".
 _TOP_LEVEL_KEYS = (
     "default", "deny_args", "tools", "server_requests", "client_requests", "injection", "secrets", "limits",
     "flows", "classify_by_annotations", "hide_blocked_tools", "require_labels", "server_labels", "approvals", "hook",
+    "schema_checks",
 )
 # The keys of a tool rule, and of its "command" section.
 _TOOL_RULE_KEYS = (
     "action", "deny_args", "allow_args", "other_args", "max_calls_per_minute", "labels", "command",
-    "max_calls_per_session", "max_distinct",
+    "max_calls_per_session", "max_distinct", "schema_checks",
 )
 _COMMAND_KEYS = ("arg", "shell", "deny_classes", "ask_classes", "allow_programs", "labels_by_class", "unreadable")
 MAX_ALLOW_PROGRAMS = 100
@@ -209,7 +241,7 @@ _SECRETS_KEYS = (
 _INJECTION_KEYS = ("block_severity", "warn_severity", "mark_at", "mark")
 _LIMITS_KEYS = (
     "max_calls_per_minute", "max_calls_per_session", "max_distinct", "max_sink_bytes_per_session",
-    "max_identical_calls",
+    "max_identical_calls", "call_timeout_seconds",
 )
 _APPROVALS_KEYS = ("refusal_window_seconds", "max_refusals_per_tool")
 _HOOK_KEYS = ("config_changes", "treat_auto_as_non_prompting")
@@ -342,6 +374,37 @@ class DistinctLimit:
 
 
 @dataclass(frozen=True)
+class SchemaChecks:
+    """A "schema_checks" section, at the top of a policy or in a tool rule. None: not set here.
+
+    arguments:       a call's arguments against the tool's inputSchema: "off", "warn" (reported and
+                     recorded, let through) or "enforce" (refused, rule schema.arguments).
+    results:         a tools/call result's structuredContent against the tool's outputSchema, the same
+                     three choices (rule schema.result).
+    undeclared_args: "block" refuses a call with a top-level argument the inputSchema's properties do
+                     not name (rule schema.arguments); "allow" leaves that to `arguments`.
+    remote_refs:     a tool whose schema refers outside itself: "warn" (reported) or "quarantine".
+    Policy.schema_checks_for gives the settings that apply to one tool, with every value set.
+    """
+
+    arguments: str | None = None
+    results: str | None = None
+    undeclared_args: str | None = None
+    remote_refs: str | None = None
+
+    def __post_init__(self) -> None:
+        for key, choices in SCHEMA_CHECK_CHOICES.items():
+            value = getattr(self, key)
+            if value is not None:
+                _expect_choice(value, f"schema_checks.{key}", choices)
+
+    def enabled(self) -> bool:
+        """Whether these settings ask the proxy to check calls or results against the schemas."""
+        return self.arguments in ("warn", "enforce") or self.results in ("warn", "enforce") or (
+            self.undeclared_args == "block")
+
+
+@dataclass(frozen=True)
 class ToolRule(_NamedRule):
     deny_args: tuple[ArgRule, ...] = ()
     allow_args: tuple[ArgRule, ...] = ()
@@ -359,6 +422,8 @@ class ToolRule(_NamedRule):
     # Session limits (0.6): calls in one session, and different values of an argument.
     max_calls_per_session: int | None = None
     max_distinct: tuple[DistinctLimit, ...] = ()
+    # The tool's own schema_checks (proxy only); None: the policy's top-level settings apply.
+    schema_checks: SchemaChecks | None = None
 
     @property
     def labelled(self) -> bool:
@@ -566,6 +631,11 @@ class Policy:
                                      without asking (0: never), and after how many refusals of one tool
                                      within that time its asks are refused too (0: never).
     hook                             the "hook" section (HookOptions): settings only the Claude Code hook reads.
+    schema_checks                    the top-level SchemaChecks (proxy only); see schema_checks_for.
+    call_timeout_seconds             limits.call_timeout_seconds: how long the proxy waits for the server
+                                     to answer a call (tools/call, resources/read, prompts/get) before it
+                                     answers the client with an error and cancels the call; None (the
+                                     default) waits as long as it takes.
     """
 
     default: str = "block"
@@ -603,6 +673,11 @@ class Policy:
     refusal_window_seconds: int = DEFAULT_REFUSAL_WINDOW_SECONDS
     max_refusals_per_tool: int = DEFAULT_MAX_REFUSALS_PER_TOOL
     hook: HookOptions = field(default_factory=HookOptions)
+    schema_checks: SchemaChecks = field(default_factory=SchemaChecks)
+    # Not a field (no annotation): the SHA-256 of the file from_file read, for the audit
+    # records; None for a policy built in code or with from_dict.
+    source_sha256 = None
+    call_timeout_seconds: int | float | None = None
 
     def __post_init__(self) -> None:
         # A policy can also be built in code, without the loader. An action such
@@ -620,6 +695,10 @@ class Policy:
             for label in rule.labels:
                 _expect_label(label, f"{where}.labels")
             _check_session_limits(rule.max_calls_per_session, rule.max_distinct, where)
+            if rule.schema_checks is not None and not isinstance(rule.schema_checks, SchemaChecks):
+                raise PolicyError(f"{where}.schema_checks must be a SchemaChecks, got {type_name(rule.schema_checks)}")
+        if not isinstance(self.schema_checks, SchemaChecks):
+            raise PolicyError(f"schema_checks must be a SchemaChecks, got {type_name(self.schema_checks)}")
         _check_code_arg_rules(self.deny_args, "deny_args", deny=True)
         if self.max_calls_per_minute is not None:
             _expect_calls_per_minute(self.max_calls_per_minute, "limits")
@@ -638,6 +717,8 @@ class Policy:
         _expect_severity(self.warn_severity, "injection.warn_severity", "null gives no notice")
         _expect_severity(self.mark_at, "injection.mark_at", "null sets no mark")
         _expect_mark_label(self.injection_mark, "injection.mark")
+        if self.call_timeout_seconds is not None:
+            _expect_call_timeout(self.call_timeout_seconds)
         for request in self.server_requests:
             _expect_choice(request.action, f"server_requests.{request.name}", ("allow", "block"))
         for request in self.client_requests or ():
@@ -684,10 +765,15 @@ class Policy:
 
         A file that cannot be read raises OSError, as open() does;
         `policy_errors.file_error_message` words it for a person.
+
+        The policy remembers the SHA-256 of the file's bytes, in `source_sha256`,
+        so that each audit record can name the policy that decided it. A policy
+        built any other way has None there.
         """
         label = str(path)
         try:
-            text = Path(path).read_text(encoding="utf-8-sig")
+            raw = Path(path).read_bytes()
+            text = raw.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
             raise PolicyError(unicode_error_message(label, exc)) from exc
         try:
@@ -699,9 +785,11 @@ class Policy:
         except (ValueError, RecursionError) as exc:  # absurd nesting, a huge number, NaN or Infinity
             raise PolicyError(f"{label}: not valid JSON ({exc})") from exc
         try:
-            return cls.from_dict(data)
+            policy = cls.from_dict(data)
         except PolicyError as exc:
             raise PolicyError(f"{label}: {exc}") from exc
+        policy.source_sha256 = hashlib.sha256(raw).hexdigest()
+        return policy
 
     @classmethod
     def from_dict(cls, data: Any) -> "Policy":
@@ -734,6 +822,9 @@ class Policy:
 
         limits = data.get("limits", {})
         _expect_object(limits, "limits", allowed_keys=_LIMITS_KEYS)
+        call_timeout = limits.get("call_timeout_seconds")
+        if "call_timeout_seconds" in limits:
+            _expect_call_timeout(call_timeout)
         approvals = data.get("approvals", {})
         _expect_object(approvals, "approvals", allowed_keys=_APPROVALS_KEYS)
 
@@ -783,6 +874,8 @@ class Policy:
                 approvals, "max_refusals_per_tool", "approvals", 0, MAX_REFUSALS_SETTING, DEFAULT_MAX_REFUSALS_PER_TOOL,
             ),
             hook=_hook_options(data.get("hook", {})),
+            schema_checks=_schema_checks(data.get("schema_checks", {}), "schema_checks"),
+            call_timeout_seconds=call_timeout,
         )
 
     # ---- evaluating ---------------------------------------------------------
@@ -991,6 +1084,33 @@ class Policy:
         """Every flow label the policy gives this call: the tool's labels and its command's (for explain, check)."""
         return self.tool_labels(tool) | self.command_labels(tool, args)
 
+    def schema_checks_for(self, tool: str) -> SchemaChecks:
+        """The schema_checks that apply to `tool` (the proxy's checks against the server's schemas), every value set.
+
+        For each setting: the tool rules that decide for the tool (the exact
+        rule if there is one, otherwise every wildcard that matches, as for
+        actions), and of those that set it, the strictest; else the top-level
+        "schema_checks"; else SCHEMA_CHECK_DEFAULTS. So an exact rule can make
+        an exception for one tool with a sloppy schema, as it can for an action.
+        """
+        rules = _deciding_rules(self.tools, tool) if isinstance(tool, str) else []
+        settings: dict[str, str] = {}
+        for key, choices in SCHEMA_CHECK_CHOICES.items():
+            given = [getattr(rule.schema_checks, key) for rule in rules if rule.schema_checks is not None]
+            given = [value for value in given if value is not None]
+            if given:
+                settings[key] = max(given, key=choices.index)  # the choices are listed from loosest to strictest
+            else:
+                top = getattr(self.schema_checks, key)
+                settings[key] = top if top is not None else SCHEMA_CHECK_DEFAULTS[key]
+        return SchemaChecks(**settings)
+
+    @property
+    def uses_schema_checks(self) -> bool:
+        """Whether any tool's calls or results are checked against the server's schemas (so the proxy keeps them)."""
+        return self.schema_checks.enabled() or any(
+            rule.schema_checks is not None and rule.schema_checks.enabled() for rule in self.tools)
+
     def flow_verdict(
         self, tool: str, marks: SessionMarks | Iterable[str], extra_labels: Iterable[str] = (),
         args: dict[str, Any] | None = None,
@@ -1034,6 +1154,27 @@ class Policy:
     def server_marks(self, server: str | None) -> frozenset[str]:
         """The marks server_labels gives everything the server of this name delivers (proxy --name; None: no name)."""
         return frozenset(label for rule in self.server_labels if rule.matches(server) for label in rule.labels)
+
+    def sampling_flow_verdict(self, marks: SessionMarks | Iterable[str]) -> Verdict | None:
+        """The verdict on a sampling request (sampling/createMessage) in a session with these marks, or None.
+
+        The answer to a sampling request is text the client's model writes
+        from the conversation, sent to the server: data leaves as it would
+        through a tool labelled "sink". So the first "block" flow whose
+        "then" is "sink" and whose "after" marks the session holds refuses
+        it, as it would refuse such a call. An "ask" flow does not apply:
+        a sampling request is not a call anyone is asked about.
+        """
+        if not self.flows:
+            return None
+        if not isinstance(marks, SessionMarks):
+            marks = SessionMarks.of(marks)
+        for index, flow in enumerate(self.flows):
+            if flow.action == "block" and flow.then == SINK and marks.has_all(flow.after):
+                reason = _flow_reason(index, flow, SAMPLING_CREATE, marks)
+                return Verdict("block", f"{reason} (a sampling request is judged as a call to a sink)", NOT_PERMITTED,
+                               f"flows[{index}]")
+        return None
 
     def call_limits(self, tool: str) -> list[tuple[str, int]]:
         """Return the (bucket name, calls per minute) limits that apply to a call of `tool`.
@@ -1102,6 +1243,15 @@ class Policy:
                               "session state that cannot be used), so it refused",
             RULE_HOOK_CONFIG_CHANGES: f'hook.config_changes is "{self.hook.config_changes}": the Claude Code hook '
                                       "refuses a change to Claude Code's settings or skills made during a session",
+            RULE_AUDIT: "the audit record could not be written, and --audit-required refuses what is not recorded",
+            RULE_SCHEMA_ARGUMENTS: "the proxy's check of a call's arguments against the input schema the server "
+                                   "declared for the tool (schema_checks.arguments, schema_checks.undeclared_args)",
+            RULE_SCHEMA_RESULT: "the proxy's check of a result's structuredContent against the output schema the "
+                                "server declared for the tool (schema_checks.results)",
+            RULE_SCHEMA_REMOTE_REFS: "the tool's schema refers to something outside itself, such as a $ref to a "
+                                     "web address, so the tool was quarantined (schema_checks.remote_refs)",
+            RULE_INCLUDE_CONTEXT: "a sampling request that asks the client to include context (includeContext other "
+                                  "than 'none') is refused by the proxy",
         }
         if rule_id in fixed:
             return fixed[rule_id]
@@ -1113,6 +1263,11 @@ class Policy:
         session_limit = self._describe_session_limit(rule_id)
         if session_limit is not None:
             return session_limit
+        if rule_id == RULE_CALL_TIMEOUT:
+            if self.call_timeout_seconds is None:
+                return "limits.call_timeout_seconds: a call the server does not answer in time is cancelled (not set)"
+            return (f"a call the server does not answer within {self.call_timeout_seconds:g} seconds is answered "
+                    "with an error and cancelled (limits.call_timeout_seconds)")
         indexed = re.fullmatch(rf"deny_args{_INDEX}", rule_id)
         if indexed:
             entry = _entry(self.deny_args, indexed.group(1))
@@ -1888,6 +2043,8 @@ def _tool_rule(name: Any, spec: Any) -> ToolRule:
         labels_given="labels" in spec,
         max_calls_per_session=_whole_setting(spec, "max_calls_per_session", where, 1, MAX_SESSION_CALLS),
         max_distinct=_distinct_limits(spec.get("max_distinct", []), f"{where}.max_distinct"),
+        schema_checks=_schema_checks(spec["schema_checks"], f"{where}.schema_checks") if "schema_checks" in spec
+        else None,
     )
 
 
@@ -1943,6 +2100,14 @@ def _labels_by_class(specs: Any, where: str) -> tuple[tuple[str, tuple[str, ...]
         matchers.command_classes([kind], f"{where}: key")
         pairs.append((kind, _labels(labels, f"{where}.{kind}", allow_sink=True)))
     return tuple(pairs)
+
+
+def _schema_checks(spec: Any, where: str) -> SchemaChecks:
+    """Read a "schema_checks" object: each key optional, each value one of its SCHEMA_CHECK_CHOICES."""
+    _expect_object(spec, where, allowed_keys=tuple(SCHEMA_CHECK_CHOICES))
+    for key, value in spec.items():
+        _expect_choice(value, f"{where}.{key}", SCHEMA_CHECK_CHOICES[key])
+    return SchemaChecks(**spec)
 
 
 def _labels(specs: Any, where: str, allow_sink: bool) -> tuple[str, ...]:
@@ -2324,6 +2489,14 @@ def _expect_calls_per_minute(value: Any, where: str) -> None:
     # bool is a subclass of int in Python, and `true` is not a number of calls.
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise PolicyError(f"{where}.max_calls_per_minute must be a whole number of 1 or more, got {quoted(value)}")
+
+
+def _expect_call_timeout(value: Any) -> None:
+    """Refuse a limits.call_timeout_seconds that is not a number of seconds above 0 and at most a day."""
+    if (isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            or not 0 < value <= MAX_CALL_TIMEOUT_SECONDS):
+        raise PolicyError(f"limits.call_timeout_seconds must be a number of seconds above 0 and at most "
+                          f"{MAX_CALL_TIMEOUT_SECONDS}, got {quoted(value)}")
 
 
 def _check_code_arg_rules(rules: Sequence[ArgRule], where: str, deny: bool) -> None:

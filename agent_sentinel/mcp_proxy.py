@@ -62,6 +62,14 @@ this machine, and the client's answer to the proxy's own elicitation is
 matched by a random id that is never sent to the server, and never
 forwarded to it.
 
+Containing the server
+---------------------
+With --contain (or a --server-* limit, or --sandbox), the server is started
+inside a job object (Windows) or a process group with resource limits
+(Linux, macOS), so that it ends with the proxy, and with --sandbox behind
+bubblewrap or sandbox-exec. When what was asked for cannot be set up, the
+proxy does not start. See containment.py, including what this does not do.
+
 What the operator sees
 ----------------------
 On stderr, which MCP clients keep in their log of the server (see
@@ -134,16 +142,52 @@ resources/templates/list reply are checked one by one (_clean_items):
 * each entry is scanned (a tool's description also with the tool names the
   policy gives other servers, to catch shadowing), and tools, prompts and
   resource templates are compared with their pins (pins.py), as are the
-  server's instructions.
+  server's instructions;
+* a tool whose inputSchema or outputSchema refers outside itself (a $ref to
+  a web address or a file) is reported, or quarantined when the policy's
+  schema_checks.remote_refs says so (schema_check.remote_refs).
 
 A tool, prompt or template that fails is removed from the list and
 quarantined for as long as the proxy runs: it is left out of later lists, a
-tool cannot be called, a prompt cannot be fetched. Changed instructions are
-removed from the reply. With a pins file, a changed definition is kept
-beside it for `agent-sentinel pins diff` and `pins accept`. Then, if the
-policy says hide_blocked_tools, the tools it blocks outright are hidden from
-the list (never in monitor mode); a call to a hidden tool is still checked
-and refused.
+tool cannot be called, a prompt cannot be fetched, and no URI the template
+may produce can be read or subscribed to (uri_template.py). Changed
+instructions are removed from the reply. With a pins file, a changed
+definition is kept beside it for `agent-sentinel pins diff` and `pins
+accept`. Then, if the policy says hide_blocked_tools, the tools it blocks
+outright are hidden from the list (never in monitor mode); a call to a
+hidden tool is still checked and refused.
+
+A list that comes in pages (nextCursor) is scanned across the boundary of
+two pages as well (_checked_page_boundary): the end of the page before is
+read with the start of the next.
+
+With --pin-server the server itself is pinned too (pins.py, "The server
+itself"): how it is launched, before it starts, and the serverInfo of its
+handshake. A server that differs from its pin is not started, or its
+handshake is refused (--on-server-change refuse, the default); with
+--on-server-change quarantine it runs quarantined (quarantine_server): every
+tool, prompt, resource and resource template is left out of its lists; its
+instructions are removed and never pinned; tool calls, prompts, resource
+reads, subscriptions (subscriptions/listen too), completions and any other
+request but the handshake, ping, the lists and logging/setLevel are
+refused; every request it sends the client (sampling, elicitation, roots;
+not ping) is refused, and every notification it sends but
+notifications/cancelled is dropped. Monitor mode logs the change only.
+
+Schemas and server metadata
+---------------------------
+When the policy's schema_checks ask for it, the schemas of each tool that
+passed the list's checks are kept (schema_check.SchemaStore), and a call's
+arguments are checked against its inputSchema before the policy sees the
+call, a result's structuredContent against its outputSchema before it is
+scanned: "warn" records and reports a mismatch, "enforce" refuses it (rules
+schema.arguments and schema.result). A tool not in this session's checked
+list cannot be checked, which counts as a mismatch.
+
+The serverInfo that MCP 2026-07-28 puts into every result's _meta, and that
+a client may show, has its unsafe icons and an unsafe websiteUrl dropped in
+every result and message from the server, as in the handshake; so do the
+icons of the resource_link items in a result's content (_clean_metadata).
 
 Requests other than tool calls
 ------------------------------
@@ -164,16 +208,31 @@ entries of input_required results and to URLElicitationRequiredError replies.
 
 Flow rules
 ----------
-One proxy process is one session. When a tools/call or resources/read result
-is delivered, the session gains the marks of that tool (Firewall.marks_for,
-worked out when the call was let through), so a later call can be refused by
-a flow rule. Marks are set just before the reply is sent, and only for a
-reply that is sent; a reply that is blocked sets none. The labels implied by
-each listed tool's MCP annotations are passed to the firewall as well.
+One proxy process is one session, unless it is given --session-group: then
+the proxies of one run of the MCP client that name the same group share one
+session, kept in a file (session.GroupSessionStore; the run is found by
+client_run.py), and what one server delivered counts for the calls of the
+others. When a tools/call or resources/read result is delivered, the session
+gains the marks of that tool (Firewall.marks_for, worked out when the call
+was let through), so a later call can be refused by a flow rule. Marks are
+set just before the reply is sent, and only for a reply that is sent; a
+reply that is blocked sets none.
+
+The labels implied by each listed tool's MCP annotations are passed to the
+firewall as well, and at startup those of the pinned tools. While the policy
+has flow rules and classify_by_annotations is on, a tool that neither a
+checked tools/list nor a pin has shown counts as untrusted and a sink.
+
+A sampling request from the server (sampling/createMessage, or an
+input_required entry asking for one) is refused when it asks for
+includeContext other than "none", and, once the session holds every mark of
+a "block" flow whose "then" is "sink", as a call to a sink would be.
 
 Also set on delivery: the policy's server_labels for this server (--name),
 for every reply, notification and request the server sends; and the
-injection.mark for content at or above injection.mark_at.
+injection.mark for content at or above injection.mark_at. In a session
+group these marks are shared like a tool's (each records the member that
+set it, and how its content arrived).
 
 Warn notices and the tail scan
 ------------------------------
@@ -185,12 +244,48 @@ of each delivered tools/call, resources/read and prompts/get reply, and of
 each notification and request from the server, is kept (in the session
 store) and read together with the start of the next one on the same channel
 (tail_scan.py), so an injection cut in two at that boundary is seen whole.
+The tail is this server's own, in memory, in a session group too: only the
+marks are shared there, and so are not the counts of the session limits or
+approval memory, which each proxy keeps for itself.
+
+Call timeout
+------------
+With limits.call_timeout_seconds, a tools/call, resources/read or
+prompts/get the server does not answer in time is answered with a JSON-RPC
+error (the neutral reason and a ref), cancelled at the server with
+notifications/cancelled, and recorded with event "timeout". The server's
+late reply is dropped, and the request's id stays in use until it comes.
+
+The audit log
+-------------
+Every record is linked into the log's hash chain (audit_chain.py), and with
+--audit-key-file signed (HMAC-SHA256). Three session records say what
+wrote the records between them: session_start before the server is started
+(the version, the policy's SHA-256, monitor mode, the pins file's SHA-256, a
+hash of the server command with secrets masked, whether the server is
+contained or sandboxed, the OS user and the host),
+protocol once the handshake is done (the protocol version, the client's and
+the server's name and version; at most MAX_PROTOCOL_RECORDS), and
+session_end when the proxy stops. --audit-required refuses to start when
+the log cannot be written, and refuses what cannot be recorded afterwards;
+--audit-max-bytes rotates the log (FILE.1, FILE.2, ...; never deleted).
+
+A proxy that does not start its server after session_start says why in its
+session_end: the server differs from its pin (--pin-server), it could not be
+contained as asked, the session group could not be joined, or it could not
+be started. The order at startup is: the options, the policy and the pins;
+the firewall (the audit key is read); the startup lines; session_start; the
+server's launch against its pin; the containment; the session group; then
+the server is started.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
+import heapq
+import itertools
 import json
 import os
 import re
@@ -203,7 +298,8 @@ from dataclasses import dataclass, field
 from secrets import token_hex
 from typing import Any, BinaryIO, Callable, Iterable, Mapping, Sequence
 
-from . import __version__, elicitation, proxy_report
+from . import __version__, audit_chain, client_run, containment, elicitation, home, proxy_report, schema_check
+from . import uri_template
 from . import mcp_protocol as protocol
 from . import server_env
 from .approvers import (
@@ -228,21 +324,37 @@ from .firewall import (
     secret_rule,
 )
 from .jsonutil import finite_float, no_constant
+from .launch import launch_identity
 from .leaks import Found
 from .mcp_protocol import ShapeError
-from .pins import CHANGED, FULL, KIND_WORDS, PINNED_LISTS, ToolPins, definition_of, fingerprint
+from .pins import (
+    CHANGED, FULL, KIND_WORDS, NEW, PINNED_LISTS, ToolPins, definition_of, fingerprint, pending_path, server_info_value,
+)
 from .policy import (
     PROMPTS_GET,
+    RULE_CALL_TIMEOUT,
+    RULE_INCLUDE_CONTEXT,
     RULE_MALFORMED,
     RULE_QUARANTINE,
+    RULE_SCHEMA_ARGUMENTS,
+    RULE_SCHEMA_REMOTE_REFS,
+    RULE_SCHEMA_RESULT,
     RULE_SECRETS_IN_RESULTS,
     RULE_UNSCANNABLE,
+    SAMPLING_CREATE,
     Policy,
     PolicyError,
+    SchemaChecks,
 )
 from .policy_errors import file_error_message, type_name
-from .session import SessionStateError
-from .textutil import UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable, tool_parameters
+from .detector import METADATA, SEVERITY_ORDER, max_severity, scan_views
+from .session import (
+    GROUP_NAME_RULE, JOINED, NEW_RUN, REPLACED, GroupJoin, GroupSessionStore, SessionStateError, group_name,
+)
+from .textutil import (
+    MAX_CONTAINERS, UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable, text_views,
+    tool_parameters,
+)
 
 # How long a tool call waits for an in-flight tools/list reply to be checked.
 TOOL_LIST_WAIT_SECONDS = 15
@@ -263,6 +375,25 @@ MAX_REPORTED = 10_000  # things reported once on stderr (see _first_report)
 MAX_LABEL_CHARS = 200
 MAX_NAME_CHARS = 256  # tool names and request ids the proxy has to remember
 MAX_WAITING_APPROVALS = 16  # calls held for a person's answer; more are refused at once
+MAX_WEBSITE_URL_CHARS = 2048  # a serverInfo websiteUrl longer than this is dropped unread
+MAX_QUARANTINED_TEMPLATES = 1_000  # the uriTemplates of quarantined resource templates; past it, no read is let through
+
+# Pagination (_checked_page_boundary): while a list's cursor chain is open, the text nearest the end
+# of the page before is scanned with the text nearest the start of the next page, this many bytes of
+# each (see _boundary_view).
+PAGE_BOUNDARY_BYTES = 4096
+# The text members kept at a boundary, on each side: the five a model reads first, then others (nested
+# ones too, such as "inputSchema/properties/q/description"), the first found nearest the boundary.
+MAX_BOUNDARY_MEMBERS = 16
+MAX_BOUNDARY_PATH_CHARS = 128  # a member's path ("annotations/title") is cut to its last this many characters
+_MEMBER_OVERHEAD = 6  # what a kept value costs besides its path and its text: quotes, colon, comma, as in JSON
+_REPEATS_KEPT = 3  # as in textutil.text_views: a run of one text says nothing more after a few copies
+# Ends of pages kept at once, per list, by the cursor of the page after: the one used least recently goes first.
+MAX_OPEN_CURSORS = 8
+
+# limits.call_timeout_seconds applies to these requests: the ones the policy decides like a call.
+_TIMED_METHODS = ("tools/call", "resources/read", PROMPTS_GET)
+TIMEOUT_ERROR_CODE = -32001  # what MCP's SDKs answer a request that timed out with
 
 # proxy --approval-timeout: how long a held call waits for an answer, in seconds.
 DEFAULT_APPROVAL_TIMEOUT = 120
@@ -279,8 +410,12 @@ _RESERVED_TOOL_NAMES = (*_RESOURCE_METHODS, PROMPTS_GET)
 # The client requests the policy decides. Each must have an id: sent as a notification, it is refused.
 _POLICY_METHODS = ("tools/call", *_RESERVED_TOOL_NAMES, protocol.SUBSCRIPTIONS_LISTEN)
 COMPLETION_COMPLETE = "completion/complete"
-# Where 2026-07-28 puts the server's serverInfo (in the _meta of a server/discover result).
+# Where 2026-07-28 puts the server's serverInfo (in the _meta of a server/discover result), and the client's.
 _SERVER_INFO_KEY = "io.modelcontextprotocol/serverInfo"
+_CLIENT_INFO_KEY = "io.modelcontextprotocol/clientInfo"
+# "protocol" audit records per proxy: one per handshake, and a client that repeats it cannot fill the log.
+MAX_PROTOCOL_RECORDS = 16
+MAX_RECORDED_VERSIONS = 10
 
 # List methods and the result field that holds their items. Items are scanned
 # one by one, so a single poisoned entry does not take the whole list down.
@@ -290,6 +425,14 @@ _LIST_ITEMS_KEY = {
     "resources/list": "resources",
     "resources/templates/list": "resourceTemplates",
 }
+# What a client may still ask of a server quarantined for differing from its pin (Proxy.quarantine_server): the
+# handshake, ping, the lists (every entry is removed) and the log level. The other requests are refused.
+_ASKED_OF_A_QUARANTINED_SERVER = frozenset({
+    protocol.INITIALIZE, protocol.SERVER_DISCOVER, "ping", *_LIST_ITEMS_KEY, "logging/setLevel",
+})
+# What such a server may still tell the client: that it cancelled a request of its own. Its other
+# notifications (log messages, progress, list changes, resource updates) are dropped.
+_TOLD_BY_A_QUARANTINED_SERVER = frozenset({"notifications/cancelled"})
 # One entry of each list, as audit events name it ("tool_changed", "prompt_lookalike", ...).
 _ENTRY_NAME = {"tools": "tool", "prompts": "prompt", "resources": "resource", "resourceTemplates": "resource_template"}
 # The lists whose names are what the client calls or fetches by: they follow the
@@ -307,7 +450,14 @@ TOOL_NAMES_WARN = "warn"  # kept, and reported on stderr and in the audit log (t
 TOOL_NAMES_OFF = "off"  # neither the naming rules nor look-alikes are checked
 TOOL_NAME_MODES = (TOOL_NAMES_STRICT, TOOL_NAMES_WARN, TOOL_NAMES_OFF)
 
+# proxy --on-server-change, with --pin-server: what happens when the server differs from its pin (pins.py).
+SERVER_CHANGE_REFUSE = "refuse"  # the proxy does not start (a changed launch) or refuses the handshake (serverInfo)
+SERVER_CHANGE_QUARANTINE = "quarantine"  # it starts, with every tool, prompt and resource template quarantined
+SERVER_CHANGE_MODES = (SERVER_CHANGE_REFUSE, SERVER_CHANGE_QUARANTINE)
+
 JsonObject = dict[str, Any]
+# What the boundary scan keeps of one entry of a list (_boundary_view): (member path, text) pairs, in the entry's order.
+_KeptEntry = tuple[tuple[str, str], ...]
 
 # A name the proxy may put into a command line it suggests to the operator (pins diff NAME). The name
 # comes from the server, and Windows quoting (list2cmdline) does not stop cmd.exe reading "&" or
@@ -324,6 +474,15 @@ _UNSUPPORTED_REQUEST = "this request is not supported"
 _UNSUPPORTED_REPLY = "the server sent a reply this proxy cannot check"
 _UNSUPPORTED_VERSION = "the server chose a protocol version this proxy does not support"
 _UNCHECKED_CONTENT = "the content could not be checked, so it was withheld"
+# A call or result refused by schema_checks. Neither says which part failed: the audit record does.
+_SCHEMA_ARGUMENTS_REFUSAL = "the arguments do not match the tool's input schema"
+_SCHEMA_RESULT_REFUSAL = "the server sent a result that does not match the tool's output schema"
+# A property name a schema problem leaves out, and why (_ShownNames).
+_NAME_NOT_SHOWN = "[name not shown]"
+_NAMES_NOT_SHOWN = " (names are not shown: they hold what looks like a secret)"
+_TIMEOUT_REFUSAL = "the server did not answer in time, so the request was cancelled"
+_TIMED_OUT_ID_REFUSAL = "the id of this request belongs to a request that timed out; send it with another id"
+_TEMPLATE_REFUSAL = "this resource cannot be read: its template was removed from the template list"
 # What a refused server is told: nothing about why.
 _SERVER_REFUSAL = "request refused"
 
@@ -343,6 +502,25 @@ class _PendingRequest:
     call_id: str | None = None  # the firewall's id for this call, so the result's record shares it
     # The request named a 2026-07-28 protocol version, so a result the proxy builds for it needs a resultType.
     modern: bool = False
+    tool: str | None = None  # tools/call only: the tool's name in full (the label may be shortened)
+    # A list request that continues a cursor chain: a digest of its cursor (see _checked_page_boundary).
+    cursor: str | None = None
+    # limits.call_timeout_seconds: when, on time.monotonic(), the call is answered with an error if the
+    # server has not answered it. Once that happened, `timed_out` is set and the server's reply is dropped.
+    deadline: float | None = None
+    timed_out: bool = False
+
+
+@dataclass(frozen=True)
+class _PageTail:
+    """The end of a page of a list whose next page has not been checked yet (see _checked_page_boundary).
+
+    Side by side, for each entry with text in the boundary view (_boundary_view), in page order:
+    """
+
+    texts: tuple[_KeptEntry, ...]  # the text kept of it, PAGE_BOUNDARY_BYTES in all
+    names: tuple[str, ...]  # its name, to quarantine (tools, prompts, resource templates); "" if it has none
+    templates: tuple[str, ...]  # its uriTemplate (resource templates); "" if it has none
 
 
 @dataclass(frozen=True)
@@ -504,11 +682,277 @@ def _request_description(message: JsonObject) -> str:
     return printable(method, limit=MAX_LABEL_CHARS)
 
 
+def _content_blocks(holder: JsonObject) -> Iterable[JsonObject]:
+    """The content blocks of a result or a message's params: its `content`, that of each of its `messages`, and theirs.
+
+    A tool's result holds a list of blocks; a prompt's messages (prompts/get)
+    and a sampling request's messages each hold one block, or a list of them.
+    A block may hold blocks of its own: a sampling message's tool_result
+    (2025-11-25) has a `content` list like a tool's result. So the `content`
+    of every block is walked too, at any depth, whatever the block's type.
+    Anything that is not an object is skipped. The walk is iterative and
+    stops after textutil.MAX_CONTAINERS blocks: a message with more parts
+    than that is refused by the scan that follows.
+    """
+    holders = [holder]
+    messages = holder.get("messages")
+    if isinstance(messages, list):
+        holders += [message for message in messages if isinstance(message, dict)]
+    pending: list[Any] = [one.get("content") for one in reversed(holders)]
+    seen = 0
+    while pending and seen < MAX_CONTAINERS:
+        content = pending.pop()
+        for block in content if isinstance(content, list) else [content]:
+            if isinstance(block, dict):
+                seen += 1
+                yield block
+                if "content" in block:
+                    pending.append(block["content"])
+
+
 def _reply_description(pending: _PendingRequest) -> str:
     """The reply to a request, as the operator reads it: "the reply to tools/call 'fetch_page'"."""
     if pending.label != pending.method:
         return f"the reply to {pending.method} '{printable(pending.label, limit=MAX_LABEL_CHARS)}'"
     return f"the reply to {pending.method}"
+
+
+class _ShownNames:
+    """How the problems of a schema check show property names: of a call's arguments, or a result's structuredContent.
+
+    A schema check runs before the secret guard and the scanner, and its
+    reason names properties ("the argument 'x' is not declared"). The reason
+    goes to stderr, which the client keeps in its log and which is not
+    redacted, and to the audit log, which redacts each string alone and so
+    misses a secret split over two names, or cut in half when a long name is
+    shortened. So the problems are made twice when they name anything: first
+    with every name as it is, which records the names (`asked`); then, if
+    the policy's guard finds a secret in those names, each alone or joined
+    (Firewall.holds_a_secret), again with no name shown (`hide_if_secret`).
+    The names are read once each, in the order first asked for, so that the
+    path a parent's name repeats in every problem does not come between two
+    halves of a secret split over its members. Only the names a reason would
+    show are read, never the whole value, and a value without problems costs
+    nothing more.
+    """
+
+    def __init__(self, firewall: Firewall) -> None:
+        self._firewall = firewall
+        self.asked: dict[str, None] = {}  # bounded: names are asked for only for the few problems reported
+        self.hidden = False
+
+    def __call__(self, name: str) -> str:
+        if self.hidden:
+            return _NAME_NOT_SHOWN
+        self.asked.setdefault(name)
+        return name
+
+    def hide_if_secret(self) -> bool:
+        """Whether the names asked for so far hold a secret; if so, no name is shown from now on."""
+        if not self.hidden and self.asked and self._firewall.holds_a_secret(list(self.asked)):
+            self.hidden = True
+        return self.hidden
+
+    def note(self) -> str:
+        """What to add to a reason: why its names are missing, or nothing."""
+        return _NAMES_NOT_SHOWN if self.hidden else ""
+
+
+def _digest(text: str) -> str:
+    """A short fixed-length stand-in for a text the proxy must recognise later, such as a cursor."""
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+def _cursor_digest(message: JsonObject) -> str | None:
+    """The digest of the cursor a list request continues from, or None for the first page.
+
+    Every string is a cursor, "" too, as every string nextCursor starts a
+    chain (_remember_page_end). A list reply whose nextCursor is not a
+    string is refused, so a cursor of another type was never handed out by
+    the server through this proxy.
+    """
+    params = message.get("params")
+    cursor = params.get("cursor") if isinstance(params, dict) else None
+    return _digest(cursor) if isinstance(cursor, str) else None
+
+
+# The members of a list entry a model reads first: the boundary scan always looks for them.
+_BOUNDARY_MEMBERS = ("description", "title", "name", "uriTemplate", "uri")
+
+
+def _boundary_view(
+    entries: Sequence[Any], from_end: bool, wanted: Iterable[str] = (),
+) -> list[tuple[int, _KeptEntry]]:
+    """The text nearest one end of a page of a list, PAGE_BOUNDARY_BYTES in all, for _checked_page_boundary.
+
+    A list is scanned whole (textutil.text_views), and one of the ways it is
+    read joins the texts at one path ("description", "annotations/title",
+    "inputSchema/properties/q/description", "arguments/*/description": a
+    member, nested or not, with list positions as "*") over the entries that
+    have it, skipping the entries that do not. So for each member this keeps
+    the values of the entries nearest that end (the end of the page when
+    from_end, else its start) that have text in it, as many as fit the
+    member's share. The budget is shared fairly: a member that needs less than
+    an equal share leaves the rest to the others, so a long description cannot
+    crowd out a title. A kept value costs its path, its text and
+    _MEMBER_OVERHEAD bytes; the last value kept of a member is cut, keeping
+    the part nearest the boundary. The five members of _BOUNDARY_MEMBERS and
+    the `wanted` ones (the members the other side of the boundary kept) are
+    always looked for, and besides them the first others found nearest the
+    boundary, MAX_BOUNDARY_MEMBERS - 5 of them. As in text_views, a run of the
+    same text is kept at most _REPEATS_KEPT times.
+
+    `entries` are list entries, or what this kept of entries before (a
+    _KeptEntry, read as it is). Returns (index into `entries`, the (member,
+    kept text) pairs) for each entry with text kept, in page order, its texts
+    in the entry's own order.
+    """
+    found = _boundary_values(entries, from_end, wanted)
+    shares = _fair_shares({key: sum(_value_cost(key, value) for _, _, value in values)
+                           for key, values in found.items()}, PAGE_BOUNDARY_BYTES)
+    kept: dict[int, list[tuple[int, str, str]]] = {}
+    for key, values in found.items():
+        room = shares[key]
+        fixed = _value_cost(key, "")
+        for index, position, value in values:
+            piece = _cut_to_bytes(value, room - fixed, keep_end=from_end) if room > fixed else ""
+            if not piece:
+                break
+            kept.setdefault(index, []).append((position, key, piece))
+            room -= _value_cost(key, piece)
+    return [(index, tuple((key, piece) for _, key, piece in sorted(kept[index]))) for index in sorted(kept)]
+
+
+def _boundary_values(
+    entries: Sequence[Any], from_end: bool, wanted: Iterable[str] = (),
+) -> dict[str, list[tuple[int, int, str]]]:
+    """For each member, the (index, position, value) of the entries nearest one end that have text in it, nearest first.
+
+    `position` is the value's place among the texts of its entry
+    (_entry_texts). A member is followed until its values would cost
+    PAGE_BOUNDARY_BYTES, which no share can exceed. The walk reads every entry
+    otherwise (entries without a member must not hide the next one that has
+    it), unless every member is full and no other can be added.
+    """
+    found: dict[str, list[tuple[int, int, str]]] = {key: [] for key in (*_BOUNDARY_MEMBERS, *wanted)}
+    cost = dict.fromkeys(found, 0)
+    others = 0  # members found that were not looked for from the start
+    full = 0  # members whose values cost PAGE_BOUNDARY_BYTES already
+    room_for_others = MAX_BOUNDARY_MEMBERS - len(_BOUNDARY_MEMBERS)
+    for index in range(len(entries) - 1, -1, -1) if from_end else range(len(entries)):
+        entry = entries[index]
+        texts = entry if isinstance(entry, tuple) else _entry_texts(entry) if isinstance(entry, dict) else ()
+        positions = range(len(texts) - 1, -1, -1) if from_end else range(len(texts))
+        for position in positions:
+            key, value = texts[position]
+            if not value or value.isspace():
+                continue
+            if key not in found:
+                if others >= room_for_others:
+                    continue
+                found[key], cost[key] = [], 0
+                others += 1
+            values = found[key]
+            if cost[key] >= PAGE_BOUNDARY_BYTES:
+                continue
+            if len(values) >= _REPEATS_KEPT and all(text == value for _, _, text in values[-_REPEATS_KEPT:]):
+                continue
+            values.append((index, position, value))
+            cost[key] += _value_cost(key, value)
+            full += cost[key] >= PAGE_BOUNDARY_BYTES
+        if full == len(found) and others >= room_for_others:
+            break  # nothing further can be kept
+    return {key: values for key, values in found.items() if values}
+
+
+def _entry_texts(entry: Mapping[str, Any]) -> _KeptEntry:
+    """The (member path, text) of every text value in a list entry, in document order.
+
+    A path is the keys down to the value joined by "/", with "*" for a
+    position in a list, as textutil.text_views groups texts:
+    "inputSchema/properties/q/description", "arguments/*/name". A path longer
+    than MAX_BOUNDARY_PATH_CHARS is cut to its end (two paths that are then
+    the same are read as one, which only joins more). Text at any depth is
+    read, as the whole-list scan reads it: the walk is iterative, so its cost
+    is linear in the entry, and like text_views it raises UnscannableError
+    past MAX_CONTAINERS objects and arrays (an entry that large was already
+    refused by its own scan).
+    """
+    texts: list[tuple[str, str]] = []
+    stack: list[tuple[Any, str]] = [(entry, "")]
+    opened = 0
+    while stack:
+        value, path = stack.pop()
+        if isinstance(value, str):
+            if path:
+                texts.append((path, value))
+            continue
+        opened += 1
+        if opened > MAX_CONTAINERS:
+            raise UnscannableError("the list entry has too many nested parts to read")
+        # Pushed in reverse, so that they come out in document order; numbers and the like are left out.
+        if isinstance(value, dict):
+            stack.extend([(child, _member_path(path, key)) for key, child in reversed(value.items())
+                          if isinstance(key, str) and isinstance(child, _TEXT_HOLDERS)])
+        elif isinstance(value, list):
+            inner = _member_path(path, "*")
+            stack.extend([(child, inner) for child in reversed(value) if isinstance(child, _TEXT_HOLDERS)])
+    return tuple(texts)
+
+
+_TEXT_HOLDERS = (str, dict, list)  # what _entry_texts reads: JSON's text, objects and arrays
+
+
+def _member_path(path: str, step: str) -> str:
+    """`path` one step further down, cut to its last MAX_BOUNDARY_PATH_CHARS characters (see _entry_texts)."""
+    joined = f"{path}/{step}" if path else step
+    return joined[-MAX_BOUNDARY_PATH_CHARS:] if len(joined) > MAX_BOUNDARY_PATH_CHARS else joined
+
+
+def _scannable(kept: Iterable[_KeptEntry]) -> list[list[dict[str, str]]]:
+    """Kept entries in the shape the scan reads: texts of one member share one path, in document order."""
+    return [[{key: text} for key, text in entry] for entry in kept]
+
+
+def _value_cost(key: str, value: str) -> int:
+    """What one kept value of a member costs in the boundary view's budget, in bytes."""
+    return len(key.encode("utf-8", "surrogatepass")) + len(value.encode("utf-8", "surrogatepass")) + _MEMBER_OVERHEAD
+
+
+def _fair_shares(needs: Mapping[str, int], room: int) -> dict[str, int]:
+    """Split `room` among the members: each gets what it needs, up to an equal part of what the others leave."""
+    shares: dict[str, int] = {}
+    left = len(needs)
+    for key in sorted(needs, key=needs.__getitem__):
+        shares[key] = min(needs[key], room // left)
+        room -= shares[key]
+        left -= 1
+    return shares
+
+
+def _fewest(refused: Callable[[int], bool], total: int) -> int:
+    """The smallest count from 1 to `total` that `refused` holds for, taking it to hold for `total`.
+
+    A binary search, so at most about log2(total) scans: adding text to a
+    scan rarely takes a finding away. If it ever does, the count found is
+    still one that is refused.
+    """
+    low, high = 0, total
+    while high - low > 1:
+        middle = (low + high) // 2
+        if refused(middle):
+            high = middle
+        else:
+            low = middle
+    return high
+
+
+def _cut_to_bytes(text: str, size: int, keep_end: bool) -> str:
+    """At most `size` bytes of `text` written as UTF-8: its end when keep_end, else its start."""
+    data = text.encode("utf-8", "surrogatepass")
+    if len(data) <= size:
+        return text
+    return (data[-size:] if keep_end else data[:size]).decode("utf-8", "ignore")
 
 
 # ---- names that look alike ----------------------------------------------------
@@ -569,9 +1013,14 @@ class Proxy:
         approvers: Sequence[ApprovalBackend] = (),
         approval_timeout: float = DEFAULT_APPROVAL_TIMEOUT,
         report: str = proxy_report.NORMAL,
+        pin_server: bool = False,
+        on_server_change: str = SERVER_CHANGE_REFUSE,
     ) -> None:
         """
         pins:              the pins of this server (pins.ToolPins); default: kept in memory only.
+        pin_server:        compare the serverInfo of each handshake with the server's pin (proxy --pin-server).
+        on_server_change:  when it differs: SERVER_CHANGE_REFUSE refuses the handshake, SERVER_CHANGE_QUARANTINE
+                           lets it through; either way every tool, prompt and template is quarantined.
         tool_names:        what to do with a tool or prompt whose name breaks the MCP naming
                            rules: TOOL_NAMES_STRICT, TOOL_NAMES_WARN (the default) or TOOL_NAMES_OFF.
         elicitation_hosts: the hosts a URL-mode elicitation may send the user to (proxy
@@ -591,6 +1040,12 @@ class Proxy:
             raise ValueError(f"approval_timeout must be more than 0 and at most {MAX_APPROVAL_TIMEOUT} seconds")
         if type(max_message_bytes) is not int or not 1 <= max_message_bytes <= MAX_MAX_MESSAGE_BYTES:
             raise ValueError(f"max_message_bytes must be a whole number from 1 to {MAX_MAX_MESSAGE_BYTES}")
+        if on_server_change not in SERVER_CHANGE_MODES:
+            raise ValueError(f"on_server_change must be one of {', '.join(SERVER_CHANGE_MODES)}")
+        self._pin_server = pin_server
+        self._on_server_change = on_server_change
+        # Why the whole server is quarantined (its pin changed: quarantine_server), or None. Guarded by `_state`.
+        self._server_quarantine: str | None = None
         self._firewall = firewall
         self._client_out = client_out
         self._server_in = server_in
@@ -608,6 +1063,9 @@ class Proxy:
         # The parameter names of the tools let through (at most MAX_KNOWN_NAMES): a result or error that orders
         # a credential file into one of them is high (Firewall.check_result's parameter_names). Guarded by `_state`.
         self._parameter_names: set[str] = set()
+        # The checked schemas of the listed tools, for the policy's schema_checks; None when no tool's
+        # calls or results are checked against them (schema_check.SchemaStore is thread-safe itself).
+        self._schemas = schema_check.SchemaStore() if firewall.policy.uses_schema_checks else None
 
         # `_state` guards the collections below. It is a Condition so that
         # tool calls can wait for tool lists to finish being checked.
@@ -623,6 +1081,19 @@ class Proxy:
         # Entries removed from their list for good, by list: such a tool cannot be called, nor such a prompt fetched.
         self._quarantined: dict[str, set[str]] = {kind: set() for kind in PINNED_LISTS}
         self._quarantine_overflowed = False
+        # The uriTemplates of quarantined resource templates, with their literal parts (uri_template.py): a URI
+        # one of them may produce cannot be read or subscribed to. Past MAX_QUARANTINED_TEMPLATES, none can.
+        self._quarantined_templates: dict[str, tuple[str, ...] | None] = {}
+        self._templates_overflowed = False
+        # The end of each page that gave a nextCursor, by list and by a digest of that cursor, least recently
+        # used first (at most MAX_OPEN_CURSORS per list).
+        self._page_tails: dict[str, dict[str, _PageTail]] = {kind: {} for kind in _LIST_ITEMS_KEY.values()}
+        # limits.call_timeout_seconds: (deadline, order, request id) of forwarded calls, soonest first, and the
+        # thread that answers those whose time runs out (_watch_deadlines), while there are any.
+        self._deadlines: list[tuple[float, int, Any]] = []
+        self._deadline_order = itertools.count()
+        self._watching_deadlines = False
+        self._deadline_wake = threading.Event()
         self._tools_unverified = False  # set while the latest tools/list reply was malformed
         self._tool_lists_in_flight: set[str | int] = set()
         # What was already reported on stderr: a client that lists its tools often gets each line once.
@@ -641,6 +1112,10 @@ class Proxy:
         # the client can be asked through an elicitation form. Guarded by `_state`.
         self._client_shows_forms = False
         self._negotiated_version: str | None = None
+        # For the "protocol" audit records: the client's name and version (audit_chain.peer_info),
+        # and how many such records were written. Guarded by `_state`.
+        self._client_info: dict[str, str] | None = None
+        self._protocol_records = 0
 
         # What the operator reads on stderr (proxy_report.py). `_warn` is looked up when a
         # line is written, so that output redirected or silenced around a call is respected.
@@ -648,6 +1123,21 @@ class Proxy:
         self._lines = proxy_report.LineBudget(
             lambda text, limit: _warn(text, limit=limit), has_audit=firewall.audit_path is not None
         )
+        self._seed_annotation_labels()
+
+    def _seed_annotation_labels(self) -> None:
+        """Give the firewall the flow labels of the pinned tools' annotations, and presume the rest unknown.
+
+        Annotation labels (classify_by_annotations) are otherwise learned only
+        from a tool list this process checked, and a client may call a tool
+        without listing tools first (it cached the list in an earlier process,
+        or knows the name). A pinned tool keeps the labels of its pinned
+        annotations; a tool neither pinned nor listed counts as untrusted and
+        a sink while the policy has flow rules (Firewall.presume_unlisted_tools).
+        """
+        for name, definition in self._pins.definitions("tools").items():
+            self._firewall.learn_annotations(name, definition.get("annotations"))
+        self._firewall.presume_unlisted_tools(exempt=_RESERVED_TOOL_NAMES)
 
     # ---- entry points -------------------------------------------------------
 
@@ -769,6 +1259,9 @@ class Proxy:
             # skip the list's checks (pins, quarantine, hiding), or a result could set the
             # flow marks of another tool. MCP forbids reusing an id; the request is dropped,
             # unanswered, because any answer under that id would be taken for the first one's.
+            # The first one of a request that timed out was answered already, so this one is.
+            if self._id_timed_out(message["id"]):
+                return self._refuse_timed_out_id(message)
             return self._dropped("a client request that reuses the id of a request still waiting for its reply")
 
         # What every request must pass first: the protocol revision's rules, then the
@@ -796,7 +1289,26 @@ class Proxy:
             return self._refuse_task_request(message)
         if method == "notifications/cancelled" and self._forget_cancelled_request(message):
             return _DROP  # it cancelled a call held for approval, which the server never saw
+        refused = self._refused_by_server_quarantine(message)
+        if refused is not None:
+            return refused
         return self._forward_request(message, label=_label(method))
+
+    def _refused_by_server_quarantine(self, message: JsonObject) -> _Outcome | None:
+        """Refuse a request a quarantined server (quarantine_server) may not answer; None when it may go on.
+
+        Such a server serves nothing: the client may still open the session,
+        ping it and list (every entry is removed), and set its log level. Any
+        other request, completion/complete for one, would bring the server's
+        answer to the client. Notifications get no answer, so they pass.
+        """
+        quarantined = self._whole_server_quarantined()
+        if quarantined is None or "id" not in message or message["method"] in _ASKED_OF_A_QUARANTINED_SERVER:
+            return None
+        method = message["method"]
+        reason = f"the whole server is quarantined: {quarantined}"
+        return self._refused(message, self._firewall.refuse(_label(method), reason, event="client_request",
+                                                            rule=RULE_QUARANTINE))
 
     def _refuse_batch(self, batch: list[Any]) -> _Outcome:
         # MCP no longer uses JSON-RPC batches. Refusing them keeps every
@@ -991,7 +1503,20 @@ class Proxy:
         except ShapeError as exc:
             return self._refuse_malformed_request(message, str(exc))
         self._note_era(method, version)
+        self._note_client_info(method, params)
         return None
+
+    def _note_client_info(self, method: str, params: Any) -> None:
+        """Keep the client's name and version from a handshake request, for the "protocol" audit record."""
+        if method not in (protocol.INITIALIZE, protocol.SERVER_DISCOVER) or not isinstance(params, dict):
+            return
+        meta = params.get("_meta")
+        info = audit_chain.peer_info(params.get("clientInfo")) or audit_chain.peer_info(
+            meta.get(_CLIENT_INFO_KEY) if isinstance(meta, dict) else None
+        )
+        if info is not None:
+            with self._state:
+                self._client_info = info
 
     def _note_era(self, method: str, version: str | None) -> None:
         with self._state:
@@ -1121,17 +1646,130 @@ class Proxy:
             reason = "this tool was removed from the tool list and cannot be called"
             decision = self._refusal(_label(name), reason, RULE_QUARANTINE)
         else:
+            refused = self._check_arguments_schema(message, name, arguments or {})
+            if refused is not None:
+                return refused
             return self._check_policy(message, name, arguments or {}, label=_label(name))
         return self._forward_or_refuse(message, decision, label=_label(str(name)))
 
+    # ---- client -> server: the tool's schema (the policy's schema_checks) ---------------
+
+    def _check_arguments_schema(self, message: JsonObject, name: str, arguments: JsonObject) -> _Outcome | None:
+        """Check a call's arguments against the tool's checked inputSchema; the refusal, or None to go on.
+
+        What the policy's schema_checks for the tool say (Policy.schema_checks_for):
+        `undeclared_args` "block" refuses a top-level argument that the
+        schema's properties do not name; `arguments` "enforce" refuses
+        arguments that do not match the schema (schema_check.validate), "warn"
+        reports them and lets the call go on. The schema is the one this
+        session's tools/list gave, after the tool was scanned and compared with
+        its pin; a tool with none (not listed, or too large to keep) cannot be
+        checked, which counts as a problem. Run before the policy, so that a
+        call that could never be made is not held for a person's approval.
+        A refusal is a block that monitor mode lifts. The names in a reason
+        are left out when they hold a secret (_ShownNames).
+        """
+        settings = self._firewall.policy.schema_checks_for(name)
+        if settings.arguments == "off" and settings.undeclared_args != "block":
+            return None
+        shown = _ShownNames(self._firewall)
+        blocking, warned = self._argument_problems(name, arguments, settings, shown)
+        if shown.hide_if_secret():
+            blocking, warned = self._argument_problems(name, arguments, settings, shown)
+        label = _label(name)
+        if warned:
+            self._schema_warning(label, f"the arguments of '{printable(name, limit=80)}'", warned, "schema_arguments",
+                                 note=shown.note())
+        if not blocking:
+            return None
+        reason = f"the arguments do not match the input schema of the tool: {'; '.join(blocking[:5])}{shown.note()}"
+        decision = self._firewall.block(label, reason, event="call", public_reason=_SCHEMA_ARGUMENTS_REFUSAL,
+                                        rule=RULE_SCHEMA_ARGUMENTS)
+        if decision.allowed:  # monitor mode
+            return None
+        return self._refused(message, decision)
+
+    def _argument_problems(self, name: str, arguments: JsonObject, settings: SchemaChecks,
+                           shown: _ShownNames) -> tuple[list[str], list[str]]:
+        """The problems of a call's arguments under the tool's schema_checks: (those that block, those only reported)."""
+        blocks_undeclared = settings.undeclared_args == "block"
+        blocking: list[str] = []
+        warned: list[str] = []
+        found, why = self._schemas.lookup(name) if self._schemas is not None else (None, "no schemas are kept")
+        if found is None:
+            problem = f"the arguments cannot be checked: {why}"
+            (blocking if settings.arguments == "enforce" or blocks_undeclared else warned).append(problem)
+            return blocking, warned
+        schema = found.input if isinstance(found.input, dict) else {}
+        if blocks_undeclared:
+            declared = schema.get("properties")
+            declared = declared if isinstance(declared, dict) else {}
+            undeclared = [argument for argument in arguments if argument not in declared]
+            blocking += [f"the argument '{printable(shown(argument), limit=60)}' is not declared in the input schema"
+                         for argument in undeclared[:schema_check.MAX_PROBLEMS]]
+        if settings.arguments != "off":
+            problems = schema_check.validate(arguments, schema, root="the arguments", names=shown)
+            (blocking if settings.arguments == "enforce" else warned).extend(problems)
+        return blocking, warned
+
+    def _schema_warning(self, label: str, what: str, problems: list[str], event: str,
+                        call_id: str | None = None, note: str = "") -> None:
+        """Record and report what schema_checks "warn" found: an audit note, and a stderr line once per kind.
+
+        note: added to the reason (_ShownNames.note: why names are missing).
+        """
+        reason = f"schema_checks warn: {what}: {'; '.join(problems)}{note}"
+        self._firewall.note(label, reason, event=event, call_id=call_id)
+        if self._first_report("schema", event, label, problems[0]):
+            self._report(reason, limit=1000)
+
     def _check_resource_request(self, message: JsonObject) -> _Outcome:
-        """resources/read and resources/subscribe both ask the server to open a URI."""
+        """resources/read and resources/subscribe both ask the server to open a URI.
+
+        Any URI of a server quarantined for differing from its pin, and a URI
+        that a quarantined resource template may produce, is refused first
+        (_quarantined_read), as a call to a quarantined tool is.
+        """
         params = message.get("params")
         uri = params.get("uri") if isinstance(params, dict) else None
         if not isinstance(uri, str) or not uri:
             decision = self._refusal(RESOURCE_READ, f"malformed {message['method']} request: missing uri")
             return self._forward_or_refuse(message, decision, label=RESOURCE_READ)
+        refusal = self._quarantined_read(uri)
+        if refusal is not None:
+            return self._forward_or_refuse(message, refusal, label=_label(uri))
         return self._check_policy(message, RESOURCE_READ, {"uri": uri}, label=_label(uri))
+
+    def _quarantined_read(self, uri: str, call_id: str | None = None) -> Decision | None:
+        """The refusal of a read of `uri` for a quarantine, or None: first a server that differs from its pin
+        (--pin-server: it serves nothing), then a quarantined resource template that may produce the URI."""
+        quarantined = self._whole_server_quarantined()
+        if quarantined is not None:
+            return self._refusal(_label(uri), f"the whole server is quarantined: {quarantined}", RULE_QUARANTINE,
+                                 call_id=call_id)
+        return self._template_refusal(uri, call_id)
+
+    def _template_refusal(self, uri: str, call_id: str | None = None) -> Decision | None:
+        """The refusal of a read of `uri` when a quarantined resource template may produce it, or None."""
+        why = self._quarantined_template_of(uri)
+        if why is None:
+            return None
+        return self._refusal(_label(uri), why, RULE_QUARANTINE, public_reason=_TEMPLATE_REFUSAL, call_id=call_id)
+
+    def _quarantined_template_of(self, uri: str) -> str | None:
+        """Why `uri` may come from a quarantined resource template (uri_template.may_match), or None.
+
+        Past MAX_QUARANTINED_TEMPLATES no template can be ruled out, so every URI is refused.
+        """
+        with self._state:
+            if self._templates_overflowed:
+                return "too many resource templates were quarantined to keep track of, so no resource can be read"
+            templates = list(self._quarantined_templates.items())
+        spellings = uri_template.spellings(uri) if templates else None
+        for template, parts in templates:
+            if uri_template.may_match(parts, spellings):
+                return f"the URI may come from the quarantined resource template '{printable(template, limit=120)}'"
+        return None
 
     def _check_prompt_request(self, message: JsonObject) -> _Outcome:
         """prompts/get: fetch a prompt by name, with arguments that fill it in.
@@ -1169,14 +1807,21 @@ class Proxy:
 
         Each resource URI it subscribes to is checked as a read of that URI,
         and one refusal refuses the whole request. The list-changed filters
-        ask only for notifications, which are scanned when they come.
+        ask only for notifications, which are scanned when they come. A
+        quarantined server (quarantine_server) is listened to for nothing.
         """
         try:
             uris = protocol.subscribed_uris(message.get("params"))
         except ShapeError as exc:
             return self._refuse_malformed_request(message, str(exc))
+        quarantined = self._whole_server_quarantined()
+        if quarantined is not None:  # a server that differs from its pin serves nothing (--pin-server)
+            reason = f"the whole server is quarantined: {quarantined}"
+            return self._refused(message, self._refusal(protocol.SUBSCRIPTIONS_LISTEN, reason, RULE_QUARANTINE))
         for uri in uris:
-            decision = self._firewall.check_call(RESOURCE_READ, {"uri": uri})
+            decision = self._template_refusal(uri)  # a Decision is false when it refuses: compare with None
+            if decision is None:
+                decision = self._firewall.check_call(RESOURCE_READ, {"uri": uri})
             if not decision.allowed:
                 return self._refused(message, decision)
         return self._forward_request(message, label=protocol.SUBSCRIPTIONS_LISTEN)
@@ -1421,8 +2066,11 @@ class Proxy:
         return self._forward_request(message, waiting.label, marks=self._marks_of(message), call_id=final.call_id)
 
     def _removed_while_waiting(self, message: JsonObject, label: str, call_id: str | None) -> Decision | None:
-        """The refusal of an approved call whose tool or prompt was quarantined while it waited, or None."""
+        """The refusal of an approved call whose tool, prompt, resource template or whole server (--pin-server)
+        was quarantined while it waited."""
         method, params = message["method"], message["params"]
+        if method in _RESOURCE_METHODS:
+            return self._quarantined_read(params["uri"], call_id)
         if method == "tools/call":
             if not self._wait_for_tool_lists():
                 reason = "timed out waiting for the tool list to be checked"
@@ -1444,13 +2092,23 @@ class Proxy:
         if "id" not in message:
             return _Outcome(to_server=message)  # a notification: no reply will come
         modern = _is_modern_request(message)
+        method = message["method"]
+        params = message.get("params")
+        tool = params.get("name") if method == "tools/call" and isinstance(params, dict) else None
+        cursor = _cursor_digest(message) if method in _LIST_ITEMS_KEY else None
+        timeout = self._firewall.policy.call_timeout_seconds
+        deadline = time.monotonic() + timeout if timeout is not None and method in _TIMED_METHODS else None
         with self._state:
             # A request that reuses an id still in flight never gets here (_id_in_flight).
             full = message["id"] not in self._pending and len(self._pending) >= MAX_PENDING_REQUESTS
             if not full:
-                self._pending[message["id"]] = _PendingRequest(message["method"], label, marks, call_id, modern)
-                if message["method"] == "tools/list":
+                self._pending[message["id"]] = _PendingRequest(
+                    method, label, marks, call_id, modern, tool, cursor=cursor, deadline=deadline
+                )
+                if method == "tools/list":
                     self._tool_lists_in_flight.add(message["id"])
+                if deadline is not None:
+                    self._watch_deadline(message["id"], deadline)
         if full:
             event = "call" if message["method"] == "tools/call" else "client_request"
             refusal = self._firewall.refuse(
@@ -1469,18 +2127,45 @@ class Proxy:
                 waiting.message.get("id") == msg_id and not waiting.cancelled for waiting in self._waiting.values()
             )
 
+    def _id_timed_out(self, msg_id: Any) -> bool:
+        """Whether this id belongs to a forwarded request that timed out and whose late reply has not come."""
+        with self._state:
+            pending = self._pending.get(msg_id)
+            return pending is not None and pending.timed_out
+
+    def _refuse_timed_out_id(self, message: JsonObject) -> _Outcome:
+        """Answer a request that reuses the id of one that timed out, with an error, without forwarding it.
+
+        The client was told the first request timed out, so the id looks free
+        to it; but the server may still answer the first, and that late reply
+        would be taken for this one's. The id is free again once it came.
+        """
+        method = message["method"]
+        decision = self._firewall.refuse(
+            _label(method), f"{method} reuses the id of a request that timed out, whose late reply may still come",
+            event="client_request", public_reason=_TIMED_OUT_ID_REFUSAL, rule=RULE_MALFORMED,
+        )
+        self._report(f"refused a '{method}' request that reuses the id of a request that timed out "
+                     f"{proxy_report.rule_and_ref(decision)}")
+        return _Outcome(to_client=_rpc_error(message["id"], decision.public_reason, code=protocol.INVALID_REQUEST))
+
     def _forget_cancelled_request(self, message: JsonObject) -> bool:
         """Forget a request the client cancelled. True when it was only held for approval, never forwarded.
 
         A held call that is cancelled is refused (its question, if one is
-        showing, is left to time out) and no answer is sent for it.
+        showing, is left to time out) and no answer is sent for it. A call
+        that timed out stays remembered: its id is not free until the server's
+        late reply came (see _time_out).
         """
         params = message.get("params")
         request_id = params.get("requestId") if isinstance(params, dict) else None
         if not _valid_id(request_id):
             return False
         with self._state:
-            forwarded = self._pending.pop(request_id, None) is not None
+            waiting_reply = self._pending.get(request_id)
+            forwarded = waiting_reply is not None
+            if forwarded and not waiting_reply.timed_out:
+                del self._pending[request_id]
             self._tool_lists_in_flight.discard(request_id)
             self._state.notify_all()
             held = [waiting for waiting in self._waiting.values() if waiting.message.get("id") == request_id]
@@ -1488,6 +2173,114 @@ class Proxy:
                 waiting.cancelled = True
                 waiting.answered.set()
         return bool(held) and not forwarded
+
+    # ---- limits.call_timeout_seconds ----------------------------------------------------
+
+    def _watch_deadline(self, msg_id: Any, deadline: float) -> None:
+        """Have a forwarded call answered when its deadline passes. Called with `_state` held.
+
+        One thread (_watch_deadlines) waits for the soonest deadline; it is
+        started when the first call is timed and ends when none is left. The
+        heap keeps an entry for a call answered in time until its deadline
+        passes; it is rebuilt from the waiting calls if it grows past twice
+        MAX_PENDING_REQUESTS.
+        """
+        heapq.heappush(self._deadlines, (deadline, next(self._deadline_order), msg_id))
+        if len(self._deadlines) > 2 * MAX_PENDING_REQUESTS:
+            self._deadlines = [(pending.deadline, next(self._deadline_order), key)
+                               for key, pending in self._pending.items()
+                               if pending.deadline is not None and not pending.timed_out]
+            heapq.heapify(self._deadlines)
+        if self._watching_deadlines:
+            self._deadline_wake.set()  # the new deadline may be the soonest
+            return
+        self._watching_deadlines = True
+        threading.Thread(target=self._watch_deadlines, name="agent-sentinel call timeout", daemon=True).start()
+
+    def _watch_deadlines(self) -> None:
+        """Answer each forwarded call whose time ran out (_time_out); return when no call is timed any more."""
+        while True:
+            with self._state:
+                self._deadline_wake.clear()  # a deadline added from now on wakes the wait below
+                now = time.monotonic()
+                expired = self._take_expired(now)
+                if not expired and not self._deadlines:
+                    self._watching_deadlines = False
+                    return
+                wait = self._deadlines[0][0] - now if self._deadlines else 0.0
+            for msg_id, pending in expired:
+                self._time_out(msg_id, pending)
+            if not expired:
+                self._deadline_wake.wait(min(max(wait, 0.001), 1.0))
+
+    def _take_expired(self, now: float) -> list[tuple[Any, _PendingRequest]]:
+        """The forwarded calls whose deadline has passed, each marked as timed out. Called with `_state` held.
+
+        A timed-out call stays among the requests waiting for a reply, so that
+        its id is not taken by a new request while the server may still
+        answer it (a late reply would be taken for the new request's), and so
+        that it counts against MAX_PENDING_REQUESTS. In monitor mode the call
+        is only recorded, and goes on waiting.
+        """
+        expired = []
+        while self._deadlines and self._deadlines[0][0] <= now:
+            _, _, msg_id = heapq.heappop(self._deadlines)
+            pending = self._pending.get(msg_id)
+            if pending is None or pending.timed_out or pending.deadline is None or pending.deadline > now:
+                continue  # answered in time, or the id now belongs to a later request
+            changed = {"deadline": None} if self._firewall.monitor else {"timed_out": True}
+            self._pending[msg_id] = dataclasses.replace(pending, **changed)
+            expired.append((msg_id, pending))
+        return expired
+
+    def _time_out(self, msg_id: Any, pending: _PendingRequest) -> None:
+        """Answer a call the server did not answer in time with an error, and cancel it at the server.
+
+        The record has event "timeout" and rule limits.call_timeout_seconds.
+        The reply the server may still send is dropped (_check_server_reply).
+        Monitor mode records what would have happened, and the call goes on
+        waiting; unless that record cannot be written and --audit-required
+        refuses what is not recorded: then the call times out as in any mode
+        (_time_out_after_all).
+        """
+        try:
+            seconds = self._firewall.policy.call_timeout_seconds or 0
+            reason = f"the server did not answer within {seconds:g} seconds, so the call was cancelled"
+            decision = self._firewall.block(
+                pending.label, reason, event="timeout", public_reason=_TIMEOUT_REFUSAL, rule=RULE_CALL_TIMEOUT,
+                call_id=pending.call_id,
+            )
+            what = f"timed out waiting for {_reply_description(pending)}"
+            if decision.allowed:  # monitor mode
+                self._report_allowed(what, decision)
+                return
+            if self._firewall.monitor and not self._time_out_after_all(msg_id, pending):
+                return  # the server answered meanwhile, and the client has its reply
+            self._report_block(what, decision)
+            cancel = {"jsonrpc": "2.0", "method": "notifications/cancelled",
+                      "params": {"requestId": msg_id, "reason": "the request timed out"}}
+            self._send(_Outcome(to_server=cancel,
+                                to_client=_rpc_error(msg_id, decision.public_reason, code=TIMEOUT_ERROR_CODE)))
+        except (OSError, ValueError):  # the client or the server has gone; the proxy is stopping
+            pass
+        except Exception as exc:  # a bug here must not stop the thread that times out the other calls
+            _warn(f"could not answer a call that timed out, after an internal error: {exc!r}")
+
+    def _time_out_after_all(self, msg_id: Any, pending: _PendingRequest) -> bool:
+        """Mark a call that monitor mode left waiting as timed out; False when it no longer waits.
+
+        Monitor mode lets a call that ran out of time go on waiting
+        (_take_expired), but with --audit-required a timeout that could not
+        be recorded is refused in monitor mode too (Firewall._unrecorded).
+        The client is then answered with an error, so the server's late
+        reply must be dropped like that of any call that timed out: the
+        client must not get two answers to one request.
+        """
+        with self._state:
+            if self._pending.get(msg_id) != dataclasses.replace(pending, deadline=None):
+                return False
+            self._pending[msg_id] = dataclasses.replace(pending, deadline=None, timed_out=True)
+            return True
 
     def _wait_for_tool_lists(self) -> bool:
         """Wait until no tools/list reply is being checked.
@@ -1508,14 +2301,35 @@ class Proxy:
     def _is_quarantined(self, tool: str) -> bool:
         """Whether a call to this tool must be refused because the tool cannot be vouched for."""
         with self._state:
-            # No tool can be vouched for if more were quarantined than can be
-            # remembered, or if the last tool list could not be checked at all.
-            return self._quarantine_overflowed or self._tools_unverified or tool in self._quarantined["tools"]
+            # No tool can be vouched for if more were quarantined than can be remembered, if the last tool
+            # list could not be checked at all, or if the server is no longer the one that was pinned.
+            return (self._quarantine_overflowed or self._tools_unverified or self._server_quarantine is not None
+                    or tool in self._quarantined["tools"])
 
     def _was_quarantined(self, kind: str, name: str) -> bool:
         """Whether this entry of a list (tools, prompts, resourceTemplates) was itself quarantined."""
         with self._state:
-            return self._quarantine_overflowed or name in self._quarantined[kind]
+            return self._quarantine_overflowed or self._server_quarantine is not None or name in self._quarantined[kind]
+
+    def quarantine_server(self, reason: str) -> None:
+        """Quarantine the whole server, for as long as the proxy runs (see "Lists, pins and names").
+
+        For a server that differs from its pin (proxy --pin-server): every
+        entry of its lists is left out, its instructions are removed (and not
+        pinned), calls, prompts, resource reads and subscriptions are refused,
+        and so is every other client request but the handshake, ping, the
+        lists and logging/setLevel (_refused_by_server_quarantine); every
+        request the server sends the client but ping is refused, and every
+        notification but notifications/cancelled is dropped.
+        """
+        with self._state:
+            if self._server_quarantine is None:
+                self._server_quarantine = reason
+
+    def _whole_server_quarantined(self) -> str | None:
+        """Why the whole server is quarantined (quarantine_server), or None."""
+        with self._state:
+            return self._server_quarantine
 
     def _set_tools_unverified(self, unverified: bool) -> None:
         with self._state:
@@ -1523,8 +2337,18 @@ class Proxy:
                 self._report("the tool list could not be checked; tool calls are refused until a valid list arrives")
             self._tools_unverified = unverified
 
-    def _quarantine(self, kind: str, name: str) -> None:
+    def _quarantine(self, kind: str, name: str, templates: Iterable[str] = ()) -> None:
+        """Quarantine an entry by name; for a resource template, also the uriTemplates it is known by (templates)."""
         with self._state:
+            for template in templates:
+                if template in self._quarantined_templates or self._templates_overflowed:
+                    continue
+                if len(self._quarantined_templates) < MAX_QUARANTINED_TEMPLATES:
+                    self._quarantined_templates[template] = uri_template.literal_parts(template)
+                else:
+                    self._templates_overflowed = True
+                    self._report("too many quarantined resource templates to track; every resource read is now "
+                                 "refused")
             if sum(len(names) for names in self._quarantined.values()) < MAX_QUARANTINED:
                 self._quarantined[kind].add(name)
             elif not self._quarantine_overflowed:
@@ -1599,7 +2423,17 @@ class Proxy:
             refusal = self._firewall.refuse(label, problem, event="server_request", rule=RULE_MALFORMED)
             self._report_block(f"refused a '{printable(method, limit=100)}' request from the server", refusal)
             return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL, code=protocol.METHOD_NOT_FOUND))
+        allowed = ("ping",) if is_request else _TOLD_BY_A_QUARANTINED_SERVER
+        quarantined = self._whole_server_quarantined() if method not in allowed else None
+        if quarantined is not None:  # a server that differs from its pin tells the client nothing (--pin-server)
+            refusal = self._firewall.refuse(label, f"the whole server is quarantined: {quarantined}",
+                                            event="server_request", rule=RULE_QUARANTINE)
+            kind = "request" if is_request else "notification"
+            self._report_block(f"refused a '{printable(method, limit=100)}' {kind} from the quarantined server",
+                               refusal)
+            return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL)) if is_request else _DROP
 
+        self._clean_metadata(message.get("params"), f"the server, in a '{printable(method, limit=100)}' message")
         verdict = self._firewall.policy.server_request_verdict(method)
         decision = None
         if verdict.action == "block":
@@ -1607,6 +2441,8 @@ class Proxy:
             decision = self._firewall.block(label, verdict.reason, "server_request", rule=rule)
         elif method == elicitation.ELICITATION_CREATE:
             decision = self._elicitation_refusal(label, message.get("params"))
+        elif method == SAMPLING_CREATE:
+            decision = self._sampling_refusal(label, message.get("params"))
         if decision is None:
             decision = self._firewall.scan_result(
                 label, message, event="server_request", log_clean=False, parameter_names=self._known_parameters()
@@ -1679,6 +2515,9 @@ class Proxy:
             # A reply to a request we did not forward could not be attributed
             # to a method, so there is no safe way to deliver it.
             return self._dropped("a server reply that matches no forwarded request")
+        if pending.timed_out:
+            # The client was told the call timed out, and the server was told to cancel it.
+            return self._dropped(f"a late server reply to {pending.method} '{pending.label}', which had timed out")
         try:
             return _Outcome(to_client=self._checked_reply(message, pending))
         except Exception as exc:
@@ -1714,6 +2553,7 @@ class Proxy:
             kind = protocol.result_type(result)
         except ShapeError as exc:
             return self._malformed_reply(pending, msg_id, str(exc))
+        self._clean_metadata(result, f"the server, in its reply to {pending.method}")
         if kind == protocol.RESULT_INPUT_REQUIRED:
             return self._checked_input_required(pending, msg_id, result)
         if kind == protocol.RESULT_TASK or (pending.method == "tools/call" and protocol.is_legacy_task(result)):
@@ -1732,8 +2572,12 @@ class Proxy:
                     # Its tools could not be checked, so none of them can be vouched for.
                     self._set_tools_unverified(True)
                 return self._malformed_reply(pending, msg_id, "a list reply must hold a list")
+            if result.get("nextCursor") is not None and not isinstance(result["nextCursor"], str):
+                # MCP's cursors are strings, and the boundary scan follows a chain by the string the client echoes.
+                return self._malformed_reply(pending, msg_id, "the nextCursor of a list reply must be a string")
             if items_key in result:
                 result[items_key] = self._clean_items(result[items_key], items_key)
+                result[items_key] = self._checked_page_boundary(pending, items_key, result[items_key])
                 if is_tool_list:
                     self._set_tools_unverified(False)
                 # The entries were checked one by one. What is left is scanned as a
@@ -1742,7 +2586,10 @@ class Proxy:
             refusal = self._check_handshake_reply(pending, msg_id, result)
             if refusal is not None:
                 return refusal
-        return self._deliver_or_block(pending, msg_id, "result", result, log_clean=items_key is None)
+        delivered = self._deliver_or_block(pending, msg_id, "result", result, log_clean=items_key is None)
+        if items_key is not None:
+            self._remember_page_end(pending, items_key, delivered)
+        return delivered
 
     def _checked_input_required(self, pending: _PendingRequest, msg_id: Any, result: Any) -> JsonObject:
         """Check an input_required result: a 2026-07-28 server asking the client for input inside its reply.
@@ -1772,6 +2619,7 @@ class Proxy:
         """The policy's answer for one entry of an input_required result, then what an elicitation asks, then a scan."""
         method = entry["method"]
         label = _label(f"server:{method}")
+        self._clean_metadata(entry.get("params"), f"the server, in a '{printable(method, limit=100)}' inside a reply")
         verdict = self._firewall.policy.server_request_verdict(method)
         decision = None
         if verdict.action == "block":
@@ -1781,6 +2629,8 @@ class Proxy:
             )
         elif method == elicitation.ELICITATION_CREATE:
             decision = self._elicitation_refusal(label, entry.get("params"), pending.call_id)
+        elif method == SAMPLING_CREATE:
+            decision = self._sampling_refusal(label, entry.get("params"), pending.call_id)
         if decision is None:
             decision = self._firewall.scan_result(
                 label, entry, event="server_request", log_clean=False, call_id=pending.call_id,
@@ -1820,6 +2670,41 @@ class Proxy:
         )
         return None if decision.allowed else decision
 
+    def _sampling_refusal(self, label: str, params: Any, call_id: str | None = None) -> Decision | None:
+        """Check a sampling request the policy lets through; the refusal, or None to go on (then it is scanned).
+
+        The client's answer to sampling/createMessage is text its model wrote,
+        and it goes to the server, so:
+
+        * a request whose includeContext is present and not "none" is refused:
+          it asks the client to put the conversation (or what other servers
+          sent) into what the model reads, so the answer could carry it out.
+          The value is deprecated in MCP 2026-07-28;
+        * once the session holds every "after" mark of a "block" flow whose
+          "then" is "sink", the request is refused as a call to a sink would
+          be (Policy.sampling_flow_verdict). The marks are read again here.
+
+        Both are blocks that monitor mode lifts.
+        """
+        if isinstance(params, dict) and "includeContext" in params and params["includeContext"] != "none":
+            asked = params["includeContext"]
+            shown = f"'{printable(asked, limit=40)}'" if isinstance(asked, str) else type_name(asked)
+            reason = (f"the sampling request asks for includeContext {shown}: the client's model would answer from "
+                      "the conversation, and the answer would go to the server")
+            decision = self._firewall.block(label, reason, event="server_request", public_reason=_INPUT_REFUSAL,
+                                            rule=RULE_INCLUDE_CONTEXT, call_id=call_id)
+            if not decision.allowed:
+                return decision
+        policy = self._firewall.policy
+        if not policy.flows:
+            return None
+        flow = policy.sampling_flow_verdict(self._firewall.session_marks())
+        if flow is None:
+            return None
+        decision = self._firewall.block(label, flow.reason, event="server_request", public_reason=_INPUT_REFUSAL,
+                                        rule=flow.rule or RULE_MALFORMED, call_id=call_id)
+        return None if decision.allowed else decision
+
     def _url_elicitation_refusal(self, pending: _PendingRequest, msg_id: Any, error: Any) -> JsonObject | None:
         """The refusal of an error reply that sends the user to an address that may not be opened, or None.
 
@@ -1850,7 +2735,8 @@ class Proxy:
           must keep at least one.
         * Tasks are removed from the server's capabilities, so that the client
           does not start one.
-        * Unsafe icons are removed from the serverInfo.
+        * Unsafe icons and an unsafe websiteUrl are removed from the serverInfo
+          (_clean_server_info; the one in _meta is cleaned with every result).
         * Instructions that look like an injection, or that changed since they
           were pinned, are removed.
         A server/discover result also makes the session a 2026-07-28 one,
@@ -1878,10 +2764,13 @@ class Proxy:
             return self._malformed_reply(pending, msg_id, str(exc))
         if problem is not None:
             return self._unsupported_reply(pending, msg_id, problem, _UNSUPPORTED_VERSION, code=protocol.INVALID_PARAMS)
-        meta = result.get("_meta")
-        for server_info in (result.get("serverInfo"), meta.get(_SERVER_INFO_KEY) if isinstance(meta, dict) else None):
-            if isinstance(server_info, dict) and "icons" in server_info:
-                self._clean_icons_of(server_info, f"the server, in its reply to {pending.method}")
+        if self._pin_server:
+            refusal = self._check_server_info(pending, msg_id, result)
+            if refusal is not None:
+                return refusal
+        # The serverInfo in _meta was cleaned with every result (_clean_metadata); this is the legacy one.
+        if isinstance(result.get("serverInfo"), dict):
+            self._clean_server_info(result["serverInfo"], f"the server, in its reply to {pending.method}")
         self._check_instructions(result, source=pending.method)
         with self._state:
             if pending.method == protocol.INITIALIZE:
@@ -1889,7 +2778,63 @@ class Proxy:
                 self._negotiated_version = result["protocolVersion"]
             elif pending.method == protocol.SERVER_DISCOVER and self._era is None:
                 self._era = _MODERN
+        self._record_protocol(pending.method, result)
         return None
+
+    def _record_protocol(self, method: str, result: JsonObject) -> None:
+        """Write the "protocol" audit record of a handshake the proxy let through (at most MAX_PROTOCOL_RECORDS)."""
+        with self._state:
+            if self._protocol_records >= MAX_PROTOCOL_RECORDS:
+                return
+            self._protocol_records += 1
+            client = self._client_info
+        details: dict[str, Any] = {"method": method}
+        if method == protocol.INITIALIZE:
+            details["protocol_version"] = printable(result.get("protocolVersion"), limit=40)
+            server = audit_chain.peer_info(result.get("serverInfo"))
+        else:
+            versions = result.get("supportedVersions")
+            if isinstance(versions, list):
+                details["supported_versions"] = [
+                    printable(version, limit=40) for version in versions[:MAX_RECORDED_VERSIONS]
+                ]
+            meta = result.get("_meta")
+            server = audit_chain.peer_info(meta.get(_SERVER_INFO_KEY) if isinstance(meta, dict) else None)
+        details["client_info"] = client
+        details["server_info"] = server
+        self._firewall.provenance(
+            audit_chain.PROTOCOL, f"the {method} handshake was let through", details
+        )
+
+    def _check_server_info(self, pending: _PendingRequest, msg_id: Any, result: JsonObject) -> JsonObject | None:
+        """With --pin-server: compare the serverInfo of a handshake reply with the server's pin; a refusal, or None.
+
+        The first serverInfo is pinned (pins.ToolPins.check_server_info). One
+        that differs quarantines the whole server (quarantine_server), and
+        with --on-server-change refuse (the default) the reply is refused
+        too. In monitor mode the change is logged and nothing happens.
+        """
+        meta = result.get("_meta")
+        server_info = result.get("serverInfo")
+        if not isinstance(server_info, dict) and isinstance(meta, dict):
+            server_info = meta.get(_SERVER_INFO_KEY)
+        server_info = server_info if isinstance(server_info, dict) else {}
+        status, changed = self._pins.check_server_info({"name": server_info_value(server_info.get("name")),
+                                                        "version": server_info_value(server_info.get("version"))})
+        self._save_pins()
+        if status != CHANGED:
+            return None
+        what = f"its serverInfo ({', '.join(changed)}) changed since it was pinned"
+        reason = f"the server is quarantined: {what}. {server_change_advice(self._pins.path)}"
+        decision = self._firewall.block(pending.label, reason, event="server_changed", rule=RULE_QUARANTINE,
+                                        call_id=pending.call_id)
+        if decision.allowed:  # monitor mode: logged as what would have been blocked
+            return None
+        self.quarantine_server(what)
+        self._report_block("quarantined every tool, prompt and resource template of the server", decision)
+        if self._on_server_change == SERVER_CHANGE_QUARANTINE:
+            return None
+        return _rpc_error(msg_id, decision.public_reason)
 
     def _malformed_reply(self, pending: _PendingRequest, msg_id: Any, reason: str) -> JsonObject:
         decision = self._firewall.refuse(
@@ -1928,6 +2873,10 @@ class Proxy:
         marks of the request are set just before the reply is returned. A
         tools/call result with a warn notice gets it as a first text item.
         """
+        refusal = self._result_schema_refusal(pending, member, value)
+        if refusal is not None:
+            self._report_block(f"blocked {_reply_description(pending)}", refusal)
+            return _refusal_reply(pending.method, msg_id, refusal.public_reason, pending.modern)
         checked = self._checked_for_forwarding(
             pending.label, value, "result", log_clean, pending.call_id, parameter_names=self._known_parameters(),
             cross_message=pending.method in _RESULT_METHODS,
@@ -1947,6 +2896,59 @@ class Proxy:
                 content = _with_notice(content, decision.notice)
             return {"jsonrpc": "2.0", "id": msg_id, member: content}
         return _refusal_reply(pending.method, msg_id, decision.public_reason, pending.modern)
+
+    def _result_schema_refusal(self, pending: _PendingRequest, member: str, value: Any) -> Decision | None:
+        """Check a tool's result against its checked outputSchema (schema_checks.results); a refusal, or None.
+
+        Only a complete tools/call result is checked: its structuredContent
+        must be there when the tool declares an outputSchema, and match it
+        (schema_check.validate). A result that is not an object has none. An
+        error result (isError) need not have structuredContent, but what it
+        has is checked: marking a result as an error does not get it past the
+        schema. A tool that declares no outputSchema is not checked; one whose
+        schemas this session cannot vouch for (not listed, or too large to
+        keep) counts as a problem. "warn" reports and records a problem and
+        lets the result go on; "enforce" refuses it, a block that monitor mode
+        lifts. Checked as the server sent it, before the scan; the names in a
+        reason are left out when they hold a secret (_ShownNames).
+        """
+        if pending.method != "tools/call" or member != "result" or pending.tool is None:
+            return None
+        settings = self._firewall.policy.schema_checks_for(pending.tool)
+        if settings.results == "off":
+            return None
+        is_object = isinstance(value, dict)
+        if is_object and value.get("resultType", protocol.RESULT_COMPLETE) != protocol.RESULT_COMPLETE:
+            return None  # an input_required result asks for input; the retried call's result is checked
+        if is_object and value.get("isError") is True and "structuredContent" not in value:
+            return None  # an error with nothing structured in it: nothing to check
+        found, why = self._schemas.lookup(pending.tool) if self._schemas is not None else (None, "no schemas are kept")
+        shown = _ShownNames(self._firewall)
+        if found is None:
+            problems = [f"the result cannot be checked: {why}"]
+        elif not found.has_output:
+            return None
+        elif not is_object:
+            problems = ["the result is not an object, so it has no structuredContent, although the tool declares "
+                        "an output schema"]
+        elif "structuredContent" not in value:
+            problems = ["the result has no structuredContent, although the tool declares an output schema"]
+        else:
+            problems = schema_check.validate(value["structuredContent"], found.output, root="structuredContent",
+                                             names=shown)
+            if shown.hide_if_secret():
+                problems = schema_check.validate(value["structuredContent"], found.output, root="structuredContent",
+                                                 names=shown)
+        if not problems:
+            return None
+        if settings.results == "warn":
+            what = f"the result of '{printable(pending.tool, limit=80)}'"
+            self._schema_warning(pending.label, what, problems, "schema_result", pending.call_id, note=shown.note())
+            return None
+        reason = f"the result does not match the output schema of the tool: {'; '.join(problems)}{shown.note()}"
+        decision = self._firewall.block(pending.label, reason, event="result", public_reason=_SCHEMA_RESULT_REFUSAL,
+                                        rule=RULE_SCHEMA_RESULT, call_id=pending.call_id)
+        return None if decision.allowed else decision
 
     def _checked_for_forwarding(
         self, label: str, value: Any, event: str, log_clean: bool, call_id: str | None = None,
@@ -2033,12 +3035,24 @@ class Proxy:
         without being forwarded: the stricter checks and the pin are made for
         text, and a lenient client might still show the model what is inside.
         A null is removed too; it says nothing.
+
+        A server that differs from its pin (quarantine_server) cannot be
+        vouched for, so its instructions are removed whatever they say, and
+        are never pinned: they would steer the model, and become the baseline
+        its later instructions are compared with.
         """
         if "instructions" not in result:
             return
         instructions = result["instructions"]
         if instructions is None:
             del result["instructions"]
+            return
+        quarantined = self._whole_server_quarantined()
+        if quarantined is not None:
+            del result["instructions"]
+            decision = self._firewall.refuse(source, f"the whole server is quarantined: {quarantined}",
+                                             event="server_instructions", rule=RULE_QUARANTINE)
+            self._report_block("removed the instructions of the quarantined server", decision)
             return
         if not isinstance(instructions, str):
             del result["instructions"]
@@ -2150,6 +3164,53 @@ class Proxy:
         if dropped and self._first_report("icons", whose):
             self._report(f"dropped {len(dropped)} icon(s) of {whose}: {dropped[0]}")
 
+    def _clean_metadata(self, holder: Any, whose: str) -> None:
+        """Clean what a result (or the params of a message from the server) says about the server and links to.
+
+        * The server's own description in `_meta` (MCP 2026-07-28 puts
+          io.modelcontextprotocol/serverInfo into every result): its unsafe
+          icons and an unsafe websiteUrl are dropped (_clean_server_info).
+        * The icons of each resource_link in its content (a tool's result, or
+          the messages of a prompt or a sampling request).
+        Only those members change, in place, before the whole is scanned; a
+        client could fetch them as soon as it shows the reply. whose: for the
+        stderr line ("the server, in its reply to tools/call").
+        """
+        if not isinstance(holder, dict):
+            return
+        meta = holder.get("_meta")
+        server_info = meta.get(_SERVER_INFO_KEY) if isinstance(meta, dict) else None
+        if isinstance(server_info, dict):
+            self._clean_server_info(server_info, whose)
+        for block in _content_blocks(holder):
+            if block.get("type") == "resource_link" and "icons" in block:
+                self._clean_icons_of(block, f"a resource link (from {whose})")
+
+    def _clean_server_info(self, server_info: JsonObject, whose: str) -> None:
+        """Drop the unsafe icons of a serverInfo (an MCP Implementation), and its websiteUrl unless a public https address.
+
+        A client shows websiteUrl as the server's web site, as a link the user
+        may open, so it gets the check an elicitation's address gets
+        (mcp_protocol.public_https_problem): no javascript:, no local network.
+        """
+        if "icons" in server_info:
+            self._clean_icons_of(server_info, whose)
+        if "websiteUrl" not in server_info:
+            return
+        url = server_info["websiteUrl"]
+        if not isinstance(url, str):
+            problem: str | None = "is not text"
+        elif len(url) > MAX_WEBSITE_URL_CHARS:
+            problem = f"is longer than {MAX_WEBSITE_URL_CHARS} characters"
+        else:
+            problem = protocol.public_https_problem(url)
+        if problem is None:
+            return
+        del server_info["websiteUrl"]
+        if self._first_report("websiteUrl", whose):
+            shown = f": {printable(url, limit=60)}" if isinstance(url, str) else ""
+            self._report(f"dropped the websiteUrl of {whose}: it {problem}{shown}")
+
     def _name_collisions(self, items: list[Any], kind: str) -> tuple[dict[str, tuple[str, str, bool]], set[int]]:
         """Find the names of a list that collide: {name: (reason, audit event, whether monitor mode may lift it)},
         and the positions of entries that repeat an earlier one exactly, to be dropped.
@@ -2205,8 +3266,14 @@ class Proxy:
         pinned = kind in PINNED_LISTS
         if not isinstance(item, dict) or (pinned and label == "?"):
             return "it is not a well-formed entry", None
+        with self._state:
+            server_quarantine = self._server_quarantine
+        if server_quarantine is not None:  # resources too: none of them can be read
+            return f"the whole server is quarantined: {server_quarantine}", None
         if pinned and self._was_quarantined(kind, item["name"]):
-            return "it was quarantined earlier", None  # even if it looks clean now
+            # Even if it looks clean now. A template's uriTemplate as listed now is refused too.
+            self._quarantine(kind, item["name"], self._template_texts(kind, item))
+            return "it was quarantined earlier", None
 
         decision = self._check_name(item, label, kind, collision)
         forwarded = None
@@ -2216,6 +3283,8 @@ class Proxy:
             decision, forwarded = checked.decision, checked.content
         if decision.allowed and pinned:
             decision = self._check_pin(kind, item, label)
+        if decision.allowed and kind == "tools":
+            decision = self._check_remote_refs(item, label)
         if decision.allowed:
             if kind == "tools":
                 # Annotations are pinned with the rest of the tool, and they can only add flow labels.
@@ -2223,12 +3292,26 @@ class Proxy:
                 names = list(tool_parameters(item))
                 with self._state:
                     self._parameter_names.update(names[: max(0, MAX_KNOWN_NAMES - len(self._parameter_names))])
+                if self._schemas is not None:
+                    # The schemas as the server sent them: scanned, and compared with the pin, above.
+                    self._schemas.remember(item["name"], item)
             return None, forwarded
         if pinned:
             # Remember the name: the agent may already know it from an
             # earlier list, and the server may list it again looking clean.
-            self._quarantine(kind, item["name"])
+            # A resource template's URIs cannot be read either (_template_refusal).
+            self._quarantine(kind, item["name"], self._template_texts(kind, item))
         return decision.reason, None
+
+    def _template_texts(self, kind: str, item: Any) -> list[str]:
+        """The uriTemplates a resource template is known by: as listed now, and as pinned (as first seen)."""
+        if kind != "resourceTemplates" or not isinstance(item, dict):
+            return []
+        found = [item.get("uriTemplate")]
+        if _is_name(item.get("name")):
+            pinned = self._pins.definition(kind, item["name"])
+            found.append(pinned.get("uriTemplate") if pinned is not None else None)
+        return list(dict.fromkeys(text for text in found if isinstance(text, str)))
 
     def _check_name(self, item: JsonObject, label: str, kind: str, collision: tuple[str, str, bool] | None) -> Decision:
         """The verdict on an entry's name: a collision, then hidden characters, then the MCP naming rules.
@@ -2281,6 +3364,28 @@ class Proxy:
                                          event=f"{_ENTRY_NAME[kind]}_pins_full", rule=RULE_QUARANTINE)
         return Decision(True, "the definition is unchanged or new")
 
+    def _check_remote_refs(self, tool: JsonObject, label: str) -> Decision:
+        """The verdict on a tool whose inputSchema or outputSchema refers outside itself (schema_check.remote_refs).
+
+        Such a reference ($ref to a web address or a file, a network $id or an
+        unusual $schema) brings in schema text nobody scanned if a client
+        follows it. The policy's schema_checks.remote_refs decides: "warn" (the
+        default) reports the tool once and keeps it; "quarantine" removes it
+        (rule schema.remote_refs, a block that monitor mode lifts).
+        """
+        found = schema_check.remote_refs(tool)
+        if not found:
+            return Decision(True, "the schemas refer to nothing outside themselves")
+        reason = f"its schema refers outside itself: {', '.join(found)}"
+        if self._firewall.policy.schema_checks_for(tool["name"]).remote_refs == "quarantine":
+            return self._firewall.block(label, reason, event="tool_remote_ref", rule=RULE_SCHEMA_REMOTE_REFS)
+        if self._first_report("remote_refs", tool["name"]):
+            self._firewall.note(label, f"{reason} (kept: schema_checks.remote_refs is warn)", event="tool_remote_ref")
+            self._report(f"the tool '{label}' has a schema that refers outside itself, which a client could fetch "
+                         f"unchecked: {', '.join(found)}; it is kept (schema_checks.remote_refs \"quarantine\" would "
+                         "remove it)", limit=1000)
+        return Decision(True, reason)
+
     def _save_pins(self) -> None:
         try:
             self._pins.save()
@@ -2314,6 +3419,147 @@ class Proxy:
             self._report(f"hid {len(newly_hidden)} tool(s) that the policy blocks from the tool list: {hidden}",
                          limit=2000)
         return shown
+
+    # ---- lists in pages ---------------------------------------------------------------
+
+    def _checked_page_boundary(self, pending: _PendingRequest, items_key: str, entries: list[Any]) -> list[Any]:
+        """The entries of a page of a list to forward, once the boundary with the page before was scanned.
+
+        A list reply is scanned whole because a phrase can be split over two
+        entries; the client joins the pages of a list into one, so a phrase
+        can also be split over the end of one page and the start of the next.
+        When the request's cursor is the nextCursor of a page whose end is
+        kept, the text nearest the end of that page before
+        (_remember_page_end) is scanned with the text nearest the start
+        of this page (_boundary_view: for each member, nested ones included,
+        the nearest entries that have text in it, PAGE_BOUNDARY_BYTES of each
+        side; this side always looks for the members the end kept) with the
+        metadata rules. If that is refused, the fewest entries of this page's
+        side that are refused with that end are removed, and they and the
+        fewest entries of the end of the page before that take part are
+        quarantined (tools, prompts, resource templates: they cannot be used,
+        and are left out of later lists). The page before was already
+        forwarded: its entries stay in the client's list.
+        """
+        if pending.cursor is None or not entries:
+            return entries
+        with self._state:
+            tails = self._page_tails[items_key]
+            tail = tails.pop(pending.cursor, None)
+            if tail is not None:
+                tails[pending.cursor] = tail  # just used: forgotten last
+        if tail is None or not tail.texts:
+            return entries
+        ended_with = dict.fromkeys(key for entry in reversed(tail.texts) for key, _ in reversed(entry))
+        head = _boundary_view(entries, from_end=False, wanted=ended_with)
+        start = [text for _, text in head]
+        if not start:
+            return entries
+        decision = self._firewall.scan_result(
+            pending.label, {items_key: _scannable([*tail.texts, *start])}, event="list_item", log_clean=False,
+            call_id=pending.call_id,
+        )
+        if decision.allowed:
+            return entries
+        removed, ended = self._boundary_entries(items_key, tail.texts, start)
+        if items_key in PINNED_LISTS:
+            for position in ended:
+                name = tail.names[position]
+                if name:
+                    listed = {"name": name, "uriTemplate": tail.templates[position] or None}
+                    self._quarantine(items_key, name, self._template_texts(items_key, listed))
+            for position in removed:
+                entry = entries[head[position][0]]
+                if _is_name(entry.get("name")):
+                    self._quarantine(items_key, entry["name"], self._template_texts(items_key, entry))
+        count = len(removed)
+        self._report_block(
+            f"removed {count} entr{'y' if count == 1 else 'ies'} near the start of a page of the {items_key} list: "
+            "read with the end of the page before (already forwarded), they were refused; both are quarantined",
+            decision,
+        )
+        dropped = {head[position][0] for position in removed}
+        return [entry for index, entry in enumerate(entries) if index not in dropped]
+
+    def _boundary_entries(
+        self, items_key: str, end: Sequence[_KeptEntry], start: Sequence[_KeptEntry],
+    ) -> tuple[list[int], list[int]]:
+        """Which entries of a refused boundary to remove (positions in `start`) and to quarantine (in `end`).
+
+        On each side, the fewest entries nearest the boundary that are refused
+        with the other side (_fewest: a binary search). If the farthest of
+        those is refused with the other side on its own, it alone is taken:
+        the entries in between, which a phrase may be padded with, are left
+        out. Each scan is unrecorded and of 2 * PAGE_BOUNDARY_BYTES at most,
+        about 2 * log2(entries) + 2 of them in all.
+        """
+        taken = _fewest(lambda count: self._boundary_refused(items_key, end, start[:count]), len(start))
+        removed = list(range(taken))
+        if taken > 1 and self._boundary_refused(items_key, end, [start[taken - 1]]):
+            removed = [taken - 1]
+        chosen = [start[position] for position in removed]
+        reach = _fewest(lambda count: self._boundary_refused(items_key, end[len(end) - count:], chosen), len(end))
+        ended = list(range(len(end) - reach, len(end)))
+        if reach > 1 and self._boundary_refused(items_key, [end[len(end) - reach]], chosen):
+            ended = [len(end) - reach]
+        return removed, ended
+
+    def _boundary_refused(self, items_key: str, end: Sequence[_KeptEntry], start: Sequence[_KeptEntry]) -> bool:
+        """Whether the end of one page read with the start of the next has a finding at the blocking severity.
+
+        Not recorded: it only narrows down which entries a recorded refusal
+        (_checked_page_boundary) is about.
+        """
+        threshold = self._firewall.policy.block_severity
+        if threshold is None:
+            return False
+        views = text_views({items_key: _scannable([*end, *start])}, strict=True)
+        worst = max_severity(scan_views(views, profile=METADATA))
+        return worst is not None and SEVERITY_ORDER[worst] >= SEVERITY_ORDER[threshold]
+
+    def _remember_page_end(self, pending: _PendingRequest, items_key: str, delivered: JsonObject) -> None:
+        """Keep the end of a page that was delivered with a nextCursor, for the next page's boundary scan.
+
+        What is kept is the text the client was sent (the delivered reply):
+        _boundary_view of the page, read from its end. The end of the page
+        before is read on after it, so a member this page has too little text
+        in is filled from the pages before. Every string nextCursor, "" too,
+        is followed (_cursor_digest); _checked_reply refuses any other.
+
+        The end of a page is kept when its next page arrives, too: a client
+        may ask for that page again (a retry, after a refused page, or two
+        requests at once), and each answer is scanned with the same end. At
+        most MAX_OPEN_CURSORS ends per list are kept; the one used least
+        recently is forgotten first.
+        """
+        result = delivered.get("result")
+        entries = result.get(items_key) if isinstance(result, dict) else None
+        next_cursor = result.get("nextCursor") if isinstance(result, dict) else None
+        with self._state:
+            before = self._page_tails[items_key].get(pending.cursor) if pending.cursor is not None else None
+        if not isinstance(entries, list) or not isinstance(next_cursor, str):
+            return
+        # Side by side: what to read of each entry, its name and its uriTemplate ("" when it has none).
+        texts: list[Any] = list(before.texts) if before is not None else []
+        names = list(before.names) if before is not None else []
+        templates = list(before.templates) if before is not None else []
+        for entry in entries:
+            if isinstance(entry, dict):
+                texts.append(entry)
+                names.append(entry["name"] if _is_name(entry.get("name")) else "")
+                template = entry.get("uriTemplate") if items_key == "resourceTemplates" else None
+                # One too long to read matches every URI (uri_template), cut or not: it is kept bounded.
+                templates.append(template[:uri_template.MAX_TEMPLATE_CHARS + 1] if isinstance(template, str) else "")
+        kept = _boundary_view(texts, from_end=True)
+        tail = _PageTail(tuple(text for _, text in kept), tuple(names[index] for index, _ in kept),
+                         tuple(templates[index] for index, _ in kept))
+        with self._state:
+            tails = self._page_tails[items_key]
+            key = _digest(next_cursor)
+            tails.pop(key, None)  # stored again as the newest
+            tails[key] = tail
+            while len(tails) > MAX_OPEN_CURSORS:
+                del tails[next(iter(tails))]
 
     # ---- sending ------------------------------------------------------------
 
@@ -2481,10 +3727,26 @@ def _file_path(text: str) -> str:
     return os.path.expanduser(text)
 
 
+def _audit_max_bytes(text: str) -> int:
+    """--audit-max-bytes (audit_chain.parse_max_bytes)."""
+    try:
+        return audit_chain.parse_max_bytes(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def _server_name(text: str) -> str:
     if not SERVER_NAME.fullmatch(text):
         raise argparse.ArgumentTypeError("must be 1 to 64 letters, digits, '_', '-' or '.'")
     return text
+
+
+def _session_group(text: str) -> str:
+    """--session-group: it names a file in <home>/sessions, so the characters of a server name only, in lower case."""
+    group = group_name(text)
+    if group is None:
+        raise argparse.ArgumentTypeError(f"must be {GROUP_NAME_RULE}")
+    return group
 
 
 def _pass_env_name(text: str) -> str:
@@ -2516,6 +3778,37 @@ def _say_nothing(message: str, limit: int = 300) -> None:
     """What `_warn` becomes for notices under --quiet."""
 
 
+def _containment_value(read: Callable[[str], int], text: str) -> int:
+    try:
+        return read(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _server_memory_mb(text: str) -> int:
+    """--server-memory-mb (containment.memory_mb)."""
+    return _containment_value(containment.memory_mb, text)
+
+
+def _server_processes(text: str) -> int:
+    """--server-processes (containment.processes)."""
+    return _containment_value(containment.processes, text)
+
+
+def _server_cpu_seconds(text: str) -> int:
+    """--server-cpu-seconds (containment.cpu_seconds)."""
+    return _containment_value(containment.cpu_seconds, text)
+
+
+def _containment_settings(args: argparse.Namespace) -> containment.Settings:
+    """What the containment options ask for (containment.Settings); each of them implies --contain."""
+    return containment.Settings(
+        contain=args.contain, memory_mb=args.server_memory_mb, processes=args.server_processes,
+        cpu_seconds=args.server_cpu_seconds, sandbox=args.sandbox, allow=tuple(args.sandbox_allow),
+        read=tuple(args.sandbox_read), network=args.sandbox_network,
+    )
+
+
 def _argument_parser() -> argparse.ArgumentParser:
     # allow_abbrev=False: "--mon" is not --monitor, and "--polic weak.json" is not another --policy. A config
     # file is read by people and by `doctor`, and both must see the options the proxy really uses.
@@ -2525,9 +3818,23 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--policy", type=_file_path, required=True, help="path to the policy JSON file")
     parser.add_argument("--audit", type=_file_path, default=None, help="path of the audit log (JSON lines)")
     parser.add_argument("--no-log-args", action="store_true", help="leave tool arguments out of the audit log")
+    parser.add_argument("--audit-key-file", type=_file_path, default=None, metavar="FILE",
+                        help="sign every audit record (HMAC-SHA256) with the key in FILE; on POSIX the file must be "
+                             "owner-only. Keep it where the agent's tools cannot read it")
+    parser.add_argument("--audit-required", action="store_true",
+                        help="do not start if the audit log cannot be written, and refuse every call whose record "
+                             "cannot be written")
+    parser.add_argument("--audit-max-bytes", type=_audit_max_bytes, default=None, metavar="BYTES",
+                        help="past about this size, move the audit log to FILE.1 (then FILE.2, ...) and start it "
+                             "again, its chain continuing; nothing is deleted "
+                             f"({audit_chain.MIN_MAX_BYTES} to {audit_chain.MAX_MAX_BYTES})")
     parser.add_argument("--name", type=_server_name, default=None, metavar="NAME",
                         help="a short name for the server (letters, digits, '_', '-', '.'; at most 64), written into "
                              "every audit record and at the start of every line the proxy prints")
+    parser.add_argument("--session-group", type=_session_group, default=None, metavar="NAME",
+                        help="share flow marks with the other proxies of the same client run that name this group "
+                             "(kept in <home>/sessions/NAME.json, NAME in lower case; needs --name). wrap gives "
+                             "every server of one client the same group")
     parser.add_argument("--pins", type=_file_path, default=None, metavar="FILE",
                         help="remember tool, prompt and template definitions in FILE, and quarantine one that "
                              "changes later")
@@ -2560,6 +3867,41 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--approval-timeout", type=_approval_timeout, default=None, metavar="SECONDS",
                         help=f"refuse a call nobody answered within this time (default {DEFAULT_APPROVAL_TIMEOUT}, "
                              f"at most {MAX_APPROVAL_TIMEOUT})")
+    # Containing the server (containment.py). Each option below implies --contain; the proxy does not start
+    # when what they ask for cannot be set up.
+    parser.add_argument("--contain", action="store_true",
+                        help="end the server and the processes it starts with the proxy (Windows: a job object; "
+                             "Linux and macOS: its own process group, no core dumps, at most "
+                             f"{containment.SERVER_OPEN_FILES} open files). This cleans up after a server; it does "
+                             "not contain a hostile one, which can still read your files and have a process "
+                             "started outside the job or group (Windows: WMI, the Task Scheduler; elsewhere: "
+                             "setsid): see --sandbox")
+    parser.add_argument("--server-memory-mb", type=_server_memory_mb, default=None, metavar="MB",
+                        help="with --contain: at most this much memory for each of the server's processes (Windows: "
+                             "committed memory; elsewhere virtual memory, which Node reserves plenty of)")
+    parser.add_argument("--server-processes", type=_server_processes, default=None, metavar="N",
+                        help="with --contain, Windows only: at most N processes of the server's at once")
+    parser.add_argument("--server-cpu-seconds", type=_server_cpu_seconds, default=None, metavar="SECONDS",
+                        help="with --contain: at most this much CPU time for each of the server's processes")
+    parser.add_argument("--sandbox", choices=containment.SANDBOXES, default=None,
+                        help="also start the server in a sandbox that is installed already: bwrap (Linux: the file "
+                             "system read-only, the home folder empty but for --sandbox-allow and --sandbox-read, "
+                             "no network) or sandbox-exec (macOS: the credential folders and agent-sentinel's own "
+                             "hidden, no network)")
+    parser.add_argument("--sandbox-allow", type=_file_path, action="append", default=[], metavar="FOLDER",
+                        help="with --sandbox bwrap: a folder the server may read and write; repeat it for more")
+    parser.add_argument("--sandbox-read", type=_file_path, action="append", default=[], metavar="FOLDER",
+                        help="with --sandbox bwrap: a folder the server may read (where its program is, for "
+                             "example); repeat it for more")
+    parser.add_argument("--sandbox-network", action="store_true",
+                        help="with --sandbox: let the sandboxed server use the network")
+    parser.add_argument("--pin-server", action="store_true",
+                        help="also pin the server itself in the --pins file: how it is launched (the program, a "
+                             "runner's package version, the SHA-256 of a local script) and the name and version it "
+                             "reports. A server that differs is refused, see --on-server-change")
+    parser.add_argument("--on-server-change", choices=SERVER_CHANGE_MODES, default=None,
+                        help="with --pin-server, a server that differs from its pin: refuse (the default) does not "
+                             "start it, or refuses its handshake; quarantine starts it with every tool quarantined")
     loudness = parser.add_mutually_exclusive_group()
     loudness.add_argument("--quiet", action="store_true",
                           help="print only errors (the server's own stderr is still passed on)")
@@ -2622,6 +3964,71 @@ def _report_server_environment(
             "name each one it needs with --pass-env NAME", limit=2000)
 
 
+@dataclass(frozen=True)
+class _JoinedGroup:
+    """A session group this proxy joined at startup (--session-group), for the startup lines and the audit log."""
+
+    store: GroupSessionStore
+    joined: GroupJoin
+    run: client_run.ClientRun
+
+
+def _session_group_store(group: str, name: str) -> tuple[GroupSessionStore, client_run.ClientRun] | None:
+    """The store of the session group's file in <home>/sessions, not joined yet; None, after saying why, if not.
+
+    Nothing is written here. The firewall is given the store, for which
+    every mark counts as set until it has joined (_join_session_group); the
+    proxy joins just before it starts the server.
+    """
+    try:
+        folder = home.sessions_folder(home.home_folder())
+    except home.HomeError as exc:
+        _warn(f"cannot use --session-group: {exc}", limit=500)
+        return None
+    run = client_run.find_client_run()
+    return GroupSessionStore(folder, group, run.id, name, run_started=run.started), run
+
+
+def _join_session_group(store: GroupSessionStore, run: client_run.ClientRun) -> _JoinedGroup | None:
+    """Join the session group's file (session.GroupSessionStore.join); None, after saying why, if that fails."""
+    try:
+        joined = store.join()
+    except SessionStateError as exc:
+        _warn(f"cannot use --session-group: {exc}", limit=500)
+        return None
+    return _JoinedGroup(store, joined, run)
+
+
+def _report_session_group(group: _JoinedGroup, firewall: Firewall, say: Callable[..., None]) -> None:
+    """Say (and record, as a note) how the proxy joined its session group; a file it cannot use is always reported."""
+    joined, store, run = group.joined, group.store, group.run
+    members = ", ".join(joined.members)
+    client = f"{printable(run.program, limit=60)} {run.id}" if run.id != client_run.UNKNOWN else "unknown"
+    others = (f" (the file holds the sessions of {joined.others} other client run(s) too, each of its own)"
+              if joined.others else "")
+    if joined.status == NEW_RUN:
+        text = f"began the flow session of client run {client}{others}"
+        if joined.replaced:
+            text += (f"; the session of the client run begun first (its members: {', '.join(joined.replaced)}) "
+                     "was removed to make room")
+    elif joined.status == JOINED:
+        text = f"joined the flow session of client run {client}, with {members}{others}"
+    elif joined.status == REPLACED:
+        before = f" (its members: {', '.join(joined.replaced)})" if joined.replaced else ""
+        text = f"began the flow session of client run {client}, replacing the file: {joined.detail}{before}"
+    else:
+        text = f"{joined.detail}. Delete {store.path} while the client is not running to start afresh"
+    firewall.note(f"session_group:{store.group}", text, event="session_group")
+    line = f"session group '{store.group}': {text}"
+    if joined.status not in (NEW_RUN, JOINED, REPLACED):
+        _warn(line, limit=1000)
+    else:
+        say(line, limit=1000)
+    if run.id == client_run.UNKNOWN:
+        _warn(f"session group '{store.group}': the client process could not be told apart, so the group's flow "
+              "marks carry over from one run of the client to the next (stricter than needed, never laxer)", limit=500)
+
+
 def _report_policy_error(path: str, error: Exception) -> None:
     """Say why the policy cannot be loaded, line by line, with advice for a relative path that was not found.
 
@@ -2638,6 +4045,41 @@ def _report_policy_error(path: str, error: Exception) -> None:
         _warn(hint, limit=500)
 
 
+def server_change_advice(pins_path: Any) -> str:
+    """What the operator can do about a server that differs from its pin (proxy --pin-server)."""
+    command = ["agent-sentinel", "pins", "diff", "--server", "--pins", str(pins_path)]
+    return (f"If the change is expected, review it with: {proxy_report.shell_line(command)}; then pins accept "
+            "--server, and restart the proxy")
+
+
+def _check_server_launch(pins: ToolPins, firewall: Firewall, executable: str, command: list[str],
+                         label: str, say: Callable[..., None]) -> str | None:
+    """With --pin-server: compare how the server is about to be launched with its pin (pins.py).
+
+    The first launch is pinned. Returns what changed when it differs and
+    the change is not lifted by monitor mode (the caller then refuses to
+    start, or quarantines the server), else None.
+    """
+    status, changed = pins.check_server_launch(launch_identity(executable, command))
+    try:
+        pins.save()
+    except OSError as exc:
+        _warn(f"cannot save the pins file: {exc}")
+    if status == NEW:
+        say("--pin-server: pinned how the server is launched; it is compared at every later start")
+    if status != CHANGED:
+        return None
+    what = f"its launch ({', '.join(changed)}) changed since it was pinned"
+    decision = firewall.block(label, f"the server differs from its pin: {what}. {server_change_advice(pins.path)}",
+                              event="server_changed", rule=RULE_QUARANTINE)
+    if decision.allowed:  # monitor mode
+        say(f"monitor mode: the server differs from its pin ({what}); it starts as usual")
+        return None
+    _warn(f"the server differs from its pin: {what}. {server_change_advice(pins.path)} "
+          f"{proxy_report.rule_and_ref(decision)}", limit=2000)
+    return what
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _argument_parser()
     args = parser.parse_args(argv)
@@ -2649,10 +4091,20 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     if not command:
         parser.error("give the MCP server command after '--'")
+    if not args.audit and (args.audit_key_file or args.audit_required or args.audit_max_bytes is not None):
+        parser.error("--audit-key-file, --audit-required and --audit-max-bytes need --audit FILE")
+    if args.pin_server and (args.pins is None or args.no_pins):
+        parser.error("--pin-server pins the server in the pins file: give --pins FILE, without --no-pins")
+    if args.on_server_change is not None and not args.pin_server:
+        parser.error("--on-server-change says what happens to a server that differs from its pin: it needs "
+                     "--pin-server")
+    on_server_change = args.on_server_change or SERVER_CHANGE_REFUSE
     backends = [approver.describe() for approver in args.approve_with]
     for backend in backends:
         if backends.count(backend) > 1:
             parser.error(f"--approve-with {backend} is given twice")
+    if args.session_group is not None and args.name is None:
+        parser.error("--session-group needs --name: each mark the group shares names the server it came from")
     report = proxy_report.QUIET if args.quiet else proxy_report.VERBOSE if args.verbose else proxy_report.NORMAL
     say = _say_nothing if args.quiet else _warn  # notices; errors always go through _warn
     try:
@@ -2685,30 +4137,102 @@ def main(argv: list[str] | None = None) -> int:
     if added is None:
         return 2
     environment = server_env.server_environment(os.environ, args.clean_env, args.pass_env, added)
-    firewall = Firewall(
-        policy, audit_path=args.audit, log_args=not args.no_log_args, monitor=args.monitor, server_name=args.name
-    )
+    # A session group shares the flow marks; without flow rules there are none to share. The group's
+    # file is only named here: the proxy joins it just before it starts the server (below), so that a
+    # proxy that refuses to start is never listed as a member.
+    group_store = None
+    if args.session_group is not None and policy.flows:
+        group_store = _session_group_store(args.session_group, args.name)
+        if group_store is None:
+            return 2
+    try:
+        firewall = Firewall(
+            policy, audit_path=args.audit, log_args=not args.no_log_args, monitor=args.monitor, server_name=args.name,
+            session_store=group_store[0] if group_store is not None else None,
+            audit_key_file=args.audit_key_file, audit_max_bytes=args.audit_max_bytes,
+            audit_required=args.audit_required,
+        )
+    except audit_chain.AuditKeyError as exc:  # its text never holds the key; the path is the operator's own
+        _warn(f"cannot use --audit-key-file {args.audit_key_file}: {exc}", limit=1000)
+        return 2
     # secrets.known_values_from_env guards the values the server is given (--clean-env, --pass-env, --env-file).
     firewall.set_secret_environment(_guarded_values(policy.secrets_known_values_from_env, environment))
 
     approval_timeout = args.approval_timeout or DEFAULT_APPROVAL_TIMEOUT
+    contain = _containment_settings(args)
     start = proxy_report.Startup(
         version=__version__, name=args.name, policy_path=args.policy, policy=policy, audit_path=args.audit,
         pins_path=args.pins, pins_enabled=not args.no_pins, server_command=[executable, *command[1:]],
         approvers=[(approver.describe(), approver.unavailable()) for approver in args.approve_with],
         approval_timeout=approval_timeout, approval_timeout_given=args.approval_timeout is not None,
         monitor=args.monitor, secret_warnings=firewall.secret_warnings(),
+        audit_signed=firewall.audit_signed, audit_required=args.audit_required, audit_max_bytes=args.audit_max_bytes,
+        containment=containment.describe(contain) if contain.active else "",
+        session_group=args.session_group,
+        session_file=str(group_store[0].path) if group_store is not None else None,
     )
     for line in proxy_report.startup_lines(start):
         say(line, limit=1500)
     _report_server_environment(args, environment, added, say)
+    started = firewall.provenance(
+        audit_chain.SESSION_START, "the proxy started",
+        _session_details(firewall, args, [executable, *command[1:]], contain),
+    )
+    if not started and args.audit_required:
+        _warn("not starting: the audit log cannot be written, and --audit-required was given")
+        return 2
+    # From here on, a proxy that does not start its server says why in a session_end record.
+    server_changed = None
+    if args.pin_server:
+        server_changed = _check_server_launch(pins, firewall, executable, command, args.name or "server", say)
+        if server_changed is not None and on_server_change == SERVER_CHANGE_REFUSE:
+            _warn("refusing to start the server (--on-server-change refuse)")
+            firewall.provenance(audit_chain.SESSION_END, "the server differs from its pin, so it was not started")
+            return 2
+    try:
+        # On Windows the proxy joins its job object here, before the server starts (containment.py).
+        # The audit key file is a secret of the proxy's: a sandbox must not show it to the server.
+        # The audit log's rotated copies (FILE.1, FILE.2, ...) are the proxy's own files as well, and so are
+        # the changes that wait beside the pins file for `pins accept` (what doctor calls the control plane).
+        contained = containment.prepare(contain, _resolve_executable, server_executable=executable,
+                                        control_files=_control_files(args),
+                                        secret_files=[args.audit_key_file] if args.audit_key_file else [],
+                                        numbered_files=[args.audit] if args.audit else [])
+    except containment.ContainmentError as exc:
+        _warn(f"cannot contain the server as asked, so it is not started: {exc}", limit=1000)
+        firewall.provenance(audit_chain.SESSION_END, "the server could not be contained as asked, so it was not "
+                                                     "started")
+        return 2
+    # Nothing above refused, so the server is about to start: join the session group, before any call.
+    group = None
+    if group_store is not None:
+        group = _join_session_group(*group_store)
+        if group is None:
+            firewall.provenance(audit_chain.SESSION_END, "the session group could not be joined, so the server was "
+                                                         "not started")
+            return 2
+        _report_session_group(group, firewall, say)
     try:
         server = subprocess.Popen(
-            [executable, *command[1:]], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            env=environment,
+            contained.command([executable, *command[1:]]), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=environment, **contained.popen_options(),
         )
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:  # SubprocessError: the containment setup in the child failed
         _warn(f"cannot start server: {exc}")
+        if group is not None:
+            group.store.leave()  # its server never ran, so it is no member of the client run
+        firewall.provenance(audit_chain.SESSION_END, "the server could not be started")
+        return 2
+    try:
+        contained.after_start(server)
+    except containment.ContainmentError as exc:
+        _warn(f"cannot contain the server as asked, so it was stopped: {exc}", limit=1000)
+        exit_code = _stop(server, time.monotonic())
+        contained.sweep(server)
+        if group is not None:
+            group.store.leave()
+        firewall.provenance(audit_chain.SESSION_END, "the server could not be contained as asked, so it was stopped",
+                            {"server_exit_code": exit_code})
         return 2
     assert server.stdin is not None and server.stdout is not None and server.stderr is not None
     if args.monitor:
@@ -2718,8 +4242,12 @@ def main(argv: list[str] | None = None) -> int:
     proxy = Proxy(
         firewall, sys.stdout.buffer, server.stdin, pins=pins, max_message_bytes=args.max_message_bytes,
         tool_names=args.tool_names, elicitation_hosts=args.elicitation_host, approvers=args.approve_with,
-        approval_timeout=approval_timeout, report=report,
+        approval_timeout=approval_timeout, report=report, pin_server=args.pin_server,
+        on_server_change=on_server_change,
     )
+    if server_changed is not None:
+        _warn("every tool, prompt and resource template of the server is quarantined (--on-server-change quarantine)")
+        proxy.quarantine_server(server_changed)
 
     # Run one relay per direction. When either side closes, shut down.
     one_side_closed = threading.Event()
@@ -2757,8 +4285,50 @@ def main(argv: list[str] | None = None) -> int:
     server_relay.join(timeout=SHUTDOWN_GRACE_SECONDS)  # let it finish answering
     proxy.close_report()  # how many lines about traffic were left out, if any
     exit_code = _stop(server, deadline)
+    contained.sweep(server)  # with --contain: whatever the server started that is still running
     server_lines.flush()  # and how many of the server's stderr lines, if its relay has not said so yet
+    firewall.provenance(audit_chain.SESSION_END, "the proxy stopped", {"server_exit_code": exit_code})
     return exit_code
+
+
+def _control_files(args: argparse.Namespace) -> list[str]:
+    """The proxy's own files that a sandboxed server may not write: the policy, the pins, the audit log.
+
+    With them the file beside the pins file in which changed definitions
+    wait for `pins diff` and `pins accept` (pins.pending_path): a server
+    that could write it could have the operator accept a definition of its
+    own choosing.
+    """
+    files = [args.policy]
+    if args.pins:
+        files += [args.pins, str(pending_path(args.pins))]
+    if args.audit:
+        files.append(args.audit)
+    return files
+
+
+def _session_details(firewall: Firewall, args: argparse.Namespace, server_argv: list[str],
+                     contain: containment.Settings | None = None) -> dict[str, Any]:
+    """What the session_start record says: what is running, under which policy, for whom (no secret, no path).
+
+    contain: what the containment options ask for (_containment_settings),
+    recorded as "containment": "none", "contained" or "sandboxed (NAME)"
+    (containment.label). It is what was asked for: when it cannot be set up,
+    a session_end follows at once.
+    """
+    return {
+        "version": __version__,
+        "policy_sha256": firewall.policy_sha256,
+        "monitor": bool(args.monitor),
+        "pins_sha256": audit_chain.file_sha256(args.pins) if args.pins and not args.no_pins else None,
+        "server_program": printable(os.path.basename(server_argv[0]), limit=audit_chain.MAX_PROVENANCE_TEXT),
+        "server_argv_sha256": audit_chain.argv_sha256(server_argv, firewall.redact),
+        "containment": (containment.label(contain) or "none") if contain is not None else None,
+        "signed": firewall.audit_signed,
+        "user": audit_chain.os_user(),
+        "host": audit_chain.host_name(),
+        "pid": os.getpid(),
+    }
 
 
 if __name__ == "__main__":

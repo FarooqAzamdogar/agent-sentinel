@@ -4,6 +4,7 @@ import json
 import unittest
 
 from cli_support import TempFolderTest, run_cli
+from support import audit_records
 from agent_sentinel import Firewall, Policy
 from agent_sentinel.cli_suggest import MIN_LIMIT
 
@@ -146,7 +147,7 @@ class Suggesting(TempFolderTest):
         refusing = Firewall(Policy.from_dict({"default": "ask"}), audit_path=audit, approver=lambda *_: False)
         refusing.check_call("delete_repository", {"repo": "acme/prod"})
         Firewall(Policy.from_dict({"default": "ask"}), audit_path=audit).check_call("drop_table", {})
-        records = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines()]
+        records = audit_records(audit)
         self.assertEqual([record.get("approval") for record in records], ["refused", "unavailable"])
         out = self.suggest(records)  # judged against a policy whose default is "block"
         self.assertIn("Nothing to suggest", out)

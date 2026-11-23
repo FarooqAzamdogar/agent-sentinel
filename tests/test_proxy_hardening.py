@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import INJECTION, POLICY, ROOT
+from support import INJECTION, POLICY, ROOT, audit_records
 from test_proxy import Harness, ProxyEndToEndTests, call, reply, request, text_result
 from agent_sentinel import Firewall, Policy, mcp_proxy
 from agent_sentinel.mcp_proxy import ToolPins
@@ -23,7 +23,7 @@ SECRET_TOKEN = "ghp_" + "a1B2c3D4e5" * 4
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 class RepliesAreRebuilt(unittest.TestCase):
@@ -196,6 +196,7 @@ class RequestIdsInFlight(unittest.TestCase):
 
     def test_an_id_can_be_used_again_once_its_reply_came_or_it_was_cancelled(self):
         h = Harness()
+        h.list_tools("read_file")  # else, under the example policy's flow rule, read_file counts as a sink too
         h.round_trip(call(1, "read_file", {"path": "a.txt"}), text_result("one"))
         self.assertEqual(h.round_trip(call(1, "read_file", {"path": "b.txt"}), text_result("two"))["id"], 1)
         h.from_client(call(2, "read_file", {"path": "c.txt"}))

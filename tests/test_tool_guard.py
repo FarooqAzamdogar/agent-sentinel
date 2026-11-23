@@ -5,11 +5,10 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
-import json
 import typing
 
 from cli_support import TempFolderTest
-from support import INJECTION, REF_SUFFIX
+from support import INJECTION, REF_SUFFIX, audit_records
 from agent_sentinel import BlockedError, Firewall, Policy
 from agent_sentinel.tool_guard import guard
 
@@ -39,7 +38,7 @@ class GuardTest(TempFolderTest):
         self.ran = []
 
     def records(self):
-        return [json.loads(line) for line in self.audit.read_text(encoding="utf-8").splitlines()]
+        return audit_records(self.audit)
 
     def read_file_tool(self, **options):
         @guard(self.firewall, **options)

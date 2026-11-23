@@ -13,6 +13,7 @@ Module map:
     session_limits.py session limits, approval memory, and what an approval question shows
     tail_scan.py      reads the end of the last delivered result with the start of the next (DET-5)
     filelock.py       operating-system file locks (audit log, session files)
+    audit_chain.py    the audit log's hash chain: writing, rotation, checking (audit verify)
     firewall.py       combines the three and writes the audit log   (the public core)
     tool_guard.py     guard(): the firewall around a tool function
     textutil.py       helpers shared by the above
@@ -24,8 +25,12 @@ Module map:
     pins.py           what the proxy remembers of tools, prompts, templates and instructions (pins file v2)
     elicitation.py    what an elicitation may ask the user
     server_env.py     the environment the server is started with
+    containment.py    keeping the server's processes in check (--contain: job object, process group; --sandbox)
+    schema_check.py   tool arguments and results against the server's schemas; references outside a schema
     approvers.py      how the proxy asks a person to approve a call (dialog, command, elicitation)
     proxy_report.py   what the proxy tells the operator on stderr
+    client_run.py     which run of the MCP client a proxy belongs to (proxy --session-group)
+    uri_template.py   whether a URI may come from a quarantined resource template (RFC 6570)
 
   Claude Code and the Claude Agent SDK
     claude_hooks.py   the answers to Claude Code's hook events; claude_sdk_hooks() for the Agent SDK
@@ -43,6 +48,10 @@ Module map:
     clients.py        the MCP clients and where their configurations are
     config_file.py    reading and editing a client's configuration file safely
     wrapping.py       putting the proxy in front of one server entry, and taking it out
+    launch.py         what a server's launch command runs, and what is risky about it (doctor, wrap, pins)
+    advisories.py     known-bad MCP packages and popular names, as dated data (goes stale between releases)
+    control_plane.py  whether the agent can reach agent-sentinel's own files (doctor)
+    doctor_baseline.py  doctor --save-baseline / --baseline: what was added or changed since
     demo_server.py    the deliberately poisoned server of `agent-sentinel demo`
 """
 

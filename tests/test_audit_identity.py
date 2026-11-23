@@ -10,13 +10,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from support import INJECTION, POLICY
+from support import INJECTION, POLICY, audit_records
 from test_proxy import Harness, call, reply, request, text_result
 from agent_sentinel import BlockedError, Firewall
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 class AuditSetup(unittest.TestCase):
@@ -68,9 +68,10 @@ class ServerAndSession(AuditSetup):
     def test_a_hostile_session_id_cannot_break_the_record(self):
         Firewall(POLICY, audit_path=self.audit, session_id="s\n\x1b[2J ").check_call("read_file", {"path": "a"})
         raw = self.audit.read_text(encoding="utf-8")
-        self.assertEqual(len(raw.splitlines()), 1)
+        lines = raw.splitlines()
+        self.assertEqual(len(lines), 2)  # the new log's chain_start (which names the session too), then the call
         self.assertNotIn("\x1b", raw)
-        self.assertEqual(json.loads(raw)["session"], "s\n\x1b[2J ")
+        self.assertEqual(json.loads(lines[-1])["session"], "s\n\x1b[2J ")
 
 
 class CallIds(AuditSetup):
@@ -133,6 +134,7 @@ class CallIds(AuditSetup):
 class InTheProxy(AuditSetup):
     def test_a_tool_call_and_its_result_share_a_call_id(self):
         h = Harness(Firewall(POLICY, audit_path=self.audit, server_name="files"))
+        h.list_tools("read_file", "fetch_page")  # else, under the example policy's flow rule, they count as sinks too
         h.round_trip(call(1, "read_file", {"path": "notes.txt"}), text_result("hello"))
         h.round_trip(call(2, "fetch_page", {"url": "u"}), text_result(INJECTION))
         records = self.records()

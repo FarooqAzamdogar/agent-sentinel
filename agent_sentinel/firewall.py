@@ -77,6 +77,7 @@ from secrets import token_hex
 from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from . import session_limits, tail_scan
+from .audit_chain import CHAIN_FIELDS, append_chained, checked_max_bytes, read_key_file
 from .detector import (
     MAX_PARAMETER_NAMES,
     METADATA,
@@ -88,7 +89,6 @@ from .detector import (
     merge_findings,
     scan_views,
 )
-from .filelock import lock_file as _lock_file, unlock_file as _unlock_file
 from .leaks import (
     CANARY,
     CUSTOM,
@@ -102,6 +102,7 @@ from .leaks import (
 from .policy import (
     NOT_PERMITTED,
     PERMITTED,
+    RULE_AUDIT,
     RULE_CALLER,
     RULE_INJECTION,
     RULE_MALFORMED,
@@ -215,7 +216,11 @@ _UNSCANNABLE_REFUSAL = "the content has a type that cannot be checked"
 _SECRET_RESULT_REFUSAL = "the content holds what looks like a secret, so it was withheld"
 # Says nothing about flows or sessions: the agent must not learn that its history is tracked.
 _WITHHELD_REFUSAL = "the content could not be checked, so it was withheld"
-_UNCHECKED_CALL = "the call could not be checked, so it was not made"
+# A call that could not be checked: its session limits could not be counted (rule "session"), or, under
+# audit_required, its record could not be written (rule "audit_required"). The words the hook uses.
+_UNCHECKED_CALL_REFUSAL = "the call could not be checked, so it was not made"
+# How many hex characters of the policy's SHA-256 a block record keeps, as "policy".
+POLICY_HASH_CHARS = 12
 
 
 class _Uncheckable(Exception):
@@ -393,6 +398,10 @@ class Firewall:
         session_id: str | None = None,
         session_store: SessionStore | None = None,
         rate_limiter: Any = None,
+        *,
+        audit_key_file: str | Path | None = None,
+        audit_max_bytes: int | None = None,
+        audit_required: bool = False,
     ) -> None:
         """
         policy:        the Policy that decides each call (Policy.from_file, or built in code).
@@ -423,6 +432,21 @@ class Firewall:
                        the counts in a file (hook_state.FileRateLimiter). It needs
                        one method, over_limit(limits, now) -> the name of a full
                        bucket, or None after counting the call in every bucket.
+
+        The audit log is a hash chain (see audit_chain.py): every record
+        carries seq, prev and hash, and a new log starts with a "chain_start"
+        record. A new log is created readable by its owner only (0600 on POSIX).
+        audit_key_file:  also sign every record (mac: HMAC-SHA256) with the key in
+                       this file. On POSIX the file must be owner-only. The key
+                       is read now; audit_chain.AuditKeyError (a ValueError) if
+                       it cannot be used. Keep the file out of the agent's reach.
+        audit_max_bytes: rotate the log before it grows past this many bytes: it
+                       is copied to FILE.1 (then FILE.2, ...) and started again,
+                       its chain continuing. Nothing is ever deleted.
+        audit_required:  refuse what cannot be recorded: an allowed call, approval
+                       or result whose audit record cannot be written is refused
+                       (rule "audit_required"), also in monitor mode.
+        These three need an audit_path (ValueError otherwise).
         """
         if server_name is not None and (not isinstance(server_name, str) or not SERVER_NAME.fullmatch(server_name)):
             raise ValueError("server_name must be 1 to 64 letters, digits, '_', '-' or '.'")
@@ -432,6 +456,17 @@ class Firewall:
             raise ValueError(f"session_id must be text of 1 to {MAX_SESSION_ID_CHARS} characters")
         self.policy = policy
         self.audit_path = Path(audit_path) if audit_path else None
+        if self.audit_path is None and (
+            audit_key_file is not None or audit_max_bytes is not None or audit_required
+        ):
+            raise ValueError("audit_key_file, audit_max_bytes and audit_required need an audit_path")
+        try:
+            self.audit_max_bytes = checked_max_bytes(audit_max_bytes)
+        except ValueError as exc:
+            raise ValueError(f"audit_max_bytes {exc}") from None
+        self.audit_required = audit_required is True
+        # The key of the records' MACs: read once, never written anywhere.
+        self._audit_key = read_key_file(audit_key_file) if audit_key_file is not None else None
         self.approver = approver
         self.log_args = log_args
         self.monitor = monitor
@@ -447,9 +482,14 @@ class Firewall:
         self._rate_clock: Callable[[], float] | None = None
         # Guards the two collections below; each check takes it only briefly.
         self._state_lock = threading.Lock()
-        # Labels learned from MCP tool annotations: tool name -> labels. Only ever grows.
+        # Labels learned from MCP tool annotations: tool name -> labels (empty for a tool whose annotations
+        # imply none). Every tool whose annotations were read is here. Only ever grows.
         self._annotation_labels: dict[str, frozenset[str]] = {}
         self._annotations_overflowed = False
+        # presume_unlisted_tools: a tool whose annotations were never read counts as untrusted and a sink,
+        # except these names (requests the policy checks under a tool's name, such as "resources/read").
+        self._presume_unlisted = False
+        self._unlisted_exempt: frozenset[str] = frozenset()
         # Calls waiting for finish_approval: call id -> (the pending decision, the tool, its reason, its
         # arguments, the labels the call's command sections gave it (Policy.command_labels)). The arguments
         # are the JSON copy that was checked (textutil.normalised_arguments).
@@ -522,10 +562,14 @@ class Firewall:
         try:
             decision = self._decide_call(tool, args, defer_ask and not self.monitor, call_id)
         except _Uncheckable as exc:
-            return self.refuse(tool, str(exc), public_reason=_UNCHECKED_CALL, rule=RULE_SESSION, call_id=call_id)
+            return self.refuse(tool, str(exc), public_reason=_UNCHECKED_CALL_REFUSAL, rule=RULE_SESSION,
+                               call_id=call_id)
         if decision.pending:
             self._remember_pending(decision, tool, args, self.policy.command_labels(tool, args))
-            self._audit("call", tool, "ask", decision, args)
+            if not self._audit("call", tool, "ask", decision, args) and self.audit_required:
+                with self._state_lock:  # nobody is asked about a call that left no record
+                    self._pending_approvals.pop(decision.call_id or "", None)
+                return self._unrecorded("call", tool, decision, ref=decision.ref)
             return decision
         return self._finish("call", tool, decision, args=args)
 
@@ -583,7 +627,9 @@ class Firewall:
                 self._remember_refusal(tool, entry[3])
         else:
             final = self._approved_unless_a_flow_blocks(decision, tool, entry[3], base, who, entry[4])
-        self._audit("approval", tool, "allow" if final.allowed else "block", final, None)
+        written = self._audit("approval", tool, "allow" if final.allowed else "block", final, None)
+        if final.allowed and not written:
+            return self._unrecorded("approval", tool, final, ref=decision.ref)
         return final
 
     def scan_result(
@@ -718,6 +764,24 @@ class Firewall:
         """
         return self._secrets_in_call(None, value)
 
+    def holds_a_secret(self, value: Any) -> bool:
+        """Whether a person who reads the texts in `value` might read a secret there, even one split between two.
+
+        For a caller that puts texts it did not write into a line for the
+        operator or the log: the proxy's schema checks pass the property names
+        a reason would show. Everything the log's redaction replaces is looked
+        for, whatever secrets.in_arguments says: the built-in and custom
+        formats, the known values and the canaries. Keys and strings are read
+        as a call's arguments are, one per line and joined end to end, so a
+        secret split over two names is seen, which redacting each name alone
+        would miss. A value too deeply nested to read counts as holding one.
+        """
+        try:
+            spellings = _call_spellings(None, value)
+        except UnscannableError:
+            return True
+        return bool(self._secret_guard().find_in_texts(spellings, redaction_only=True))
+
     def secret_warnings(self) -> list[str]:
         """Why some secrets.known_values_from_env values are not guarded: for the operator, at startup.
 
@@ -768,6 +832,38 @@ class Firewall:
         or a tool the proxy hid from the tool list. Nothing reaches the agent.
         """
         self._audit(event, tool, "note", Decision(True, reason, call_id=call_id), None)
+
+    def provenance(self, event: str, reason: str, details: Mapping[str, Any] | None = None) -> bool:
+        """Record who is writing what follows: a session record ("session_start", "protocol", "session_end").
+
+        The record has the identity fields of every record (time, server,
+        session), action "note", the reason, then `details` (values the caller
+        made printable and short; secrets in them are redacted as in any
+        record). No tool. Returns whether it was written (True without an
+        audit log): a caller with audit_required stops when it was not.
+        """
+        record = self._identity()
+        record.update(event=event, action="note", reason=reason)
+        for name, value in (details or {}).items():
+            # The chain's own fields are added when the line is written, after everything else.
+            if name not in record and name not in CHAIN_FIELDS and value is not None:
+                record[name] = value
+        return self._write_record(record)
+
+    @property
+    def policy_sha256(self) -> str | None:
+        """The SHA-256 of the policy file (Policy.from_file), or None for a policy built otherwise."""
+        value = getattr(self.policy, "source_sha256", None)
+        return value if isinstance(value, str) else None
+
+    @property
+    def audit_signed(self) -> bool:
+        """Whether the audit records carry a MAC (audit_key_file was given)."""
+        return self._audit_key is not None
+
+    def redact(self, text: str) -> str:
+        """`text` with what this policy's secret guard recognises replaced: the formats, known values and canaries."""
+        return self._secret_guard().redact(text)
 
     def refuse(
         self, tool: str, reason: str, event: str = "call", public_reason: str = "", rule: str = RULE_MALFORMED,
@@ -887,16 +983,37 @@ class Firewall:
         Annotation labels count only when the policy's classify_by_annotations
         is on (the default). When more tools were annotated than can be
         remembered, a tool whose annotations were not kept counts as both
-        untrusted and a sink.
+        untrusted and a sink. So does, after presume_unlisted_tools and when
+        the policy has flow rules, a tool whose annotations were never read.
         """
         labels = self.policy.tool_labels(tool)
         if self.policy.classify_by_annotations and isinstance(tool, str):
             with self._state_lock:
                 learned = self._annotation_labels.get(tool)
-                if learned is None and self._annotations_overflowed:
+                unknown = self._annotations_overflowed or (
+                    self._presume_unlisted and bool(self.policy.flows) and tool not in self._unlisted_exempt
+                )
+                if learned is None and unknown:
                     learned = labels_from_annotations({"openWorldHint": True})
             labels |= learned or frozenset()
         return labels
+
+    def presume_unlisted_tools(self, exempt: Iterable[str] = ()) -> None:
+        """From now on, a tool whose annotations were never read (learn_annotations) counts as untrusted and a sink.
+
+        For the proxy, which reads annotations from the tool lists it checks:
+        a call to a tool no checked list has shown (a client that reuses a
+        tool list it cached in an earlier process, or calls a name it knows)
+        could otherwise be a sink the flow rules do not see. It applies only
+        while the policy has flow rules and classify_by_annotations is on.
+        `exempt`: names that are no tool (the requests the policy checks
+        under a tool's name, such as "resources/read").
+        """
+        if isinstance(exempt, (str, bytes)):
+            raise TypeError("exempt must be a collection of names, not one text")
+        with self._state_lock:
+            self._presume_unlisted = True
+            self._unlisted_exempt = frozenset(name for name in exempt if isinstance(name, str))
 
     def marks_for(self, tool: str, args: Any = None) -> frozenset[str]:
         """The marks a delivered result of `tool` gives the session: its labels except "sink".
@@ -1001,18 +1118,19 @@ class Firewall:
         """Remember the flow labels an MCP tool's annotations imply (see session.labels_from_annotations).
 
         The proxy calls this for each tool of a tools/list reply that it lets
-        through. Labels only add up: annotations that later drop a hint do not
-        remove a label learned earlier.
+        through, and at startup for each pinned tool. Labels only add up:
+        annotations that later drop a hint do not remove a label learned
+        earlier. A tool whose annotations imply no label is remembered too, as
+        one whose annotations were read (see presume_unlisted_tools).
         """
         if not isinstance(tool, str):
             return
         labels = labels_from_annotations(annotations)
-        if not labels:
-            return
         with self._state_lock:
             known = self._annotation_labels.get(tool)
             if known is not None:
-                self._annotation_labels[tool] = known | labels
+                if labels:
+                    self._annotation_labels[tool] = known | labels
             elif len(self._annotation_labels) < MAX_ANNOTATED_TOOLS:
                 self._annotation_labels[tool] = labels
             else:
@@ -1135,10 +1253,19 @@ class Firewall:
         return found
 
     def _verdict(self, tool: str, args: dict[str, Any]) -> Verdict:
-        """The policy's verdict, with the flow rules applied when the policy has any."""
+        """The policy's verdict, with the flow rules applied when the policy has any.
+
+        The session's marks are read only for a call that a flow rule can
+        apply to (the tool has the label of some rule's "then"): for any
+        other call they cannot change the verdict, and a store kept in a
+        file shared by several processes (session groups) costs a lock to read.
+        """
         if not self.policy.flows:
             return self.policy.evaluate(tool, args)
-        return self.policy.evaluate(tool, args, marks=self.session_marks(), extra_labels=self.tool_labels(tool))
+        labels = self.tool_labels(tool)
+        if not any(flow.then in labels for flow in self.policy.flows):
+            return self.policy.evaluate(tool, args)
+        return self.policy.evaluate(tool, args, marks=self.session_marks(), extra_labels=labels)
 
     def _charge_session_limits(self, tool: str, args: dict[str, Any]) -> session_limits.SessionLimit | None:
         """Count the call in its session limits; the limit that is full (nothing counted), or None.
@@ -1477,27 +1604,56 @@ class Firewall:
     def _finish(
         self, event: str, tool: str, decision: Decision, args: dict[str, Any] | None = None, log: bool = True
     ) -> Decision:
-        """Write the audit record and apply monitor mode. An allowed result with a notice is recorded as "note"."""
+        """Write the audit record and apply monitor mode (and audit_required: see _unrecorded).
+
+        An allowed result with a notice is recorded as "note".
+        """
         if self.monitor and not decision.allowed:
-            self._audit(event, tool, "would_block", decision, args)
-            return Decision(
+            written = self._audit(event, tool, "would_block", decision, args)
+            lifted = Decision(
                 True, WOULD_BLOCK_PREFIX + decision.reason, decision.findings, rule=decision.rule,
                 matched_arg=decision.matched_arg, call_id=decision.call_id, redacted=decision.redacted,
                 would_block=True, marks=decision.marks, tail=decision.tail,
             )
+            return lifted if written else self._unrecorded(event, tool, lifted)
         if log:
             action = ("note" if decision.notice else "allow") if decision.allowed else "block"
-            self._audit(event, tool, action, decision, args)
+            written = self._audit(event, tool, action, decision, args)
+            if decision.allowed and not written:
+                return self._unrecorded(event, tool, decision)
         return decision
 
-    def _audit(self, event: str, tool: str, action: str, decision: Decision, args: dict[str, Any] | None) -> None:
-        if self.audit_path is None:
-            return
+    def _unrecorded(self, event: str, tool: str, decision: Decision, ref: str | None = None) -> Decision:
+        """What was let through but left no audit record: refused under audit_required, else as it was.
+
+        The refusal holds in monitor mode too, and the agent is told only that
+        the call (or the content) could not be checked. Its own record is tried
+        once more, in case the failure has passed.
+        """
+        if not self.audit_required:
+            return decision
+        public = _UNCHECKED_CALL_REFUSAL if event in ("call", "approval") else _WITHHELD_REFUSAL
+        refusal = Decision(
+            False, "the audit record could not be written, and audit_required refuses what is not recorded",
+            public_reason=public, rule=RULE_AUDIT, ref=ref, call_id=decision.call_id,
+        )
+        self._audit(event, tool, "block", refusal, None)
+        return refusal
+
+    def _identity(self) -> dict[str, Any]:
+        """The fields every record starts with: when, and where it comes from."""
         record: dict[str, Any] = {"time": datetime.now(timezone.utc).isoformat(timespec="seconds")}
         # Where the record comes from: several proxies (and hook processes) can share one log.
         if self.server_name is not None:
             record["server"] = self.server_name
         record["session"] = self.session_id
+        return record
+
+    def _audit(self, event: str, tool: str, action: str, decision: Decision, args: dict[str, Any] | None) -> bool:
+        """Write one record about a decision; whether it was written (True when there is no audit log)."""
+        if self.audit_path is None:
+            return True
+        record = self._identity()
         record.update(event=event, tool=tool)
         if decision.call_id is not None:
             record["call_id"] = decision.call_id
@@ -1507,6 +1663,10 @@ class Firewall:
             value = getattr(decision, name)
             if value is not None:
                 record[name] = value
+        # Which policy decided a block: the start of its file's SHA-256 (session_start has all of it).
+        policy_hash = self.policy_sha256
+        if action in ("block", "would_block") and policy_hash is not None:
+            record["policy"] = policy_hash[:POLICY_HASH_CHARS]
         record["reason"] = decision.reason
         if decision.redacted:
             record["redacted"] = list(decision.redacted)
@@ -1517,17 +1677,37 @@ class Firewall:
         if decision.findings:
             guard = self._secret_guard()
             record["findings"] = [dict(asdict(f), excerpt=shown_excerpt(f.excerpt, guard)) for f in decision.findings]
+        return self._write_record(record)
+
+    def _write_record(self, record: dict[str, Any]) -> bool:
+        """Append a record to the chain of the audit log (audit_chain.append_chained); whether it was written."""
+        if self.audit_path is None:
+            return True
+        guard = self._secret_guard()
         try:
-            _append_line(self.audit_path, _audit_line(record, self._secret_guard()))
+            append_chained(
+                self.audit_path, _audit_line(record, guard), self._chain_start_line,
+                key=self._audit_key, max_bytes=self.audit_max_bytes,
+            )
+            return True
         except OSError as exc:
-            # A broken log must not stop the firewall from enforcing decisions.
+            # A broken log must not stop the firewall from enforcing decisions (unless audit_required).
             if not self._audit_failed:
                 self._audit_failed = True
                 # Named like the proxy's own lines (agent-sentinel[NAME]:), so that in a client log with
                 # several proxies the line can be traced to its server; the path and error made printable.
                 who = f"agent-sentinel[{self.server_name}]" if self.server_name else "agent-sentinel"
+                then = "; what cannot be recorded is refused (audit required)" if self.audit_required else ""
                 print(f"{who}: cannot write audit log {printable(str(self.audit_path), limit=500)}: "
-                      f"{printable(exc, limit=500)}", file=sys.stderr)
+                      f"{printable(exc, limit=500)}{then}", file=sys.stderr)
+            return False
+
+    def _chain_start_line(self, fields: dict[str, Any]) -> str:
+        """The line of a chain_start record (see audit_chain.py), written by whoever starts a new or rotated log."""
+        record = self._identity()
+        record.update(event="chain_start", action="note")
+        record.update(fields)
+        return _audit_line(record, self._secret_guard())
 
 
 def _checked_call_id(call_id: Any) -> str:
@@ -1771,23 +1951,4 @@ def _log_safe(json_line: str) -> str:
         return f"\\u{0xD800 + (code >> 10):04x}\\u{0xDC00 + (code & 0x3FF):04x}"
 
     return "".join(ch if ch.isprintable() else escape(ch) for ch in json_line)
-
-
-def _append_line(path: Path, line: str) -> None:
-    """Append one line to a file that other processes may be appending to as well.
-
-    Two proxies given the same --audit file would otherwise overwrite each
-    other's records: on Windows an append is "seek to the end, then write",
-    and another process can write in between. An operating-system lock around
-    the append makes it one step.
-    """
-    data = (line + "\n").encode("utf-8", errors="backslashreplace")
-    with open(path, "ab") as handle:
-        _lock_file(handle)
-        try:
-            handle.seek(0, os.SEEK_END)
-            handle.write(data)
-            handle.flush()
-        finally:
-            _unlock_file(handle)
 

@@ -24,14 +24,20 @@ from .policy import (
     IDENTICAL_CALLS_LIMIT,
     SESSION_CALLS_LIMIT,
     SINK_BYTES_LIMIT,
+    RULE_AUDIT,
+    RULE_CALL_TIMEOUT,
     RULE_CALLER,
     RULE_DEFAULT,
     RULE_HOOK_CONFIG_CHANGES,
     RULE_HOOK_FAILED,
+    RULE_INCLUDE_CONTEXT,
     RULE_INDEX,
     RULE_INJECTION,
     RULE_MALFORMED,
     RULE_QUARANTINE,
+    RULE_SCHEMA_ARGUMENTS,
+    RULE_SCHEMA_REMOTE_REFS,
+    RULE_SCHEMA_RESULT,
     RULE_SECRETS,
     RULE_SECRETS_CANARIES,
     RULE_SECRETS_IN_RESULTS,
@@ -75,6 +81,12 @@ _FIXED_KINDS = {
     RULE_HOOK_CONFIG_CHANGES: "config_change",
     RULE_ELICITATION_URL: "elicitation",
     RULE_ELICITATION_FORM: "elicitation",
+    RULE_AUDIT: "audit_required",
+    RULE_SCHEMA_ARGUMENTS: "schema_arguments",
+    RULE_SCHEMA_RESULT: "schema_result",
+    RULE_SCHEMA_REMOTE_REFS: "schema_remote_refs",
+    RULE_INCLUDE_CONTEXT: "include_context",
+    RULE_CALL_TIMEOUT: "call_timeout",
 }
 _INDEXED_KINDS = (
     (re.compile(rf"deny_args{_INDEX}"), "deny_global"),
@@ -91,7 +103,8 @@ _PART_KINDS = {"other_args": "other_args", "max_calls_per_minute": "limit_tool",
 PROTECTIVE_KINDS = frozenset({
     "deny_global", "deny_tool", "secrets", "secrets_results", "canary", "known_value", "secret_pattern",
     "injection", "unscannable", "malformed", "quarantine", "session", "flow", "flow_exception", "hook_failed",
-    "command", "config_change", "elicitation",
+    "command", "config_change", "elicitation", "audit_required",
+    "schema_arguments", "schema_result", "schema_remote_refs", "include_context",
 })
 
 
@@ -398,6 +411,15 @@ _FIXED_HINTS = {
         "state folder is writable."
     ),
     "caller": "The program that uses the firewall blocked this itself (Firewall.block). Look at that program.",
+    "include_context": (
+        "The server asked the client's model for an answer written with context included (a sampling request "
+        "whose includeContext is not 'none'), and that answer would have gone back to the server. The proxy "
+        "refuses such requests whatever the policy says; a server that needs sampling can ask without it."
+    ),
+    "call_timeout": (
+        "The server did not answer the call within limits.call_timeout_seconds, so the client was answered with an "
+        "error and the server was asked to cancel the call. Raise the limit if this tool is slow by nature."
+    ),
     "hook_failed": (
         "The Claude Code hook could not finish its checks, so it refused (the reason says why: often a policy "
         "that does not load, or a state folder that cannot be written). Fix that cause; no policy rule changes "
@@ -413,6 +435,27 @@ _FIXED_HINTS = {
         "An MCP server asked the user for something an elicitation may not ask: an address that is not a public "
         "https one, or a password, key or card number in a form. The request was declined. Look at the server; no "
         "policy setting allows this."
+    ),
+    "audit_required": (
+        "The audit record could not be written, and the proxy or hook runs with --audit-required, which refuses "
+        "what it cannot record. Make the audit log writable again (disk space, permissions, its folder); no policy "
+        "rule changes this."
+    ),
+    "schema_arguments": (
+        "The call's arguments did not match the input schema the server declared for the tool, or named an "
+        "argument it does not declare (schema_checks.arguments, schema_checks.undeclared_args). A well-behaved "
+        "agent follows the schema; if the server's schema is sloppy, set \"schema_checks\": {\"arguments\": "
+        "\"warn\"} in that tool's rule."
+    ),
+    "schema_result": (
+        "The server's result did not match the output schema it declared for the tool (schema_checks.results). "
+        "Look at the server; if its schema is sloppy, set \"schema_checks\": {\"results\": \"warn\"} in that "
+        "tool's rule."
+    ),
+    "schema_remote_refs": (
+        "The tool's schema refers to something outside itself (a $ref, $id or $schema naming a web address or a "
+        "file), which a client could fetch unchecked, so the tool was quarantined (schema_checks.remote_refs). "
+        "Look at the server's schema; \"warn\" only reports such tools."
     ),
     "none": (
         "This record names no rule: it was written by agent-sentinel before 0.5, or edited. Its reason says what "

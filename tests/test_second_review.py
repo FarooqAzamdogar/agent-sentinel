@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from support import EXAMPLE_POLICY_PATH, INJECTION, POLICY, ROOT, without_ref
+from support import EXAMPLE_POLICY_PATH, INJECTION, POLICY, ROOT, audit_records, without_ref
 from test_proxy import Harness, call, reply, request, text_result
 from agent_sentinel import BlockedError, Firewall, Policy, mcp_proxy, scan
 from agent_sentinel.detector import scan_views
@@ -27,7 +27,7 @@ TOKEN = "ghp_" + "a1B2c3D4e5" * 4
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 class TemporaryAudit(unittest.TestCase):

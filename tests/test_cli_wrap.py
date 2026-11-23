@@ -594,5 +594,50 @@ class ListingClients(WrapTest):
         self.assertIn("Claude Desktop has more than one configuration file", out)
 
 
+class SessionGroups(WrapTest):
+    """Every server of one client gets the same --session-group, so that their proxies share flow marks."""
+
+    def groups(self):
+        servers = json.loads(self.config.read_text(encoding="utf-8"))["mcpServers"]
+        found = {}
+        for name in ("files", "github"):
+            args = servers[name]["args"]
+            found[name] = args[args.index("--session-group") + 1] if "--session-group" in args else None
+        return found
+
+    def test_by_default_the_group_is_the_clients_name(self):
+        self.place()
+        code, out, err = self.wrap("--apply")
+        self.assertEqual(code, 0, err)
+        self.assertIn("session group 'claude-desktop'", out)
+        self.assertEqual(self.groups(), {"files": "claude-desktop", "github": "claude-desktop"})
+
+    def test_a_group_can_be_named_or_left_out(self):
+        self.place()
+        self.assertEqual(self.wrap("--apply", "--session-group", "work")[0], 0)
+        self.assertEqual(self.groups(), {"files": "work", "github": "work"})
+        self.place()
+        self.assertEqual(self.wrap("--apply", "--session-group", "Work")[0], 0)  # one file whatever the case
+        self.assertEqual(self.groups(), {"files": "work", "github": "work"})
+        self.place()
+        self.assertEqual(self.wrap("--apply", "--no-session-group")[0], 0)
+        self.assertEqual(self.groups(), {"files": None, "github": None})
+
+    def test_a_group_that_could_name_another_file_is_refused(self):
+        self.place()
+        for name in ("../x", "nul"):
+            code, _, err = self.wrap("--session-group", name)
+            self.assertEqual(code, 2)
+            self.assertIn("--session-group", err)
+        code, _, err = self.wrap("--session-group", "x", "--no-session-group")
+        self.assertEqual(code, 2)
+
+    def test_an_entry_to_paste_gets_the_group_too(self):
+        code, out, err = run_cli("wrap", "--client", "vscode", "--policy", self.policy, "--name", "files", "--", "npx")
+        self.assertEqual(code, 0, err)
+        args = json.loads(out[out.index("{"):out.index("\nIf the server")])["servers"]["files"]["args"]
+        self.assertEqual(args[args.index("--session-group") + 1], "vscode")
+
+
 if __name__ == "__main__":
     unittest.main()

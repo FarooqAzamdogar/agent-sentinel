@@ -9,19 +9,25 @@ proxy would let it through, why not, what the server claims about it (its
 MCP annotations, marked unverified), and with --policy how that policy
 would treat a call to it. Nothing is called and nothing is written.
 
+Before the server is started, its command gets doctor's launch checks
+(cli_doctor.launch_lines): what they warn about is printed on stderr, and a
+package that advisories.py lists as malware is not started at all.
+
 Exit codes: 0 nothing was removed; 1 the proxy removed a tool, the server's
 instructions or the whole list; 2 the server could not be started or did
-not answer.
+not answer, or its package is known malware.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import server_probe
+from .cli_doctor import launch_lines
 from .cli_common import (
     EXIT_ERROR,
     EXIT_FAIL,
@@ -103,9 +109,17 @@ def run(args: argparse.Namespace) -> int:
         policy = load_policy(args.policy)
         if policy is None:
             return EXIT_ERROR
+    launch = launch_lines(command)
+    malware = [line.text for line in launch if line.level == "fail"]
+    if malware:
+        raise CommandError(f"the server was not started: {malware[0]}")
+    for line in launch:  # before the server starts, so that a person can still stop it
+        print(f"agent-sentinel: warning: {line.text}", file=sys.stderr)
     result = server_probe.probe(command, policy, args.timeout)
     if args.format == "json":
-        print(json.dumps(as_json(result, policy), indent=2, ensure_ascii=True))
+        data = as_json(result, policy)
+        data["launch"] = [{"level": line.level, "text": line.text} for line in launch]
+        print(json.dumps(data, indent=2, ensure_ascii=True))
     else:
         print_result(result, policy, args.policy)
     return EXIT_FAIL if result.found_problems else EXIT_OK

@@ -16,6 +16,7 @@
     agent-sentinel report AUDIT_LOG                     summarize an audit log
     agent-sentinel explain AUDIT_LOG [--ref REF]        say why calls were blocked, and how to allow them
     agent-sentinel suggest AUDIT_LOG --policy POLICY    draft rules from a monitor-mode log
+    agent-sentinel audit verify AUDIT_LOG               check the audit log's hash chain (and MACs)
     agent-sentinel demo                                 see the firewall and the proxy at work
 
 This module only builds the argument parser and hands each command to the
@@ -35,6 +36,7 @@ import sys
 
 from . import (
     __version__,
+    cli_audit,
     cli_check,
     cli_clients,
     cli_demo,
@@ -73,6 +75,7 @@ _COMMANDS = (
     ("report", cli_report),
     ("explain", cli_explain),
     ("suggest", cli_suggest),
+    ("audit", cli_audit),
     ("demo", cli_demo),
 )
 

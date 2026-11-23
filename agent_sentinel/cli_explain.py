@@ -22,9 +22,10 @@ from __future__ import annotations
 import argparse
 import re
 from collections import deque
-from typing import Any
+from typing import Any, Callable
 
 from . import auditlog, fix_hints
+from .audit_chain import ChainChecker
 from .auditlog import field_text, text_of
 from .cli_common import (
     EXIT_ERROR,
@@ -36,6 +37,7 @@ from .cli_common import (
     print_field,
     shown_args,
 )
+from .cli_report import integrity_line
 from .firewall import shown_excerpt
 from .policy import Policy
 from .policy_errors import quoted
@@ -99,9 +101,14 @@ def run(args: argparse.Namespace) -> int:
         if policy is None:
             return EXIT_ERROR
     ref = parse_ref(args.ref) if args.ref is not None else None
-    records, unreadable, more = find_records(args.audit, ref, args.last or DEFAULT_LAST)
+    checker = ChainChecker()
+    checker.start_file()
+    records, unreadable, more = find_records(args.audit, ref, args.last or DEFAULT_LAST, on_line=checker.add)
     if unreadable:
         print(f"WARNING: {unreadable} line(s) of the log could not be read; a record there cannot be explained.")
+    integrity = checker.finish()
+    if integrity.lines:
+        print(integrity_line(args.audit, integrity))
     if not records:
         print(f"No record in the log has ref {ref}." if ref else "The log has no blocked calls.")
         return EXIT_FAIL
@@ -126,12 +133,17 @@ def parse_ref(text: str) -> str:
     return found.group(1)
 
 
-def find_records(path: str, ref: str | None, last: int) -> tuple[list[dict[str, Any]], int, int]:
-    """(the records to explain, unreadable lines, how many more matched than are returned)."""
+def find_records(
+    path: str, ref: str | None, last: int, on_line: Callable[[bytes | None], dict[str, Any] | None] | None = None,
+) -> tuple[list[dict[str, Any]], int, int]:
+    """(the records to explain, unreadable lines, how many more matched than are returned).
+
+    on_line: called with each raw line (see auditlog.iter_records), for the chain check.
+    """
     unreadable = more = 0
     if ref is not None:
         matches: list[dict[str, Any]] = []
-        for record in auditlog.iter_records(path):
+        for record in auditlog.iter_records(path, on_line=on_line):
             if record is None:
                 unreadable += 1
             elif record.get("ref") == ref:
@@ -141,7 +153,7 @@ def find_records(path: str, ref: str | None, last: int) -> tuple[list[dict[str, 
                     more += 1
         return matches, unreadable, more
     blocks: deque[dict[str, Any]] = deque(maxlen=last)
-    for record in auditlog.iter_records(path):
+    for record in auditlog.iter_records(path, on_line=on_line):
         if record is None:
             unreadable += 1
         elif auditlog.is_block(record):

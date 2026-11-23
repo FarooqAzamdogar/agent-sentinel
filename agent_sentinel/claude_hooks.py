@@ -57,6 +57,9 @@ SessionStart        a new session (source "startup" or "clear") gets an empty se
                     Every SessionStart also notes the top-level keys of the user's and the
                     project's Claude Code settings files (hook_state.SettingsSnapshot) for
                     ConfigChange.
+                    Every source writes a "session_start" audit record (the version, the
+                    policy's SHA-256, the OS user and the host). SessionEnd is not handled,
+                    so hook mode writes no "session_end" record.
 Elicitation         an MCP server asks the user for input. The policy's server_requests rule
                     for elicitation/create, then what is asked (elicitation.review_request: a
                     URL must be a public https address; a form may not ask for a password, a
@@ -107,7 +110,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
 
-from . import elicitation
+from . import __version__, audit_chain, elicitation
+from .auditlog import SESSION_START as SESSION_START_RECORD
 from .firewall import (
     MAX_CALL_ID_CHARS,
     CheckedResult,
@@ -267,6 +271,10 @@ class HookSettings:
     audit: Path | None
     state_dir: Path
     log_args: bool = True
+    # --audit-key-file, --audit-required, --audit-max-bytes: as the proxy's (see Firewall).
+    audit_key_file: Path | None = None
+    audit_required: bool = False
+    audit_max_bytes: int | None = None
 
 
 # ---- reading an event ----------------------------------------------------------------------------
@@ -389,9 +397,9 @@ def answer_event(data: bytes, settings: HookSettings) -> HookAnswer:
         reason = f"the hook event could not be read: {exc}"
         if exc.event_name == CONFIG_CHANGE and _only_audits_config_changes(settings.policy):
             # hook.config_changes "audit" refuses no settings change, so an unreadable one is recorded only.
-            _log_note(settings.audit, reason, "config:?", "config_change")
+            _log_note(settings.audit, reason, "config:?", "config_change", settings)
             return HookAnswer(message="agent-sentinel: a ConfigChange event could not be read; see the audit log")
-        ref = _log_failure(settings.audit, None, reason, RULE_MALFORMED)
+        ref = _log_failure(settings.audit, None, reason, RULE_MALFORMED, settings)
         return failed_answer(exc.event_name, ref)
     name = event["hook_event_name"]
     if name not in HANDLED_EVENTS:
@@ -406,13 +414,13 @@ def answer_event(data: bytes, settings: HookSettings) -> HookAnswer:
                 f"agent-sentinel: {problem}\nEvery tool call will be blocked until the policy loads. "
                 f"Check it with: agent-sentinel validate {settings.policy}"
             ))
-        ref = _log_failure(settings.audit, event, problem.splitlines()[0], RULE_HOOK_FAILED)
+        ref = _log_failure(settings.audit, event, problem.splitlines()[0], RULE_HOOK_FAILED, settings)
         return failed_answer(name, ref)
     except Exception as exc:  # fail closed
         if name == SESSION_START:
             return HookAnswer(exit_code=EXIT_BLOCK, message=f"agent-sentinel could not start: {printable(exc)}")
         ref = _log_failure(settings.audit, event, f"the hook could not start: {type(exc).__name__}: {exc}",
-                           RULE_HOOK_FAILED)
+                           RULE_HOOK_FAILED, settings)
         return failed_answer(name, ref)
     return answer_with(firewall, event)
 
@@ -427,7 +435,16 @@ def open_firewall(settings: HookSettings, session_id: str) -> Firewall:
         session_id=session_id,
         session_store=FileSessionStore(settings.state_dir, session_id),
         rate_limiter=FileRateLimiter(settings.state_dir, session_id),
+        **_audit_options(settings),
     )
+
+
+def _audit_options(settings: HookSettings | None) -> dict[str, Any]:
+    """The Firewall's audit options from the hook's settings (none without an audit log)."""
+    if settings is None or settings.audit is None:
+        return {}
+    return {"audit_key_file": settings.audit_key_file, "audit_max_bytes": settings.audit_max_bytes,
+            "audit_required": settings.audit_required}
 
 
 def answer_with(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
@@ -478,7 +495,9 @@ def _policy_problem(path: Path, error: Exception) -> str:
     return f"Invalid policy: {error}"
 
 
-def refusal_without_settings(data: bytes, audit: Path | None, problem: str) -> HookAnswer:
+def refusal_without_settings(
+    data: bytes, audit: Path | None, problem: str, settings: HookSettings | None = None
+) -> HookAnswer:
     """The answer when the hook cannot even be set up (say, no home folder for the default state folder).
 
     It refuses like any failure; the problem goes to the audit log (when
@@ -493,23 +512,31 @@ def refusal_without_settings(data: bytes, audit: Path | None, problem: str) -> H
         return HookAnswer(exit_code=EXIT_BLOCK, message=f"agent-sentinel: {problem}")
     if name is not None and name not in HANDLED_EVENTS:
         return HookAnswer(message=f"agent-sentinel: the hook does not check {printable(name, limit=60)} events")
-    return failed_answer(name, _log_failure(audit, event, problem, RULE_HOOK_FAILED))
+    return failed_answer(name, _log_failure(audit, event, problem, RULE_HOOK_FAILED, settings))
 
 
-def _log_failure(audit: Path | None, event: dict[str, Any] | None, reason: str, rule: str) -> str:
+def _log_failure(
+    audit: Path | None, event: dict[str, Any] | None, reason: str, rule: str, settings: HookSettings | None = None
+) -> str:
     """Write an audit record for a refusal made without the policy; return its ref. Never raises.
 
     The record is all the operator gets: Claude Code shows the hook's stderr
-    to Claude, which must not read the detail.
+    to Claude, which must not read the detail. It is signed with the audit
+    key when `settings` has one that can be used; when the key itself is the
+    problem, it is written unsigned (and `audit verify --key-file` reports it).
     """
     event = event or {}
     session = event.get("session_id")
     call_id = event.get("tool_use_id")
+    session_id = session if _text(session, MAX_SESSION_ID_CHARS) else None
     try:
-        firewall = Firewall(
-            Policy(), audit, log_args=False, server_name=AUDIT_SERVER_NAME,
-            session_id=session if _text(session, MAX_SESSION_ID_CHARS) else None,
-        )
+        try:
+            firewall = Firewall(
+                Policy(), audit, log_args=False, server_name=AUDIT_SERVER_NAME, session_id=session_id,
+                **_audit_options(settings),
+            )
+        except ValueError:  # the key file (AuditKeyError) or the size cannot be used
+            firewall = Firewall(Policy(), audit, log_args=False, server_name=AUDIT_SERVER_NAME, session_id=session_id)
         decision = firewall.refuse(
             event_label(event), reason, event=_AUDIT_EVENTS.get(event.get("hook_event_name"), "call"), rule=rule,
             call_id=call_id if _text(call_id, MAX_CALL_ID_CHARS) else None,
@@ -519,10 +546,23 @@ def _log_failure(audit: Path | None, event: dict[str, Any] | None, reason: str, 
         return new_ref()
 
 
-def _log_note(audit: Path | None, reason: str, label: str, event: str) -> None:
-    """Write an audit record that blocks nothing (action "note"), without the policy. Never raises."""
+def _log_note(
+    audit: Path | None, reason: str, label: str, event: str, settings: HookSettings | None = None
+) -> None:
+    """Write an audit record that blocks nothing (action "note"), without the policy. Never raises.
+
+    Like _log_failure's record, it is signed with the audit key when
+    `settings` has one that can be used, and written unsigned when the key
+    itself cannot be read.
+    """
     try:
-        Firewall(Policy(), audit, log_args=False, server_name=AUDIT_SERVER_NAME).note(label, reason, event=event)
+        try:
+            firewall = Firewall(
+                Policy(), audit, log_args=False, server_name=AUDIT_SERVER_NAME, **_audit_options(settings)
+            )
+        except ValueError:  # the key file (AuditKeyError) or the size cannot be used
+            firewall = Firewall(Policy(), audit, log_args=False, server_name=AUDIT_SERVER_NAME)
+        firewall.note(label, reason, event=event)
     except Exception:
         pass
 
@@ -800,8 +840,23 @@ def _session_start(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
     store = firewall.session_store
     if event.get("source") in NEW_SESSION_SOURCES and isinstance(store, FileSessionStore):
         store.begin()  # SessionStateError if the file cannot be written: answer_with reports it to the user
+    written = firewall.provenance(SESSION_START_RECORD, "a Claude Code session started", {
+        "version": __version__,
+        "policy_sha256": firewall.policy_sha256,
+        "monitor": firewall.monitor,
+        "source": printable(event.get("source"), limit=40) if isinstance(event.get("source"), str) else None,
+        "signed": firewall.audit_signed,
+        "user": audit_chain.os_user(),
+        "host": audit_chain.host_name(),
+    })
+    # After the session_start record, so that a snapshot that fails is noted inside the session it belongs to.
     if isinstance(store, FileSessionStore):
         _snapshot_settings(firewall, store, event.get("source"), event.get("cwd"))
+    if not written and firewall.audit_required:
+        return HookAnswer(exit_code=EXIT_BLOCK, message=(
+            "agent-sentinel: the audit log cannot be written, and --audit-required is set: every tool call will be "
+            "blocked until it can be."
+        ))
     return HookAnswer()
 
 

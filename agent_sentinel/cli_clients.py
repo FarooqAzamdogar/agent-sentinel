@@ -5,7 +5,9 @@ and how many of its servers are protected (wrapped), not protected, remote
 (which the proxy cannot protect) or broken (wrapping.status_of; for a
 project's configuration, with its project folder). For Claude Desktop, the Desktop
 Extensions beside it, which cannot be wrapped, and a warning when there are
-two configuration files and it is not clear which one the app reads.
+two configuration files and it is not clear which one the app reads. And for
+each server, what doctor's launch checks find in its command
+(cli_doctor.launch_lines: known-bad packages, typosquats, risky commands).
 """
 
 from __future__ import annotations
@@ -17,10 +19,11 @@ from typing import Any
 
 from . import clients
 from .cli_common import EXIT_OK, shown_path
+from .cli_doctor import launch_lines
 from .clients import CLIENTS, Location
 from .config_file import ConfigError, read_config
 from .textutil import printable
-from .wrapping import status_of
+from .wrapping import command_line, read_proxy_command, status_of
 
 HELP = "list the MCP client configurations on this machine and in this folder, and how many servers are protected"
 DESCRIPTION = (
@@ -97,6 +100,11 @@ def _print_location(location: Location) -> None:
         return
     project = clients.project_folder(location.path) if location.scope == "project" else None
     print(f"  {'':24} {describe_counts(server_counts(servers, project))}")
+    for name, entry in servers.items():
+        words = command_line(entry)
+        proxy = read_proxy_command(words) if words is not None else None
+        for line in launch_lines(proxy.server if proxy is not None else words or []):
+            print(f"  {'':24} {printable(name, limit=60)}: {line.level}: {line.text}")
     if location.client == "claude-desktop":
         extensions = clients.desktop_extensions(location.path)
         if extensions:

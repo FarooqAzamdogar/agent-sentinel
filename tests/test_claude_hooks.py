@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from cli_support import IsolatedHomeTest, TempFolderTest, run_cli
-from support import INJECTION, ROOT
+from support import INJECTION, ROOT, audit_records
 from agent_sentinel import Firewall, Policy, claude_hooks
 from agent_sentinel.claude_hooks import claude_sdk_hooks
 from agent_sentinel.session import SessionStateError
@@ -93,7 +93,7 @@ class HookTest(TempFolderTest):
     def records(self):
         if not self.audit.exists():
             return []
-        return [json.loads(line) for line in self.audit.read_text(encoding="utf-8").splitlines()]
+        return audit_records(self.audit)
 
     def decision(self, answer):
         specific = answer["hookSpecificOutput"]
@@ -565,7 +565,7 @@ class ClaudeAgentSdkCallbacks(TempFolderTest):
         return asyncio.run(self.hooks[event_name](input_data, tool_use_id, {"signal": None}))
 
     def records(self):
-        return [json.loads(line) for line in self.audit.read_text(encoding="utf-8").splitlines()]
+        return audit_records(self.audit)
 
     def test_anything_but_a_firewall_is_refused_at_once(self):
         for wrong in (Policy.from_dict(HOOK_POLICY), None, "policy.json"):

@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from support import INJECTION, without_ref
+from support import INJECTION, audit_records, without_ref
 from test_proxy import Harness, call, request, text_result
 from agent_sentinel import BlockedError, Firewall, Policy, PolicyError
 from agent_sentinel.policy import NOT_PERMITTED, FlowRule, ToolRule
@@ -45,7 +45,7 @@ def load_error(data):
 
 
 def read_audit(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    return audit_records(Path(path))
 
 
 # ---- the policy file ----------------------------------------------------------------
@@ -440,6 +440,8 @@ class OneSessionAcrossProcesses(unittest.TestCase):
 class FlowsInTheProxy(unittest.TestCase):
     def setUp(self):
         self.h = Harness(Firewall(flow_policy()))
+        # As a client does: list the tools first. A tool no checked list has shown counts as untrusted and a sink.
+        self.h.list_tools(*TOOLS)
 
     def test_a_sink_call_is_refused_after_untrusted_and_private_results_were_delivered(self):
         self.h.round_trip(call(1, "fetch_page", {"url": "u"}), text_result("a page"))
@@ -480,9 +482,11 @@ class FlowsInTheProxy(unittest.TestCase):
         self.assertEqual(self.h.firewall.tool_labels("search_notes"), frozenset())
 
     def test_a_removed_tool_teaches_the_firewall_nothing(self):
-        tools = [{"name": "web_fetch", "description": INJECTION, "annotations": {"openWorldHint": True}}]
+        tools = [{"name": "web_fetch", "description": INJECTION, "annotations": {"readOnlyHint": True}}]
         self.h.round_trip(request(1, "tools/list"), {"tools": tools})
-        self.assertEqual(self.h.firewall.tool_labels("web_fetch"), frozenset())
+        # Its annotations were not read, so it is as unknown as a tool never listed: untrusted and a sink
+        # (it is quarantined anyway).
+        self.assertEqual(self.h.firewall.tool_labels("web_fetch"), {"untrusted", "sink"})
 
     def test_resource_reads_mark_with_the_labels_of_the_resources_read_rule(self):
         tools = {**TOOLS, "resources/read": {"action": "allow", "labels": ["private"]}}
