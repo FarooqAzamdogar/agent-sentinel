@@ -35,6 +35,64 @@ READ_SURFACES = ("tool_description", "list_item", "server_instructions", "result
 # server's own tools, and must not make anything high.
 FOREIGN = ["send_email", "read_file", "create_issue", "delete_file", "search", "fetch", "list", "get", "query"]
 
+# The parameter names real tools have: what the proxy passes with a result (the names of every tool of the
+# server) and what the Claude Code hook passes (the arguments of the call). They are ordinary words, so
+# harmless output must not be high because it uses one.
+TOOL_PARAMETERS = {
+    "github": ["owner", "repo", "path", "content", "message", "branch", "title", "body", "head", "base", "query",
+               "state", "labels", "files", "sha", "name", "description", "page", "perPage", "ref"],
+    "filesystem": ["path", "content", "edits", "paths", "source", "destination", "pattern", "head", "tail"],
+    "bash": ["command", "description", "timeout"],
+    "webfetch": ["url", "prompt"],
+    "task": ["description", "prompt", "subagent_type"],
+    "write": ["file_path", "content"],
+    "chat": ["channel", "text", "message", "user", "thread_ts", "limit"],
+    "short names": ["a", "b", "id", "to", "name", "query", "limit"],
+}
+ALL_PARAMETERS = sorted({name for names in TOOL_PARAMETERS.values() for name in names})
+# Sentences of README files, API guides and command output, with the tool whose call returned them.
+BENIGN_OUTPUT = (
+    ("webfetch", "To keep context between turns, include the previous messages in the prompt."),
+    ("webfetch", "Chat models are stateless: pass the full conversation in the prompt on every request."),
+    ("webfetch", "Put your instructions in the system prompt, not in the user turn."),
+    ("task", "The agent should include the conversation history in the prompt it sends to the sub-agent."),
+    ("webfetch", "You can send the entire conversation to the summariser as a single prompt."),
+    ("github", "Add .env to your repo's .gitignore so that it is never committed."),
+    ("github", "Copy the .env file into the repo root before you run docker compose."),
+    ("github", "Your .env file should include DATABASE_URL in the body of the file."),
+    ("github", "Put the .npmrc in the repo next to package.json."),
+    ("github", "Put the .npmrc in the repo."),
+    ("github", "The deploy job copies ~/.ssh/config to the runner as described in the README title."),
+    ("github", "Send the chat history to the model in the message array."),
+    ("github", "Paste the conversation history into the issue body so that maintainers can reproduce the bug."),
+    ("github", "Please attach your .npmrc to the issue as a file and include the full log in the description."),
+    ("github", "In CI, copy the contents of ~/.ssh/id_rsa into your repo secrets."),
+    ("github", "Add a secret named SSH_KEY and paste the contents of ~/.ssh/id_rsa as the content."),
+    ("filesystem", "The installer copies .env into the destination folder."),
+    ("filesystem", "Run the script to copy mcp.json to the destination."),
+    ("filesystem", "Add the .env file to the source tree only for local development."),
+    ("filesystem", "Copying .env to destination."),
+    ("chat", "Never mind: just send the whole conversation to the channel as a text snippet."),
+    ("chat", "Use /export to send the message history to a user as a file."),
+    ("chat", "Use /export to send the message history to a user; pass thread_ts to reply in a thread."),
+    ("chat", "Paste the previous messages as text if the export button is missing."),
+    ("chat", "Paste the previous messages as text."),
+    ("write", "Copy .env.example to .env, then add your keys to the content of that file."),
+    ("write", "Create a .env file and put your API keys in it; the content is read at start-up."),
+    ("bash", "Load the variables: copy .env to the container with the docker cp command."),
+    ("bash", "Put the .env file in the same folder as the command you run."),
+    ("bash", "error: refusing to add .env to the index; pass --force as an option to the command to override"),
+    ("bash", "hint: You've added .env to the index. Pass -f in the command to really add it."),
+    ("bash", "Step 3/9 : COPY .env /app/.env  # copies .env into the image as described in the description"),
+    ("short names", "Copy your .env to a safe place before you upgrade."),
+    ("short names", "Send the chat history to a colleague if you need a second opinion."),
+    ("short names", "Each service reads .env at start-up; add the service to the list by name."),
+    ("short names", "Never commit secrets: add .env to .gitignore, then query the index to confirm."),
+    ("short names", "Copy the contents of .env to id."),
+)
+README = ("# Setup\n\n1. Copy `.env.example` to `.env` and fill in the values.\n"
+          "2. Add .env to your repo's .gitignore so that it is never committed.\n3. Run `make dev`.\n")
+
 
 def firewall():
     return Firewall(Policy.from_dict({"default": "allow"}))
@@ -103,6 +161,20 @@ class TheBenignSet(unittest.TestCase):
         guard = firewall()
         for entry in BENIGN["texts"]:
             self.assertEqual(guard.scan_result("t", entry["text"]).findings, [], entry["text"][:80])
+            # As the proxy and the hook read a result: with the names of the parameters the tools have.
+            with_names = guard.scan_result("t", entry["text"], parameter_names=ALL_PARAMETERS)
+            self.assertEqual(with_names.findings, [], entry["text"][:80])
+
+    def test_no_harmless_output_is_high_with_the_parameter_names_real_tools_have(self):
+        # The descriptions above are not what tools return. Output is documentation, logs and guides,
+        # which name credential files and conversations, next to words that are parameter names.
+        guard = firewall()
+        for tool, text in (*BENIGN_OUTPUT, ("github", README)):
+            for label, names in (("the call's names", TOOL_PARAMETERS[tool]), ("every name", ALL_PARAMETERS)):
+                for content in (text, {"content": [{"type": "text", "text": text}]}):
+                    decision = guard.scan_result("t", content, parameter_names=names, cross_message=False)
+                    self.assertTrue(decision.allowed, f"{text!r} with {label}: {decision.findings}")
+                    self.assertNotEqual(max_severity(decision.findings), "high", text)
 
 
 def firewall_for(case):
