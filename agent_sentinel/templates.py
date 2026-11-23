@@ -40,24 +40,36 @@ _NAME_START = r"(^|[\s\\/:@='\"`<>|;&(,{\u2018-\u201e])"
 # The quotes a setting's name may stand in: ' and ", and the typographic ones PowerShell also reads as quotes.
 _QUOTE = r"[\"'\u2018-\u201e]"
 
+# What may come right after a credential file's name when the name ends there:
+# the end of the value, white space, or a character that closes an argument.
+# A path separator is not here, and neither is "." or "-", because a name that
+# goes on is a different name.
+_NAME_END = r"(?=$|[\s'\"`<>|;&,)}\]\u2018-\u201e])"
 # A name that only looks like a credential file: the example committed beside
 # it (".env.example", ".npmrc.sample"), which holds placeholders, not secrets.
-# Writing and naming one is ordinary work, so it is left out; the detector
-# leaves the same four endings out (_CREDENTIAL_FILE in detector.py).
-_EXAMPLE_FILE = r"(?!\.(example|sample|template|dist)\b)"
+# Writing and naming one is ordinary work, so EVERY name below is left out when
+# one of the four endings is where the name ends. ".env.example" and
+# "cat .npmrc.sample" pass; ".env.example.bak", ".env.sample-prod" and anything
+# under a folder named ".env.example" are refused, as ".env" itself is. The
+# detector leaves the same four endings out of its own names the same way
+# (_CREDENTIAL_FILE in detector.py); a test holds the two together.
+_EXAMPLE_FILE = r"(?!\.(example|sample|template|dist)" + _NAME_END + r")"
 
 # The credential preset of policy.example.json (a test keeps the two the same).
+# Every alternative ends with _EXAMPLE_FILE, so no name is refused in its
+# committed-example spelling.
 CREDENTIAL_PATTERN = (
     _NAME_START + r"\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\b"
     + _EXAMPLE_FILE
-    + r"|id_(rsa|dsa|ecdsa|ed25519)"
-    r"|" + _NAME_START + r"(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]"
-    r"|" + _NAME_START + r"(\.config|config~[0-9]+)[\\/](gh|gcloud|github-copilot)\b"
-    r"|(^|[\\/])proc[\\/][^\\/]+[\\/]environ\b"
-    r"|claude_desktop_config\.json"
-    r"|" + _NAME_START + r"\.claude\.json\b"
-    r"|" + _NAME_START + r"\.(cursor|vscode)[\\/]mcp\.json\b"
-    r"|[\\/]code[\\/]user[\\/]mcp\.json\b"
+    + r"|id_(rsa|dsa|ecdsa|ed25519)" + _EXAMPLE_FILE
+    + r"|" + _NAME_START + r"(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]"
+    + _EXAMPLE_FILE
+    + r"|" + _NAME_START + r"(\.config|config~[0-9]+)[\\/](gh|gcloud|github-copilot)\b" + _EXAMPLE_FILE
+    + r"|(^|[\\/])proc[\\/][^\\/]+[\\/]environ\b" + _EXAMPLE_FILE
+    + r"|claude_desktop_config\.json" + _EXAMPLE_FILE
+    + r"|" + _NAME_START + r"\.claude\.json\b" + _EXAMPLE_FILE
+    + r"|" + _NAME_START + r"\.(cursor|vscode)[\\/]mcp\.json\b" + _EXAMPLE_FILE
+    + r"|[\\/]code[\\/]user[\\/]mcp\.json\b" + _EXAMPLE_FILE
 )
 
 # Deny rules for every call. The second and third keep an agent away from

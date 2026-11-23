@@ -9,7 +9,7 @@ from unittest import mock
 
 from cli_support import FAKE_SERVER, TESTS, IsolatedHomeTest, run_cli
 from support import EXAMPLE_POLICY_PATH
-from agent_sentinel import Policy, cli_init, templates
+from agent_sentinel import Policy, cli_init, detector, templates
 from agent_sentinel.cli_common import shown_path
 from agent_sentinel.server_probe import ListedTool
 
@@ -178,6 +178,121 @@ class TheTemplates(unittest.TestCase):
             templates.template("starter", roots=("/w",))
         with self.assertRaises(KeyError):
             templates.template("lenient")
+
+
+# The four endings a committed placeholder is written with.
+ENDINGS = (".example", ".sample", ".template", ".dist")
+# A path for every alternative of templates.CREDENTIAL_PATTERN, so that the
+# tests below read each one. Add a line here when the preset gains a name.
+PRESET_NAMES = (
+    "~/.ssh", "/home/me/.aws", ".azure", ".docker", ".gnupg", ".kube", ".env", ".netrc", ".npmrc",
+    ".pypirc", ".pgpass", ".git-credentials",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    "C:\\Users\\me\\SSH~1", "C:\\Users\\me\\ENV~1", "C:\\Users\\me\\GIT-CR~1",
+    ".config/gh", ".config/gcloud", ".config/github-copilot", "C:\\Users\\me\\CONFIG~1\\gh",
+    "/proc/self/environ", "claude_desktop_config.json", ".claude.json",
+    ".cursor/mcp.json", ".vscode/mcp.json", "/code/user/mcp.json",
+)
+
+
+class TheCommittedExampleBesideACredentialFile(unittest.TestCase):
+    """`.env.example` and its like hold placeholders, not secrets.
+
+    Writing, copying or naming one is ordinary work, and the preset is a deny
+    rule with no action: were it to match, every template would refuse the
+    call outright, with no prompt. So every name the preset knows is left out
+    in that spelling -- and only where the name really ends there, because
+    `.env.example.bak` and what lies under a folder named `.env.example` are
+    not placeholders at all.
+    """
+
+    def setUp(self):
+        self.pattern = re.compile(templates.CREDENTIAL_PATTERN, re.IGNORECASE)
+
+    def test_every_name_is_left_out_with_each_of_the_four_endings(self):
+        for name in PRESET_NAMES:
+            self.assertTrue(self.pattern.search(name), f"{name} itself must be refused")
+            for ending in ENDINGS:
+                example = name + ending
+                for text in (example, "cat " + example, "cp " + example + " x",
+                             "git commit -m 'add " + example + "'", '{"path": "' + example + '"}'):
+                    with self.subTest(text=text):
+                        self.assertFalse(self.pattern.search(text))
+
+    def test_the_name_must_end_at_the_ending_and_not_go_on(self):
+        for name in PRESET_NAMES:
+            for ending in ENDINGS:
+                # A longer name, and anything under a folder named that way, are the real file again.
+                for text in (name + ending + ".bak", name + ending + "-prod", name + ending + ".local",
+                             name + ending + "/secrets", name + ending + "\\secrets",
+                             name + ending + "s", "cat " + name + ending + ".bak"):
+                    with self.subTest(text=text):
+                        self.assertTrue(self.pattern.search(text))
+
+    def test_the_hook_templates_let_the_example_be_written_and_still_refuse_the_real_file(self):
+        for template in ("claude-code", "claude-code-strict"):
+            policy = Policy.from_dict(templates.template(template))
+            for command in ("touch .env.example", "cp claude_desktop_config.json.example x",
+                            "cp id_rsa.example x", "cat .cursor/mcp.json.example",
+                            "git commit -m 'document .npmrc.sample'"):
+                with self.subTest(template=template, command=command):
+                    self.assertEqual(policy.evaluate("Bash", {"command": command}).action, "allow")
+            for command in ("cat .env.example.bak", "cat .env.example/secrets",
+                            "cat claude_desktop_config.json", "cat id_rsa", "cat .cursor/mcp.json"):
+                with self.subTest(template=template, command=command):
+                    self.assertEqual(policy.evaluate("Bash", {"command": command}).action, "block")
+
+
+class TheTwoCredentialListsStayInStep(unittest.TestCase):
+    """templates.CREDENTIAL_PATTERN refuses a call that names a credential file;
+    detector._CREDENTIAL_FILE reads a description or a result that names one.
+    A name that only one of them knows leaves a gap on the other side, so the
+    words of the two are held together here: add a name to one, and this test
+    fails until someone has looked at the other.
+    """
+
+    # Words of a pattern that are regex, not a file name.
+    NOT_A_NAME = frozenset({"example", "sample", "template", "dist"})
+    # Names the preset has and the detector has not. The preset names the
+    # folder where the detector names the file in it (".docker" against
+    # ".docker/config.json"), and it knows the Windows short names and the
+    # MCP clients' own configuration, which no tool description names.
+    ONLY_IN_THE_PRESET = frozenset({
+        "azure", "pgpass", "gcloud", "github-copilot", "vscode", "code", "user",
+        "claude_desktop_config", "git-cr", "id_ed2",
+    })
+    # Names the detector has and the preset has not. The files inside the
+    # folders the preset names, the public-key files it must NOT count, and
+    # the system's own password files, which no policy argument should name.
+    ONLY_IN_THE_DETECTOR = frozenset({
+        "credentials", "desktop", "etc", "passwd", "shadow", "self",
+        "pub", "known", "hosts", "authorized", "keys2",
+    })
+
+    @classmethod
+    def names(cls, pattern):
+        """The file and folder names a credential pattern lists, as plain words."""
+        bare = re.sub(r"\[[^]]*\]", " ", pattern)       # character classes, and the quotes in them
+        bare = re.sub(r"\\[a-z]", " ", bare)            # \b, \w, \d, \s
+        return frozenset(word.strip("_-") for word in re.findall(r"[a-z][a-z0-9_-]*", bare)) - cls.NOT_A_NAME
+
+    def test_the_two_lists_name_the_same_files_but_for_the_differences_written_here(self):
+        preset, detected = self.names(templates.CREDENTIAL_PATTERN), self.names(detector._CREDENTIAL_FILE)
+        self.assertEqual(preset - detected, self.ONLY_IN_THE_PRESET)
+        self.assertEqual(detected - preset, self.ONLY_IN_THE_DETECTOR)
+
+    def test_both_lists_leave_the_same_four_endings_out(self):
+        preset = re.compile(templates.CREDENTIAL_PATTERN, re.IGNORECASE)
+        detected = re.compile(detector._CREDENTIAL_FILE)
+        for name in ("~/.ssh", ".env", ".npmrc", ".pypirc", ".netrc", ".git-credentials", ".gnupg",
+                     "id_rsa", "id_ed25519", "/proc/self/environ", ".config/gh", "claude_desktop_config.json"):
+            for pattern in (preset, detected):
+                with self.subTest(name=name, pattern=pattern.pattern[:24]):
+                    self.assertTrue(pattern.search(name))
+                    for ending in ENDINGS:
+                        self.assertFalse(pattern.search(name + ending))
+                        self.assertTrue(pattern.search(name + ending + ".bak"))
+                        self.assertTrue(pattern.search(name + ending + "/secrets"))
 
 
 class InitFromATemplate(IsolatedHomeTest):

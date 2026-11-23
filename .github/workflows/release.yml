@@ -1,7 +1,7 @@
 name: release
 
 # Builds the package and publishes it to PyPI, only when a version tag such as
-# "v0.5.0" is pushed. Nothing else starts it: not a push to a branch, not a pull
+# "v0.6.0" is pushed. Nothing else starts it: not a push to a branch, not a pull
 # request, not a schedule, not a button.
 #
 # PyPI trusts this workflow through Trusted Publishing (OpenID Connect), so no

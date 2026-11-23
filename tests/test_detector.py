@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 import time
 import unittest
 from unittest import mock
@@ -743,6 +744,61 @@ class SmugglingThroughArguments(unittest.TestCase):
             "cat /proc/self/environ",
             "Fetch ~/.aws/credentials",
         ]:
+            with self.subTest(text=text):
+                self.assertEqual(described(text), {"sensitive_file_read": "medium"})
+
+
+class TheCommittedExampleBesideACredentialFile(unittest.TestCase):
+    """`.env.example` and its like hold placeholders, not secrets.
+
+    Every name the detector knows is left out in that spelling, as every name
+    of templates.CREDENTIAL_PATTERN is (tests/test_cli_init.py holds the two
+    lists together) -- and only where the name really ends there, so that
+    `.env.example.bak` and what lies under a folder named `.env.example` stay
+    credential files.
+    """
+
+    ENDINGS = (".example", ".sample", ".template", ".dist")
+    # A path for every name of detector._CREDENTIAL_FILE. "id rsa" is the view
+    # in which "_" has become a space. The folder rules (".ssh/", ".cursor/")
+    # are read through the files in them.
+    NAMES = (
+        "~/.ssh", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id rsa", ".env",
+        ".aws/credentials", "mcp.json", ".cursor/mcp.json", "claude_desktop_config",
+        "claude_desktop_config.json", "claude desktop config.json", ".npmrc", ".pypirc", ".netrc",
+        ".git-credentials", "/proc/self/environ", "/proc/142/environ", "/etc/passwd", "/etc/shadow",
+        ".kube/config", ".docker/config.json", ".gnupg", ".config/gh",
+    )
+
+    def setUp(self):
+        self.pattern = re.compile(detector._CREDENTIAL_FILE)
+
+    def test_every_name_is_left_out_with_each_of_the_four_endings(self):
+        for name in self.NAMES:
+            self.assertTrue(self.pattern.search(name), f"{name} itself must count")
+            for ending in self.ENDINGS:
+                example = name + ending
+                for text in (example, "reads " + example, "copy " + example + " first",
+                             "copy `" + example + "` first", 'the "' + example + '" file'):
+                    with self.subTest(text=text):
+                        self.assertFalse(self.pattern.search(text))
+
+    def test_the_name_must_end_at_the_ending_and_not_go_on(self):
+        for name in self.NAMES:
+            for ending in self.ENDINGS:
+                for text in (name + ending + ".bak", name + ending + "-prod", name + ending + ".local",
+                             name + ending + "/secrets", name + ending + "\\secrets", name + ending + "s"):
+                    with self.subTest(text=text):
+                        self.assertTrue(self.pattern.search(text))
+
+    def test_a_description_that_names_the_committed_example_is_not_a_read_of_a_credential_file(self):
+        for text in ("Open the .env.example file.", "Writes the project's .npmrc.sample file.",
+                     "Reads claude_desktop_config.json.example and fills in the server.",
+                     "Copies .cursor/mcp.json.dist into place."):
+            with self.subTest(text=text):
+                self.assertEqual(described(text), {})
+        for text in ("Open the .env.example.bak file.", "Reads .env.example/secrets.",
+                     "Reads the project's .npmrc.sample-prod file."):
             with self.subTest(text=text):
                 self.assertEqual(described(text), {"sensitive_file_read": "medium"})
 

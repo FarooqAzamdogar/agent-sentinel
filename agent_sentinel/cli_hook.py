@@ -136,8 +136,9 @@ def _add_paths(parser: argparse.ArgumentParser) -> None:
                              "agent-sentinel home folder)")
     parser.add_argument("--state-dir", metavar="DIR",
                         help="the folder for each session's flow marks, rate-limit counts, session limits, the end "
-                             "of the last output (tail scan) and the settings snapshot (default: hook-state in the "
-                             "agent-sentinel home folder). Keep it out of the agent's reach")
+                             "of the last output (tail scan), the settings snapshot and the hash of the policy the "
+                             "session began with (default: hook-state in the agent-sentinel home folder). Keep it "
+                             "out of the agent's reach")
     parser.add_argument("--no-log-args", action="store_true", help="leave tool inputs out of the audit log")
     parser.add_argument("--audit-key-file", metavar="FILE",
                         help="sign every audit record (HMAC-SHA256) with the key in FILE; on POSIX the file must be "

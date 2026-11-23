@@ -425,5 +425,29 @@ class DescribingRules(unittest.TestCase):
                 self.assertIsNotNone(POLICY.describe_rule(decision.rule))
 
 
+class EveryRuleIdIsInTheReadme(unittest.TestCase):
+    """A rule id reaches the operator: it stands in the audit log and in what
+    `explain` and `report` print. One that no document names leaves the reader
+    of a log with nothing to look up, as `hook_failed` did until 0.6.0.
+    """
+
+    README = Path(__file__).resolve().parent.parent / "README.md"
+
+    def test_every_rule_constant_of_the_policy_module_is_named_in_the_readme(self):
+        text = self.README.read_text(encoding="utf-8")
+        named = [name for name in dir(policy_module) if name.startswith("RULE_")]
+        self.assertIn("RULE_HOOK_FAILED", named)  # the one the check was written for
+        checked = 0
+        for name in named:
+            value = getattr(policy_module, name)
+            # RULE_INDEX and anything else that is a pattern, not an id, is not a word to look up.
+            if not isinstance(value, str) or not re.fullmatch(r"[\w.]+(/[\w.]+)?", value):
+                continue
+            checked += 1
+            with self.subTest(rule=name):
+                self.assertIn(value, text, f"policy.{name} ({value!r}) is in no line of README.md")
+        self.assertGreater(checked, 15)
+
+
 if __name__ == "__main__":
     unittest.main()

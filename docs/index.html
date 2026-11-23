@@ -123,7 +123,7 @@
       "name": "Is it production ready?",
       "acceptedAnswer": {
         "@type": "Answer",
-        "text": "Not yet. Version 0.6.0 is an alpha release. It has not been tested against a wide range of third-party MCP servers, its Linux and macOS sandboxes have had little real-world testing, and it has had no independent audit. Start in monitor mode, read the limits, and treat it as one layer of defense."
+        "text": "Not yet. Version 0.6.0 is an alpha release. It has not been tested against a wide range of third-party MCP servers, its macOS sandbox profile has never been run and its Linux sandbox has had little real-world testing, and it has had no independent audit. Start in monitor mode, read the limits, and treat it as one layer of defense."
       }
     },
     {
@@ -1152,7 +1152,7 @@ agent-sentinel scan page.html</code></pre>
               <li><span class="hl hl--mint">The permission policy is the dependable part.</span> Treat the detector as an extra layer, not as proof that content is safe.</li>
               <li>Paths and URLs are judged as text: symbolic links are not followed and host names are not looked up.</li>
               <li>In the proxy, flow rules hold across servers only when the proxies share a session group, which <code>wrap</code> sets up, and the client starts them from one process. Only the marks are shared: each server has session budgets of its own.</li>
-              <li><code>--contain</code> is cleanup, not isolation. A hostile server still runs as you and can read your files. The sandboxes exist for Linux and macOS only and have had little real-world testing.</li>
+              <li><code>--contain</code> is cleanup, not isolation. A hostile server still runs as you and can read your files. The sandboxes exist for Linux and macOS only; the Linux one has had little real-world testing, and the macOS profile has never been run, only tested as text.</li>
               <li>Reading a shell command raises the bar; it is not a boundary. Variables, scripts and interpreters are not followed.</li>
               <li>The audit log's hash chain shows a careless edit. Without a key, whoever can write the log can rewrite it, and records cut from its end are not noticed.</li>
               <li>The list of known bad packages is a dated snapshot. A package that is not on it is not thereby safe.</li>
@@ -1385,7 +1385,7 @@ agent-sentinel scan page.html</code></pre>
             <h3 class="faq__q">Is it production ready?</h3>
             <svg class="icon faq__icon" aria-hidden="true" focusable="false" width="18" height="18"><use href="#i-chevron"/></svg>
           </summary>
-          <p class="faq__a">Not yet. Version 0.6.0 is an alpha release. It has not been tested against a wide range of third-party MCP servers, its Linux and macOS sandboxes have had little real-world testing, and it has had no independent audit. Start in monitor mode, read the limits, and treat it as one layer of defense.</p>
+          <p class="faq__a">Not yet. Version 0.6.0 is an alpha release. It has not been tested against a wide range of third-party MCP servers, its macOS sandbox profile has never been run and its Linux sandbox has had little real-world testing, and it has had no independent audit. Start in monitor mode, read the limits, and treat it as one layer of defense.</p>
         </details>
         <details class="faq__item">
           <summary class="faq__summary">

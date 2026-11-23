@@ -130,6 +130,14 @@ class PrintingTheSnippet(InstallTest):
         self.assertNotIn("server_labels", out)
         self.assertIn("session limits, the end of the last output for the tail scan, the settings snapshot, and the "
                       "hash of the policy each session began with", out)
+        # The --state-dir help lists the same contents; the two drifted apart once.
+        _, help_text, _ = run_cli("hook", "claude-code", "--help")
+        help_text = " ".join(help_text.split())
+        for part in ("flow marks", "rate-limit counts", "session limits", "tail scan", "settings snapshot",
+                     "hash of the policy"):
+            with self.subTest(part=part):
+                self.assertIn(part, help_text)
+                self.assertIn(part, " ".join(out.split()))
         self.policy = self.write("policy.json", {"default": "block", "tools": {"Read": "allow"},
                                                  "injection": {"warn_severity": "medium"},
                                                  "server_labels": {"web": ["untrusted"]},

@@ -618,18 +618,41 @@ _RULES: tuple[_Rule, ...] = (
 # Files that only look like one hold nothing secret, and setup guides tell the
 # reader to paste them into a form ("paste ~/.ssh/id_rsa.pub into the key
 # field"): a public key (".pub"; in some views "_" is a space, so "id rsa.pub")
-# and a template of an .env file (".env.example"). So do the files of ~/.ssh
-# that hold only public keys: known_hosts and authorized_keys.
+# and the example committed beside a credential file (".env.example"). So do
+# the files of ~/.ssh that hold only public keys: known_hosts and authorized_keys.
 _PUBLIC_KEY_FILE = r"(?:[\w-]{1,64}(?:[ .][\w-]{1,64}){0,2}\.pub\b|known[_ ]?hosts\b|authorized[_ ]?keys2?\b)"
+# The example committed beside a credential file holds placeholders, not
+# secrets, so EVERY name below is left out in that spelling -- but only where
+# one of the four endings is where the name ENDS: nothing may follow but the
+# end of the view, white space, a character that closes a name, or the break
+# text_views writes between fields. Never a path separator and never a further
+# dotted part, so ".env.example.bak", ".env.sample-prod" and what lies under a
+# folder named ".env.example" stay credential files. templates.CREDENTIAL_PATTERN
+# leaves the same four endings out of its own names in the same way, and a test
+# holds the two together.
+_EXAMPLE_ENDING = r"\.(?:example|sample|template|dist)(?=$|[\s'\"`<>|;&,)}\]\u2018-\u201e\u241e])"
+_EXAMPLE_FILE = rf"(?!{_EXAMPLE_ENDING})"
+# "claude_desktop_config" stops before ".json", so its committed example is
+# written "claude_desktop_config.json.example".
+_EXAMPLE_WITH_JSON = rf"(?!(?:\.json)?{_EXAMPLE_ENDING})"
+# A folder's rule names what is inside it, so there the example is a name of
+# its own: ".cursor/mcp.json.example". Only ".cursor" is read that way, because
+# the preset names one file in it (mcp.json) and the whole of ~/.ssh.
+_EXAMPLE_IN_FOLDER = rf"(?![\w.-]{{1,64}}{_EXAMPLE_ENDING})"
 _KEY_FILES = "|".join(
-    rf"id[_ ]{key}\b(?<![a-z0-9]id.{key})(?![\w-]{{0,32}}\.pub\b)" for key in ("rsa", "dsa", "ecdsa", "ed25519")
+    rf"id[_ ]{key}\b(?<![a-z0-9]id.{key})(?![\w-]{{0,32}}\.pub\b){_EXAMPLE_FILE}"
+    for key in ("rsa", "dsa", "ecdsa", "ed25519")
 )
 _CREDENTIAL_FILE = (
-    rf"(~/\.ssh\b(?![/\\]{_PUBLIC_KEY_FILE})|\.ssh[/\\](?!{_PUBLIC_KEY_FILE})|{_KEY_FILES}"
-    r"|\.env\b(?<![\w.]\.env)(?!\.(?:example|sample|template|dist)\b)"
-    r"|\.aws[/\\]credentials\b|mcp\.json\b|claude[_ ]desktop[_ ]config\b"
-    r"|\.cursor[/\\]|\.npmrc\b|\.pypirc\b|\.netrc\b|\.git-credentials\b|/proc/(self|\d{1,7})/environ\b"
-    r"|/etc/(passwd|shadow)\b|\.kube[/\\]config\b|\.docker[/\\]config\.json\b|\.gnupg\b|\.config[/\\]gh\b)"
+    rf"(~/\.ssh\b(?![/\\]{_PUBLIC_KEY_FILE}){_EXAMPLE_FILE}|\.ssh[/\\](?!{_PUBLIC_KEY_FILE})|{_KEY_FILES}"
+    rf"|\.env\b(?<![\w.]\.env){_EXAMPLE_FILE}"
+    rf"|\.aws[/\\]credentials\b{_EXAMPLE_FILE}|mcp\.json\b{_EXAMPLE_FILE}"
+    rf"|claude[_ ]desktop[_ ]config\b{_EXAMPLE_WITH_JSON}"
+    rf"|\.cursor[/\\]{_EXAMPLE_IN_FOLDER}|\.npmrc\b{_EXAMPLE_FILE}|\.pypirc\b{_EXAMPLE_FILE}"
+    rf"|\.netrc\b{_EXAMPLE_FILE}|\.git-credentials\b{_EXAMPLE_FILE}"
+    rf"|/proc/(self|\d{{1,7}})/environ\b{_EXAMPLE_FILE}"
+    rf"|/etc/(passwd|shadow)\b{_EXAMPLE_FILE}|\.kube[/\\]config\b{_EXAMPLE_FILE}"
+    rf"|\.docker[/\\]config\.json\b{_EXAMPLE_FILE}|\.gnupg\b{_EXAMPLE_FILE}|\.config[/\\]gh\b{_EXAMPLE_FILE})"
 )
 # What a file's content is called: "the contents of ~/.ssh/id_rsa", "the full text from .env".
 _CONTENT_OF = (

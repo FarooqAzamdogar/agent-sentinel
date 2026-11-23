@@ -245,7 +245,7 @@ class PolicyWideDeny(unittest.TestCase):
                 self.assertEqual(action("read_file", {"path": path}), "block")
 
     def test_example_policy_leaves_other_short_names_and_lookalike_names_alone(self):
-        for value in ["C:\\Users\\FAROOQ~1\\AppData\\Local\\Temp\\notes.txt", "C:\\PROGRA~1\\app\\readme.txt",
+        for value in ["C:\\Users\\ALEXAN~1\\AppData\\Local\\Temp\\notes.txt", "C:\\PROGRA~1\\app\\readme.txt",
                       ".dockerignore", "docker compose up", "the kube config docs", "config/settings.json",
                       "/home/me/app/.envrc", "procedure/environment.md", "project/.configure"]:
             with self.subTest(value=value):
