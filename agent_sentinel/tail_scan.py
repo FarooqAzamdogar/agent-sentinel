@@ -87,7 +87,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Iterable, Sequence
 
-from .detector import VIEW_KINDS, Finding, reads_as, scan_views, view_of, view_sources, views_of
+from .detector import SEVERITY_ORDER, VIEW_KINDS, Finding, reads_as, scan_views, view_of, view_sources, views_of
 from .session import TAIL_CHARS
 from .textutil import MAX_CONTAINERS, texts_in
 
@@ -449,24 +449,44 @@ def _joined_findings(tail: str, head: str, known: list[Finding], names: tuple[st
 
     (A pair from _readings: `head` starts with the space between them, if any.)
     `known` are the findings of the new text itself: a rule it matches is
-    reported for it already. For a rule the tail matches on its own
-    (reported with the content it came from), the joined text is read again
-    from just after the tail's own match (_after_own_match), so that only
-    another match, one that ends in the new text, counts. Excerpts start
-    with JOINED.
+    reported for it already, at the severity it has there. A rule is
+    reported again when the joined text makes it more severe: a link with
+    a slot for data is medium alone and high once the sentence before it,
+    at the end of the last result, names a secret. For a rule the tail
+    matches on its own at the same severity (reported with the content it
+    came from), the joined text is read again from just after the tail's
+    own match (_after_own_match), so that only another match, one that ends
+    in the new text, counts; one the joined text makes more severe than the
+    tail has it alone needs the new text, and counts as it is. Excerpts
+    start with JOINED.
     """
     if not head.strip():
         return []
-    have = {finding.rule for finding in known}
-    joined = [finding for finding in _scan(tail + head, names) if finding.rule not in have]
+    have = _severities(known)
+    joined = [finding for finding in _scan(tail + head, names) if _more_severe(finding, have)]
     if not joined:
         return []
-    alone = {finding.rule for finding in _scan(tail, names)}
-    found = [finding for finding in joined if finding.rule not in alone]
-    for rule in sorted({finding.rule for finding in joined} & alone):
+    alone = _severities(_scan(tail, names))
+    found = [finding for finding in joined if _more_severe(finding, alone)]
+    for rule in sorted({finding.rule for finding in joined} - {finding.rule for finding in found}):
         rest = _after_own_match(tail, rule, names)
-        found += [finding for finding in _scan(rest + head, names) if finding.rule == rule]
+        found += [
+            finding for finding in _scan(rest + head, names) if finding.rule == rule and _more_severe(finding, have)
+        ]
     return [Finding(finding.rule, finding.severity, JOINED + finding.excerpt) for finding in found]
+
+
+def _severities(findings: Iterable[Finding]) -> dict[str, int]:
+    """Each rule among `findings` with the rank of its severity (the highest, should a rule be there twice)."""
+    ranks: dict[str, int] = {}
+    for finding in findings:
+        ranks[finding.rule] = max(SEVERITY_ORDER[finding.severity], ranks.get(finding.rule, -1))
+    return ranks
+
+
+def _more_severe(finding: Finding, than: dict[str, int]) -> bool:
+    """Whether `finding` is of a rule not among `than`, or more severe than that rule is there."""
+    return SEVERITY_ORDER[finding.severity] > than.get(finding.rule, -1)
 
 
 def _after_own_match(tail: str, rule: str, names: tuple[str, ...] = ()) -> str:
