@@ -809,10 +809,15 @@ _MAX_CARRIER_RUNS = 256
 _MAX_BIT_GROUPS = 8 * 1024
 # Bits scattered in groups of one to seven are read joined across the visible
 # text only when there are this many of one pair (a payload of
-# HIDDEN_TEXT_CHARS characters), and both of its characters occur: ordinary
+# _MIN_SCATTERED_CHARS characters), and both of its characters occur: ordinary
 # text uses one of them alone (Persian ZWNJ), which reads as no text at all.
 # Of them, the first _MAX_SCATTERED_BITS are read (4 KiB of hidden text).
-_MIN_SCATTERED_BITS = 8 * HIDDEN_TEXT_CHARS
+# A payload gathered from across a text needs more characters than one that
+# stands in a run: text that uses both characters of a pair (Persian words
+# next to emoji joined by ZWJ) spells random bytes, and eight random bytes
+# are printable once in a few hundred texts, sixteen about never.
+_MIN_SCATTERED_CHARS = 16
+_MIN_SCATTERED_BITS = 8 * _MIN_SCATTERED_CHARS
 _MAX_SCATTERED_BITS = 8 * 4096
 
 
@@ -962,15 +967,33 @@ def _scattered_text(carriers: str, pair: str) -> str | None:
     """What the carriers of one pair, gathered from across a text, spell; None unless it is a payload.
 
     That needs _MIN_SCATTERED_BITS carriers or more, both characters of the
-    pair, and text of HIDDEN_TEXT_CHARS characters or more, with
-    _MIN_DISTINCT_CHARS different ones, in the first _MAX_SCATTERED_BITS.
+    pair, and, in the first _MAX_SCATTERED_BITS, text with
+    _MIN_DISTINCT_CHARS different characters that reads as written text
+    somewhere (`_reads_as_written_text`): the joiners of ordinary text, read
+    as bits, pass for "mostly printable" now and then, but not for that.
     """
     if len(carriers) < _MIN_SCATTERED_BITS or pair[0] not in carriers or pair[1] not in carriers:
         return None
     spelled = _bits_spelled(carriers[:_MAX_SCATTERED_BITS], pair)
-    if spelled is None or len(spelled) < HIDDEN_TEXT_CHARS or len(set(spelled)) < _MIN_DISTINCT_CHARS:
+    if spelled is None or len(set(spelled)) < _MIN_DISTINCT_CHARS or not _reads_as_written_text(spelled):
         return None
     return spelled
+
+
+def _reads_as_written_text(text: str) -> bool:
+    """Whether `text` has _MIN_SCATTERED_CHARS characters in a row that are all printable, at least half of them
+    letters or spaces: a sentence or a command, not bytes that happen to be printable."""
+    position = 0
+    unprintable = [
+        match.start() for match in _NOT_PLAIN_ASCII.finditer(text)
+        if match.group() == _REPLACEMENT or not match.group().isprintable()
+    ]
+    for at in (*unprintable, len(text)):
+        if at - position >= _MIN_SCATTERED_CHARS:
+            if 2 * len(_LETTERS_AND_SPACES.findall(text, position, at)) >= at - position:
+                return True
+        position = at + 1
+    return False
 
 
 def _unprintable(text: str) -> float:
