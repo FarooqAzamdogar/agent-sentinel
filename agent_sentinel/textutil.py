@@ -1547,7 +1547,10 @@ MAX_BINARY_BYTES = 4 * 1024
 # break before the block (or the start of the text), which lets the regex
 # engine jump from one line break to the next.
 _BASE64_CHARS = "A-Za-z0-9+/_-"
+# How long a piece is: wrapped base64 has lines of 64 or 76 characters, and a
+# longer run is a value of its own, not a piece of one.
 _MIN_PIECE_CHARS = 16
+_MAX_PIECE_CHARS = 256
 # What stands between two pieces. A written-out "\n" puts an "n" in front of the next piece ("\r" the
 # character between the two backslashes), which the run that follows starts with.
 _PIECE_BREAK = re.compile(r"\r?\n[ \t]{0,8}|[ \t]{1,2}")
@@ -1742,7 +1745,7 @@ class EncodedRuns:
         for match in self._run_pattern.finditer(text):
             if match.end() - match.start() >= self._shortest:
                 yield match.group()
-            if len(blocks) >= _MAX_BLOCKS or match.end() - match.start() < _MIN_PIECE_CHARS:
+            if len(blocks) >= _MAX_BLOCKS or not _MIN_PIECE_CHARS <= match.end() - match.start() <= _MAX_PIECE_CHARS:
                 continue
             if not pieces or not _follows_as_a_piece(text, pieces[-1].end(), match):
                 if len(pieces) > 1:
