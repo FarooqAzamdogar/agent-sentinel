@@ -909,11 +909,20 @@ class OrdinaryCommands(unittest.TestCase):
         self.assertGreater(asked, 5)
 
     def test_the_strict_template_refuses_only_network_and_install_among_them(self):
+        # It refuses exactly the commands the starter asks about, by the same class: counted, so that the test
+        # fails if the command sections stop judging (it held when every command was allowed).
+        refused = 0
         for tool, text in self.commands():
             with self.subTest(tool=tool, command=text):
                 verdict = STRICT.evaluate(tool, {"command": text})
-                if verdict.action != "allow":
+                starter = STARTER.evaluate(tool, {"command": text})
+                self.assertIn(verdict.action, ("allow", "block"), verdict.reason)
+                if verdict.action == "block":
+                    refused += 1
                     self.assertIn(verdict.rule, (f"tools.{tool}.command.network", f"tools.{tool}.command.install"))
+                self.assertEqual((verdict.action, verdict.rule), ("block", starter.rule) if starter.action == "ask"
+                                 else ("allow", f"tools.{tool}"))
+        self.assertGreater(refused, 5)
 
 
 class Attacks(unittest.TestCase):

@@ -315,7 +315,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
         },
         {
           "arg": "*",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])([\\w.]|\\\\(u00|U000000)[0-9a-f]{2}){0,80}[\\\"'\\u2018-\\u201e]?\\s*[:=]",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|(?<![\\w.\\\\])(?=[\\w.\\\\]*?\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a]))[\\w.\\\\]*[\\\"'\\u2018-\\u201e]?\\s*[:=]",
           "action": "ask"
         }
       ]
@@ -343,7 +343,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
         },
         {
           "arg": "*",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])([\\w.]|\\\\(u00|U000000)[0-9a-f]{2}){0,80}[\\\"'\\u2018-\\u201e]?\\s*[:=]",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|(?<![\\w.\\\\])(?=[\\w.\\\\]*?\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a]))[\\w.\\\\]*[\\\"'\\u2018-\\u201e]?\\s*[:=]",
           "action": "ask"
         }
       ]
@@ -371,7 +371,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
         },
         {
           "arg": "*",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])([\\w.]|\\\\(u00|U000000)[0-9a-f]{2}){0,80}[\\\"'\\u2018-\\u201e]?\\s*[:=]",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|(?<![\\w.\\\\])(?=[\\w.\\\\]*?\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a]))[\\w.\\\\]*[\\\"'\\u2018-\\u201e]?\\s*[:=]",
           "action": "ask"
         }
       ]
@@ -399,7 +399,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
         },
         {
           "arg": "*",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])([\\w.]|\\\\(u00|U000000)[0-9a-f]{2}){0,80}[\\\"'\\u2018-\\u201e]?\\s*[:=]",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|(?<![\\w.\\\\])(?=[\\w.\\\\]*?\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a]))[\\w.\\\\]*[\\\"'\\u2018-\\u201e]?\\s*[:=]",
           "action": "ask"
         }
       ]
@@ -410,7 +410,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
       "deny_args": [
         {
           "arg": "command",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])([\\w.]|\\\\(u00|U000000)[0-9a-f]{2}){0,80}[\\\"'\\u2018-\\u201e]?\\s*[:=]",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|(?<![\\w.\\\\])(?=[\\w.\\\\]*?\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a]))[\\w.\\\\]*[\\\"'\\u2018-\\u201e]?\\s*[:=]",
           "action": "ask"
         }
       ],
@@ -426,7 +426,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
       "deny_args": [
         {
           "arg": "command",
-          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])([\\w.]|\\\\(u00|U000000)[0-9a-f]{2}){0,80}[\\\"'\\u2018-\\u201e]?\\s*[:=]",
+          "pattern": "(?<![\\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\\w*_base_url|node_options|chat\\.tools\\.(global\\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)[\\\"'\\u2018-\\u201e]?\\s*[:=]|\\bsetx(\\.exe)?\\s+(/m\\s+)?[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|\\$\\{?env:(\\w*_base_url|node_options)\\}?\\s*\\+?=|(?<![\\w$:{])env:[\\\\/]?(\\w*_base_url|node_options)\\b|SetEnvironmentVariable\\s*\\(\\s*[\\\"'\\u2018-\\u201e]?(\\w*_base_url|node_options)\\b|(?<![\\w.\\\\])(?=[\\w.\\\\]*?\\\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a]))[\\w.\\\\]*[\\\"'\\u2018-\\u201e]?\\s*[:=]",
           "action": "ask"
         }
       ],
