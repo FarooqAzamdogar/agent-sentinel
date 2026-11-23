@@ -109,7 +109,7 @@ MAX_SECONDS_AGO = 10**7
 SHOWN_HISTORY_STEPS = 50
 HISTORY_ANSWERS = ("approve", "refuse")
 _CALL_STEP_KEYS = ("call", "args", "answer", "seconds_ago")
-_RESULT_STEP_KEYS = ("result", "content", "seconds_ago")
+_RESULT_STEP_KEYS = ("result", "content", "args", "seconds_ago")
 MAX_STEP_TOOL_CHARS = 512
 
 
@@ -260,6 +260,7 @@ class HistoryStep:
     args: dict[str, Any] = field(default_factory=dict)
     answer: str = "approve"  # a call that needs approval: what the person answers
     content: Any = None  # a result: the text, or a JSON value
+    call_args: dict[str, Any] | None = None  # a result: the arguments of the call it answers, when given
     seconds_ago: float = 0.0
 
 
@@ -277,8 +278,11 @@ def parse_history(data: Any, where: str, most: int = MAX_HISTORY_STEPS) -> list[
 
     {"call": TOOL, "args": {...}, "answer": "approve" | "refuse", "seconds_ago": N}
         an earlier call; "answer" is used when the policy says ask (default "approve").
-    {"result": TOOL, "content": TEXT or JSON, "seconds_ago": N}
+    {"result": TOOL, "content": TEXT or JSON, "args": {...}, "seconds_ago": N}
         a result of TOOL that reached the agent (if the policy lets it through).
+        "args" (optional) are the arguments of the call it answers: a command
+        section's labels_by_class then marks the session by what the command
+        did, and the result is read with the names of those arguments.
     "seconds_ago" (default 0) dates the step, for approval memory and the
     rate limits (both count in seconds). Steps go oldest first: a step's
     seconds_ago is never more than the one before it.
@@ -322,7 +326,10 @@ def _history_step(entry: Any, where: str) -> HistoryStep:
     if kind == "result":
         if "content" not in entry:
             raise CommandError(f'{where} needs "content": the text or JSON value the tool returned')
-        return HistoryStep(kind, tool, content=entry["content"], seconds_ago=float(seconds_ago))
+        call_args = entry.get("args")
+        if call_args is not None and not isinstance(call_args, dict):
+            raise CommandError(f"{where}.args must be an object of arguments, got {type_name(call_args)}")
+        return HistoryStep(kind, tool, content=entry["content"], call_args=call_args, seconds_ago=float(seconds_ago))
     args = entry.get("args", {})
     if not isinstance(args, dict):
         raise CommandError(f"{where}.args must be an object of arguments, got {type_name(args)}")
@@ -369,11 +376,12 @@ def _played(firewall: Firewall, step: HistoryStep) -> str:
                 what += f", {decision.approval}"
         rule = f" ({printable(decision.rule, limit=120)})" if decision.rule else ""
         return f"call {shown_call(step.tool, step.args)}{when} -> {what}{rule}"
-    checked = firewall.check_result(step.tool, step.content)
+    names = [name for name in step.call_args or () if isinstance(name, str)]
+    checked = firewall.check_result(step.tool, step.content, parameter_names=names)
     decision = checked.decision
     if not decision.allowed:
         return f"result of {printable(step.tool, limit=80)}{when} -> withheld ({printable(decision.rule, limit=120)})"
-    firewall.mark_delivered(step.tool, decision=decision)
+    firewall.mark_delivered(step.tool, args=step.call_args, decision=decision)
     marks = sorted(firewall.session_marks().labels)
     shown = f"; the session's marks: {', '.join(marks)}" if marks else ""
     return f"result of {printable(step.tool, limit=80)}{when} -> delivered{shown}"

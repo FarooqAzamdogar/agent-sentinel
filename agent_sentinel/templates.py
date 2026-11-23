@@ -383,6 +383,10 @@ def _claude_code(strict: bool) -> dict[str, Any]:
     tools["Monitor"] = {"action": "ask", "labels": ["untrusted", "sink"]}
     tools.update(_rules(CLAUDE_CODE_PLAIN_TOOLS, {"action": "allow", "labels": []}))
     tools["mcp__*"] = {"action": "ask", "labels": ["untrusted", "sink"]}
+    # As in the proxy templates: output that reads like instructions to the agent (a medium finding)
+    # reaches Claude with a notice to treat it as data (PostToolUse additionalContext). In the strict
+    # template such output is withheld, so the notice shows only where it is let through (monitor mode).
+    policy["injection"]["warn_severity"] = "medium"
     if strict:
         policy["injection"]["block_severity"] = "medium"
         policy["secrets"]["in_results"] = "block"

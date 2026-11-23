@@ -1700,10 +1700,14 @@ def _rule_of_two_warnings(policy: Policy) -> list[str]:
     The agents' "Rule of Two": an agent should not have all three at once. A
     tool counts when a rule allows it or asks for it; with
     classify_by_annotations, MCP annotations can make any server tool
-    untrusted and a sink. A flow covers the combination when its "after" holds
-    only 'untrusted' and 'private' and its "then" is 'sink'.
+    untrusted and a sink. The marks that come from no tool rule count too:
+    those server_labels gives what a server delivers, and injection.mark
+    once injection.mark_at is set (neither is ever 'sink'). A flow covers the
+    combination when its "after" holds only 'untrusted' and 'private' and its
+    "then" is 'sink'; one with unless_args covers it too: the calls that meet
+    its exception are the ones its author chose to let through.
     """
-    reachable = {UNTRUSTED: [], PRIVATE: [], SINK: []}
+    reachable: dict[str, list[str]] = {UNTRUSTED: [], PRIVATE: [], SINK: []}
     for rule in policy.tools:
         if rule.action == "block":
             continue
@@ -1711,6 +1715,12 @@ def _rule_of_two_warnings(policy: Policy) -> list[str]:
         for label, names in reachable.items():
             if label in labels:
                 names.append(rule.name)
+    for entry in policy.server_labels:
+        for label in entry.labels:
+            if label in reachable:
+                reachable[label].append(f"server_labels.{entry.name}")
+    if policy.mark_at is not None and policy.injection_mark in reachable:
+        reachable[policy.injection_mark].append("injection.mark")
     if not reachable[PRIVATE]:
         return []
     if policy.classify_by_annotations:

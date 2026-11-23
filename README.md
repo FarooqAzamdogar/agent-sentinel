@@ -461,7 +461,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
     "mcp__*": { "action": "ask", "labels": ["untrusted", "sink"] }
   },
   "server_requests": { "sampling/createMessage": "block", "*": "allow" },
-  "injection": { "block_severity": "high" },
+  "injection": { "block_severity": "high", "warn_severity": "medium" },
   "secrets": { "in_arguments": "block", "in_results": "redact" },
   "limits": { "max_calls_per_minute": 120 },
   "flows": [{ "after": ["untrusted", "private"], "then": "sink", "action": "block" }]
