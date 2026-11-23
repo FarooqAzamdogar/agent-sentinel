@@ -254,7 +254,7 @@
           <li class="badge">MIT license</li>
           <li class="badge">Python 3.10+</li>
           <li class="badge">Zero dependencies</li>
-          <li class="badge">About 2,950 automated tests</li>
+          <li class="badge">About 3,200 automated tests</li>
           <li class="badge">MCP proxy over stdio</li>
           <li class="badge">Claude Code hooks</li>
         </ul>
@@ -716,7 +716,7 @@
       <header class="section__head">
         <p class="eyebrow"><span class="eyebrow__num">04</span> Features</p>
         <h2 id="features-title">What is in version 0.6.0</h2>
-        <p class="section__lead">Guardrails for the tools an LLM agent can call, written as <span class="hl">rules you can read and test</span>. The project has about 2,950 automated tests, run on Linux and Windows with Python 3.10 to 3.13. New in 0.6.0: flow rules that hold across the servers of one client, shell commands judged by what they do, an audit log you can verify, checks of how each server is started, and options to contain or sandbox a server.</p>
+        <p class="section__lead">Guardrails for the tools an LLM agent can call, written as <span class="hl">rules you can read and test</span>. The project has about 3,200 automated tests, run on Linux and Windows with Python 3.10 to 3.13. New in 0.6.0: flow rules that hold across the servers of one client, shell commands judged by what they do, an audit log you can verify, checks of how each server is started, and options to contain or sandbox a server.</p>
       </header>
 
       <div class="grid grid--3 features">
@@ -791,6 +791,7 @@
           <p class="feature__sum">Checks Claude Code's own tools too.</p>
           <p>Installed as hooks, it checks Read, Edit, Bash, WebFetch and MCP tools before they run, and scans what web and MCP tools return. An ask uses Claude Code's own prompt.</p>
           <p>It also checks what an MCP server asks you in a form, and records changes to Claude Code's settings during a session. The <code>claude-code</code> policy template asks before a write to an agent's settings or instruction files.</p>
+          <p>If the policy file itself changes while a session runs, the rest of that session is refused, so an agent cannot rewrite the rules it is judged by. Start a new session to use an edited policy.</p>
         </article>
 
         <article class="card feature feature--yellow">

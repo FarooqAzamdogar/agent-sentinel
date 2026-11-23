@@ -7,11 +7,11 @@ Thanks for helping. This page explains how the code is organized, how a message 
 There is nothing to install. You need Python 3.10 or newer. The package uses only the standard library.
 
 ```bash
-python -m unittest discover tests -v     # run all tests (10 to 15 minutes)
+python -m unittest discover tests -v     # run all tests (ten minutes or more)
 python -m agent_sentinel demo            # see the library and the proxy at work
 ```
 
-The code must run on Python 3.10: no `except*`, `ExceptionGroup`, `add_note`, `tomllib` or typing features newer than 3.10. CI runs the tests on Linux and Windows with Python 3.10 to 3.13.
+The code must run on Python 3.10: no `except*`, `ExceptionGroup`, `add_note`, `tomllib` or typing features newer than 3.10. CI runs the tests on Linux and Windows with Python 3.10 to 3.13. Its test and build jobs are given 45 minutes each, so that a slow hosted runner is not cancelled with every test passing.
 
 Run the tests with `AGENT_SENTINEL_HOME` unset, or set to a folder named `.agent-sentinel` (see "The tests").
 
@@ -60,7 +60,7 @@ All code is in `agent_sentinel/`. The module map at the top of `agent_sentinel/_
 | File | What it does | Depends on |
 |---|---|---|
 | `claude_hooks.py` | The answers to Claude Code's hook events (tool calls and results, elicitations, settings changes, the start of a session); `claude_sdk_hooks()` for the Agent SDK. | audit_chain, auditlog, elicitation, firewall, hook_state, home, jsonutil, mcp_protocol, policy, policy_errors, session, textutil |
-| `hook_state.py` | Rate-limit counts per session and the snapshot of Claude Code's settings, each in a file (every hook run is a new process). | filelock, firewall, jsonutil, session |
+| `hook_state.py` | Rate-limit counts per session, the snapshot of Claude Code's settings, and the policy file a session began with, each in a file (every hook run is a new process). Also the owner-only state folder and the pruning of old sessions' files. | filelock, firewall, jsonutil, session |
 
 ### The command line
 
@@ -69,6 +69,7 @@ All code is in `agent_sentinel/`. The module map at the top of `agent_sentinel/_
 | `__main__.py` | The `agent-sentinel` command: builds the parser and hands each command to its module. `proxy` goes straight to `mcp_proxy.main`. |
 | `cli_<command>.py` | One module per command: `cli_init`, `cli_inspect`, `cli_clients`, `cli_wrap`, `cli_unwrap`, `cli_doctor`, `cli_hook`, `cli_pins`, `cli_check`, `cli_test`, `cli_validate`, `cli_scan`, `cli_report`, `cli_explain`, `cli_suggest`, `cli_audit`, `cli_demo`. |
 | `cli_common.py` | What the commands share: exit codes, loading a policy, reading input, strict JSON, printing a command line. |
+| `shortened_options.py` | The shortened options that 0.5.0 read as one option and a newer option made ambiguous (`hook claude-code --au`, `wrap --con`, `check --s`): the table and the function that registers them on a parser. |
 | `auditlog.py` | Reading audit logs with bounded lines; times and filters; which records describe the log and the session and not a call (`META_EVENTS`). |
 | `fix_hints.py` | How to allow a call that a rule blocked, one hint per kind of rule (explain, report, check), and which kinds `suggest` never loosens. |
 | `home.py` | The agent-sentinel home folder (`~/.agent-sentinel`, or `AGENT_SENTINEL_HOME`). |
@@ -98,7 +99,7 @@ Tests are in `tests/`, one file (or a few) per module. From the project folder, 
 | Proxy | `test_proxy.py`, `test_proxy_hardening.py`, `test_proxy_lists.py`, `test_proxy_pins.py`, `test_proxy_client_requests.py`, `test_proxy_launch.py`, `test_proxy_approvals.py`, `test_proxy_report.py`, `test_approvers.py`, `test_proxy_gaps.py` (unseen tools, sampling, template quarantine, pages of a list, the call timeout), `test_proxy_schemas.py`, `test_schema_check.py`, `test_containment.py`, `test_session_groups.py`, `test_server_pins.py` |
 | MCP protocol | `test_protocol.py`, `test_protocol_elicitation.py`, `test_protocol_coverage.py` |
 | Claude Code | `test_claude_hooks.py` and `test_hook_events.py` (with events in the shape Claude Code sends them, in `claude_code_events/`), `test_hook_state.py`, `test_cli_hook.py`, `test_recipes.py` |
-| Commands | `test_cli.py`, `test_cli_commands.py`, `test_cli_cases.py`, and `test_cli_<command>.py` for each command (`audit verify` is tested in `test_audit_chain.py`); `test_auditlog.py`, `test_fix_hints.py`, `test_home.py`, `test_clients.py`, `test_config_file.py`, `test_wrapping.py`, `test_launch.py` (the launch check, advisories, what a server pin holds), `test_doctor_checks.py` (doctor's launch lines, control plane, permissions, baseline) |
+| Commands | `test_cli.py`, `test_cli_commands.py`, `test_cli_cases.py`, and `test_cli_<command>.py` for each command (`audit verify` is tested in `test_audit_chain.py`); `test_auditlog.py`, `test_fix_hints.py`, `test_home.py`, `test_clients.py`, `test_config_file.py`, `test_wrapping.py`, `test_launch.py` (the launch check, advisories, what a server pin holds), `test_doctor_checks.py` (doctor's launch lines, control plane, permissions, baseline), `test_shortened_options.py` (every shortening 0.5.0 took, against today's parsers) |
 | Several parts together | `test_json_arguments_meet_the_rules.py`, `test_checks_meet_the_session.py`, `test_hook_session_features.py`, `test_server_pin_and_flows.py`, `test_startup_audit_and_sandbox.py`, `test_shared_marks_and_one_trail.py` |
 | Everything together | `test_integration.py`, `test_second_review.py` (one test for each gap found in the 0.4.0 review), `test_end_to_end.py` (real processes, as a user runs them: the library, every command, the Claude Code hook, and the proxy in both protocol eras), and the end-to-end modules of single areas: `test_core_end_to_end.py`, `test_detection_end_to_end.py`, `test_audit_end_to_end.py` |
 
@@ -113,7 +114,7 @@ Shared helpers: `tests/support.py` (the example policy, a typical injection, and
 - **Timing tests and a busy machine.** About thirty test modules check that hostile input stays fast, with `assertLess(seconds, limit)`. On an idle machine no check uses more than about 40% of its limit. A second test run on the same machine at the same time makes the scans three to four times slower, and then the 5-second checks with an idle time above about 1.2 seconds can fail: the hostile-input classes of `test_hidden_text.py`, `test_result_rules.py`, `test_detector.py` and `test_proxy_gaps.py`. Run the suite alone before you read such a failure as a regression, and do not raise a limit to make a loaded run pass.
 - **Tests for another system skip themselves.** The tests of POSIX file modes, the Linux sandbox and the Windows job object run only where they can. On Windows about 16 tests are skipped; they run in CI. Nothing runs on macOS, so the code for it (the `sandbox-exec` profile, the `ps` reader of `client_run.py`) is tested as text or with a stand-in: say so in SECURITY.md when you add to it.
 - **Tests that use pydantic** must skip when it is not installed. The package itself never imports it.
-- **The attack corpus.** `tests/attack_corpus/benign_tool_metadata.json` holds 650 real tool descriptions: none may be high. `tests/attack_corpus/published/` holds one file per published attack (81 of them), written by `make_published.py` (run it after editing; a test checks the files are what it writes).
+- **The attack corpus.** `tests/attack_corpus/benign_tool_metadata.json` holds 650 real tool descriptions: none may be high, read as metadata and as tool output with the parameter names of real tools. `tests/attack_corpus/published/` holds one file per published attack (87 of them), written by `make_published.py` (run it after editing; a test checks the files are what it writes).
 
 ## How a tool call flows (library use)
 
@@ -195,7 +196,7 @@ These are the security properties of the project. A pull request that breaks one
 10. **Say what a feature does not do.** Every limit of a new defence goes into SECURITY.md, and code that could not be run on the system it is written for is listed there under "What has not been run on a real system".
 11. **Readable code.** Small functions, plain-English docstrings, comments that say why, names that say what things are.
 
-Some lists must stay in step, and a test fails when they do not: the module map in `agent_sentinel/__init__.py` names every module; `wrapping.VALUE_OPTIONS` and `FLAG_OPTIONS` together are exactly the options of the proxy's parser; `mcp_protocol.COVERAGE` has a row for every method the proxy's code names; the hook policy in the README is the `claude-code` template; the credential pattern in `policy.example.json` is `templates.CREDENTIAL_PATTERN`.
+Some lists must stay in step, and a test fails when they do not: the module map in `agent_sentinel/__init__.py` names every module; `wrapping.VALUE_OPTIONS` and `FLAG_OPTIONS` together are exactly the options of the proxy's parser; `mcp_protocol.COVERAGE` has a row for every method the proxy's code names; the hook policy in the README is the `claude-code` template; the credential pattern in `policy.example.json` is `templates.CREDENTIAL_PATTERN`; `agent-sentinel validate` names every setting of a policy that decides something; and every shortened option 0.5.0 read as one option still reads as that option (`shortened_options.KEPT`).
 
 ## How to add a detector rule
 
@@ -223,14 +224,15 @@ A matcher is one way of judging an argument's value (`"pattern"`, `"one_of"`, `"
 
 1. Find the list the program belongs to: a wrapper that runs another command (`_WRAPPERS`, with the options of it that take a value), a program that talks to another machine (`_NETWORK_PROGRAMS`), a writer, an installer, a program that changes folder (`_CD_PROGRAMS`). The module's docstring says what each class means.
 2. If the reader cannot be sure what a form of the command runs, make it unreadable (`Unreadable`), not "nothing found". The policy then asks or refuses.
-3. In `tests/test_commands.py`, add the command with the class it must get, a look-alike that must stay clean, and a hostile input with a time limit. Add an everyday use of the program to `ORDINARY_BASH` or `ORDINARY_POWERSHELL`: the `claude-code` template must deny none of those commands.
-4. Add what the reader still does not follow to "The command reader" in SECURITY.md.
+3. A word the shell may expand to a hidden protected file counts as that file ("Names the shell expands" in the module's docstring). If the program you add writes, reads or changes folder, say which of its words are paths, so that check applies to them.
+4. In `tests/test_commands.py`, add the command with the class it must get, a look-alike that must stay clean, and a hostile input with a time limit. Add an everyday use of the program to `ORDINARY_BASH` or `ORDINARY_POWERSHELL`: the `claude-code` template must deny none of those commands, and `claude-code-strict` must refuse exactly what `claude-code` asks about, apart from an unreadable command, Monitor and MCP tools.
+5. Add what the reader still does not follow to "The command reader" in SECURITY.md.
 
 ## How to add a policy key
 
-1. Add it to the key list of its section in `policy.py` (`_TOP_LEVEL_KEYS`, `_TOOL_RULE_KEYS`, `_LIMITS_KEYS`, `_INJECTION_KEYS` ...), validate its value there with a message that says what to write, and add a field with a default at the end of `Policy` or `ToolRule`, so that code that builds them by position keeps working.
+1. Add it to the key list of its section in `policy.py` (`_TOP_LEVEL_KEYS`, `_TOOL_RULE_KEYS`, `_LIMITS_KEYS`, `_INJECTION_KEYS`, `_HOOK_KEYS` ...), validate its value there with a message that says what to write, and add a field with a default at the end of `Policy` or `ToolRule`, so that code that builds them by position keeps working.
 2. A policy built in code must be validated like a file (`__post_init__`).
-3. Print it in `cli_validate.py`, and add a warning to `Policy.warnings()` for a value that loads but is probably a mistake.
+3. Print it in `cli_validate.py`: every setting that decides something must be named there, and `tests/test_policy_sections.py` holds that rule. Say the value that is worth saying — for a setting whose default is the strict value, that is the value which turns a check off. Add a warning to `Policy.warnings()` for a value that loads but is probably a mistake.
 4. Decide what each template gets (`templates.py`). Every template must still load without a warning.
 5. Test wrong values and unknown keys in `tests/test_policy_sections.py`, and add the key to the README's policy reference.
 
@@ -250,6 +252,8 @@ Every refusal names the rule that decided, and operators look it up with `explai
 3. Say what it does in the startup summary (`proxy_report.Startup`).
 4. Keep the order at startup (above): nothing may start the server before the checks that can still refuse it.
 5. Add it to the proxy options table in the README.
+
+The proxy takes no shortened option, so nothing more is needed for it. An option added to any **other** command can make a shortening that 0.5.0 read as one option ambiguous, and then a script or a hand-written hook entry stops working (a Claude Code hook that exits with an error blocks every tool call). `tests/test_shortened_options.py` tries every shortening 0.5.0 took against today's parsers; when it fails, add the shortening and the option it meant to `shortened_options.KEPT`. Never widen the table beyond that: a shortening that was already ambiguous in 0.5.0 must stay ambiguous.
 
 ## How to add an audit event
 
