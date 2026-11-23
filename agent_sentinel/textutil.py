@@ -1230,7 +1230,9 @@ def folded_text(text: str) -> str:
     returned as it is. Normalized in slices, never cut between a character
     and the marks that combine with it, and a slice that would grow more than
     _MAX_FOLD_EXPANSION times has its expanding characters made spaces, so
-    hostile text stays quick and short.
+    hostile text stays quick and short. (A slice with one of the characters
+    of _MAY_EXPAND is measured by its characters each folded alone, which
+    can be a little longer than the slice folded whole.)
     """
     if text.isascii():
         return text
@@ -1243,15 +1245,38 @@ def folded_text(text: str) -> str:
         while end < reach and unicodedata.combining(text[end]):
             end += 1
         piece = text[start:end]
+        # Normalising a slice full of characters that expand is itself slow (on Windows above all), so a
+        # slice that holds any of those that expand most is first measured without normalising it.
+        if _MAY_EXPAND.search(piece) is not None and _folded_length(piece) > _MAX_FOLD_EXPANSION * len(piece):
+            piece = _without_expanding(piece)
         folded = unicodedata.normalize("NFKC", piece)
-        if len(folded) > _MAX_FOLD_EXPANSION * len(piece):
-            piece = "".join(
-                " " if len(unicodedata.normalize("NFKC", ch)) > _MAX_FOLD_EXPANSION else ch for ch in piece
-            )
-            folded = unicodedata.normalize("NFKC", piece)
+        if len(folded) > _MAX_FOLD_EXPANSION * len(piece):  # a character that expands, not among those
+            folded = unicodedata.normalize("NFKC", _without_expanding(piece))
         pieces.append(folded)
         start = end
     return "".join(pieces)
+
+
+# Where the characters are that NFKC writes as more than _MAX_FOLD_EXPANSION characters: squared Katakana
+# words and units (U+3307 ... U+33AF) and two Arabic ligatures (U+FDFA, U+FDFB, which become 18 and 8).
+_MAY_EXPAND = re.compile("[㌀-㏿ﷺﷻ]")
+
+
+def _folded_length(piece: str) -> int:
+    """How long `piece` is with each character in its own NFKC form (composing marks only shortens it)."""
+    return sum(piece.count(ch) * len(unicodedata.normalize("NFKC", ch)) for ch in set(piece))
+
+
+def _without_expanding(piece: str) -> str:
+    """`piece` with a space for each character NFKC writes as more than _MAX_FOLD_EXPANSION characters.
+
+    One translate, with a table of the characters of the piece: not a
+    normalisation per character.
+    """
+    expanding = {
+        ord(ch): " " for ch in set(piece) if len(unicodedata.normalize("NFKC", ch)) > _MAX_FOLD_EXPANSION
+    }
+    return piece.translate(expanding)
 
 
 def clean_value_for_forwarding(value: Any) -> Any:

@@ -591,6 +591,21 @@ class KnownValueSpellings(unittest.TestCase):
         folded_text("ﷺ" * 200_000 + "á" * 200_000)
         self.assertLess(time.perf_counter() - started, 5)
 
+    def test_text_full_of_characters_that_expand_is_folded_about_as_quickly_as_other_text(self):
+        # U+FDFA becomes 18 characters, U+FDFB 8, U+3307 5: slices full of them were normalised whole and
+        # then character by character, many times slower than any other text (seconds per million).
+        def took(text):
+            started = time.perf_counter()
+            folded_text(text)
+            return time.perf_counter() - started
+
+        ordinary = min(took("\N{LATIN SMALL LETTER E WITH ACUTE}" * 300_000) for _ in range(3))
+        for char in ("\ufdfa", "\ufdfb", "\u3307"):
+            with self.subTest(char=ascii(char)):
+                self.assertLess(min(took(char * 300_000) for _ in range(3)), 10 * ordinary + 0.05)
+        self.assertEqual(folded_text("\ufdfa" * 300), " " * 300)  # still made spaces, not 5,400 characters
+        self.assertEqual(len(folded_text("The ligature \ufdfa.")), len("The ligature .") + 18)  # folded in a sentence
+
     def test_the_policy_names_the_values_matched_with_case_ignored(self):
         def secrets(ignore_case):
             return {"secrets": {"known_values_from_env": ["WORD"], "known_values_ignore_case": ignore_case}}
