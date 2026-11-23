@@ -735,11 +735,11 @@ def percent_decoded(text: str) -> str:
 # sequence, so no character is read by more than a few attempts. An OSC is
 # bounded, so that one attempt cannot read far ahead; a longer one is not
 # matched, and removing the ESC character then leaves it as visible text.
-TERMINAL_ESCAPE = re.compile(
-    r"(?:\x1b\[|\x9b)[0-?]*[ -/]{0,8}[@-~]|(?:\x1b\]|\x9d)[^\x07\x1b\x9c]{0,512}(?:\x07|\x1b\\|\x9c)"
-)
-# The characters a terminal escape sequence starts with.
-TERMINAL_ESCAPE_STARTS = ("\x1b", "\x9b", "\x9d")
+TERMINAL_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]{0,8}[@-~]|\x1b\][^\x07\x1b\x9c]{0,512}(?:\x07|\x1b\\|\x9c)")
+# The same sequences started by the one-character CSI and OSC. A pattern of its
+# own, used only on text that has one: a pattern that starts with ESC alone is
+# searched for far more quickly than one that starts with any of three.
+C1_TERMINAL_ESCAPE = re.compile(r"\x9b[0-?]*[ -/]{0,8}[@-~]|\x9d[^\x07\x1b\x9c]{0,512}(?:\x07|\x1b\\|\x9c)")
 
 # Unicode tag characters (U+E0000 to U+E007F) draw nothing, and U+E0020 to
 # U+E007E copy printable ASCII one to one. A sentence written in them is
@@ -1194,8 +1194,10 @@ def clean_for_forwarding(text: str) -> str:
     the original before passing the cleaned one on: what is forwarded must be
     what was checked.
     """
-    if any(start in text for start in TERMINAL_ESCAPE_STARTS):
+    if "\x1b" in text:
         text = TERMINAL_ESCAPE.sub("", text)
+    if "\x9b" in text or "\x9d" in text:
+        text = C1_TERMINAL_ESCAPE.sub("", text)
     text = text.translate(_CONTROLS_AND_BIDI)
     if "\r" in text:
         text = _LONE_CARRIAGE_RETURN.sub("\n", text)
@@ -1534,27 +1536,47 @@ _MAX_SKIPPED_BYTES = 16
 MAX_BINARY_BYTES = 4 * 1024
 # Base64 cut into pieces, read joined up (besides each piece that is long
 # enough, on its own: two values next to each other are not one).
-# _PIECES: pieces of 16 characters or more with a line break (and its indent),
-# a space or two, or a written-out "\n" between them; after a line break the
-# last piece may be shorter. Shorter pieces are the words of ordinary text. A
-# block starts only where a piece starts, so no character is read by more
-# than a few attempts.
+# Pieces: runs of _MIN_PIECE_CHARS characters or more (as the run pattern
+# finds them) with a line break and its indent, a space or two, or a
+# written-out "\n" between them (_PIECE_BREAK); after a line break the last
+# piece may be shorter (_LAST_PIECE). Shorter pieces are the words of
+# ordinary text. They are grouped as the runs are found, so the text is
+# read once.
 # _SHORT_LINES: three or more whole lines of 8 to 15 characters, as base64
 # wrapped at a short width, and a shorter last line. It starts with the line
 # break before the block (or the start of the text), which lets the regex
 # engine jump from one line break to the next.
 _BASE64_CHARS = "A-Za-z0-9+/_-"
-_PIECE_BREAK = r"(?:\r?\n[ \t]{0,8}|[ \t]{1,2}|\\r\\n|\\n)"
-_PIECES = re.compile(
-    rf"(?<![{_BASE64_CHARS}])[{_BASE64_CHARS}]{{16,}}(?:{_PIECE_BREAK}[{_BASE64_CHARS}]{{16,}})+"
-    rf"(?:\r?\n[ \t]{{0,8}}[{_BASE64_CHARS}]{{1,15}}(?![{_BASE64_CHARS}]))?={{0,2}}"
-)
+_MIN_PIECE_CHARS = 16
+# What stands between two pieces. A written-out "\n" puts an "n" in front of the next piece ("\r" the
+# character between the two backslashes), which the run that follows starts with.
+_PIECE_BREAK = re.compile(r"\r?\n[ \t]{0,8}|[ \t]{1,2}")
+_WRITTEN_OUT_BREAK = ("\\", "\\r\\")
+_LAST_PIECE = re.compile(rf"\r?\n[ \t]{{0,8}}[{_BASE64_CHARS}]{{1,15}}(?![{_BASE64_CHARS}])={{0,2}}")
 _LINES = (
     rf"(?P<block>[{_BASE64_CHARS}]{{8,15}}(?:\r?\n[{_BASE64_CHARS}]{{8,15}}){{2,}}"
     rf"(?:\r?\n[{_BASE64_CHARS}]{{1,7}}(?![{_BASE64_CHARS}]))?={{0,2}})"
 )
 _SHORT_LINES = re.compile(r"\n" + _LINES)
 _SHORT_LINES_FIRST = re.compile(_LINES)
+
+
+_MAX_BLOCKS = 256  # blocks of pieces gathered from one text: more than the attempts of any decoder
+
+
+def _follows_as_a_piece(text: str, end: int, match: re.Match[str]) -> bool:
+    """Whether the run `match` is the next piece of the one that ends at `end`: only a break between them."""
+    gap = text[end:match.start()] if match.start() - end <= 10 else ""
+    if gap in _WRITTEN_OUT_BREAK:
+        return match.group().startswith("n")
+    return _PIECE_BREAK.fullmatch(gap) is not None
+
+
+def _block_of(text: str, pieces: list[re.Match[str]]) -> str:
+    """The text of pieces that follow each other, and of a shorter last piece on the next line."""
+    end = pieces[-1].end()
+    last = _LAST_PIECE.match(text, end)
+    return text[pieces[0].start():last.end() if last else end]
 
 
 def _joined_up(run: str) -> str:
@@ -1596,7 +1618,7 @@ class EncodedRuns:
     little. Every run that looks encoded costs an attempt, binary or not.
 
     Base64 cut into pieces (lines, spaces, written-out line breaks between
-    them: `_PIECES`, `_SHORT_LINES`) is also read joined up. A run full of "/"
+    them: `_runs`, `_SHORT_LINES`) is also read joined up. A run full of "/"
     is tried out of a count of its own and kept only if it is text (a path is
     no text). A run that is not text as it stands is also read from its second
     character on (base64: also its third and fourth; hex: one digit in front),
@@ -1643,11 +1665,12 @@ class EncodedRuns:
         # several lines, as `base64` wraps its output. Hex is also looked for on
         # its own, because a letter or "/" before it ("example/6768...") makes
         # the longer run base64-shaped.
-        # A run starts where no base64 character stands before it: said in the
-        # pattern, so that the inside of each word is not tried as a start.
-        shortest = min(min_base64_chars, min_hex_chars)
+        # Runs as short as a piece are found (`_runs`), and only those of the
+        # shortest length decoded are tried on their own. Each match is a whole
+        # run: one that is long enough matches from its first character on.
+        self._shortest = shortest = min(min_base64_chars, min_hex_chars)
         self._run_pattern = re.compile(
-            rf"(?<![{_BASE64_CHARS}])[{_BASE64_CHARS}]{{{shortest},}}(?:\r?\n[{_BASE64_CHARS}]+)*={{0,2}}"
+            rf"[{_BASE64_CHARS}]{{{min(shortest, _MIN_PIECE_CHARS)},}}(?:\r?\n[{_BASE64_CHARS}]+)*={{0,2}}"
         )
         self._hex_pattern = re.compile(rf"[0-9A-Fa-f]{{{min_hex_chars},}}")
         self._seen: set[str] = set()
@@ -1657,7 +1680,7 @@ class EncodedRuns:
 
     def decoded(self, text: str, *, read_before: str | None = None) -> list[DecodedRun]:
         """Each new run in `text` that decodes to text: base64-shaped runs first, then hex ones, then base64
-        cut into pieces (`_PIECES`, `_SHORT_LINES`).
+        cut into pieces (see `_runs`) and in short lines (`_SHORT_LINES`).
 
         read_before: a text this decoder was given before, of which `text`
         is another spelling (the same without invisible characters, say). A
@@ -1709,14 +1732,28 @@ class EncodedRuns:
         return found
 
     def _runs(self, text: str) -> Iterator[str]:
-        """The candidates in `text`, as they stand in it: runs, hex runs, then blocks of pieces and short lines."""
+        """The candidates in `text`, as they stand in it: runs, hex runs, then blocks of pieces and short lines.
+
+        The blocks of pieces are gathered from the runs as they are found
+        (at most _MAX_BLOCKS of them), and come after the hex runs.
+        """
+        blocks: list[str] = []
+        pieces: list[re.Match[str]] = []
         for match in self._run_pattern.finditer(text):
-            yield match.group()
+            if match.end() - match.start() >= self._shortest:
+                yield match.group()
+            if len(blocks) >= _MAX_BLOCKS or match.end() - match.start() < _MIN_PIECE_CHARS:
+                continue
+            if not pieces or not _follows_as_a_piece(text, pieces[-1].end(), match):
+                if len(pieces) > 1:
+                    blocks.append(_block_of(text, pieces))
+                pieces = []
+            pieces.append(match)
+        if len(pieces) > 1 and len(blocks) < _MAX_BLOCKS:
+            blocks.append(_block_of(text, pieces))
         for match in self._hex_pattern.finditer(text):
             yield match.group()
-        if "\n" in text or " " in text or "\\" in text or "\t" in text:
-            for match in _PIECES.finditer(text):
-                yield match.group()
+        yield from blocks
         if "\n" in text:
             first = _SHORT_LINES_FIRST.match(text)
             if first is not None:
@@ -1906,20 +1943,21 @@ def _realigned(
     One to three characters in front of base64 text, or one digit in front of
     hex, shift every byte of the run, and none of it reads as text any more.
     Each shift is judged on a sample, as the run itself is, and counts only
-    if the sample is text throughout, _MIN_TEXT_CHARS characters or more:
-    binary data read four ways must not pass for text more often. Returns
+    if the sample is text throughout from its first byte, _MIN_TEXT_CHARS
+    characters or more: binary data read four ways must not pass for text
+    more often, and one look at each shift keeps a binary run cheap. Returns
     the shifted run and what `_decode` knows of it (its sample, how many
     characters that took, whether that is all of it, where its text starts).
     """
     for skipped in range(1, 2 if kind == "hex" else 4):
         shifted = _whole_groups(bare[skipped:], kind)
-        sample, cut = _raw_bytes(shifted, kind, min(limit, _SAMPLE_BYTES + _MAX_SKIPPED_BYTES))
-        if sample is None:
+        sample, cut = _raw_bytes(shifted, kind, min(limit, _SAMPLE_BYTES))
+        if sample is None or len(sample) < _MIN_TEXT_CHARS:
             continue
         whole = cut >= len(shifted)
-        found = _start_of_text(sample, truncated=not whole)
-        if found is not None and found[1] and len(sample) - found[0] >= _MIN_TEXT_CHARS:
-            return shifted, sample, cut, whole, found
+        found = _text_of(sample, truncated=not whole)
+        if found is not None and found[1]:
+            return shifted, sample, cut, whole, (0, True)
     return None
 
 

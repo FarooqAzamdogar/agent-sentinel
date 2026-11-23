@@ -152,6 +152,7 @@ from .textutil import (
     without_flags,
 )
 from .textutil import TERMINAL_ESCAPE as _ANSI_RE
+from .textutil import C1_TERMINAL_ESCAPE as _C1_ANSI_RE
 
 SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
 
@@ -357,8 +358,10 @@ def _decode(text: str) -> str:
     decoded. HTML tags are removed by the caller, as a separate view, and so
     are tag characters, base64 and hex.
     """
-    if "\x1b" in text or "\x9b" in text or "\x9d" in text:  # ESC, or the one-character CSI and OSC
+    if "\x1b" in text:
         text = _ANSI_RE.sub("", text)
+    if "\x9b" in text or "\x9d" in text:  # the one-character CSI and OSC
+        text = _C1_ANSI_RE.sub("", text)
     if "\\/" in text:
         text = text.replace("\\/", "/")  # "http:\/\/host", as JSON kept inside a string writes it
     if "%" in text:
@@ -433,8 +436,11 @@ def _matching_views(
     decoded = _decode(text)
     # (view, marker, whether to unglue it)
     candidates = [(plain if decoded == text else _normalize(decoded), "", True)]
+    tagged = False  # whether the text has HTML tags or comments, which the view without tags removes
     if "<" in decoded:
-        candidates.append((_normalize(_TAG_RE.sub("", decoded)), "", True))
+        without_tags = _TAG_RE.sub("", decoded)
+        tagged = without_tags != decoded
+        candidates.append((_normalize(without_tags), "", True))
     # The most decoded of them: without escapes, tags and invisible characters, compatibility forms folded.
     most_decoded = candidates[-1][0]
     joined = _joined_words(decoded)
@@ -459,7 +465,7 @@ def _matching_views(
     # it arrived and, where something can stand inside a run that a reader looks through (an invisible
     # character, a tag, an escape, full-width letters), in the most decoded view as well.
     runs = context.encoded.decoded(text)
-    if invisible or decoded != text or "<" in decoded or not _ascii_but_for_field_breaks(text):
+    if invisible or tagged or decoded != text or not _ascii_but_for_field_breaks(text):
         runs += context.encoded.decoded(most_decoded, read_before=text)
     for run in runs:
         for spelled in _read_through(run.text):

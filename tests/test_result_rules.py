@@ -412,7 +412,8 @@ class ImageAlphabets(unittest.TestCase):
                 self.assertEqual(found(text), {"image_alphabet": "high"})
         # A row of flags next to the token it is about orders nothing.
         flags = " ".join(f"![{c}](https://flagcdn.com/w20/{c}.png)" for c in "us gb de fr es it nl se".split())
-        for text in ("Choose the region for your API token: " + flags, "Your API key works in these regions: " + images):
+        for text in ("Choose the region for your API token: " + flags,
+                     "Your API key works in these regions: " + images):
             with self.subTest(text=text[:40]):
                 self.assertEqual(found(text), {"image_alphabet": "medium"})
 

@@ -537,7 +537,8 @@ class Firewall:
         policy, an approver, the audit record) reads the copy that
         textutil.normalised_arguments makes, in which a path is its text, an
         Enum its value, a pydantic model what model_dump(mode="json") gives
-        with the fields it hides as the model holds them, and so on. The tool itself still gets the original objects (`run`,
+        (with the fields it hides as the model holds them), and so on. The
+        tool itself still gets the original objects (`run`,
         guard()). Arguments that cannot be made JSON (an object of unknown
         kind, a generator, a value that holds itself) are refused, as content
         that cannot be read is: rule "unscannable", in monitor mode too.
