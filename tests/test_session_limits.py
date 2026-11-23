@@ -19,7 +19,7 @@ from agent_sentinel.approvers import ApprovalRequest, approval_text
 from agent_sentinel.cli_check import parse_history
 from agent_sentinel.cli_common import CommandError
 from agent_sentinel.firewall import APPROVAL_REFUSED, APPROVAL_REPEAT, APPROVAL_UNAVAILABLE
-from agent_sentinel.policy import NOT_PERMITTED, FlowRule
+from agent_sentinel.policy import NOT_PERMITTED, DistinctLimit, FlowRule
 from agent_sentinel.session import (
     MAX_DISTINCT_VALUES,
     MAX_IDENTICAL_KEYS,
@@ -216,6 +216,32 @@ class SessionLimitSettings(unittest.TestCase):
         for expected, data in cases.items():
             with self.subTest(expected=expected):
                 self.assertIn(expected, load_error(data))
+
+    def test_two_entries_for_one_argument_in_another_case_are_an_error(self):
+        # max_distinct finds its argument ignoring case, so "to" and "To" count the same values: the second
+        # entry loaded without a word and kept every value twice against the session's bound.
+        for distinct in ([{"arg": "to", "max": 1}, {"arg": "To", "max": 5}],
+                         [{"arg": "Straße", "max": 1}, {"arg": "STRASSE", "max": 2}]):
+            with self.subTest(distinct=distinct):
+                self.assertIn("is listed twice", load_error({"limits": {"max_distinct": distinct}}))
+                rule = {"action": "allow", "max_distinct": distinct}
+                self.assertIn("tools.send.max_distinct[1]", load_error({"tools": {"send": rule}}))
+        with self.assertRaisesRegex(PolicyError, "listed twice"):  # the same when built in code
+            Policy(max_distinct=(DistinctLimit("to", 1), DistinctLimit("TO", 2)))
+        # One entry per argument, and the same argument for all tools and for one tool, still load.
+        policy(limits={"max_distinct": [{"arg": "to", "max": 1}, {"arg": "cc", "max": 1}]},
+               tools={"send": {"action": "allow", "max_distinct": [{"arg": "To", "max": 1}]}})
+
+    def test_a_wrong_value_is_not_repeated_whole_in_the_error(self):
+        # A list of thousands of entries written where an argument name belongs came back whole in the message.
+        huge = [f"entry{n}" for n in range(5000)]
+        for data in ({"limits": {"max_distinct": [{"arg": huge, "max": 3}]}},
+                     {"tools": {"send": {"action": "allow", "max_distinct": [{"arg": huge, "max": 3}]}}},
+                     {"limits": {"max_distinct": [{"arg": "to" * 5000 + "*", "max": 3}]}},
+                     {"deny_args": [{"arg": "x" * 5000 + "*", "pattern": "y"}]},
+                     {"tools": {" " + "x" * 5000: "allow"}}):
+            with self.subTest(data=str(data)[:60]):
+                self.assertLess(len(load_error(data)), 400)
 
     def test_describe_and_hints(self):
         loaded = policy(limits={"max_calls_per_session": 5, "max_sink_bytes_per_session": 100,
