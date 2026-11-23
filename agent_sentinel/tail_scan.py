@@ -337,13 +337,24 @@ def _grown(source: str, kinds: Sequence[str], wanted: int, from_end: bool, whole
 
 
 def _redacted(views: _Views, redact: Callable[[str], str]) -> _Views:
-    """The views of each piece once `redact` has replaced its secrets (made again only where it replaced any)."""
+    """The views of each piece once `redact` has replaced its secrets (made again only where it replaced any).
+
+    A secret is looked for in the piece as it is (before the views close up
+    its words) and then in its plain view: a view writes a value spelled in
+    full-width letters, or with zero-width spaces or marks inside it, as
+    plain text, which `redact` does not read in the piece. Where the plain
+    view holds one, the redacted plain view is the piece from then on.
+    """
     pieces: dict[int, tuple[str, list[str]]] = {}
     for kind, (piece, _) in views.items():
         pieces.setdefault(id(piece), (piece, []))[1].append(kind)
     redacted = dict(views)
     for piece, kinds in pieces.values():
         kept = redact(piece)
+        plain = view_of(VIEW_KINDS[0], kept)
+        folded = redact(plain)
+        if folded != plain:
+            kept = folded
         if kept != piece:
             redacted.update({kind: (kept, view) for kind, view in views_of(kept, kinds).items()})
     return redacted
@@ -384,15 +395,22 @@ def read_with_tail(
     before += [""] * (len(VIEW_KINDS) - len(before))
     found: list[Finding] = []
     read: set[tuple[str, str]] = set()
-    after: list[str] = []
+    after: list[tuple[str, bool]] = []
+    alone: list[str] = []
     for kind, kept in zip(VIEW_KINDS, before):
         if kept.strip():
             for pair in _readings(kept, ends.start(kind)):
                 if pair not in read:  # most texts read the same in several kinds of view
                     read.add(pair)
                     found += _joined_findings(*pair, known, names)
-        after.append(_next_tail(kept, *ends.end(kind), redact))
-    return found, tuple(after)
+        end, whole = ends.end(kind)
+        after.append(_next_tail(kept, end, whole, redact))
+        alone.append(end[-TAIL_CHARS:] if end.strip() else kept)
+    if any(replaced for _, replaced in after):
+        # A secret the tail and the text make together was replaced in one kind of view. Another kind may
+        # spell it otherwise ("_" read as a space), where `redact` does not see it: no kind rolls this time.
+        return found, tuple(kept if replaced else end for (kept, replaced), end in zip(after, alone))
+    return found, tuple(kept for kept, _ in after)
 
 
 def _readings(tail: str, head: str) -> list[tuple[str, str]]:
@@ -410,8 +428,11 @@ def _readings(tail: str, head: str) -> list[tuple[str, str]]:
     return [(left, gap + head) for left in lefts for gap in gaps]
 
 
-def _next_tail(tail: str, end: str, whole: bool, redact: Callable[[str], str] | None = None) -> str:
-    """The tail of one kind to keep once a text is delivered after `tail`; `end`, `whole`: _Ends.end of the text.
+def _next_tail(
+    tail: str, end: str, whole: bool, redact: Callable[[str], str] | None = None
+) -> tuple[str, bool]:
+    """(The tail of one kind to keep once a text is delivered after `tail`, whether a secret was replaced in it
+    that the two make together); `end`, `whole`: _Ends.end of the text.
 
     A text with nothing to read keeps the tail as it was. A short text (all
     of it is in `end`) rolls into the tail: with SEAM between them when the
@@ -420,16 +441,16 @@ def _next_tail(tail: str, end: str, whole: bool, redact: Callable[[str], str] | 
     joined only.
     """
     if not end.strip():
-        return tail
+        return tail, False
     if not tail or not whole:
-        return end[-TAIL_CHARS:]
+        return end[-TAIL_CHARS:], False
     rolled = tail + ("" if tail.endswith(" ") or end.startswith(" ") else SEAM) + end
     if redact is not None and SEAM in rolled:
         joined = rolled.replace(SEAM, "")
         kept = redact(joined)
         if kept != joined:
-            rolled = kept
-    return rolled[-TAIL_CHARS:]
+            return kept[-TAIL_CHARS:], True
+    return rolled[-TAIL_CHARS:], False
 
 
 def _names(parameter_names: Iterable[str]) -> tuple[str, ...]:

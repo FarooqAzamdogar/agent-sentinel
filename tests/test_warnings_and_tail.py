@@ -657,12 +657,22 @@ class TailScan(unittest.TestCase):
         # CORE2-2: the tail is kept as text (in hook mode, in the session file); 0.6 before review kept it as the
         # model read it, secrets included, whatever secrets.in_results said.
         token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+        def full_width(text):
+            return "".join(chr(ord(char) + 0xFEE0) if "!" <= char <= "~" else char for char in text)
+
         texts = {
             "written out": f"GITHUB_TOKEN={token}",
             "cut by the start of the tail": "x " + token + " " + "w" * (TAIL_CHARS - 20),
             "percent-encoded": "GITHUB_TOKEN=" + token.replace("_", "%5F"),
             "in tag characters": "".join(chr(0xE0000 + ord(char)) for char in token) + " end",
             "a known value": "the value is s3cr3t-Value-0042 here",
+            # Spellings the views write as plain text, which redaction of the text as it arrived does not read.
+            "a known value in full-width letters": "the value is " + full_width("s3cr3t-Value-0042") + " here",
+            "a known value with zero-width spaces": "the value is " + "\N{ZERO WIDTH SPACE}".join("s3cr3t-Value-0042"),
+            "a token in full-width letters": "token: " + full_width(token),
+            "a token with a soft hyphen and a mark": token[:12] + "\N{SOFT HYPHEN}" + token[12:20] + "́" + token[20:],
+            "a known value cut by the start of the tail": "x " + full_width("s3cr3t-Value-0042") + " " + "w" * 495,
         }
         for name, text in texts.items():
             with self.subTest(text=name):
@@ -672,9 +682,21 @@ class TailScan(unittest.TestCase):
                 firewall.set_secret_environment({"MY_KEY": "s3cr3t-Value-0042"})
                 self.deliver_all(firewall, [text])
                 kept = " ".join(store.read_state().tails["result"])
-                for secret in (token[21:], "C3d4E5f6G7h8", "s3cr3t-Value"):
+                for secret in (token[21:], "C3d4E5f6G7h8", "s3cr3t-Value", "Value-0042"):
                     self.assertNotIn(secret.lower(), kept.lower())
                 self.assertRegex(kept, r"(GitHub token|value of MY_KEY)\]")  # the marker, perhaps cut
+
+    def test_a_secret_two_results_make_together_is_kept_in_no_kind_of_view(self):
+        # Each half alone holds no secret. Rolled into one tail they make a token, which is replaced where the
+        # tail reads it as written; the kinds that read "_" as a space keep the second half alone.
+        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        store = MemorySessionStore()
+        firewall = Firewall(policy(injection={"block_severity": None}), session_store=store)
+        self.deliver_all(firewall, ["tok " + token[:20], token[20:]])
+        tails = store.read_state().tails["result"]
+        self.assertTrue(any("[redacted GitHub token]" in kept for kept in tails))
+        for kept in tails:
+            self.assertFalse(token[4:20] in kept.replace(SEAM, "") and token[20:] in kept, ascii(kept))
 
     def test_content_refused_for_a_secret_keeps_no_tail(self):
         store = MemorySessionStore()
