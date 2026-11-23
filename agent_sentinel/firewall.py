@@ -1813,6 +1813,8 @@ def _call_spellings(tool: str | None, args: Any) -> list[str]:
        start of a split token is glued to the end of the argument before it,
        and the formats that must not continue a longer word (an AWS key,
        "sk-...") would not be seen there; a pair starts on a line of its own.
+    4. The same for each run of 3 to _MAX_PIECES strings in a row
+       (`_runs_of_strings`): a token cut into more pieces than two.
 
     Each joined text is cut at MAX_JOINED_ARGUMENT_CHARS: past that, a split
     token is not seen. The one-per-line text is not cut (it is what the guard
@@ -1824,9 +1826,31 @@ def _call_spellings(tool: str | None, args: Any) -> list[str]:
         spellings.append(_joined(strings, MAX_JOINED_ARGUMENT_CHARS))
         pairs = (strings[index] + strings[index + 1] for index in range(len(strings) - 1))
         spellings.append(_joined(pairs, MAX_JOINED_ARGUMENT_CHARS, separator="\n"))
+    if len(strings) > 2:
+        spellings.append(_joined(_runs_of_strings(strings), MAX_JOINED_ARGUMENT_CHARS, separator="\n"))
     if len(everything) > len(strings):
         spellings.append(_joined(everything, MAX_JOINED_ARGUMENT_CHARS))
     return list(dict.fromkeys(spellings))
+
+
+# `_runs_of_strings`: the most strings a split token is looked for in, and how much of each string is read.
+# A token that starts at the start of a string and goes on into the next is shorter than _PIECE_CHARS, so a
+# run ends once it is that long.
+_MAX_PIECES = 8
+_PIECE_CHARS = 256
+
+
+def _runs_of_strings(strings: list[str]) -> Iterable[str]:
+    """Each run of 3 to _MAX_PIECES strings in a row, joined: one text per run, each starting with its first
+    string, and ending with its last, so that a token cut into that many pieces stands alone on a line."""
+    for start in range(len(strings) - 2):
+        joined = strings[start][:_PIECE_CHARS]
+        for end in range(start + 1, min(len(strings), start + _MAX_PIECES)):
+            if len(joined) >= _PIECE_CHARS:
+                break
+            joined += strings[end][:_PIECE_CHARS]
+            if end - start >= 2:
+                yield joined
 
 
 def _joined(texts: Iterable[str], limit: int, separator: str = "") -> str:
