@@ -131,11 +131,13 @@ from .wrapping import (
 HELP = "check, without changing anything, that every server in your MCP client configurations is protected"
 DESCRIPTION = (
     "Check every MCP client configuration (or the files given with --config): is each server protected, would "
-    "the proxy start, do the policies load, can the logs and pins be written, are packages pinned. Read-only."
+    "the proxy start, do the policies load, can the logs and pins be written, are packages pinned, is a server "
+    "launched in a risky way or from a package with a known problem, and could the agent reach agent-sentinel's "
+    "own files. Read-only (--save-baseline writes its one file)."
 )
 EPILOG = """\
-exit codes: 0 every stdio server is protected; 1 something is not protected, broken, or unreadable; 2 a --config
-file does not exist
+exit codes: 0 every stdio server is protected; 1 something is not protected, broken, or unreadable, or differs
+from the --baseline; 2 a --config file does not exist, or the --baseline file is missing or is not a baseline
 
 A configuration may come from someone else (a project's .mcp.json), so doctor never starts a program it names
 (only the Python running doctor is asked which agent-sentinel it has) and never opens a path on another machine

@@ -57,7 +57,7 @@ Module map:
 """
 
 # Set before the imports below, so that a module can read it while the package is being imported.
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 from .claude_hooks import claude_sdk_hooks  # noqa: E402
 from .detector import Finding, scan  # noqa: E402

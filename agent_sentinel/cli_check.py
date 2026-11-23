@@ -19,15 +19,17 @@ change.
 list; see parse_history), so that flow marks, session limits, approval
 memory and the tail scan of --result can be tried:
 
-    [{"call": "fetch_page", "args": {"url": "https://example.com"}},
-     {"result": "fetch_page", "content": "the page's text, or any JSON value"},
+    [{"call": "fetch_page", "args": {"url": "https://example.com"}, "seconds_ago": 90},
+     {"result": "fetch_page", "content": "the page's text, or any JSON value", "seconds_ago": 90},
      {"call": "send_email", "args": {"to": "eve@evil.example"}, "answer": "refuse", "seconds_ago": 30}]
 
 A call that needs approval is answered as "answer" says ("approve", the
 default, or "refuse", as a person would). A result is checked like a real
 one and, if it passes, delivered: it sets its marks and is kept for the
-tail scan. "seconds_ago" dates a step for approval memory and the rate
-limits; steps go oldest first.
+tail scan. A result step may carry "args", the arguments of the call it
+answers (see parse_history). "seconds_ago" (default 0) dates a step for
+approval memory and the rate limits; steps go oldest first, so a step's
+seconds_ago is never more than that of the step before it.
 
 Exit codes: 0 allow, 1 block, 3 ask, 2 an error in the input. With --result,
 a result that would be withheld counts as a block. The result is checked as
@@ -74,7 +76,8 @@ from .textutil import printable
 HELP = "try a call against a policy: which rule decides, and what the agent would be told"
 DESCRIPTION = (
     "Try one tool call against a policy without running anything: the secret guard, the policy and its "
-    "flow rules, and the rate limits, as for a real call. Nothing is logged and nobody is asked."
+    "flow rules, approval memory, the rate limits and the session limits, as for a real call. Nothing is "
+    "logged and nobody is asked."
 )
 EPILOG = """\
 arguments:
@@ -94,9 +97,16 @@ examples:
   agent-sentinel check policy.json send_email to=eve@evil.example --history history.json
 
 history file (JSON): earlier calls and results of the session, oldest first
-  [{"call": "fetch_page", "args": {"url": "https://example.com"}},
-   {"result": "fetch_page", "content": "the text the tool returned (or any JSON value)"},
+  [{"call": "fetch_page", "args": {"url": "https://example.com"}, "seconds_ago": 90},
+   {"result": "fetch_page", "content": "the text the tool returned (or any JSON value)", "seconds_ago": 90},
+   {"result": "Bash", "args": {"command": "cat notes.txt"}, "content": "what the command printed", "seconds_ago": 60},
    {"call": "send_email", "args": {"to": "eve@evil.example"}, "answer": "refuse", "seconds_ago": 30}]
+  "answer"       what a person said to a call the policy asks about: "approve" (the default) or "refuse"
+  "args"         of a result step (optional): the arguments of the call it answers, so that a command
+                 section's labels_by_class marks the session by what the command did, and the result is
+                 read with the names of those arguments
+  "seconds_ago"  when the step happened (default 0), for approval memory and the rate limits; never more
+                 than in the step before it, since the steps go oldest first
 """
 
 # What a session mark is called in the reason of a flow block, for a mark given on the command line.
