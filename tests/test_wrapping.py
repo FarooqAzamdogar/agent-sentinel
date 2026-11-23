@@ -616,5 +616,63 @@ class NamesAndPinsFiles(unittest.TestCase):
         self.assertIsNone(wrapping.installed_version(os.path.join(ROOT, "no-such-python")))
 
 
+class AddingTheSessionGroup(unittest.TestCase):
+    """wrapping.add_session_group: one option more for an entry wrapped before there were session groups."""
+
+    PYTHON = "C:\\Python313\\python.exe" if os.name == "nt" else "/usr/bin/python3"
+
+    def wrapped(self, *options, command=None, env=None):
+        entry = {"type": "stdio", "command": command or self.PYTHON,
+                 "args": ["-I", "-m", "agent_sentinel", "proxy", "--policy", "p.json", "--audit", "a.jsonl",
+                          "--pins", "pins.json", "--name", "files", *options, "--", "npx", "-y", "srv@1.0.0", "--", "x"]}
+        return dict(entry, env=env) if env is not None else entry
+
+    def test_the_option_goes_in_front_of_the_server_command_and_nothing_else_changes(self):
+        entry = self.wrapped("--pass-env", "TOKEN", "--monitor", env={"TOKEN": "secret"})
+        new = wrapping.add_session_group(entry, "desk", self.PYTHON)
+        at = entry["args"].index("--")
+        self.assertEqual(new["args"], [*entry["args"][:at], "--session-group", "desk", "--", "npx", "-y",
+                                       "srv@1.0.0", "--", "x"])
+        self.assertEqual({key: value for key, value in new.items() if key != "args"},
+                         {key: value for key, value in entry.items() if key != "args"})
+        self.assertEqual(list(new), list(entry))
+        self.assertEqual(entry["args"].count("--session-group"), 0)  # a copy: the entry given is not changed
+        found = wrapping.proxy_command_of(new)
+        self.assertEqual((found.value("--session-group"), found.server), ("desk", ["npx", "-y", "srv@1.0.0", "--", "x"]))
+        self.assertTrue(found.has("--monitor"))
+        self.assertEqual(wrapping.unwrap_entry(new), wrapping.unwrap_entry(entry))
+
+    def test_the_python_is_compared_as_the_system_compares_paths(self):
+        entry = self.wrapped()
+        other_spelling = self.PYTHON.upper().replace("\\", "/") if os.name == "nt" else self.PYTHON + "/../python3"
+        self.assertIn("--session-group", wrapping.add_session_group(entry, "desk", other_spelling)["args"])
+
+    def test_what_cannot_be_done_safely_is_refused(self):
+        unnamed = self.wrapped()
+        at = unnamed["args"].index("--name")
+        del unnamed["args"][at:at + 2]
+        no_server = self.wrapped()
+        no_server["args"] = no_server["args"][:no_server["args"].index("--")]
+        for entry, expected in (
+            ({"command": "npx", "args": ["-y", "srv@1.0.0"]}, "it is not wrapped"),
+            ({"url": "https://x.example/mcp"}, "it is not wrapped"),
+            (self.wrapped("--session-group", "other"), "it has a session group already"),
+            (self.wrapped("--session-group=other"), "it has a session group already"),
+            (unnamed, "it has no --name"),
+            (no_server, "without a server command"),
+            (self.wrapped(command="C:\\other\\python.exe" if os.name == "nt" else "/opt/other/python3"),
+             "it does not start the proxy with the Python that runs this command"),
+            ({"command": "uvx", "args": ["agent-sentinel==0.5.0", "proxy", "--policy", "p.json", "--name", "files",
+                                         "--", "npx", "srv@1.0.0"]},
+             "it does not start the proxy with the Python that runs this command"),
+            ({"command": "agent-sentinel", "args": ["proxy", "--policy", "p.json", "--name", "files", "--", "npx"]},
+             "it does not start the proxy with the Python that runs this command"),
+        ):
+            with self.subTest(expected=expected, entry=entry.get("args", [])[:3]):
+                with self.assertRaises(wrapping.WrapError) as raised:
+                    wrapping.add_session_group(entry, "desk", self.PYTHON)
+                self.assertIn(expected, str(raised.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

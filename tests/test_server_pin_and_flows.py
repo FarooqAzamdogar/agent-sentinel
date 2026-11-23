@@ -36,7 +36,7 @@ POLICY = {
     "flows": [{"after": ["untrusted", "private"], "then": "sink", "action": "block"}],
 }
 LAUNCH = {"executable": "C:/nodejs/node.exe", "package": None, "script": "C:/srv/server.js",
-          "script_sha256": "a" * 64}
+          "script_sha256": "a" * 64, "command_sha256": "d" * 64}
 NOTE = {"name": "read_note", "description": "Read a note.", "inputSchema": {"type": "object"},
         "annotations": {"readOnlyHint": True}}
 FETCH = {"name": "fetch_page", "description": "Fetch a web page.", "inputSchema": {"type": "object"},

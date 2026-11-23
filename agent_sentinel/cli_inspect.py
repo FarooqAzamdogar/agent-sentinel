@@ -28,6 +28,7 @@ from typing import Any
 
 from . import server_probe
 from .cli_doctor import launch_lines
+from .launch import without_address_credentials
 from .cli_common import (
     EXIT_ERROR,
     EXIT_FAIL,
@@ -165,7 +166,7 @@ def print_result(result: ProbeResult, policy: Policy | None, policy_path: str | 
     if result.server_version:
         server += f" {printable(result.server_version, limit=40)}"
     print(f"Server: {server}, MCP {printable(result.protocol_version or '(no version)', limit=40)}")
-    print(f"Started with: {shown_command(result.command)}")
+    print(f"Started with: {shown_command([without_address_credentials(word) for word in result.command])}")
     print(f"Capabilities: {', '.join(printable(name, limit=40) for name in result.capabilities) or 'none'}")
     print(f"Instructions: {_instructions(result)}")
     if result.list_error:
@@ -235,7 +236,7 @@ def _print_footer(result: ProbeResult, policy: Policy | None, policy_path: str |
     if messages:
         notes.append("The proxy reported:")
         notes.extend(f"  {line}" for line in messages[:20])
-    command = shown_command(result.command)
+    command = shown_command([without_address_credentials(word) for word in result.command])
     if policy is None:
         notes.append(f"Draft a policy from this list: agent-sentinel init -- {command}")
         notes.append(f"See how a policy treats each tool: agent-sentinel inspect --policy POLICY -- {command}")

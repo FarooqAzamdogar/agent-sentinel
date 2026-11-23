@@ -674,6 +674,47 @@ def wrap_entry(entry: dict[str, Any], settings: ProxySettings, label: str, pins:
     return new
 
 
+def add_session_group(entry: dict[str, Any], group: str, python: str) -> dict[str, Any]:
+    """A copy of a wrapped entry with "--session-group GROUP" added to the proxy's options, just before the
+    "--" of the server command. Nothing else of the entry changes.
+
+    For an entry that was wrapped before there were session groups (0.5.0
+    wrote none). WrapError when that cannot be done safely: the entry has a
+    group already; it has no --name, which the proxy needs for a group; or
+    it does not start the proxy with `python`, the Python that runs this
+    command. Any other launcher may run an agent-sentinel that does not
+    know the option, and a proxy refuses to start with an option it does
+    not know. The paths are compared as text; no file is looked at.
+    """
+    words = command_line(entry)
+    found = read_proxy_command(words) if words is not None else None
+    if words is None or found is None:
+        raise WrapError("it is not wrapped")
+    if found.value("--session-group") is not None:
+        raise WrapError("it has a session group already")
+    if not found.server:
+        raise WrapError("it starts the proxy without a server command after '--'; fix it by hand")
+    if not found.values("--name"):
+        raise WrapError("it has no --name, which a session group needs; unwrap it, then wrap again")
+    module = found.python_module()
+    if module is None or _path_text(module[0]) != _path_text(python):
+        raise WrapError("it does not start the proxy with the Python that runs this command, so its "
+                        "agent-sentinel may not know --session-group; unwrap it, then wrap again")
+    at = len(words) - len(found.server) - 1  # where the "--" in front of the server command is
+    changed = [*words[:at], "--session-group", group, *words[at:]]
+    new = _with_command(entry, changed[0], changed[1:])
+    again = proxy_command_of(new)
+    if (again is None or again.launcher != found.launcher or again.server != found.server
+            or again.options != [*found.options, ("--session-group", group)]):
+        raise WrapError("it would not read back as the same entry with the group added; unwrap it, then wrap again")
+    return new
+
+
+def _path_text(path: str) -> str:
+    """A path as text to compare: normalised, without case where the system has none. Nothing is looked at."""
+    return os.path.normcase(os.path.normpath(path))
+
+
 def unwrap_entry(entry: dict[str, Any]) -> dict[str, Any]:
     """A copy of a wrapped entry that starts the server command directly again. WrapError if it is not wrapped."""
     found = proxy_command_of(entry)

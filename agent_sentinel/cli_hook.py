@@ -41,7 +41,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
-from . import __version__, audit_chain, claude_hooks, home
+from . import __version__, audit_chain, claude_hooks, home, shortened_options
 from .claude_hooks import HookAnswer, HookSettings
 from .cli_common import EXIT_ERROR, EXIT_OK, INSTALL_COMMAND, CommandError, full_path, load_policy, shown_path
 from .firewall import new_ref
@@ -169,12 +169,18 @@ def run_event(argv: list[str]) -> int:
     __main__ comes here first for the command Claude Code runs for every
     event. The options are those of add_arguments; a word that is not one of
     them ends the process with exit code 2 (argparse), which blocks.
+
+    This parser is built here, not by __main__._build_parser, so the
+    shortened options 0.5.0 took are registered here too: a hook entry
+    written for 0.5.0 ("--au" for --audit) must keep working, and an
+    argparse error for it would block every tool call of the session.
     """
     parser = argparse.ArgumentParser(
         prog="agent-sentinel hook claude-code",
         description="Answer one Claude Code hook event, read as JSON on stdin. Exits 0, or 2 to block.",
     )
     _add_paths(parser)
+    shortened_options.keep("hook claude-code", parser)
     return run_claude_code(parser.parse_args(argv))
 
 

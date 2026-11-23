@@ -12,7 +12,9 @@ doctor looks for four ways in. None of them opens a file; the permissions are
 read with stat.
 
 * server_reaches: a server given a folder that holds one of them (a
-  filesystem server started on the home folder can write the policy).
+  filesystem server started on the home folder can write the policy), as
+  an argument or as the host side of a container's mount (docker run -v
+  HOST:/data, --mount type=bind,src=HOST,dst=/data).
 * roots_holding: an allow_args "type": "path" root of a policy that holds one.
 * writable_by: a policy that lets a write call name one of them. It is a dry
   run of Policy.evaluate (the policy-wide deny_args, the tool rules and the
@@ -23,6 +25,9 @@ read with stat.
   that another user owns; on Windows, an AGENT_SENTINEL_HOME outside the
   user profile, which does not get the profile's private permissions.
 
+And one thing by name (home_name_lines): an AGENT_SENTINEL_HOME that is not
+a folder called .agent-sentinel, which the templates' rules do not cover.
+
 Every check is bounded: at most MAX_CONTROL_FILES files, MAX_DRY_RUNS policy
 evaluations, MAX_PATH_ARGUMENTS arguments of one server.
 """
@@ -32,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import stat
 import sys
 from collections.abc import Callable, Iterable, Mapping
@@ -122,13 +128,20 @@ class FolderIndex:
 
 
 def _path_arguments(args: list[str]) -> list[str]:
-    """The arguments of a server command that are full paths (or the value of an option such as --root=PATH)."""
+    """The arguments of a server command that are full paths (or the value of an option such as --root=PATH),
+    and the host side of what a container is given: "HOST:/data" (docker run -v, also written -vHOST:/data or
+    --volume=HOST:/data) and "type=bind,src=HOST,dst=/data" (--mount)."""
     found = []
     for arg in args[:MAX_PATH_ARGUMENTS]:
         value = arg.split("=", 1)[1] if arg.startswith("-") and "=" in arg else arg
-        value = os.path.expanduser(value.strip()) if value.startswith("~") else value.strip()
-        if value and home.is_absolute(value):
-            found.append(value)
+        if arg.startswith("-v") and not arg.startswith("--") and "=" not in arg:
+            value = arg[2:]  # -vHOST:/data
+        if len(value) > 4 * launch.MAX_PATH_CHARS:
+            continue  # no path, and no mount of one, is this long
+        for each in dict.fromkeys((value, launch._volume_source(value), launch._mount_source(value))):
+            each = os.path.expanduser(each.strip()) if each.startswith("~") else each.strip()
+            if each and len(each) <= launch.MAX_PATH_CHARS and home.is_absolute(each):
+                found.append(each)
     return found
 
 
@@ -197,10 +210,15 @@ def writable_warning(policy: Policy, path: str | Path, what: str) -> str | None:
     tools = writable_by(policy, str(path))
     if not tools:
         return None
-    rule = json.dumps({"arg": "*", "type": "path", "roots": [str(path)]})
+    # A "type": "path" entry needs a named argument (the policy refuses "arg": "*" for it): one entry for each
+    # argument by which an allowed write call names its file.
+    names = dict.fromkeys(argument for tool, arguments in WRITE_CALLS for argument in arguments
+                          if tool in tools or f"{tool} (could not be checked)" in tools)
+    rules = ", ".join(json.dumps({"arg": name, "type": "path", "roots": [str(path)]}) for name in names)
     return (f"the policy would let the agent write {what} {printable(str(path), limit=300)} ({', '.join(tools)} "
             "allowed): a hijacked agent could take agent-sentinel out of it, for this session and every later one. "
-            f"Deny it in the policy's deny_args, for example {printable(rule, limit=400)}")
+            "Deny it in the policy's deny_args, with an entry for each argument that names a file: "
+            f"{printable(rules, limit=2500)}")
 
 
 def policy_writes(policy: Policy, files: list[ControlFile], budget: Budget) -> list[tuple[ControlFile, list[str]]]:
@@ -303,15 +321,16 @@ def permission_lines(files: list[ControlFile], stat_of: Callable[[str], Any] = o
         if problem is None:
             continue
         mode = f"(mode {stat.S_IMODE(found.st_mode):o})"
-        shown_path = printable(control.path, limit=300)
+        # The path as a POSIX shell takes it as one word: a configuration may name a file with a space or "$(...)".
+        quoted_path = printable(shlex.quote(control.path), limit=400)
         fix = "chmod 755" if control.what == "approver program" else ("chmod 700" if folder else "chmod 600")
         if by_root and not owned:
-            lines.append(f"{control.shown()} {problem} {mode}. Let only root change it: sudo chmod go-w {shown_path}")
+            lines.append(f"{control.shown()} {problem} {mode}. Let only root change it: sudo chmod go-w {quoted_path}")
         elif not owned:
             lines.append(f"{control.shown()} {problem} {mode}. Use one of your own instead, and make it yours alone "
                          f"({fix})")
         else:
-            lines.append(f"{control.shown()} {problem} {mode}. Make it yours alone: {fix} {shown_path}")
+            lines.append(f"{control.shown()} {problem} {mode}. Make it yours alone: {fix} {quoted_path}")
     return lines
 
 
@@ -328,6 +347,34 @@ def windows_home_lines(environ: Mapping[str, str] | None = None, platform: str |
     return [f"{home.ENV_VAR} is {printable(chosen, limit=300)}, outside your user profile: a folder there takes the "
             "permissions of the folder above it (often any signed-in user may change it), not the profile's private "
             "ones. Keep it in your profile, or let only your account in (icacls)"]
+
+
+def home_name_lines(environ: Mapping[str, str] | None = None) -> list[str]:
+    """An AGENT_SENTINEL_HOME that is not a folder named .agent-sentinel: the templates do not protect it.
+
+    The templates' rules deny any argument that names ".agent-sentinel", and
+    their path rules name ~/.agent-sentinel. A home folder called anything
+    else is outside both, so the policy must name it itself. (The rule
+    suggested is by name, as the templates' own is: a "type": "path" entry
+    cannot stand for every argument.)
+    """
+    environ = os.environ if environ is None else environ
+    chosen = environ.get(home.ENV_VAR, "")
+    if not chosen or not home.is_absolute(chosen):
+        return []
+    name = chosen.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    if name.lower() == home.FOLDER_NAME:
+        return []
+    theirs = json.dumps({"arg": "*", "contains": home.FOLDER_NAME})
+    said = (f"{home.ENV_VAR} is {printable(chosen, limit=300)}, a folder that is not named {home.FOLDER_NAME}: the "
+            f"templates keep the agent's tools out of agent-sentinel's own files by that name (their rule is "
+            f"{theirs}), so their rules do not cover this folder")
+    if not name or name.endswith(":"):  # a drive or the root: no name to deny
+        return [f"{said}. Name the folder {home.FOLDER_NAME} instead"]
+    ours = json.dumps({"arg": "*", "contains": name})
+    return [f"{said}. Add the same rule for this folder's name to the policy's deny_args: {printable(ours, limit=400)} "
+            "(it refuses every argument that contains that text, so if the name is a common word, name the folder "
+            f"{home.FOLDER_NAME} instead)"]
 
 
 _LOCAL_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")

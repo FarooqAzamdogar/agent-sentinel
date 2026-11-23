@@ -42,7 +42,8 @@ the server the audit key file. --audit-key-file, --audit-required and
 read here.
 
 How each server is launched (launch_lines, with launch.py): a package of
-advisories.py that is malware fails, one with a known vulnerability warns,
+advisories.py that is malware fails, one with a known vulnerability warns
+(the date of that list is printed: advisories_line),
 so does one a letter away from a popular MCP package's name; and so does a
 risky command: inline code (sh -c, cmd /c, powershell -EncodedCommand,
 node -e, python -c), shell operators in arguments, sudo, a download piped to
@@ -96,8 +97,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import __version__, clients, config_file, containment, control_plane, doctor_baseline, elicitation, home
-from . import launch, mcp_proxy, server_env, session
+from . import __version__, advisories, clients, config_file, containment, control_plane, doctor_baseline
+from . import elicitation, home, launch, mcp_proxy, pins as pins_file, server_env, session
 from .approvers import COMMAND_PREFIX
 from .cli_common import EXIT_FAIL, EXIT_OK, CommandError, full_path, shell_line, shown_command, shown_path
 from .clients import CLIENTS
@@ -105,7 +106,7 @@ from .config_file import ConfigError, read_config
 from .control_plane import ControlFile
 from .firewall import SERVER_NAME
 from .launch import unpinned_package  # noqa: F401  (doctor's own check, kept under its old name too)
-from .leaks import find_secrets, redact
+from .leaks import find_secrets
 from .pins import pending_path
 from .policy import Policy, PolicyError
 from .policy_errors import file_error_message
@@ -151,6 +152,8 @@ STATUSES = ("protected", "unprotected", "remote", "broken")
 MAX_POLICY_WARNINGS_SHOWN = 20
 # The largest policy or pins file doctor reads (both are small; a configuration could name anything).
 MAX_CHECKED_FILE_BYTES = 16 * 1024 * 1024
+# A pins file is read up to the size the proxy itself reads: stored definitions can make a real one large.
+MAX_CHECKED_PINS_BYTES = pins_file.MAX_FILE_BYTES
 # The agent-sentinel version this Python runs, isolated (-I) or not (see _check_launcher), for one run.
 _versions: dict[tuple[str, bool], str | None] = {}
 
@@ -209,6 +212,7 @@ class Extras:
     """What doctor checks beyond each server: the control plane, and the baseline."""
 
     control_plane: list[Line] = field(default_factory=list)
+    advisory_list: Line | None = None  # how old the list of package advisories is (advisories_line)
     baseline_file: str | None = None  # --baseline
     drift: list[str] = field(default_factory=list)  # what differs from it (names only)
     saved_baseline: str | None = None  # --save-baseline
@@ -237,9 +241,10 @@ def run(args: argparse.Namespace) -> int:
     for report in reports:
         for server in report.servers:
             _add_policy_result(server, policies)
+        report.lines += no_group_lines(report, policies)
     shared = shared_pins(reports)
     settings = control_plane.claude_settings()
-    extras = Extras(control_plane=check_control_plane(reports, policies, settings))
+    extras = Extras(control_plane=check_control_plane(reports, policies, settings), advisory_list=advisories_line())
     state = control_plane.claude_state() if saved is not None or args.save_baseline else None
     if state is not None and state.error:
         extras.baseline_warnings.append(f"Claude Code's {shown_path(state.path)} cannot be read ({state.error}), so "
@@ -374,9 +379,47 @@ def session_group_lines(servers: list[ServerReport], sessions: Path | None = Non
         what = "some wrapped servers have a --session-group and some do not"
     else:
         what = "the wrapped servers name different session groups"
+    names = sorted(group for group in groups if group)
+    if None in groups and len(names) == 1:  # wrap adds the option to an entry that has none, and to no other
+        fix = (f"run wrap again with {printable(shell_line(['--session-group', names[0]]), limit=100)} (it adds the "
+               "option to each wrapped entry that has none, and shows the change first)")
+    else:
+        fix = ("wrap keeps the group a wrapped entry names, so unwrap the servers of the other groups, then wrap "
+               "them again with one --session-group")
     return [Line("warn", f"{what}: {named}. Flow rules see only what the servers of one group delivered, so a "
                          "server outside it can send out what another read. Give every server of this client the "
-                         "same --session-group (wrap does)")]
+                         f"same --session-group: {fix}")]
+
+
+def no_group_lines(report: ConfigReport, policies: dict[str, PolicyReport]) -> list[Line]:
+    """A warning when the wrapped servers of one configuration have no --session-group at all, and a policy
+    of theirs has flow rules.
+
+    That is how a version before 0.6 wrapped them (and wrap --no-session-group
+    does): each proxy keeps its own flow marks, so a flow rule never sees
+    what another server of the same client delivered.
+    """
+    wrapped = [server for server in report.servers if server.proxied]
+    if len(wrapped) < 2 or any(server.session_group for server in wrapped):
+        return []  # one server shares with no one; mixed groups are session_group_lines' warning
+    loaded = [policies.get(os.path.normcase(server.policy)) for server in wrapped if server.policy]
+    if not any(found is not None and found.policy is not None and found.policy.flows for found in loaded):
+        return []  # no flow rules: there are no marks to share
+    fix = (f"agent-sentinel wrap --client {report.client} --policy POLICY" if report.client
+           else "agent-sentinel wrap --client CLIENT --config FILE --policy POLICY")
+    return [Line("warn", f"the {len(wrapped)} wrapped servers here have no --session-group (they were wrapped by a "
+                         "version before 0.6, or with --no-session-group), and the policy has flow rules: each "
+                         "proxy keeps its own flow marks, so a flow rule does not see what another server "
+                         f"delivered. To share them, run: {fix} (it shows the --session-group it would add to "
+                         "each wrapped entry, and --apply writes it)")]
+
+
+def advisories_line() -> Line:
+    """How old doctor's list of package advisories is (advisories.py): the launch checks know nothing newer."""
+    count = len(advisories.MALICIOUS) + len(advisories.VULNERABLE)
+    return Line("info", f"package advisories: the built-in list of {count} entries, last updated "
+                        f"{advisories.LAST_UPDATED}. doctor looks nothing up on the network, so a package it "
+                        "does not flag may still have a newer advisory")
 
 
 def _lone_member_lines(wrapped: list[ServerReport], sessions: Path | None) -> list[Line]:
@@ -440,7 +483,7 @@ def check_server(name: str, entry: Any, client: str | None, project: Path | None
 
 
 def _shown(words: list[str]) -> str:
-    return shown_command(words, limit=120)
+    return shown_command([launch.without_address_credentials(word) for word in words], limit=120)
 
 
 def _check_wrapped(report: ServerReport, proxy: ProxyCommand, entry: dict[str, Any], project: Path | None) -> None:
@@ -627,9 +670,9 @@ def _option_path(path: str) -> str:
     return os.path.expanduser(path)
 
 
-def _too_big(path: str) -> bool:
+def _too_big(path: str, limit: int | None = None) -> bool:
     try:
-        return os.path.getsize(path) > MAX_CHECKED_FILE_BYTES
+        return os.path.getsize(path) > (MAX_CHECKED_FILE_BYTES if limit is None else limit)
     except OSError:
         return True
 
@@ -675,16 +718,23 @@ def _pins_path(lines: list[Line], proxy: ProxyCommand) -> str | None:
         lines.append(Line("warn", f"the pins path {printable(written, limit=200)!r} is relative to whatever folder "
                                   "the client starts the proxy in. Write the full path"))
         return None
-    if os.path.exists(pins) and (not os.path.isfile(pins) or _too_big(pins)):
+    server_pinned = False
+    if os.path.exists(pins) and (not os.path.isfile(pins) or _too_big(pins, MAX_CHECKED_PINS_BYTES)):
         lines.append(Line("fail", f"the pins path {printable(pins, limit=200)} is not an ordinary pins file "
-                                  f"(a folder, a device, or over {MAX_CHECKED_FILE_BYTES} bytes)"))
+                                  f"(a folder, a device, or over {MAX_CHECKED_PINS_BYTES} bytes)"))
     elif os.path.exists(pins):
         try:
-            mcp_proxy.ToolPins(pins)
+            pin = mcp_proxy.ToolPins(pins).server_pin
+            server_pinned = pin is not None and pin.info is not None
         except (OSError, ValueError, RecursionError) as exc:
             lines.append(Line("fail", f"the pins file cannot be read, so the proxy will not start: "
                                       f"{printable(exc, limit=200)}"))
-    _check_writable(lines, pins, "pins file", "tool pins are not saved")
+    if proxy.has("--pin-server") and not server_pinned:
+        # The proxy refuses to start when it cannot save the server's first pin (it would be compared with nothing).
+        _check_writable(lines, pins, "pins file", "the proxy will not start: with --pin-server it must save the "
+                                                  "server's pin", level="fail")
+    else:
+        _check_writable(lines, pins, "pins file", "tool pins are not saved")
     return os.path.normpath(pins)
 
 
@@ -735,13 +785,13 @@ def _check_env_file(lines: list[Line], env_file: str | None) -> None:
                                   f"{printable(exc, limit=300)}"))
 
 
-def _check_writable(lines: list[Line], path: str, what: str, consequence: str) -> None:
+def _check_writable(lines: list[Line], path: str, what: str, consequence: str, level: str = "warn") -> None:
     folder = os.path.dirname(path)
     if not os.path.isdir(folder):
-        lines.append(Line("warn", f"the {what}'s folder {printable(folder, limit=200)} does not exist, "
-                                  f"so {consequence}"))
+        lines.append(Line(level, f"the {what}'s folder {printable(folder, limit=200)} does not exist, "
+                                 f"so {consequence}"))
     elif not os.access(folder, os.W_OK) or (os.path.exists(path) and not os.access(path, os.W_OK)):
-        lines.append(Line("warn", f"the {what} {printable(path, limit=200)} cannot be written, so {consequence}"))
+        lines.append(Line(level, f"the {what} {printable(path, limit=200)} cannot be written, so {consequence}"))
 
 
 def _check_name(lines: list[Line], names: list[str]) -> None:
@@ -949,19 +999,30 @@ def launch_lines(words: list[str]) -> list[Line]:
         lines += [Line(level, text) for level, text in launch.advisory_findings(ref)]
         squatted = launch.typosquat_of(ref)
         if squatted:
-            lines.append(Line("warn", f"the package {printable(ref.spec, limit=120)!r} is named one letter away from "
+            subject = (f"the word {_piece(ref.spec, 120)!r}, which may be the package this command runs,"
+                       if ref.unsure else f"the package {_piece(ref.spec, 120)!r}")
+            lines.append(Line("warn", f"{subject} is named one letter away from "
                                       f"the popular {squatted!r}: a typosquat runs someone else's code under a "
                                       "name you meant to trust. Check that it is the package you mean"))
         found = launch.unpinned_spec(ref)
         if found is not None:
             package, pinned = found
-            lines.append(Line("warn", f"the package {printable(package, limit=80)!r} is not pinned to an exact "
+            # After an option this check does not know, the word may be that option's value and not the package.
+            what = (f"the word {_piece(package, 80)!r} may be the package this command runs (an option before it "
+                    "is not one this check knows, so the package cannot be told from that option's value). If it "
+                    "is, it" if ref.unsure else f"the package {_piece(package, 80)!r}")
+            lines.append(Line("warn", f"{what} is not pinned to an exact "
                                       "version: a new release would run without review. Pin it, for example "
-                                      f"{printable(pinned, limit=80)}"))
+                                      f"{_piece(pinned, 80)}"))
     risks = launch.launch_risks(words)
     if risks:
         lines.append(Line("warn", f"the launch command {'; '.join(risks)}. The full command: {full_command(words)}"))
     return lines
+
+
+def _piece(text: str, limit: int) -> str:
+    """A piece of a command to quote in a line: its secrets masked (launch.masked), printable, at most `limit`."""
+    return printable(launch.masked(text[:launch.MAX_QUOTED_CHARS]), limit=limit)
 
 
 def full_command(words: list[str]) -> str:
@@ -972,7 +1033,7 @@ def full_command(words: list[str]) -> str:
     letter by letter (the result is the same as shell_line and printable give).
     """
     line = " ".join(_windows_word(word) for word in words) if sys.platform == "win32" else shell_line(words)
-    text = redact(line)
+    text = launch.masked(line)  # the built-in secret formats, and a credential written into an address
     pieces, start = [], 0
     for run in _PLAIN_TEXT.finditer(text):  # printable() leaves plain ASCII as it is
         if run.start() > start:
@@ -1131,6 +1192,7 @@ def check_control_plane(reports: list[ConfigReport], policies: dict[str, PolicyR
     lines += [Line("warn", text) for text in control_plane.permission_lines(
         [found for found in files if found.what not in ("audit log", "hook audit log")])]
     lines += [Line("warn", text) for text in control_plane.windows_home_lines()]
+    lines += [Line("warn", text) for text in control_plane.home_name_lines()]
     if too_many or budget.exceeded:
         lines.append(Line("warn", "there are more of agent-sentinel's own files and policies than doctor checks in one "
                                   f"run ({control_plane.MAX_CONTROL_FILES} files, {control_plane.MAX_DRY_RUNS} "
@@ -1196,6 +1258,8 @@ def print_report(reports: list[ConfigReport], policies: dict[str, PolicyReport],
         print(f"{_mark('info')}home folder: {shown_path(folder)}" + ("" if folder.is_dir() else " (not created yet)"))
     except home.HomeError as exc:
         print(f"{_mark('warn')}{printable(exc, limit=300)}")
+    if extras is not None and extras.advisory_list is not None:
+        print(f"{_mark(extras.advisory_list.level)}{extras.advisory_list.text}")
     if not reports:
         print("\nNo MCP client configuration was found. Check a file with: agent-sentinel doctor --config FILE")
     for report in reports:
@@ -1292,6 +1356,8 @@ def as_json(reports: list[ConfigReport], policies: dict[str, PolicyReport],
         "policies": [{"path": printable(policy.path, limit=500), "loads": policy.loads, "summary": policy.summary,
                       "warnings": policy.warnings} for policy in policies.values()],
         "shared_pins": [{"path": printable(path, limit=500), "servers": names} for path, names in shared],
+        "advisories": {"last_updated": advisories.LAST_UPDATED,
+                       "entries": len(advisories.MALICIOUS) + len(advisories.VULNERABLE)},
         "control_plane": [{"level": line.level, "text": line.text} for line in extras.control_plane],
         "baseline": None if extras.baseline_file is None else {
             "file": printable(extras.baseline_file, limit=500), "changes": extras.drift},

@@ -40,6 +40,7 @@ Module map:
     __main__.py       the `agent-sentinel` command line: the parser, then one module per command
     cli_<command>.py  each command (cli_check.py, cli_wrap.py, cli_pins.py, ...)
     cli_common.py     what the commands share: exit codes, reading input, printing
+    shortened_options.py  the shortened options of 0.5.0 that later options made ambiguous, kept
     auditlog.py       reading audit logs (report, explain, suggest)
     fix_hints.py      how to allow a call that a rule blocked (explain, report)
     home.py           the agent-sentinel home folder (~/.agent-sentinel)

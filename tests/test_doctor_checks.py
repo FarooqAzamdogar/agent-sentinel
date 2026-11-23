@@ -5,6 +5,8 @@ Every test runs in a temporary home (IsolatedHomeTest): no real client
 configuration or settings file is read.
 """
 
+import contextlib
+import io
 import json
 import os
 import stat
@@ -347,6 +349,22 @@ class Permissions(unittest.TestCase):
             policy.chmod(0o600)
             self.assertEqual(permission_lines([ControlFile("policy", str(policy))]), [])
 
+    def test_the_command_to_copy_is_quoted_for_a_shell(self):
+        spaced, hostile = "/home/me/My Policies/policy.json", "/home/me/pins/$(touch pwned);x.json"
+        root_owned = "/etc/agent sentinel/`id`.json"
+        files = [ControlFile("policy", spaced), ControlFile("pins file", hostile), ControlFile("policy", root_owned)]
+        modes = {spaced: (stat.S_IFREG | 0o644, 1000), hostile: (stat.S_IFREG | 0o666, 1000),
+                 root_owned: (stat.S_IFREG | 0o666, 0)}
+        lines = permission_lines(files, stat_of=self.fake(modes), posix=True, uid=1000)
+        self.assertTrue(lines[0].endswith("Make it yours alone: chmod 600 '/home/me/My Policies/policy.json'"), lines[0])
+        self.assertTrue(lines[1].endswith("chmod 600 '/home/me/pins/$(touch pwned);x.json'"), lines[1])
+        self.assertTrue(lines[2].endswith("sudo chmod go-w '/etc/agent sentinel/`id`.json'"), lines[2])
+        quote = "/home/me/it's.json"
+        (line,) = permission_lines([ControlFile("policy", quote)], stat_of=self.fake({quote: (stat.S_IFREG | 0o644, 1000)}),
+                                   posix=True, uid=1000)
+        import shlex
+        self.assertEqual(shlex.split(line.split("yours alone: ", 1)[1]), ["chmod", "600", quote])
+
     def test_windows_warns_about_a_home_outside_the_profile(self):
         profile = {"USERPROFILE": "C:\\Users\\me"}
         self.assertEqual(windows_home_lines(profile, "win32"), [])
@@ -379,6 +397,184 @@ class Permissions(unittest.TestCase):
                 self.assertIn("outside your user profile", lines[0])
             finally:
                 os.rmdir(profile / "linked")  # the junction itself, not the folder it leads to
+
+
+class WhatDoctorSaysOfALaunch(DoctorTest):
+    """The launch lines as doctor, clients, wrap and inspect print them: no secret, no silent cut, a dated list."""
+
+    ADDRESS = f"git+https://x-access-token:{TOKEN}@github.com/acme/private-mcp"
+
+    def test_a_token_in_a_package_address_is_printed_nowhere(self):
+        servers = {"private": {"command": "uvx", "args": ["--from", self.ADDRESS, "private-mcp"]},
+                   "tarball": {"command": "npx", "args": ["-y", f"https://user:{TOKEN}@host.example/x.tgz"]},
+                   "password": {"command": "npx", "args": ["-y", "https://user:hunter2-not-a-format@host.example/x.tgz"]}}
+        config = self.config(servers)
+        for json_output in (False, True):
+            code, out, err = self.doctor(config, json_output=json_output)
+            self.assertNotIn(TOKEN, out + err)
+            self.assertNotIn("hunter2-not-a-format", out + err)
+            self.assertIn("unreviewed and unpinned (uvx git+https://x-access-token:[redacted GitHub token]@github.com/"
+                          "acme/private-mcp)", out)
+            self.assertIn("https://user:[redacted credential]@host.example/x.tgz", out)
+        self.write("project/.mcp.json", {"mcpServers": servers})
+        code, out, err = run_cli("clients")
+        self.assertIn("private: warn:", out)
+        self.assertNotIn(TOKEN, out + err)
+        self.assertNotIn("hunter2-not-a-format", out + err)
+        code, out, err = run_cli("wrap", "--client", "claude-code", "--policy", self.policy)
+        self.assertEqual(code, 0, err)
+        self.assertIn("will be wrapped", out)
+        self.assertNotIn(TOKEN, out + err)
+        self.assertNotIn("hunter2-not-a-format", out + err)
+
+    def test_inspect_warns_without_the_token(self):
+        err = io.StringIO()
+        with mock.patch("agent_sentinel.server_probe.probe", side_effect=KeyboardInterrupt), \
+                contextlib.redirect_stderr(err), self.assertRaises(KeyboardInterrupt):
+            from agent_sentinel import cli_inspect
+            cli_inspect.run(SimpleNamespace(server_command=["uvx", "--from", self.ADDRESS, "private-mcp"],
+                                            policy=None, timeout=5, format="text"))
+        self.assertIn("agent-sentinel: warning: the launch command runs a package straight from a git repository",
+                      err.getvalue())
+        self.assertNotIn(TOKEN, err.getvalue())
+
+    def test_a_word_that_may_be_the_package_is_said_to_be_in_doubt(self):
+        _, servers, _ = self.statuses(self.config({
+            "doubt": self.wrapped("doubt", server=["npx", "--some-option", "value", "some-server"]),
+            "sure": self.wrapped("sure", server=["npx", "--loglevel", "error", "some-server"]),
+            "mail": self.wrapped("mail", server=["npx", "--prefix", "C:/tools/npm", "-y", "postmark-mcp@1.0.16"]),
+            "squat": self.wrapped("squat", server=["npx", "--some-option", "mcp-remot@1.0.0", "x"]),
+        }))
+        self.assertIn("the word 'mcp-remot@1.0.0', which may be the package this command runs, is named one letter "
+                      "away from the popular 'mcp-remote'", texts(servers["squat"]))
+        self.assertIn("the word 'value' may be the package this command runs", texts(servers["doubt"]))
+        self.assertIn("the word 'some-server' may be the package this command runs", texts(servers["doubt"]))
+        self.assertIn("the package 'some-server' is not pinned to an exact version", texts(servers["sure"]))
+        self.assertNotIn("'error'", texts(servers["sure"]))
+        self.assertEqual(servers["mail"]["status"], "broken")
+        self.assertIn("npx postmark-mcp@1.0.16 is a malicious version", texts(servers["mail"]))
+
+    def test_a_command_longer_than_the_bounds_gets_a_warning(self):
+        padded = self.wrapped("padded", server=["env", *["A=1"] * 130, "npx", "-y", "postmark-mcp@1.0.16"])
+        _, servers, _ = self.statuses(self.config({"padded": padded}))
+        (line,) = [finding for finding in servers["padded"]["findings"] if "only part of it was checked" in finding["text"]]
+        self.assertEqual(line["level"], "warn")
+        self.assertTrue(line["text"].rstrip().endswith("npx -y postmark-mcp@1.0.16"), line["text"][-80:])  # in full
+
+    def test_the_date_of_the_advisory_list_is_printed(self):
+        from agent_sentinel import advisories
+        code, out, _ = self.doctor(self.config({"s": self.wrapped("s")}))
+        (line,) = [line for line in out.splitlines() if "package advisories" in line]
+        self.assertTrue(line.startswith("[info]"), line)
+        self.assertIn(f"last updated {advisories.LAST_UPDATED}", line)
+        _, _, report = self.statuses(self.config({"s": self.wrapped("s")}))
+        self.assertEqual(report["advisories"]["last_updated"], advisories.LAST_UPDATED)
+        self.assertEqual(report["advisories"]["entries"], len(advisories.MALICIOUS) + len(advisories.VULNERABLE))
+
+
+class ThePinsFileOfAPinnedServer(DoctorTest):
+    def reasons(self, entry):
+        _, servers, _ = self.statuses(self.config({"s": entry}))
+        return servers["s"]["status"], texts(servers["s"])
+
+    def test_with_pin_server_a_pins_file_that_cannot_be_saved_is_broken(self):
+        missing = self.folder / "no-such-folder" / "pins.json"
+        status, text = self.reasons(self.wrapped("s", "--pin-server", pins=missing))
+        self.assertEqual(status, "broken")
+        self.assertIn("does not exist, so the proxy will not start: with --pin-server it must save the server's pin",
+                      text)
+        status, text = self.reasons(self.wrapped("s", pins=missing))  # without it: tool pins live in memory
+        self.assertEqual(status, "protected")
+        self.assertIn("does not exist, so tool pins are not saved", text)
+        with mock.patch.object(os, "access", return_value=False):
+            status, text = self.reasons(self.wrapped("s", "--pin-server"))
+            self.assertEqual(status, "broken")
+            self.assertIn("cannot be written, so the proxy will not start", text)
+            # a server that is pinned already starts as long as it matches: a warning, as before
+            pins = self.home / "pins" / "pinned.json"
+            self.write("user/.agent-sentinel/pins/pinned.json", {"version": 2, "server": {
+                "launch": {"executable": "C:/x/node.exe", "package": None, "script": None, "script_sha256": None},
+                "info": {"name": "notes", "version": "1.0.0"}}})
+            status, text = self.reasons(self.wrapped("s", "--pin-server", pins=pins))
+            self.assertEqual(status, "protected")
+            self.assertIn("cannot be written, so tool pins are not saved", text)
+
+    def test_a_pins_file_is_read_up_to_the_size_the_proxy_reads(self):
+        from agent_sentinel import cli_doctor, pins
+        self.assertEqual(cli_doctor.MAX_CHECKED_PINS_BYTES, pins.MAX_FILE_BYTES)
+        big = self.write("user/.agent-sentinel/pins/big.json", {"version": 2, "tools": {}})
+        with mock.patch.object(cli_doctor, "MAX_CHECKED_FILE_BYTES", 5):  # the bound of the other files
+            status, text = self.reasons(self.wrapped("s", pins=big, policy=""))
+            self.assertNotIn("is not an ordinary pins file", text)
+        with mock.patch.object(cli_doctor, "MAX_CHECKED_PINS_BYTES", 5):
+            status, text = self.reasons(self.wrapped("s", pins=big))
+            self.assertIn("is not an ordinary pins file", text)
+
+
+class WhatAContainerIsGiven(DoctorTest):
+    def test_a_mount_of_the_home_folder_is_a_folder_the_server_is_given(self):
+        digest = "img@sha256:" + "a" * 64
+        for name, server in (
+            ("volume", ["docker", "run", "-i", "--rm", "-v", f"{self.home}:/data", digest]),
+            ("attached", ["docker", "run", "-i", f"-v{self.home}:/data:ro", digest]),
+            ("equals", ["podman", "run", "-i", f"--volume={self.user}:/data", digest]),
+            ("cluster", ["docker", "run", "-iv", f"{self.home}:/data", digest]),
+            ("mount", ["docker", "run", "-i", "--mount", f"type=bind,src={self.home},dst=/d", digest]),
+            ("mount-equals", ["docker", "run", "-i", f"--mount=type=bind,source={self.home},target=/d", digest]),
+        ):
+            with self.subTest(name=name):
+                _, servers, _ = self.statuses(self.config({name: self.wrapped(name, server=server)}))
+                self.assertIn("the server is given the folder", texts(servers[name]))
+                self.assertIn(f"which holds the policy {self.policy}", texts(servers[name]))
+        elsewhere = ["docker", "run", "-i", "-v", f"{self.project}:/data", "--mount",
+                     f"type=bind,src={self.project},dst=/d", digest]
+        _, servers, _ = self.statuses(self.config({"s": self.wrapped("s", server=elsewhere)}))
+        self.assertNotIn("the server is given the folder", texts(servers["s"]))
+
+
+class AHomeFolderByAnotherName(unittest.TestCase):
+    def test_a_home_not_named_dot_agent_sentinel_is_warned_about(self):
+        from agent_sentinel.control_plane import home_name_lines
+        root = "C:\\data" if sys.platform == "win32" else "/data"
+        for chosen in (os.path.join(root, ".agent-sentinel"), os.path.join(root, ".Agent-Sentinel") + os.sep):
+            with self.subTest(chosen=chosen):
+                self.assertEqual(home_name_lines({"AGENT_SENTINEL_HOME": chosen}), [])
+        self.assertEqual(home_name_lines({}), [])
+        self.assertEqual(home_name_lines({"AGENT_SENTINEL_HOME": "relative/folder"}), [])  # refused elsewhere
+        chosen = os.path.join(root, "sentinel-state")
+        (line,) = home_name_lines({"AGENT_SENTINEL_HOME": chosen})
+        self.assertIn(f"AGENT_SENTINEL_HOME is {chosen}, a folder that is not named .agent-sentinel", line)
+        rule = {"arg": "*", "contains": "sentinel-state"}
+        self.assertIn("Add the same rule for this folder's name to the policy's deny_args: " + json.dumps(rule), line)
+        # the rule it names is one a policy takes, and it denies the folder
+        policy = Policy.from_dict({"default": "allow", "deny_args": [rule]})
+        self.assertEqual(policy.evaluate("write_file", {"path": os.path.join(chosen, "policy.json")}).action, "block")
+        self.assertEqual(policy.evaluate("Bash", {"command": f"cat {chosen}/policy.json"}).action, "block")
+        self.assertEqual(policy.evaluate("write_file", {"path": os.path.join(root, "notes.txt")}).action, "allow")
+        # and the templates really do not cover such a folder, which is why doctor says so
+        starter = Policy.from_dict(templates.template("starter"))
+        self.assertTrue(control_plane.writable_by(Policy.from_dict({"default": "allow"}), chosen))
+        self.assertEqual(starter.evaluate("read_file", {"path": os.path.join(root, ".agent-sentinel", "x")}).action,
+                         "block")
+        # a drive or the root has no name to deny: no rule is offered that would refuse every argument
+        for chosen in (("C:\\", "C:/") if sys.platform == "win32" else ("/", "//")):
+            with self.subTest(chosen=chosen):
+                (line,) = home_name_lines({"AGENT_SENTINEL_HOME": chosen})
+                self.assertTrue(line.endswith("so their rules do not cover this folder. Name the folder "
+                                              ".agent-sentinel instead"), line)
+                self.assertNotIn('"contains": ""', line)
+
+
+class DoctorWithAHomeByAnotherName(DoctorTest):
+    def test_doctor_prints_the_warning_in_the_control_plane(self):
+        chosen = self.folder / "sentinel-state"
+        chosen.mkdir()
+        with mock.patch.dict(os.environ, {"AGENT_SENTINEL_HOME": str(chosen)}):
+            _, _, report = self.statuses(self.config({"s": self.wrapped("s")}))
+        found = [line for line in report["control_plane"] if "is not named .agent-sentinel" in line["text"]]
+        self.assertEqual([line["level"] for line in found], ["warn"])
+        _, _, report = self.statuses(self.config({"s": self.wrapped("s")}))
+        self.assertEqual([line for line in report["control_plane"] if "is not named" in line["text"]], [])
 
 
 class Baseline(DoctorTest):
@@ -593,7 +789,19 @@ class WriteWarnings(IsolatedHomeTest):
         self.assertEqual(code, 0, out + err)
         self.assertIn(f"Warning: the policy would let the agent write this settings file {settings} (Edit, write_file "
                       "allowed)", out)
-        self.assertIn('{"arg": "*", "type": "path", "roots": [', out)
+        self.assertIn('{"arg": "file_path", "type": "path", "roots": [', out)
+        self.assertIn('{"arg": "path", "type": "path", "roots": [', out)
+
+    def test_the_rules_the_warning_names_are_rules_a_policy_takes(self):
+        target = str(self.folder / "project" / ".mcp.json")
+        for rules in ({"default": "allow"}, {"default": "block", "tools": {"Edit": "allow", "move_file": "allow"}}):
+            with self.subTest(rules=rules):
+                warning = control_plane.writable_warning(Policy.from_dict(rules), target, "this configuration file")
+                entries = json.loads("[" + warning.split("names a file: ", 1)[1] + "]")
+                self.assertTrue(entries)
+                fixed = Policy.from_dict(dict(rules, deny_args=entries))  # the policy loads with them
+                self.assertIsNone(control_plane.writable_warning(fixed, target, "this configuration file"))
+                self.assertEqual(control_plane.writable_by(fixed, target), [])
 
 
 class ClientsAndInspect(IsolatedHomeTest):

