@@ -54,6 +54,7 @@ from . import (
     cli_validate,
     cli_wrap,
     mcp_proxy,
+    shortened_options,
 )
 from .cli_common import EXIT_ERROR, CommandError, print_error
 from .textutil import printable
@@ -107,6 +108,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
             formatter_class=argparse.RawDescriptionHelpFormatter,
         )
         module.add_arguments(command)
+        shortened_options.keep(name, command)  # the shortened options 0.5.0 took still mean what they meant
         command.set_defaults(func=module.run, module=module)
         command_parsers[name] = command
     return parser, command_parsers
