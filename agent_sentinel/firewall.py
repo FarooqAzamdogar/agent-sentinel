@@ -449,7 +449,8 @@ class Firewall:
                        its chain continuing. Nothing is ever deleted.
         audit_required:  refuse what cannot be recorded: an allowed call, approval
                        or result whose audit record cannot be written is refused
-                       (rule "audit_required"), also in monitor mode.
+                       (rule "audit_required"), also in monitor mode. It must
+                       be True or False: any other value is a ValueError.
         These three need an audit_path (ValueError otherwise).
         """
         if server_name is not None and (not isinstance(server_name, str) or not SERVER_NAME.fullmatch(server_name)):
@@ -460,6 +461,10 @@ class Firewall:
             raise ValueError(f"session_id must be text of 1 to {MAX_SESSION_ID_CHARS} characters")
         self.policy = policy
         self.audit_path = Path(audit_path) if audit_path else None
+        # Refused, not guessed: 1 or "yes" taken as off would let unrecorded calls through, and "no" taken
+        # as on would surprise. The option exists to fail closed.
+        if not isinstance(audit_required, bool):
+            raise ValueError("audit_required must be True or False")
         if self.audit_path is None and (
             audit_key_file is not None or audit_max_bytes is not None or audit_required
         ):
@@ -468,7 +473,7 @@ class Firewall:
             self.audit_max_bytes = checked_max_bytes(audit_max_bytes)
         except ValueError as exc:
             raise ValueError(f"audit_max_bytes {exc}") from None
-        self.audit_required = audit_required is True
+        self.audit_required = audit_required
         # The key of the records' MACs: read once, never written anywhere.
         self._audit_key = read_key_file(audit_key_file) if audit_key_file is not None else None
         self.approver = approver

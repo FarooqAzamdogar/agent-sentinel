@@ -41,4 +41,5 @@ def audit_records(path):
     which a new log and a proxy add around them.
     """
     records = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
-    return [record for record in records if record.get("event") not in META_EVENTS]
+    return [record for record in records
+            if not (isinstance(record.get("event"), str) and record["event"] in META_EVENTS)]

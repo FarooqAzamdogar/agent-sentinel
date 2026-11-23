@@ -64,6 +64,18 @@ class TheOptions(unittest.TestCase):
             with self.subTest(words=words), self.assertRaises(SystemExit):
                 self.parse(*words)
 
+    def test_a_memory_limit_too_small_to_start_anything_is_refused_with_the_least_value(self):
+        for text in ("0", "1", str(containment.MIN_SERVER_MEMORY_MB - 1)):
+            with self.subTest(text=text), self.assertRaisesRegex(
+                    ValueError, f"must be {containment.MIN_SERVER_MEMORY_MB} to .* megabytes; the least is "
+                                f"{containment.MIN_SERVER_MEMORY_MB}"):
+                containment.memory_mb(text)
+        self.assertEqual(containment.memory_mb(str(containment.MIN_SERVER_MEMORY_MB)), containment.MIN_SERVER_MEMORY_MB)
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr), self.assertRaises(SystemExit):
+            mcp_proxy._argument_parser().parse_args(["--policy", "p.json", "--server-memory-mb", "4", "--", "server"])
+        self.assertIn(f"the least is {containment.MIN_SERVER_MEMORY_MB}", stderr.getvalue())
+
     def test_each_option_implies_contain(self):
         for settings in (Settings(memory_mb=64), Settings(processes=2), Settings(cpu_seconds=5),
                          Settings(sandbox="bwrap"), Settings(allow=("/w",)), Settings(network=True)):
@@ -405,6 +417,22 @@ class SettingUpWithoutAnything(unittest.TestCase):
         with self.assertRaises(ContainmentError):
             containment.prepare(refused, found)
 
+    def test_an_error_nobody_planned_for_is_a_refusal_too(self):
+        # ctypes raises OSError or AttributeError when the system lacks a call, or refuses one.
+        for error in (OSError(1, "Operation not permitted"), AttributeError("function 'prctl' not found"),
+                      ValueError("not allowed to raise maximum limit"), ImportError("No module named 'resource'")):
+            with self.subTest(error=error), \
+                    mock.patch.object(containment, "_WindowsJob", side_effect=error), \
+                    mock.patch.object(containment, "_ProcessGroup", side_effect=error):
+                with self.assertRaises(ContainmentError) as raised:
+                    containment.prepare(Settings(contain=True), found)
+                self.assertIn(f"this system refused a step of the set-up ({type(error).__name__}: ",
+                              str(raised.exception))
+                self.assertNotIn("\n", str(raised.exception))
+        with mock.patch.object(containment, "check", side_effect=ValueError("embedded null byte")):
+            with self.assertRaises(ContainmentError):
+                containment.prepare(Settings(contain=True), found)
+
 
 class TheAuditTrailOfContainment(unittest.TestCase):
     """What the proxy's audit records say about containment: session_start, and session_end when it fails.
@@ -474,6 +502,77 @@ class TheAuditTrailOfContainment(unittest.TestCase):
         self.assertIsInstance(end["server_exit_code"], int)
         self.assertEqual(self.verified(), ("intact", 0))
 
+    def test_a_containment_that_fails_in_an_unplanned_way_is_refused_in_plain_words_and_recorded(self):
+        error = AttributeError("function 'prctl' not found")
+        with mock.patch.object(containment, "_WindowsJob", side_effect=error), \
+                mock.patch.object(containment, "_ProcessGroup", side_effect=error):
+            code, err = self.run_proxy("--contain", prepare=containment.prepare)
+        self.assertEqual(code, 2)
+        self.assertIn("cannot contain the server as asked, so it is not started: this system refused a step of the "
+                      "set-up (AttributeError: function 'prctl' not found)", err)
+        self.assertNotIn("Traceback", err)
+        start, end = self.sessions()
+        self.assertEqual(end["reason"], "the server could not be contained as asked, so it was not started")
+
+    def recording(self):
+        """A containment that notes what the proxy asks of it, and the server it was given."""
+        calls, servers = [], []
+
+        class Recording(containment.Containment):
+            def after_start(self, server):
+                servers.append(server)
+                calls.append("after_start")
+
+            def sweep(self, server):
+                calls.append("sweep" if server.poll() is not None else "sweep of a running server")
+
+        return Recording(), calls, servers
+
+    def stop_signals(self):
+        return {name: signal.getsignal(getattr(signal, name))
+                for name in ("SIGTERM", "SIGINT", "SIGBREAK", "SIGHUP", "SIGQUIT") if hasattr(signal, name)}
+
+    def test_an_error_after_the_server_started_still_stops_it_sweeps_and_records_the_end(self):
+        # Nothing between starting the server and the end of main may leave it running: with --contain on
+        # Linux and macOS the sweep is the only thing that ends what the server started.
+        contained, calls, servers = self.recording()
+        before = self.stop_signals()
+        with mock.patch.object(mcp_proxy, "Proxy", side_effect=RuntimeError("a bug in the proxy")):
+            with self.assertRaisesRegex(RuntimeError, "a bug in the proxy"):
+                self.run_proxy("--contain", prepare=lambda *args, **kwargs: contained)
+        self.assertEqual(calls, ["after_start", "sweep"])
+        self.assertIsNotNone(servers[0].poll())  # stopped, not left behind
+        for stream in (servers[0].stdin, servers[0].stdout, servers[0].stderr):
+            stream.close()
+        start, end = self.sessions()
+        self.assertEqual(end["reason"], "the proxy stopped on an error or an interrupt")
+        self.assertIsInstance(end["server_exit_code"], int)
+        self.assertEqual(self.verified(), ("intact", 0))
+        self.assertEqual(self.stop_signals(), before)  # the caller's handlers are back
+
+    def test_an_interrupt_after_the_server_started_does_the_same(self):
+        # Ctrl+C where the handler could not be put in place (not the main thread) arrives as KeyboardInterrupt.
+        contained, calls, servers = self.recording()
+        with mock.patch.object(mcp_proxy, "Proxy", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_proxy("--contain", prepare=lambda *args, **kwargs: contained)
+        self.assertEqual(calls, ["after_start", "sweep"])
+        self.assertIsNotNone(servers[0].poll())
+        for stream in (servers[0].stdin, servers[0].stdout, servers[0].stderr):
+            stream.close()
+        self.assertEqual([record["event"] for record in self.sessions()], ["session_start", "session_end"])
+
+    def test_the_end_is_recorded_once_when_the_proxy_stops_the_server_itself(self):
+        class FailsAfterStart(containment.Containment):
+            def after_start(self, server):
+                raise ContainmentError("the limits job could not be applied")
+
+        before = self.stop_signals()
+        code, _ = self.run_proxy("--contain", prepare=lambda *args, **kwargs: FailsAfterStart())
+        self.assertEqual(code, 2)
+        self.assertEqual([record["event"] for record in self.sessions()], ["session_start", "session_end"])
+        self.assertEqual(self.stop_signals(), before)
+
     def test_session_start_says_what_containment_was_asked_for(self):
         from agent_sentinel import Firewall
         from support import POLICY
@@ -523,6 +622,28 @@ class TheProcessGroupSetup(unittest.TestCase):
         self.assertNotIn("as", limits)
         self.assertNotIn("cpu", limits)
 
+    def test_the_memory_limit_is_set_last_so_that_nothing_after_it_needs_memory(self):
+        # The child is a copy of the proxy and may already use more than a small limit allows: the call
+        # through ctypes, and every other limit, come before it.
+        module, _ = self.fake_resource()
+        order = []
+        module.setrlimit = lambda which, values: order.append(which)
+
+        def prctl(*arguments):
+            order.append("prctl")
+            return 0
+
+        with mock.patch.dict(sys.modules, {"resource": module}), \
+                mock.patch("threading.active_count", return_value=1), \
+                mock.patch.object(containment, "_linux_prctl", return_value=prctl), \
+                mock.patch.object(signal, "SIGKILL", 9, create=True), \
+                mock.patch.object(os, "getppid", os.getpid), \
+                mock.patch.object(os, "kill", side_effect=AssertionError("the child would have been killed")):
+            contained = containment._ProcessGroup(Settings(contain=True, memory_mb=16, cpu_seconds=60), [])
+            contained._prctl = prctl
+            contained.popen_options()["preexec_fn"]()
+        self.assertEqual(order, ["prctl", "core", "nofile", "cpu", "as"])
+
     def test_it_refuses_when_threads_are_running(self):
         module, _ = self.fake_resource()
         with mock.patch.dict(sys.modules, {"resource": module}), mock.patch("threading.active_count", return_value=3):
@@ -547,6 +668,167 @@ class TheProcessGroupSetup(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"resource": module}), mock.patch("threading.active_count", return_value=1):
             contained = containment._ProcessGroup(Settings(sandbox="bwrap"), ["/usr/bin/bwrap", "--x", "--"])
         self.assertEqual(contained.command(["node", "s.js"]), ["/usr/bin/bwrap", "--x", "--", "node", "s.js"])
+
+
+class TheWindowsLimitsJob(unittest.TestCase):
+    """--server-memory-mb and the other limits on Windows, with a stand-in for kernel32, so that it runs anywhere."""
+
+    def job(self, assigned=True, opened=True, in_job=True, error=None):
+        closed = []
+
+        def is_in_job(process, job, found):
+            found._obj.value = int(in_job)
+            return 1
+
+        def assign(job, process):
+            if error is not None:
+                raise error
+            return int(assigned)
+
+        kernel32 = types.SimpleNamespace(
+            OpenProcess=lambda access, inherit, pid: 5 if opened else 0, IsProcessInJob=is_in_job,
+            CreateJobObjectW=lambda security, name: 7, SetInformationJobObject=lambda *arguments: 1,
+            AssignProcessToJobObject=assign, CloseHandle=closed.append, TerminateJobObject=lambda job, code: 1,
+        )
+        job = object.__new__(containment._WindowsJob)
+        job._settings, job._kernel32, job._outer, job._inner = Settings(processes=4), kernel32, 11, None
+        return job, closed
+
+    def server(self, exit_code):
+        return types.SimpleNamespace(pid=4242, poll=lambda: exit_code)
+
+    def test_a_server_that_cannot_be_put_into_its_job_is_refused_while_it_runs(self):
+        with mock.patch.object(containment, "_last_error", return_value="Access is denied. (error 5)"):
+            for options, words in (({"assigned": False}, "cannot put the server into the job object of its limits: "
+                                                         "Access is denied. (error 5)"),
+                                   ({"opened": False}, "cannot open the server's process"),
+                                   ({"in_job": False}, "the server did not start inside the proxy's job object")):
+                with self.subTest(options=options):
+                    job, closed = self.job(**options)
+                    with self.assertRaises(ContainmentError) as raised:
+                        job.after_start(self.server(None))
+                    self.assertIn(words, str(raised.exception))
+                    self.assertEqual(closed, [5] if options != {"opened": False} else [])
+
+    def test_a_server_that_has_already_ended_is_not_an_error(self):
+        # A command that fails at once: Windows says "Access is denied" for a process that is gone. The proxy
+        # goes on, and passes on the server's own output and exit code.
+        with mock.patch.object(containment, "_last_error", return_value="Access is denied. (error 5)"):
+            for options in ({"assigned": False}, {"opened": False}, {"in_job": False}, {"error": OSError(5, "x")}):
+                with self.subTest(options=options):
+                    job, _ = self.job(**options)
+                    job.after_start(self.server(1))
+
+    def test_an_error_nobody_planned_for_is_a_refusal_in_plain_words(self):
+        job, closed = self.job(error=OSError(22, "exception: access violation"))
+        with self.assertRaisesRegex(ContainmentError, r"this system refused a step of the set-up \(OSError: "):
+            job.after_start(self.server(None))
+        self.assertEqual(closed, [5])
+
+    def test_a_running_server_gets_its_job(self):
+        job, closed = self.job()
+        job.after_start(self.server(None))
+        self.assertEqual((job._inner, closed), (7, [5]))
+
+    @unittest.skipUnless(WINDOWS, "job objects are a Windows matter")
+    def test_on_windows_the_limits_of_a_server_that_has_already_ended_are_passed_over(self):
+        # In a process of its own: setting up containment puts the calling process into a job for good.
+        code = (
+            "import subprocess, sys\n"
+            "from agent_sentinel import containment\n"
+            "contained = containment.prepare(containment.Settings(processes=4), lambda name: None)\n"
+            "server = subprocess.Popen([sys.executable, '-c', 'raise SystemExit(7)'], **contained.popen_options())\n"
+            "server.wait()\n"
+            "contained.after_start(server)\n"
+            "contained.sweep(server)\n"
+            "print('passed over, exit code', server.returncode)\n"
+        )
+        done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120,
+                              env=dict(os.environ, PYTHONPATH=str(ROOT)))
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "passed over, exit code 7"), done.stderr)
+
+
+class TheStopSignals(unittest.TestCase):
+    """Which signals the proxy takes as "stop", with a stand-in for the signal module, so that it runs anywhere."""
+
+    def signals(self, ignored=(), not_from_python=(), fails=(), names=("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT")):
+        handlers = {}
+        numbers = {name: number for number, name in enumerate(names, start=1)}
+
+        def get(number):
+            name = names[number - 1]
+            if number in handlers:
+                return handlers[number]
+            return "ignore" if name in ignored else None if name in not_from_python else f"default of {name}"
+
+        def set_handler(number, handler):
+            if names[number - 1] in fails:
+                raise ValueError("signal only works in main thread of the main interpreter")
+            handlers[number] = handler
+
+        module = types.SimpleNamespace(SIG_IGN="ignore", SIG_DFL="default", getsignal=get, signal=set_handler,
+                                       **numbers)
+        return module, handlers, numbers
+
+    def test_every_signal_that_would_end_the_proxy_asks_it_to_stop_instead(self):
+        module, handlers, numbers = self.signals()
+        with mock.patch.object(mcp_proxy, "signal", module):
+            under_way = mcp_proxy._Started()
+            under_way.stop_on_signals()
+            self.assertEqual(set(handlers), set(numbers.values()))  # Ctrl+C, a hangup and Ctrl+\ as well as SIGTERM
+            self.assertFalse(under_way.stop_asked())
+            handlers[numbers["SIGHUP"]](numbers["SIGHUP"], None)
+            self.assertTrue(under_way.stop_asked())
+            under_way.restore_signals()
+        self.assertEqual(handlers, {number: f"default of {name}" for name, number in numbers.items()})
+
+    def test_each_of_them_alone_is_enough(self):
+        for name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"):
+            module, handlers, numbers = self.signals()
+            with self.subTest(name=name), mock.patch.object(mcp_proxy, "signal", module):
+                under_way = mcp_proxy._Started()
+                under_way.stop_on_signals()
+                handlers[numbers[name]](numbers[name], None)
+                self.assertTrue(under_way.stop_asked())
+
+    def test_a_signal_that_was_being_ignored_stays_ignored_except_sigterm(self):
+        # nohup, or a background job of a shell without job control: the starter chose that.
+        module, handlers, numbers = self.signals(ignored=("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"))
+        with mock.patch.object(mcp_proxy, "signal", module):
+            under_way = mcp_proxy._Started()
+            under_way.stop_on_signals()
+        self.assertEqual(set(handlers), {numbers["SIGTERM"]})
+
+    def test_signals_this_system_lacks_or_refuses_are_passed_over(self):
+        module, handlers, numbers = self.signals(names=("SIGTERM", "SIGBREAK", "SIGINT"), fails=("SIGINT",),
+                                                 not_from_python=("SIGBREAK",))
+        with mock.patch.object(mcp_proxy, "signal", module):
+            under_way = mcp_proxy._Started()
+            under_way.stop_on_signals()  # Windows: no SIGHUP, no SIGQUIT
+            self.assertEqual(set(handlers), {numbers["SIGTERM"], numbers["SIGBREAK"]})
+            kept = handlers[numbers["SIGBREAK"]]
+            under_way.restore_signals()
+        self.assertEqual(handlers[numbers["SIGTERM"]], "default of SIGTERM")
+        self.assertIs(handlers[numbers["SIGBREAK"]], kept)  # set by something other than Python: left as it is
+
+    def test_abandoning_ends_the_server_sweeps_and_records_even_when_a_step_fails(self):
+        done = []
+        server = types.SimpleNamespace(pid=1)
+        contained = types.SimpleNamespace(sweep=lambda given: done.append("sweep"))
+        firewall = types.SimpleNamespace(provenance=lambda event, reason, details: done.append((event, details)))
+        under_way = mcp_proxy._Started()
+        under_way.abandon()  # nothing was started: nothing to do
+        under_way.running(server, contained, firewall)
+        with mock.patch.object(mcp_proxy, "_stop", side_effect=KeyboardInterrupt):  # a second Ctrl+C
+            under_way.abandon()
+        self.assertEqual(done, ["sweep", ("session_end", {"server_exit_code": None})])
+        under_way.abandon()  # once only
+        self.assertEqual(len(done), 2)
+        failing = types.SimpleNamespace(sweep=mock.Mock(side_effect=OSError("gone")))
+        under_way.running(server, failing, firewall)
+        with mock.patch.object(mcp_proxy, "_stop", return_value=3):
+            under_way.abandon()
+        self.assertEqual(done[-1], ("session_end", {"server_exit_code": 3}))
 
 
 # ---- wrap and doctor ---------------------------------------------------------------------------------------
@@ -681,6 +963,18 @@ while time.time() < deadline:
         time.sleep(0.2)
 '''
 
+# A server that writes its pid and then sleeps, whatever happens to its input and whatever Ctrl+C or
+# Ctrl+Break its console sends: only the proxy ends it.
+DEAF_SERVER = r'''
+import os, signal, sys, time
+for name in ("SIGINT", "SIGBREAK"):
+    if hasattr(signal, name):
+        signal.signal(getattr(signal, name), signal.SIG_IGN)
+with open(sys.argv[1], "w") as pid:
+    pid.write(str(os.getpid()))
+time.sleep(90)
+'''
+
 # A server that answers a request with what it could and could not do inside a sandbox.
 SANDBOX_SERVER = r'''
 import json, os, sys
@@ -705,6 +999,48 @@ for line in sys.stdin:
     sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}) + "\n")
     sys.stdout.flush()
 '''
+
+
+# The proxy's main() in a process of its own, with a containment that notes what is asked of it and, once the
+# server runs, does to the main thread what Ctrl+C does. argv: the file for the notes, then the proxy's arguments.
+INTERRUPTED_PROXY = r'''
+import sys, threading, _thread
+from agent_sentinel import containment, mcp_proxy
+notes = sys.argv[1]
+
+def note(text):
+    with open(notes, "a") as out:
+        out.write(text + "\n")
+
+class Recording(containment.Containment):
+    def after_start(self, server):
+        note("after_start")
+        threading.Timer(1.0, _thread.interrupt_main).start()
+
+    def sweep(self, server):
+        note("sweep")
+
+containment.prepare = lambda *args, **kwargs: Recording()
+try:
+    code = mcp_proxy.main(sys.argv[2:])
+    note("returned")
+except BaseException as error:
+    note("raised " + type(error).__name__)
+    code = 99
+mcp_proxy.exit_process(code)
+'''
+
+
+def default_signals():
+    """In a proxy the test starts (POSIX): the stop signals as a terminal's foreground process has them,
+    whatever the process that runs the tests inherited."""
+    for name in ("SIGINT", "SIGHUP", "SIGQUIT", "SIGTERM"):
+        signal.signal(getattr(signal, name), signal.SIG_DFL)
+
+
+def ignored_hangup():
+    """In a proxy the test starts (POSIX): SIGHUP ignored, as nohup leaves it."""
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
 
 def alive(pid):
@@ -780,12 +1116,12 @@ class TheRealProxy(unittest.TestCase):
         path.write_text(source, encoding="utf-8")
         return path
 
-    def start(self, proxy_args, server, *server_args, environment=None):
+    def start(self, proxy_args, server, *server_args, environment=None, **popen_options):
         proxy = subprocess.Popen(
             [sys.executable, "-m", "agent_sentinel", "proxy", "--policy", str(EXAMPLE_POLICY_PATH), "--quiet",
-             *proxy_args, "--", sys.executable, str(server), *map(str, server_args)],
+             *map(str, proxy_args), "--", sys.executable, str(server), *map(str, server_args)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.folder,
-            env=environment or self.environment,
+            env=environment or self.environment, **popen_options,
         )
         self.addCleanup(self.stop, proxy)
         return proxy
@@ -886,6 +1222,85 @@ class TheRealProxy(unittest.TestCase):
         self.assertLessEqual(seen["files"][1], containment.SERVER_OPEN_FILES)
         self.assertTrue(seen["own_group"])
         proxy.stdin.close()  # the client goes away: the proxy stops the server, then sweeps its group
+        proxy.wait(timeout=30)
+        self.assertTrue(wait_until(lambda: not alive(grandchild)), "the grandchild outlived the proxy")
+
+    def test_an_interrupt_stops_the_server_sweeps_and_records_the_end(self):
+        # What Ctrl+C does to the proxy's main thread, in a process of its own: the proxy must shut down as
+        # it does when a side closes. The server here never ends by itself, whatever happens to its input.
+        pid_file, audit, calls = self.folder / "pid.txt", self.folder / "audit.jsonl", self.folder / "calls.txt"
+        server = self.server("stubborn.py", STUBBORN_SERVER)
+        runner = self.server("runner.py", INTERRUPTED_PROXY)
+        done = subprocess.run(
+            [sys.executable, str(runner), str(calls), "--policy", str(EXAMPLE_POLICY_PATH), "--quiet", "--audit",
+             str(audit), "--contain", "--", sys.executable, str(server), str(pid_file), "sleep"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.folder,
+            env=self.environment, timeout=120,
+        )
+        (server_pid,) = self.pids(pid_file)
+        self.addCleanup(kill, server_pid)
+        self.assertNotIn(b"Traceback", done.stderr)
+        self.assertNotIn(b"KeyboardInterrupt", done.stderr)
+        noted = calls.read_text().split()
+        self.assertEqual(noted[:2], ["after_start", "sweep"], done.stderr)
+        self.assertEqual(noted[2], "returned")  # main came back with the server's exit code
+        self.assertTrue(wait_until(lambda: not alive(server_pid)), "the server outlived the proxy")
+        records = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([record["event"] for record in records][-2:], ["session_start", "session_end"])
+        self.assertEqual(records[-1]["reason"], "the proxy stopped")
+
+    @unittest.skipUnless(WINDOWS, "Ctrl+Break is a Windows matter")
+    def test_on_windows_ctrl_break_stops_the_server_and_records_the_end(self):
+        pid_file, audit = self.folder / "pid.txt", self.folder / "audit.jsonl"
+        proxy = self.start(["--contain", "--audit", audit], self.server("deaf.py", DEAF_SERVER), pid_file,
+                           creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        (server_pid,) = self.pids(pid_file)
+        self.addCleanup(kill, server_pid)
+        time.sleep(0.5)  # the server ignores the signal by now, and the proxy is relaying
+        try:
+            proxy.send_signal(signal.CTRL_BREAK_EVENT)
+        except OSError:
+            self.skipTest("this process has no console to send Ctrl+Break through")
+        proxy.wait(timeout=30)
+        self.assertTrue(wait_until(lambda: not alive(server_pid)), "the server outlived the proxy")
+        records = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual((records[-1]["event"], records[-1]["reason"]), ("session_end", "the proxy stopped"))
+
+    @unittest.skipUnless(POSIX, "these signals, and a session of the server's own, are a POSIX matter")
+    def test_on_posix_every_signal_that_stops_the_proxy_ends_the_servers_group_too(self):
+        # Under --contain the server has a session of its own, so the terminal's Ctrl+C or hangup reaches the
+        # proxy alone: the proxy must stop the server and sweep its group itself.
+        server = self.server("tree.py", TREE_SERVER)
+        for name in ("SIGINT", "SIGHUP", "SIGQUIT", "SIGTERM"):
+            with self.subTest(signal=name):
+                pid_file, audit = self.folder / f"pids-{name}.txt", self.folder / f"audit-{name}.jsonl"
+                proxy = self.start(["--contain", "--audit", audit], server, pid_file, preexec_fn=default_signals)
+                server_pid, grandchild = self.pids(pid_file)
+                self.addCleanup(kill, grandchild)
+                self.addCleanup(kill, server_pid)
+                self.assertTrue(self.ask(proxy)["own_group"])  # the proxy is relaying: its handlers are in place
+                proxy.send_signal(getattr(signal, name))
+                self.assertIsNotNone(proxy.wait(timeout=30))
+                self.assertGreaterEqual(proxy.returncode, 0, "the signal ended the proxy before it could clean up")
+                self.assertTrue(wait_until(lambda: not alive(server_pid)), "the server outlived the proxy")
+                self.assertTrue(wait_until(lambda: not alive(grandchild)), "the grandchild outlived the proxy")
+                events = [json.loads(line)["event"] for line in audit.read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(events[-1], "session_end")
+
+    @unittest.skipUnless(POSIX, "these signals are a POSIX matter")
+    def test_on_posix_a_hangup_that_was_being_ignored_stays_ignored(self):
+        # nohup: the proxy must not stop on a signal that whoever started it chose to ignore.
+        pid_file = self.folder / "pids.txt"
+        proxy = self.start(["--contain"], self.server("tree.py", TREE_SERVER), pid_file, preexec_fn=ignored_hangup)
+        server_pid, grandchild = self.pids(pid_file)
+        self.addCleanup(kill, grandchild)
+        self.addCleanup(kill, server_pid)
+        self.assertTrue(self.ask(proxy)["own_group"])
+        proxy.send_signal(signal.SIGHUP)
+        time.sleep(1.0)
+        self.assertIsNone(proxy.poll())
+        self.assertTrue(self.ask(proxy)["own_group"])  # still relaying
+        proxy.stdin.close()
         proxy.wait(timeout=30)
         self.assertTrue(wait_until(lambda: not alive(grandchild)), "the grandchild outlived the proxy")
 

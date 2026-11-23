@@ -4144,6 +4144,99 @@ def _stop(server: subprocess.Popen, deadline: float) -> int:
         return server.wait()
 
 
+# The signals that ask the proxy to stop: it shuts down as if a side had closed, so that the server is
+# stopped too (and, with --contain, what the server started is swept) instead of being left running.
+# SIGTERM, and Ctrl+Break on Windows, are always taken. The others would end the proxy at once: Ctrl+C
+# (SIGINT), a terminal that went away (SIGHUP) and Ctrl+\ (SIGQUIT). Under --contain on Linux and macOS
+# the server has a session of its own, so the terminal's signal reaches the proxy alone. One of these
+# that was being ignored when the proxy started (nohup, a shell's background job) stays ignored.
+_STOP_SIGNALS = ("SIGTERM", "SIGBREAK")
+_STOP_SIGNALS_UNLESS_IGNORED = ("SIGINT", "SIGHUP", "SIGQUIT")
+
+
+class _Started:
+    """What main has under way that must be ended however main is left.
+
+    main's own shutdown ends the server on every path it plans for. This is
+    for the others (an error nobody planned for, or Ctrl+C where its handler
+    could not be put in place): `abandon` stops the server, sweeps what it
+    started and writes the session_end record, before the error goes on.
+    It also holds the stop signals: which arrived, and the handlers to put back.
+    """
+
+    def __init__(self) -> None:
+        self.server: subprocess.Popen | None = None
+        self.contained: containment.Containment | None = None
+        self.firewall: Firewall | None = None
+        self._arrived: list[int] = []
+        self._previous: list[tuple[int, Any]] = []
+
+    def stop_on_signals(self) -> None:
+        """Have the stop signals be noted (see stop_asked) rather than end the process.
+
+        The handler only appends to a list: setting a threading.Event there
+        could wait for ever on a lock that the interrupted main thread holds.
+        """
+        def note(number: int, _frame: Any) -> None:
+            self._arrived.append(number)
+
+        for name in (*_STOP_SIGNALS, *_STOP_SIGNALS_UNLESS_IGNORED):
+            number = getattr(signal, name, None)
+            if number is None:
+                continue
+            try:
+                before = signal.getsignal(number)
+                if name in _STOP_SIGNALS_UNLESS_IGNORED and before == signal.SIG_IGN:
+                    continue
+                signal.signal(number, note)
+            except (ValueError, OSError):  # not the main thread, or not supported here
+                continue
+            self._previous.append((number, before))
+
+    def stop_asked(self) -> bool:
+        """Whether a stop signal has arrived."""
+        return bool(self._arrived)
+
+    def restore_signals(self) -> None:
+        """Put back the handlers that stop_on_signals replaced (for a caller that goes on after main)."""
+        previous, self._previous = self._previous, []
+        for number, before in previous:
+            if before is None:  # set by something other than Python: it cannot be put back from here
+                continue
+            try:
+                signal.signal(number, before)
+            except (ValueError, OSError, TypeError):
+                pass
+
+    def running(self, server: subprocess.Popen, contained: containment.Containment, firewall: Firewall) -> None:
+        """The server has started: from here on, leaving main in any way ends it."""
+        self.server, self.contained, self.firewall = server, contained, firewall
+
+    def abandon(self) -> None:
+        """Stop the server now, sweep what it started and record the end of the session. Never raises.
+
+        Each step is tried whatever became of the one before it: a server
+        left running is worse than a missing record.
+        """
+        server, self.server = self.server, None
+        if server is None or self.contained is None or self.firewall is None:
+            return
+        exit_code = None
+        try:
+            exit_code = _stop(server, time.monotonic())  # no time to finish by itself: main is leaving on an error
+        except BaseException:  # a second Ctrl+C included: the sweep below must still run
+            pass
+        try:
+            self.contained.sweep(server)
+        except BaseException:
+            pass
+        try:
+            self.firewall.provenance(audit_chain.SESSION_END, "the proxy stopped on an error or an interrupt",
+                                     {"server_exit_code": exit_code})
+        except BaseException:
+            pass
+
+
 def exit_process(code: int) -> None:
     """End the process now, with this exit code.
 
@@ -4534,6 +4627,22 @@ def _check_server_launch(pins: ToolPins, firewall: Firewall, executable: str, co
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the proxy until either side closes or it is asked to stop; its exit code.
+
+    However it is left (an error, an interrupt), a server that was started is
+    stopped, what it started is swept and the session's end is recorded.
+    """
+    under_way = _Started()
+    try:
+        return _run(argv, under_way)
+    except BaseException:
+        under_way.abandon()
+        raise
+    finally:
+        under_way.restore_signals()
+
+
+def _run(argv: list[str] | None, under_way: _Started) -> int:
     parser = _argument_parser()
     args = parser.parse_args(argv)
     if hasattr(sys.stderr, "reconfigure"):  # warnings must never crash on an odd character
@@ -4665,6 +4774,8 @@ def main(argv: list[str] | None = None) -> int:
                                                          "not started")
             return 2
         _report_session_group(group, firewall, say)
+    # In place before the server starts, so that no signal after that ends the proxy with its server running.
+    under_way.stop_on_signals()
     try:
         server = subprocess.Popen(
             contained.command([executable, *command[1:]]), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -4676,6 +4787,7 @@ def main(argv: list[str] | None = None) -> int:
             group.store.leave()  # its server never ran, so it is no member of the client run
         firewall.provenance(audit_chain.SESSION_END, "the server could not be started")
         return 2
+    under_way.running(server, contained, firewall)
     try:
         contained.after_start(server)
     except containment.ContainmentError as exc:
@@ -4711,15 +4823,6 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             one_side_closed.set()
 
-    # Asked to stop (SIGTERM, or Ctrl+Break on Windows): shut down as if a side had closed,
-    # so that the server is stopped too instead of being left running.
-    for signal_name in ("SIGTERM", "SIGBREAK"):
-        if hasattr(signal, signal_name):
-            try:
-                signal.signal(getattr(signal, signal_name), lambda *_: one_side_closed.set())
-            except (ValueError, OSError):  # not the main thread, or not supported here
-                pass
-
     client_relay = threading.Thread(target=relay, args=(proxy.pump_client_to_server, sys.stdin.buffer), daemon=True)
     server_relay = threading.Thread(target=relay, args=(proxy.pump_server_to_client, server.stdout), daemon=True)
     # The stderr relay is never joined: a grandchild of the server can hold that pipe open.
@@ -4727,7 +4830,9 @@ def main(argv: list[str] | None = None) -> int:
     threading.Thread(target=_relay_stderr, args=(server.stderr, server_lines), daemon=True).start()
     client_relay.start()
     server_relay.start()
-    while not one_side_closed.wait(0.25):  # in short waits, so that a signal handler gets to run
+    # In short waits, so that a signal handler gets to run. Asked to stop by a signal (_STOP_SIGNALS):
+    # shut down as if a side had closed.
+    while not (under_way.stop_asked() or one_side_closed.wait(0.25)):
         pass
 
     deadline = time.monotonic() + SHUTDOWN_GRACE_SECONDS

@@ -21,8 +21,12 @@ Phase 1: --contain (standard library only)
   second job that holds the server alone, nested in the first, so that they
   do not apply to the proxy. The server is put into it just after it starts:
   what the server starts in those first moments is outside the limits,
-  though still inside the first job. No UI restrictions are set: they would
-  stop a server from opening a browser to sign in.
+  though still inside the first job. (Only a process started suspended
+  could be put into the job before it runs, and subprocess cannot resume
+  one.) A server that has already ended by then is not limited at all, and
+  neither is what it started; the proxy goes on and passes on its exit.
+  No UI restrictions are set: they would stop a server from opening a
+  browser to sign in.
 * Linux and macOS: the server runs in a session and process group of its own
   (start_new_session), which the proxy ends (killpg) when it stops: whatever
   the server started that is still in the group goes too. It starts with no
@@ -31,6 +35,10 @@ Phase 1: --contain (standard library only)
   ctypes). --server-memory-mb sets RLIMIT_AS, the virtual memory of each
   process (Node and V8 reserve a great deal, so it is never set unless
   asked, and must be generous); --server-cpu-seconds sets RLIMIT_CPU.
+  The server has a session of its own, so a terminal's Ctrl+C or hangup
+  reaches the proxy alone: the proxy takes those signals as "stop" and ends
+  the group itself (mcp_proxy._STOP_SIGNALS). A signal it cannot take
+  (SIGKILL) or does not take ends the proxy without that.
   --server-processes is Windows only: RLIMIT_NPROC counts every process of
   the user, not the server's.
 
@@ -179,8 +187,18 @@ def _whole_number(text: str, low: int, high: int, unit: str) -> int:
 
 
 def memory_mb(text: str) -> int:
-    """--server-memory-mb: ValueError for a value the proxy refuses."""
-    return _whole_number(text, MIN_SERVER_MEMORY_MB, MAX_SERVER_MEMORY_MB, "megabytes")
+    """--server-memory-mb: ValueError for a value the proxy refuses.
+
+    The least is MIN_SERVER_MEMORY_MB. That is no promise that a server
+    starts with it: a limit below what its program needs ends it at once (an
+    interpreter needs several times as much), and the proxy passes that on
+    as the server's own exit.
+    """
+    try:
+        return _whole_number(text, MIN_SERVER_MEMORY_MB, MAX_SERVER_MEMORY_MB, "megabytes")
+    except ValueError as exc:
+        raise ValueError(f"{exc}; the least is {MIN_SERVER_MEMORY_MB}, and a server whose program needs more than "
+                         "its limit ends as soon as it starts") from None
 
 
 def processes(text: str) -> int:
@@ -652,18 +670,34 @@ def prepare(settings: Settings, find: Callable[[str], str | None], control_files
                    read-only and no folder the server may write may hold the
                    log, so only sandbox-exec needs a rule of its own.
     On Windows the proxy joins its job object here, before the server starts.
+
+    Whatever goes wrong is a ContainmentError: an error of the operating
+    system's, or a call this system's library does not have (ctypes raises
+    OSError or AttributeError), is a containment that cannot be set up, and
+    the proxy must refuse in plain words rather than end in a traceback.
     """
     if not settings.active:
         return Containment()
-    problem = check(settings, find, control_files=control_files, secret_files=secret_files)
-    if problem is not None:
-        raise ContainmentError(problem)
-    if sys.platform == "win32":
-        return _WindowsJob(settings)
-    prefix: list[str] = []
-    if settings.sandbox is not None:
-        prefix = _sandbox_prefix(settings, find, control_files, server_executable, secret_files, numbered_files)
-    return _ProcessGroup(settings, prefix)
+    try:
+        problem = check(settings, find, control_files=control_files, secret_files=secret_files)
+        if problem is not None:
+            raise ContainmentError(problem)
+        if sys.platform == "win32":
+            return _WindowsJob(settings)
+        prefix: list[str] = []
+        if settings.sandbox is not None:
+            prefix = _sandbox_prefix(settings, find, control_files, server_executable, secret_files, numbered_files)
+        return _ProcessGroup(settings, prefix)
+    except ContainmentError:
+        raise
+    except Exception as exc:
+        raise ContainmentError(_unexpected(exc)) from exc
+
+
+def _unexpected(error: Exception) -> str:
+    """An error nobody planned for while containment was set up, in words for the operator (one printable line)."""
+    text = " ".join(str(error).split())[:300]
+    return f"this system refused a step of the set-up ({type(error).__name__}{': ' + text if text else ''})"
 
 
 def _agent_home() -> str:
@@ -742,6 +776,21 @@ class _WindowsJob(Containment):
         return bool(self._kernel32.IsProcessInJob(process, job, ctypes.byref(found))) and bool(found.value)
 
     def after_start(self, server: subprocess.Popen) -> None:
+        try:
+            self._limit(server)
+        except Exception as exc:
+            # A server that has already ended (a command that fails at once) cannot be put into a job, and
+            # Windows says "Access is denied". Nothing is left to limit: the proxy goes on and passes on the
+            # server's own output and exit code, as it does without limits. What that server started is
+            # still in the proxy's job and ends with the proxy.
+            if server.poll() is not None:
+                return
+            if isinstance(exc, ContainmentError):
+                raise
+            raise ContainmentError(_unexpected(exc)) from exc
+
+    def _limit(self, server: subprocess.Popen) -> None:
+        """Check that the server is in the proxy's job, and put it into a job of its own with the limits asked for."""
         kernel32 = self._kernel32
         access = _PROCESS_SET_QUOTA | _PROCESS_TERMINATE | _PROCESS_QUERY_LIMITED_INFORMATION
         # Popen holds a handle to the server, so its process id cannot be reused meanwhile.
@@ -787,10 +836,12 @@ class _ProcessGroup(Containment):
         self._prefix = prefix
         self.description = describe(settings)
         wanted = [(resource.RLIMIT_CORE, 0), (resource.RLIMIT_NOFILE, SERVER_OPEN_FILES)]
-        if settings.memory_mb is not None:
-            wanted.append((resource.RLIMIT_AS, settings.memory_mb * 1024 * 1024))
         if settings.cpu_seconds is not None:
             wanted.append((resource.RLIMIT_CPU, settings.cpu_seconds))
+        # The memory limit comes last (see _in_child): once it is set, the child may not be able to
+        # allocate anything more before its program starts.
+        if settings.memory_mb is not None:
+            wanted.append((resource.RLIMIT_AS, settings.memory_mb * 1024 * 1024))
         # Worked out here, in the proxy, so that the child only has to set them. A limit the proxy already
         # has that is lower is kept.
         self._limits = []
@@ -819,13 +870,16 @@ class _ProcessGroup(Containment):
 
         def setup() -> None:
             # In the child, before the server's program runs. An exception here makes Popen fail in the proxy.
-            for which, values in limits:
-                resource.setrlimit(which, values)
+            # The limits are set after everything else, the memory limit last of them: the child is a copy
+            # of the proxy, which may already use more than a small --server-memory-mb allows, so a call
+            # made after that limit (the one through ctypes above all) could fail for want of memory.
             if prctl is not None:
                 if prctl(_PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0) != 0:
                     raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
                 if os.getppid() != parent:  # the proxy died before the signal was set up
                     os.kill(os.getpid(), signal.SIGKILL)
+            for which, values in limits:
+                resource.setrlimit(which, values)
 
         return setup
 

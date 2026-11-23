@@ -187,7 +187,15 @@ def summarize(path: str, chosen: RecordFilter, by: str, last: int) -> Summary:
     Each line is read once, by the chain check (strict JSON and a SHA-256),
     and the record it read is counted. The check costs about as much again as
     the rest (about 6 s instead of 3 s for 100,000 records, 68 MB).
+
+    A log that a writer rotates during the read is read again from its start
+    (auditlog.read_again_if_changed): half of an older file is never reported
+    on. OSError (auditlog.LogChangedError) when it keeps changing.
     """
+    return auditlog.read_again_if_changed(lambda: _summarize_once(path, chosen, by, last))
+
+
+def _summarize_once(path: str, chosen: RecordFilter, by: str, last: int) -> Summary:
     summary = Summary(path, chosen, by, blocked=deque(maxlen=last))
     checker = ChainChecker()
     checker.start_file()

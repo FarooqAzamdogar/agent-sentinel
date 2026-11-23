@@ -26,7 +26,7 @@ jobs:
   build:
     name: build and check the package
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       # Actions are pinned to exact commits so that a moved tag cannot change what runs here.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

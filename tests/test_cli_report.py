@@ -110,6 +110,22 @@ class WhatIsShown(TempFolderTest):
         self.assertIn("(other names)", out)
         self.assertLessEqual(sum(1 for line in out.splitlines() if line.startswith("tool_")), MAX_TABLE_ROWS)
 
+    def test_a_line_whose_event_or_action_is_not_text_is_counted_and_never_ends_the_report(self):
+        # Anyone who can append to the log can write such a line: it must not blind the report.
+        odd = [record(event=value) for value in ({"a": 1}, {}, [], ["call"], 5, None, True)]
+        odd += [record(action=value) for value in ({"a": 1}, [], 5, None)]
+        odd += [{"event": {}, "action": "note"}, {"event": [], "action": "note", "reason": {}}]
+        audit = self.write_log("audit.jsonl", [record(tool="real_tool"), *odd])
+        for options in ((), ("--format", "json"), ("--by", "server", "--show-args"), ("--event", "call")):
+            with self.subTest(options=options):
+                code, out, err = run_cli("report", audit, *options)
+                self.assertEqual((code, err), (0, ""))
+                self.assertIn("real_tool", out)
+        code, out, _ = run_cli("report", audit, "--format", "json")
+        data = json.loads(out)
+        self.assertEqual(data["records"], len(odd) + 1)  # none of them is taken for a chain or session record
+        self.assertEqual(data["integrity"]["chain_and_session_records"], 0)
+
     def test_a_real_log_reads_back(self):
         audit = self.folder / "audit.jsonl"
         firewall = Firewall(POLICY, audit_path=audit, server_name="files")
@@ -189,9 +205,18 @@ class Follow(TempFolderTest):
         self.assertIn("after_long", out)
 
     def test_hostile_fields_are_printed_safely_and_the_line_is_capped(self):
-        out = self.follow_while_writing([self.line(tool="evil\x1b[2J" + "y" * 5000, reason="\x07")])
+        out = self.follow_while_writing([self.line(tool="evil\x1b[2J" + "y" * 5000, reason="\x07"),
+                                         self.line(event={"a": "\x1b[2J"}), self.line(event=[])])
         self.assertNotIn("\x1b", out)
         self.assertTrue(all(len(line) <= 503 for line in out.splitlines()))
+
+    def test_lines_whose_fields_are_not_text_are_followed_without_an_error(self):
+        odd = [self.line(event={}), self.line(event=[]), self.line(action={}), self.line(tool={"a": []}),
+               self.line(tool="after_the_odd_ones")]
+        out = self.follow_while_writing(odd)
+        self.assertIn("after_the_odd_ones", out)
+        out = self.follow_while_writing(odd, chosen=RecordFilter(actions=("block",)), output="json")
+        self.assertIn("after_the_odd_ones", out)
 
     def test_json_lines_can_be_followed(self):
         out = self.follow_while_writing([self.line(tool="t1")], output="json")

@@ -2,9 +2,13 @@
 
 import io
 import json
+import os
+import sys
+import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 from cli_support import TempFolderTest
 from agent_sentinel import auditlog
@@ -116,6 +120,219 @@ class Filters(unittest.TestCase):
         odd = {"tool": ["read_file"], "server": 5, "action": None}
         self.assertFalse(RecordFilter(tool="*").matches(odd))
         self.assertFalse(RecordFilter(servers=("5",)).matches(odd))
+        for event in ({}, []):  # an object or a list is no key of a table: no look-up may raise
+            odd = {"event": event, "action": "note"}
+            self.assertFalse(RecordFilter(events=("chain_start",)).matches(odd))
+            self.assertFalse(auditlog.is_meta(odd))
+
+    def test_an_event_or_action_that_is_not_text_is_no_kind_of_record(self):
+        # A JSON object or a list cannot be looked up in a set: the test must not raise.
+        for value in ({}, {"a": 1}, [], ["chain_start"], [[]], 5, 1.5, True, None):
+            with self.subTest(value=value):
+                self.assertFalse(auditlog.is_meta({"event": value, "action": "note"}))
+                self.assertFalse(auditlog.is_meta({"event": "chain_start", "action": value}))
+                self.assertFalse(auditlog.is_block({"event": "call", "action": value}))
+                self.assertFalse(RecordFilter(events=("call",), actions=("block",)).matches(
+                    {"event": value, "action": value}))
+        self.assertTrue(auditlog.is_meta({"event": "chain_start", "action": "note"}))
+
+
+class ALogThatChangesWhileItIsRead(TempFolderTest):
+    """A writer may rotate the log (copy it aside, empty it, start it again) while a reader is part-way through."""
+
+    def lines(self, first, count):
+        return b"".join(json.dumps({"n": number, "pad": "x" * 900}).encode() + b"\n"
+                        for number in range(first, first + count))
+
+    def rotating_after(self, lines_read, new_content, times=1):
+        """A stand-in for iter_lines that replaces the log's content once `lines_read` lines were yielded."""
+        left = [times]
+
+        def reading(handle, limit=auditlog.MAX_LINE_BYTES):
+            for number, line in enumerate(iter_lines(handle, limit)):
+                if number == lines_read and left[0] > 0:
+                    left[0] -= 1
+                    with open(self.audit, "r+b") as writer:  # in place, as a rotation does it
+                        writer.truncate(0)
+                        writer.write(new_content)
+                yield line
+
+        return mock.patch.object(auditlog, "iter_lines", reading)
+
+    def setUp(self):
+        super().setUp()
+        self.audit = self.write("audit.jsonl", self.lines(0, 40))  # about 37 KiB: several reads of the buffer
+
+    def test_a_log_emptied_during_the_read_is_reported_as_changed_not_as_its_first_half(self):
+        with self.rotating_after(3, self.lines(100, 2)):
+            with self.assertRaises(auditlog.LogChangedError) as raised:
+                list(auditlog.iter_records(str(self.audit)))
+        self.assertIn("the log changed while it was read", raised.exception.strerror)
+        self.assertEqual(raised.exception.filename, str(self.audit))
+
+    def test_a_log_that_grew_back_past_the_reader_is_reported_as_changed_too(self):
+        # As long as before, so its size says nothing: it no longer starts with the same bytes.
+        with self.rotating_after(3, self.lines(100, 40)):
+            with self.assertRaises(auditlog.LogChangedError):
+                list(auditlog.iter_records(str(self.audit)))
+
+    def test_it_is_read_again_from_its_start_a_bounded_number_of_times(self):
+        def numbers():  # None: the line the first read was cut off in
+            return [record["n"] for record in auditlog.iter_records(str(self.audit)) if record is not None]
+
+        with self.rotating_after(3, self.lines(100, 5)):
+            self.assertEqual(auditlog.read_again_if_changed(numbers), [100, 101, 102, 103, 104])
+        attempts = []
+
+        def always_changed():
+            attempts.append(1)
+            raise auditlog.LogChangedError(0, "changed", "x")
+
+        with self.assertRaises(auditlog.LogChangedError):
+            auditlog.read_again_if_changed(always_changed)
+        self.assertEqual(len(attempts), auditlog.READ_ATTEMPTS)
+
+    def test_a_log_that_only_grows_is_read_once_and_whole(self):
+        calls = []
+
+        def numbers():
+            calls.append(1)
+            found = []
+            for record in auditlog.iter_records(str(self.audit)):
+                if record["n"] == 3:
+                    with open(self.audit, "ab") as writer:
+                        writer.write(self.lines(40, 2))
+                found.append(record["n"])
+            return found
+
+        self.assertEqual(auditlog.read_again_if_changed(numbers), list(range(42)))
+        self.assertEqual(len(calls), 1)
+
+    def finishing_the_last_record(self, rest):
+        """A stand-in for iter_lines: once the reader has reached the end, the writer appends `rest`."""
+        left = [rest]
+
+        def reading(handle, limit=auditlog.MAX_LINE_BYTES):
+            yield from iter_lines(handle, limit)
+            if left:
+                with open(self.audit, "ab") as writer:
+                    writer.write(left.pop())
+
+        return mock.patch.object(auditlog, "iter_lines", reading)
+
+    def test_a_record_that_was_being_appended_when_the_reader_reached_the_end_is_read_again(self):
+        # The reader got half of the last record. That is a write in progress, not a write cut short.
+        whole = self.lines(0, 3)
+        self.audit.write_bytes(whole[:-200])
+        with self.finishing_the_last_record(whole[-200:]):
+            with self.assertRaises(auditlog.LogChangedError):
+                list(auditlog.iter_records(str(self.audit)))
+        self.audit.write_bytes(whole[:-200])
+        with self.finishing_the_last_record(whole[-200:]):
+            found = auditlog.read_again_if_changed(lambda: list(auditlog.iter_records(str(self.audit))))
+        self.assertEqual([record["n"] for record in found], [0, 1, 2])
+
+    def test_a_last_line_that_stays_cut_short_is_read_as_it_is(self):
+        self.audit.write_bytes(self.lines(0, 3)[:-200])
+        calls = []
+
+        def read():
+            calls.append(1)
+            return list(auditlog.iter_records(str(self.audit)))
+
+        found = auditlog.read_again_if_changed(read)
+        self.assertEqual(([record and record["n"] for record in found], len(calls)), ([0, 1, None], 1))
+
+    def test_an_empty_log_and_one_without_a_last_newline_are_read_as_they_are(self):
+        empty = self.write("empty.jsonl", b"")
+        self.assertEqual(list(auditlog.iter_records(str(empty))), [])
+        cut = self.write("cut.jsonl", b'{"n": 1}\n{"n": 2')
+        self.assertEqual(list(auditlog.iter_records(str(cut))), [{"n": 1}, None])
+
+    def test_a_pipe_is_read_once_through(self):
+        # A log read through a pipe (`report <(zcat audit.jsonl.gz)`) cannot be looked at twice, and is not.
+        class Pipe(io.BytesIO):
+            def seekable(self):
+                return False
+
+        with mock.patch.object(auditlog, "open", lambda path, mode: io.BufferedReader(Pipe(self.lines(0, 3))),
+                               create=True):
+            self.assertEqual([record["n"] for record in auditlog.iter_records("a pipe")], [0, 1, 2])
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are a POSIX matter")
+    def test_a_named_pipe_is_read_once_through(self):
+        pipe = self.folder / "log.pipe"
+        os.mkfifo(pipe)
+        writer = threading.Thread(target=lambda: pipe.write_bytes(self.lines(0, 3)))
+        writer.start()
+        try:
+            self.assertEqual([record["n"] for record in auditlog.iter_records(str(pipe))], [0, 1, 2])
+        finally:
+            writer.join(timeout=10)
+
+
+class AWritersLock(TempFolderTest):
+    """On Windows a byte a writer has locked cannot be read: the first byte of the log, for a moment at a time."""
+
+    def test_a_refused_read_is_tried_again_until_it_works(self):
+        answers = [PermissionError(13, "Permission denied"), PermissionError(13, "Permission denied"), b"data"]
+
+        def read():
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        self.assertEqual(auditlog._despite_lock(read, "audit.jsonl"), b"data")
+
+    def test_a_read_refused_for_too_long_says_that_a_writer_holds_the_lock(self):
+        def read():
+            raise PermissionError(13, "Permission denied")
+
+        with mock.patch.object(auditlog, "LOCKED_READ_SECONDS", 0.2):
+            started = time.monotonic()
+            with self.assertRaises(PermissionError) as raised:
+                auditlog._despite_lock(read, "audit.jsonl")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn("a writer held the log's lock", raised.exception.strerror)
+        self.assertEqual(raised.exception.filename, "audit.jsonl")
+
+    def test_any_other_error_is_not_waited_for(self):
+        def read():
+            raise IsADirectoryError(21, "Is a directory")
+
+        with self.assertRaises(IsADirectoryError):
+            auditlog._despite_lock(read, "audit.jsonl")
+
+    @unittest.skipUnless(sys.platform == "win32", "only Windows refuses to read a locked byte")
+    def test_on_windows_a_log_is_read_once_its_writer_lets_go_of_the_lock(self):
+        from agent_sentinel.filelock import lock_file, unlock_file
+        audit = self.write_log("audit.jsonl", [{"n": 1}, {"n": 2}])
+        with open(audit, "a+b", buffering=0) as writer:
+            lock_file(writer)
+            with self.assertRaises(PermissionError):  # what a reader met before it waited
+                with open(audit, "rb") as plain:
+                    plain.read(1)
+            release = threading.Timer(0.3, lambda: unlock_file(writer))
+            release.start()
+            try:
+                self.assertEqual(list(auditlog.iter_records(str(audit))), [{"n": 1}, {"n": 2}])
+            finally:
+                release.join()
+
+    @unittest.skipUnless(sys.platform == "win32", "only Windows refuses to read a locked byte")
+    def test_on_windows_a_lock_that_is_never_let_go_is_an_error_that_names_it(self):
+        from agent_sentinel.filelock import lock_file, unlock_file
+        audit = self.write_log("audit.jsonl", [{"n": 1}])
+        with open(audit, "a+b", buffering=0) as writer:
+            lock_file(writer)
+            try:
+                with mock.patch.object(auditlog, "LOCKED_READ_SECONDS", 0.2):
+                    with self.assertRaises(PermissionError) as raised:
+                        list(auditlog.iter_records(str(audit)))
+            finally:
+                unlock_file(writer)
+        self.assertIn("a writer held the log's lock", raised.exception.strerror)
 
 
 class Following(TempFolderTest):
