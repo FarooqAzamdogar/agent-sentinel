@@ -89,6 +89,15 @@ BENIGN_OUTPUT = (
     ("short names", "Each service reads .env at start-up; add the service to the list by name."),
     ("short names", "Never commit secrets: add .env to .gitignore, then query the index to confirm."),
     ("short names", "Copy the contents of .env to id."),
+    # API guides: an address with a slot for the customer's own host name, flags to pick a region, next to
+    # the API token or credentials they need. The token is named, but nothing orders it put there.
+    ("webfetch", "Create an API token, then call https://{your-domain}.atlassian.net/rest/api/3/issue "
+                 "with basic auth."),
+    ("webfetch", "Upload with: curl -T file https://${BUCKET}.s3.amazonaws.com/key (set AWS credentials first)."),
+    ("webfetch", "Choose the region for your API token: " + " ".join(
+        f"![{code}](https://flagcdn.com/w20/{code}.png)" for code in "us gb de fr es it nl se no fi".split())),
+    ("webfetch", "Pinned at https://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.ipfs.dweb.link/ "
+                 "(no secret needed)."),
 )
 README = ("# Setup\n\n1. Copy `.env.example` to `.env` and fill in the values.\n"
           "2. Add .env to your repo's .gitignore so that it is never committed.\n3. Run `make dev`.\n")

