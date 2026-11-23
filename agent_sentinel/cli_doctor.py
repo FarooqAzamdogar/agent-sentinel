@@ -36,7 +36,8 @@ written in the file (names only: a value is never printed). A leading "~" in
 home folder, as the proxy reads it. An entry whose proxy contains the server
 (--contain, a --server-* limit, --sandbox) is reported as contained or
 sandboxed, and is broken when that containment cannot be set up on this
-machine (containment.check). --audit-key-file, --audit-required and
+machine (containment.check), which includes a bwrap sandbox that would show
+the server the audit key file. --audit-key-file, --audit-required and
 --audit-max-bytes need --audit, as the proxy says; the key file is never
 read here.
 
@@ -54,11 +55,11 @@ pnpm dlx, yarn dlx: launch.commands_run).
 
 The control plane (control_plane.py): whether a server, a policy's
 allow_args root or a policy's write rules let the agent reach
-agent-sentinel's own files (policies, pins, audit logs, the hook's state,
-env files, approver programs); and on POSIX whether other users can read or
-change them. In a project's configuration, an approver program or an env
-file inside the project folder is broken (the agent's own tools could
-rewrite them).
+agent-sentinel's own files (policies, pins, audit logs and their key files,
+the hook's state, the session groups, env files, approver programs); and on
+POSIX whether other users can read or change them. In a project's
+configuration, an approver program or an env file inside the project folder
+is broken (the agent's own tools could rewrite them).
 
 --save-baseline FILE records what the configurations, Claude Code's
 settings and the servers of its ~/.claude.json hold; --baseline FILE fails
@@ -889,7 +890,10 @@ def _check_containment(lines: list[Line], proxy: ProxyCommand) -> str | None:
         return None  # a value the proxy refuses: already a [fail] line
     control_files = [_option_path(path) for path in (proxy.value("--policy"), proxy.value("--pins"),
                                                      proxy.value("--audit")) if path]
-    problem = containment.check(settings, mcp_proxy._resolve_executable, control_files=control_files)
+    # The audit key file: a bwrap sandbox that would show it to the server is refused (never read here).
+    key = proxy.value("--audit-key-file")
+    problem = containment.check(settings, mcp_proxy._resolve_executable, control_files=control_files,
+                                secret_files=[_option_path(key)] if key else [])
     if problem:
         lines.append(Line("fail", f"the proxy will not start: it cannot contain the server as asked: "
                                   f"{printable(problem, limit=300)}"))
@@ -1089,7 +1093,7 @@ def control_files(reports: list[ConfigReport], hooks: list[tuple[str, str]]) -> 
             pins = [("pins file", server.pins), ("changes waiting beside the pins file",
                                                  str(pending_path(server.pins)) if server.pins else None)]
             for what, path in [("policy", server.policy), *pins, ("audit log", server.audit),
-                               ("env file", server.env_file),
+                               ("audit key file", server.audit_key), ("env file", server.env_file),
                                *(("approver program", program) for program in server.approvers)]:
                 if path and not _never_opened(path):
                     found.append(ControlFile(what, path, whose))

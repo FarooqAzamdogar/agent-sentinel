@@ -249,6 +249,14 @@ the server's name and version; at most MAX_PROTOCOL_RECORDS), and
 session_end when the proxy stops. --audit-required refuses to start when
 the log cannot be written, and refuses what cannot be recorded afterwards;
 --audit-max-bytes rotates the log (FILE.1, FILE.2, ...; never deleted).
+
+A proxy that does not start its server after session_start says why in its
+session_end: the server differs from its pin (--pin-server), it could not be
+contained as asked, the session group could not be joined, or it could not
+be started. The order at startup is: the options, the policy and the pins;
+the firewall (the audit key is read); the startup lines; session_start; the
+server's launch against its pin; the containment; the session group; then
+the server is started.
 """
 
 from __future__ import annotations
@@ -299,7 +307,9 @@ from .jsonutil import finite_float, no_constant
 from .launch import launch_identity
 from .leaks import Found
 from .mcp_protocol import ShapeError
-from .pins import CHANGED, FULL, KIND_WORDS, NEW, PINNED_LISTS, ToolPins, definition_of, fingerprint, server_info_value
+from .pins import (
+    CHANGED, FULL, KIND_WORDS, NEW, PINNED_LISTS, ToolPins, definition_of, fingerprint, pending_path, server_info_value,
+)
 from .policy import (
     PROMPTS_GET,
     RULE_CALL_TIMEOUT,
@@ -2188,7 +2198,10 @@ class Proxy:
 
         The record has event "timeout" and rule limits.call_timeout_seconds.
         The reply the server may still send is dropped (_check_server_reply).
-        Monitor mode records what would have happened, and the call goes on waiting.
+        Monitor mode records what would have happened, and the call goes on
+        waiting; unless that record cannot be written and --audit-required
+        refuses what is not recorded: then the call times out as in any mode
+        (_time_out_after_all).
         """
         try:
             seconds = self._firewall.policy.call_timeout_seconds or 0
@@ -2201,6 +2214,8 @@ class Proxy:
             if decision.allowed:  # monitor mode
                 self._report_allowed(what, decision)
                 return
+            if self._firewall.monitor and not self._time_out_after_all(msg_id, pending):
+                return  # the server answered meanwhile, and the client has its reply
             self._report_block(what, decision)
             cancel = {"jsonrpc": "2.0", "method": "notifications/cancelled",
                       "params": {"requestId": msg_id, "reason": "the request timed out"}}
@@ -2210,6 +2225,22 @@ class Proxy:
             pass
         except Exception as exc:  # a bug here must not stop the thread that times out the other calls
             _warn(f"could not answer a call that timed out, after an internal error: {exc!r}")
+
+    def _time_out_after_all(self, msg_id: Any, pending: _PendingRequest) -> bool:
+        """Mark a call that monitor mode left waiting as timed out; False when it no longer waits.
+
+        Monitor mode lets a call that ran out of time go on waiting
+        (_take_expired), but with --audit-required a timeout that could not
+        be recorded is refused in monitor mode too (Firewall._unrecorded).
+        The client is then answered with an error, so the server's late
+        reply must be dropped like that of any call that timed out: the
+        client must not get two answers to one request.
+        """
+        with self._state:
+            if self._pending.get(msg_id) != dataclasses.replace(pending, deadline=None):
+                return False
+            self._pending[msg_id] = dataclasses.replace(pending, deadline=None, timed_out=True)
+            return True
 
     def _wait_for_tool_lists(self) -> bool:
         """Wait until no tools/list reply is being checked.
@@ -3851,15 +3882,24 @@ class _JoinedGroup:
     run: client_run.ClientRun
 
 
-def _join_session_group(group: str, name: str) -> _JoinedGroup | None:
-    """Join the session group's file in <home>/sessions (session.GroupSessionStore); None, after saying why, if not."""
+def _session_group_store(group: str, name: str) -> tuple[GroupSessionStore, client_run.ClientRun] | None:
+    """The store of the session group's file in <home>/sessions, not joined yet; None, after saying why, if not.
+
+    Nothing is written here. The firewall is given the store, for which
+    every mark counts as set until it has joined (_join_session_group); the
+    proxy joins just before it starts the server.
+    """
     try:
         folder = home.sessions_folder(home.home_folder())
     except home.HomeError as exc:
         _warn(f"cannot use --session-group: {exc}", limit=500)
         return None
     run = client_run.find_client_run()
-    store = GroupSessionStore(folder, group, run.id, name, run_started=run.started)
+    return GroupSessionStore(folder, group, run.id, name, run_started=run.started), run
+
+
+def _join_session_group(store: GroupSessionStore, run: client_run.ClientRun) -> _JoinedGroup | None:
+    """Join the session group's file (session.GroupSessionStore.join); None, after saying why, if that fails."""
     try:
         joined = store.join()
     except SessionStateError as exc:
@@ -4006,16 +4046,18 @@ def main(argv: list[str] | None = None) -> int:
     if added is None:
         return 2
     environment = server_env.server_environment(os.environ, args.clean_env, args.pass_env, added)
-    # A session group shares the flow marks; without flow rules there are none to share.
-    group = None
+    # A session group shares the flow marks; without flow rules there are none to share. The group's
+    # file is only named here: the proxy joins it just before it starts the server (below), so that a
+    # proxy that refuses to start is never listed as a member.
+    group_store = None
     if args.session_group is not None and policy.flows:
-        group = _join_session_group(args.session_group, args.name)
-        if group is None:
+        group_store = _session_group_store(args.session_group, args.name)
+        if group_store is None:
             return 2
     try:
         firewall = Firewall(
             policy, audit_path=args.audit, log_args=not args.no_log_args, monitor=args.monitor, server_name=args.name,
-            session_store=group.store if group is not None else None,
+            session_store=group_store[0] if group_store is not None else None,
             audit_key_file=args.audit_key_file, audit_max_bytes=args.audit_max_bytes,
             audit_required=args.audit_required,
         )
@@ -4035,12 +4077,11 @@ def main(argv: list[str] | None = None) -> int:
         monitor=args.monitor, secret_warnings=firewall.secret_warnings(),
         audit_signed=firewall.audit_signed, audit_required=args.audit_required, audit_max_bytes=args.audit_max_bytes,
         containment=containment.describe(contain) if contain.active else "",
-        session_group=args.session_group, session_file=str(group.store.path) if group is not None else None,
+        session_group=args.session_group,
+        session_file=str(group_store[0].path) if group_store is not None else None,
     )
     for line in proxy_report.startup_lines(start):
         say(line, limit=1500)
-    if group is not None:
-        _report_session_group(group, firewall, say)
     _report_server_environment(args, environment, added, say)
     started = firewall.provenance(
         audit_chain.SESSION_START, "the proxy started",
@@ -4049,23 +4090,37 @@ def main(argv: list[str] | None = None) -> int:
     if not started and args.audit_required:
         _warn("not starting: the audit log cannot be written, and --audit-required was given")
         return 2
+    # From here on, a proxy that does not start its server says why in a session_end record.
     server_changed = None
     if args.pin_server:
         server_changed = _check_server_launch(pins, firewall, executable, command, args.name or "server", say)
         if server_changed is not None and on_server_change == SERVER_CHANGE_REFUSE:
             _warn("refusing to start the server (--on-server-change refuse)")
+            firewall.provenance(audit_chain.SESSION_END, "the server differs from its pin, so it was not started")
             return 2
     try:
         # On Windows the proxy joins its job object here, before the server starts (containment.py).
         # The audit key file is a secret of the proxy's: a sandbox must not show it to the server.
+        # The audit log's rotated copies (FILE.1, FILE.2, ...) are the proxy's own files as well, and so are
+        # the changes that wait beside the pins file for `pins accept` (what doctor calls the control plane).
         contained = containment.prepare(contain, _resolve_executable, server_executable=executable,
-                                        control_files=[path for path in (args.policy, args.pins, args.audit) if path],
-                                        secret_files=[args.audit_key_file] if args.audit_key_file else [])
+                                        control_files=_control_files(args),
+                                        secret_files=[args.audit_key_file] if args.audit_key_file else [],
+                                        numbered_files=[args.audit] if args.audit else [])
     except containment.ContainmentError as exc:
         _warn(f"cannot contain the server as asked, so it is not started: {exc}", limit=1000)
         firewall.provenance(audit_chain.SESSION_END, "the server could not be contained as asked, so it was not "
                                                      "started")
         return 2
+    # Nothing above refused, so the server is about to start: join the session group, before any call.
+    group = None
+    if group_store is not None:
+        group = _join_session_group(*group_store)
+        if group is None:
+            firewall.provenance(audit_chain.SESSION_END, "the session group could not be joined, so the server was "
+                                                         "not started")
+            return 2
+        _report_session_group(group, firewall, say)
     try:
         server = subprocess.Popen(
             contained.command([executable, *command[1:]]), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -4073,6 +4128,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     except (OSError, subprocess.SubprocessError) as exc:  # SubprocessError: the containment setup in the child failed
         _warn(f"cannot start server: {exc}")
+        if group is not None:
+            group.store.leave()  # its server never ran, so it is no member of the client run
         firewall.provenance(audit_chain.SESSION_END, "the server could not be started")
         return 2
     try:
@@ -4081,6 +4138,8 @@ def main(argv: list[str] | None = None) -> int:
         _warn(f"cannot contain the server as asked, so it was stopped: {exc}", limit=1000)
         exit_code = _stop(server, time.monotonic())
         contained.sweep(server)
+        if group is not None:
+            group.store.leave()
         firewall.provenance(audit_chain.SESSION_END, "the server could not be contained as asked, so it was stopped",
                             {"server_exit_code": exit_code})
         return 2
@@ -4139,6 +4198,22 @@ def main(argv: list[str] | None = None) -> int:
     server_lines.flush()  # and how many of the server's stderr lines, if its relay has not said so yet
     firewall.provenance(audit_chain.SESSION_END, "the proxy stopped", {"server_exit_code": exit_code})
     return exit_code
+
+
+def _control_files(args: argparse.Namespace) -> list[str]:
+    """The proxy's own files that a sandboxed server may not write: the policy, the pins, the audit log.
+
+    With them the file beside the pins file in which changed definitions
+    wait for `pins diff` and `pins accept` (pins.pending_path): a server
+    that could write it could have the operator accept a definition of its
+    own choosing.
+    """
+    files = [args.policy]
+    if args.pins:
+        files += [args.pins, str(pending_path(args.pins))]
+    if args.audit:
+        files.append(args.audit)
+    return files
 
 
 def _session_details(firewall: Firewall, args: argparse.Namespace, server_argv: list[str],

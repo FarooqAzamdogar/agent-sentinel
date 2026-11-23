@@ -427,10 +427,12 @@ def claude_state(environ: Mapping[str, str] | None = None) -> SettingsFile | Non
 
 
 def hook_paths(settings: list[SettingsFile]) -> list[tuple[str, str]]:
-    """(what, path) of each --policy, --audit and --state-dir that agent-sentinel's Claude Code hooks are given."""
+    """(what, path) of each --policy, --audit, --audit-key-file and --state-dir that agent-sentinel's Claude Code
+    hooks are given."""
     from .cli_hook import is_our_handler  # here: cli_hook imports what imports cli_doctor, which imports this module
 
-    options = {"--policy": "hook policy", "--audit": "hook audit log", "--state-dir": "hook state folder"}
+    options = {"--policy": "hook policy", "--audit": "hook audit log", "--audit-key-file": "hook audit key file",
+               "--state-dir": "hook state folder"}
     found = []
     for settings_file in settings:
         hooks = (settings_file.document or {}).get("hooks")

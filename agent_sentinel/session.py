@@ -68,7 +68,10 @@ counts as every mark set. A proxy that cannot take the lock in time gets
 every mark set when it reads, and SessionStateError when it writes, so the
 call or the result is refused. Each mark records the member (proxy --name)
 whose result set it, and each member writes its name into its run's list of
-members (at most MAX_GROUP_MEMBERS).
+members (at most MAX_GROUP_MEMBERS). The proxy joins once nothing can refuse
+to start its server any more, just before it starts it; if the server then
+cannot be started, the proxy takes its name off the list again
+(GroupSessionStore.leave).
 """
 
 from __future__ import annotations
@@ -592,6 +595,30 @@ class GroupSessionStore(SessionStore):
                 return GroupJoin(JOINED, members=mine.members, others=len(found.runs) - 1)
         except OSError as exc:
             raise SessionStateError(f"cannot join the session group file {self.path}: {exc}") from exc
+
+    def leave(self) -> None:
+        """Take this proxy's name off the members of the run it joined: its server never ran. Never raises.
+
+        For a proxy that joined and then could not start its server. Only
+        the name is removed, and only from the run this proxy joined: the run
+        and its marks stay, for the other proxies of the client run. A file
+        that cannot be read or written, or that no longer holds that run, is
+        left as it is. Afterwards every mark counts as set, as before join().
+        """
+        if self._instance is None:
+            return
+        instance, self._instance = self._instance, None
+        self._why_unusable = "the session group was left"
+        try:
+            with self._exclusive():
+                found, _ = self._load()
+                mine = found.run_of(self.run_id) if found is not None and found.group == self.group else None
+                if mine is None or mine.instance != instance or self.member not in mine.members:
+                    return
+                members = tuple(name for name in mine.members if name != self.member)
+                self._write(found.with_run(dataclasses.replace(mine, members=members)))
+        except (OSError, SessionStateError):
+            pass  # the name stays listed: nothing reads it but doctor's hint about a lone member
 
     def read(self) -> SessionMarks:
         if self._instance is None:

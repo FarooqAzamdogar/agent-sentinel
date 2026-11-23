@@ -443,7 +443,7 @@ class TheAuditTrailOfContainment(unittest.TestCase):
     def test_a_containment_that_cannot_be_set_up_is_recorded_and_the_key_file_is_kept_from_the_sandbox(self):
         asked = []
 
-        def refuse(settings, find, control_files=(), server_executable=None, secret_files=()):
+        def refuse(settings, find, control_files=(), server_executable=None, secret_files=(), numbered_files=()):
             asked.append((settings, list(control_files), list(secret_files)))
             raise ContainmentError("bwrap is not here")
 

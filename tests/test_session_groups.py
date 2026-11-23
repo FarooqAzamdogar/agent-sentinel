@@ -399,7 +399,9 @@ class TheProxyJoinsItsGroup(unittest.TestCase):
 
     def test_the_group_file_is_in_the_home_folder(self):
         with mock.patch.dict(os.environ, {"AGENT_SENTINEL_HOME": str(self.home)}):
-            group = mcp_proxy._join_session_group("claude-desktop", "files")
+            named = mcp_proxy._session_group_store("claude-desktop", "files")
+        self.assertFalse((self.home / "sessions").exists())  # only named: the proxy joins just before the server starts
+        group = mcp_proxy._join_session_group(*named)
         self.assertEqual(group.store.path, self.home / "sessions" / "claude-desktop.json")
         self.assertEqual(group.joined.status, NEW_RUN)
         firewall = Firewall(Policy.from_dict(FLOWS), session_store=group.store)
@@ -422,7 +424,7 @@ class TheProxyJoinsItsGroup(unittest.TestCase):
     def test_a_home_folder_that_cannot_be_told_stops_the_proxy(self):
         err = io.StringIO()
         with mock.patch.dict(os.environ, {"AGENT_SENTINEL_HOME": "relative/path"}), contextlib.redirect_stderr(err):
-            self.assertIsNone(mcp_proxy._join_session_group("g", "files"))
+            self.assertIsNone(mcp_proxy._session_group_store("g", "files"))
         self.assertIn("cannot use --session-group", err.getvalue())
 
     def test_session_group_needs_a_name_and_a_plain_group(self):

@@ -46,10 +46,14 @@ Phase 2: --sandbox (implies --contain), with a tool already installed
   ssh agent and keyring), since a socket can be used on a read-only mount.
   It has no network unless --sandbox-network is given. A folder the server
   may write may not hold the proxy's own files (policy, pins, audit log)
-  or the agent-sentinel home: the server could change or replace them.
+  or the agent-sentinel home: the server could change or replace them. A
+  sandbox that would show the server the audit key file is refused (check,
+  for the proxy and for doctor).
 * sandbox-exec (macOS): a generated profile denies reading and writing the
-  usual credential places in the home folder and the agent-sentinel home;
-  writing the proxy's own files, the files that run later outside the
+  usual credential places in the home folder, the agent-sentinel home and
+  the audit key file; writing the proxy's own files and the numbered copies
+  that rotation makes of the audit log beside it (FILE.1, FILE.2, ...), the
+  files that run later outside the
   sandbox (launch agents, shell startup files, cron and at jobs), and every
   folder on the way to any of these (a renamed folder would take them out
   from under the denials); asking LaunchServices, Apple Events or launchd
@@ -192,7 +196,8 @@ def cpu_seconds(text: str) -> int:
 # ---- whether it can work here ---------------------------------------------------------------------
 
 def check(settings: Settings, find: Callable[[str], str | None], platform: str = sys.platform,
-          user_home: str | Sequence[str] | None = None, control_files: Sequence[str] = ()) -> str | None:
+          user_home: str | Sequence[str] | None = None, control_files: Sequence[str] = (),
+          secret_files: Sequence[str] = ()) -> str | None:
     """Why these settings cannot be used on this machine, or None. Nothing is started or changed.
 
     For the proxy before it starts, and for doctor. `find` looks a program
@@ -202,6 +207,9 @@ def check(settings: Settings, find: Callable[[str], str | None], platform: str =
     user_home: the home folders a sandbox hides (default: _homes).
     control_files: the proxy's own files (policy, pins, audit log), which no
     folder the server may write may hold.
+    secret_files: the proxy's files the server may not read either (the
+    audit key file), which a bwrap sandbox must not show
+    (_secret_shown_problem). They are never opened.
     """
     if not settings.active:
         return None
@@ -232,7 +240,10 @@ def check(settings: Settings, find: Callable[[str], str | None], platform: str =
                 problem = _sandbox_path_problem(path, homes)
                 if problem:
                     return f"{option} {path}: {problem}"
-        return _writable_problem(settings.allow, control_files)
+        problem = _writable_problem(settings.allow, control_files)
+        if problem is None and any(secret_files):
+            problem = _secret_files_problem(settings, secret_files, homes)
+        return problem
     if platform != "darwin":
         return "--sandbox sandbox-exec needs macOS"
     if not os.path.isfile(SANDBOX_EXEC):
@@ -376,6 +387,23 @@ def _secret_shown_problem(settings: Settings, secrets: Sequence[str], homes: Seq
     return None
 
 
+def _secret_files_problem(settings: Settings, secret_files: Sequence[str], homes: Sequence[str],
+                          agent_home: Callable[[], str] | None = None,
+                          exists: Callable[[str], bool] = os.path.exists,
+                          real: Callable[[str], str] = os.path.realpath) -> str | None:
+    """_secret_shown_problem for the files as they are named, on this machine (for check: the proxy and doctor).
+
+    agent_home: gives the agent-sentinel home folder (default: _agent_home);
+    when it cannot be told, that is the problem.
+    """
+    try:
+        hidden_home = (agent_home or _agent_home)()
+    except ContainmentError as exc:
+        return str(exc)
+    secrets = [real(name) for name in secret_files if name]
+    return _secret_shown_problem(settings, secrets, homes, hidden_home, exists=exists, real=real)
+
+
 def _system_places(exists: Callable[[str], bool] = os.path.exists,
                    real: Callable[[str], str] = os.path.realpath) -> list[str]:
     """The HIDDEN_SYSTEM_PLACES that exist, as real paths, each once and none inside another already listed."""
@@ -465,12 +493,15 @@ def bwrap_arguments(settings: Settings, home: str | Sequence[str], agent_home: s
 
 def sandbox_exec_profile(settings: Settings, home: str | Sequence[str], agent_home: str | None,
                          control_files: Iterable[str] = (), real: Callable[[str], str] = os.path.realpath,
-                         secret_files: Iterable[str] = ()) -> str:
+                         secret_files: Iterable[str] = (), numbered_files: Iterable[str] = ()) -> str:
     """The sandbox-exec (SBPL) profile for a sandboxed server. ContainmentError for a path it cannot quote.
 
     home: the home folder, or the home folders ($HOME's and the account's).
     secret_files: files the server may neither read nor write (the audit key
     file), wherever they are.
+    numbered_files: files whose numbered copies beside them (FILE.1, FILE.2,
+    ...: the audit log's rotated files) the server may not write, change,
+    remove or create either: a regex denial, as those files come and go.
     Later rules win over earlier ones, so everything is allowed first and the
     denials follow. `real` gives a path's real path: the sandbox matches real
     paths (/tmp is /private/tmp), so both spellings are denied. The denials
@@ -500,7 +531,10 @@ def sandbox_exec_profile(settings: Settings, home: str | Sequence[str], agent_ho
         lines.append(f"(deny file-write* (subpath {_sbpl_string(path)}))")
     for path in _with_real_paths(files, real):
         lines.append(f"(deny file-write* (literal {_sbpl_string(path)}))")
-    folders = _ancestors(_with_real_paths([*hidden, *unwritable, *files], real))
+    numbered = [path for path in numbered_files if path]
+    for path in _with_real_paths(numbered, real):
+        lines.append(f"(deny file-write* (regex {_sbpl_numbered_copies(path)}))")
+    folders = _ancestors(_with_real_paths([*hidden, *unwritable, *files, *numbered], real))
     for path in _with_real_paths(folders, real):
         lines.append(f"(deny file-write* (literal {_sbpl_string(path)}))")
     return "\n".join(dict.fromkeys(lines)) + "\n"
@@ -532,6 +566,17 @@ def _sbpl_string(path: str) -> str:
         raise ContainmentError(f"cannot write {path!r} into a sandbox profile (a quote, backslash or control "
                                "character)")
     return f'"{path}"'
+
+
+# The characters with a meaning in a sandbox profile's regular expressions (a backslash is refused outright).
+_SBPL_REGEX_SPECIAL = frozenset(".^$*+?()[]{}|")
+
+
+def _sbpl_numbered_copies(path: str) -> str:
+    """A profile regex for the numbered copies of a file: PATH.1, PATH.2, ... (#"^PATH\\.[0-9]+$", PATH quoted)."""
+    _sbpl_string(path)  # the same paths are refused: a quote, a backslash or a control character
+    quoted = "".join(f"\\{character}" if character in _SBPL_REGEX_SPECIAL else character for character in path)
+    return f'#"^{quoted}\\.[0-9]+$"'
 
 
 def describe(settings: Settings, platform: str = sys.platform) -> str:
@@ -590,7 +635,8 @@ class Containment:
 
 
 def prepare(settings: Settings, find: Callable[[str], str | None], control_files: Sequence[str] = (),
-            server_executable: str | None = None, secret_files: Sequence[str] = ()) -> Containment:
+            server_executable: str | None = None, secret_files: Sequence[str] = (),
+            numbered_files: Sequence[str] = ()) -> Containment:
     """Set up containment for a server about to start; ContainmentError when it cannot be (fail closed).
 
     control_files: the proxy's own files (policy, pins, audit log), which a
@@ -600,18 +646,23 @@ def prepare(settings: Settings, find: Callable[[str], str | None], control_files
     secret_files:  the proxy's files a sandboxed server may not read either
                    (the audit key file, --audit-key-file). --contain alone
                    does not hide them: the server runs as the same user.
+    numbered_files: the files whose numbered copies (FILE.1, FILE.2, ...) a
+                   sandboxed server may not write either: the audit log,
+                   for its rotated files. bwrap shows the whole file system
+                   read-only and no folder the server may write may hold the
+                   log, so only sandbox-exec needs a rule of its own.
     On Windows the proxy joins its job object here, before the server starts.
     """
     if not settings.active:
         return Containment()
-    problem = check(settings, find, control_files=control_files)
+    problem = check(settings, find, control_files=control_files, secret_files=secret_files)
     if problem is not None:
         raise ContainmentError(problem)
     if sys.platform == "win32":
         return _WindowsJob(settings)
     prefix: list[str] = []
     if settings.sandbox is not None:
-        prefix = _sandbox_prefix(settings, find, control_files, server_executable, secret_files)
+        prefix = _sandbox_prefix(settings, find, control_files, server_executable, secret_files, numbered_files)
     return _ProcessGroup(settings, prefix)
 
 
@@ -626,7 +677,8 @@ def _agent_home() -> str:
 
 
 def _sandbox_prefix(settings: Settings, find: Callable[[str], str | None], control_files: Sequence[str],
-                    server_executable: str | None, secret_files: Sequence[str] = ()) -> list[str]:
+                    server_executable: str | None, secret_files: Sequence[str] = (),
+                    numbered_files: Sequence[str] = ()) -> list[str]:
     homes = _homes()
     if homes is None:
         raise ContainmentError("the home folder is / or unknown, so the sandbox could not hide it")
@@ -638,7 +690,9 @@ def _sandbox_prefix(settings: Settings, find: Callable[[str], str | None], contr
         if problem is not None:
             raise ContainmentError(problem)
     if settings.sandbox == "sandbox-exec":
-        return [SANDBOX_EXEC, "-p", sandbox_exec_profile(settings, homes, agent_home, files, secret_files=secrets)]
+        numbered = [os.path.realpath(name) for name in numbered_files if name]
+        return [SANDBOX_EXEC, "-p", sandbox_exec_profile(settings, homes, agent_home, files, secret_files=secrets,
+                                                         numbered_files=numbered)]
     problem = _writable_problem(settings.allow, [*files, agent_home])
     if problem is None:
         problem = _secret_shown_problem(settings, secrets, homes, agent_home)
