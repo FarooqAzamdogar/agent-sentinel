@@ -643,6 +643,7 @@ class Firewall:
         foreign_tools: Iterable[str] = (),
         parameter_names: Iterable[str] = (),
         cross_message: bool = True,
+        rendered_media: bool = True,
     ) -> Decision:
         """Scan what a tool returned before the agent reads it.
 
@@ -679,11 +680,19 @@ class Firewall:
                    refused for a secret). False for content the
                    model does not read next to a result (the proxy: a tool list
                    or the reply to initialize).
+        rendered_media: whether the content is an MCP message that a client
+                   renders: then the base64 "data" of an image or audio
+                   content block where MCP puts one (a result's content, a
+                   message's content: textutil.media_blocks) is not decoded by
+                   the detector and takes part in no phrase; it is still
+                   scanned as text. Pass False for any other value (what a
+                   Python function returned, the output of a tool that is not
+                   an MCP tool): nothing renders it, the model is handed its
+                   text, and an object shaped like an image block is read
+                   like every other. `run` and `run_async` do.
 
-        The base64 "data" of an image or audio content block that a client
-        renders as media (a result's content, a message's content) is not
-        decoded by the detector and takes part in no phrase; it is still
-        scanned as text. The same text anywhere else is read like any other.
+        Whatever rendered_media says, the same text anywhere else in the
+        content is read like any other.
         A clean result does not set flow marks: call `mark_delivered` once it
         is certain the result reaches the agent, with the decision, which
         also keeps its tail.
@@ -698,7 +707,7 @@ class Firewall:
         """
         checked = self._checked_content(
             tool, content, event, log_clean, call_id, foreign_tools, parameter_names, can_replace=False,
-            cross_message=cross_message,
+            cross_message=cross_message, rendered_media=rendered_media,
         )
         return checked.decision
 
@@ -714,6 +723,7 @@ class Firewall:
         parameter_names: Iterable[str] = (),
         cross_message: bool = True,
         notice_ref: str | None = None,
+        rendered_media: bool = True,
     ) -> CheckedResult:
         """Like `scan_result`, and also return the content that may be passed on: for a caller that forwards it.
 
@@ -743,7 +753,7 @@ class Firewall:
             raise ValueError("notice_ref must be a ref: 8 characters from 0-9 and a-f")
         return self._checked_content(
             tool, content, event, log_clean, call_id, foreign_tools, parameter_names, can_replace=True,
-            cross_message=cross_message, notice_ref=notice_ref,
+            cross_message=cross_message, notice_ref=notice_ref, rendered_media=rendered_media,
         )
 
     def find_secrets(self, value: Any) -> list[Found]:
@@ -1404,6 +1414,7 @@ class Firewall:
         can_replace: bool,
         cross_message: bool = True,
         notice_ref: str | None = None,
+        rendered_media: bool = True,
     ) -> CheckedResult:
         """scan_result and check_result: the secret step (for results), then the detector, then one audit record.
 
@@ -1411,9 +1422,10 @@ class Firewall:
         not, a result that would need redacting is refused instead.
         cross_message: whether the tail scan applies (see scan_result).
         notice_ref: the ref of a notice, if it gets one (see check_result).
+        rendered_media: whether image and audio blocks of the content are rendered (see scan_result).
         """
         try:
-            views, media = _views_of(content)
+            views, media = _views_of(content, rendered_media)
         except UnscannableError as exc:
             # Fail closed: content that cannot be read cannot be called clean.
             refusal = self.refuse(
@@ -1426,7 +1438,7 @@ class Firewall:
         secret_problem = None
         if event in RESULT_EVENTS and self.policy.secrets_in_results != "off":
             content, views, media, redacted, secret_problem = self._secrets_in_result(
-                content, views, media, can_replace
+                content, views, media, can_replace, rendered_media
             )
 
         # The detector reads what will be passed on: after redaction, the copy.
@@ -1464,7 +1476,7 @@ class Firewall:
             return ()  # a session whose state cannot be read is read without a tail
 
     def _secrets_in_result(
-        self, content: Any, views: list[str], media: list[str], can_replace: bool
+        self, content: Any, views: list[str], media: list[str], can_replace: bool, rendered_media: bool = True
     ) -> tuple[Any, list[str], list[str], tuple[str, ...], str | None]:
         """Apply secrets.in_results: (content, its views, its media, kinds replaced, why it must be refused or None).
 
@@ -1488,7 +1500,7 @@ class Firewall:
             return content, views, media, (), None
         try:
             copy, kinds = guard.redact_result(content)
-            copy_views, copy_media = (views, media) if not kinds else _views_of(copy)
+            copy_views, copy_media = (views, media) if not kinds else _views_of(copy, rendered_media)
         except (CannotRedact, UnscannableError) as exc:
             reason = f"the result holds what looks like a secret that cannot be redacted: {exc}"
             return content, views, media, (), reason
@@ -1568,8 +1580,11 @@ class Firewall:
         return frozenset({self.policy.injection_mark})
 
     def _checked_result(self, tool: str, result: Any, call_id: str | None, args: Any = None) -> Any:
-        """The result `run` returns: checked (and, with secrets.in_results "redact", redacted), and marked delivered."""
-        checked = self.check_result(tool, result, call_id=call_id)
+        """The result `run` returns: checked (and, with secrets.in_results "redact", redacted), and marked delivered.
+
+        What a Python function returns is no MCP message, whatever its shape: no part of it is read as rendered media.
+        """
+        checked = self.check_result(tool, result, call_id=call_id, rendered_media=False)
         self._require_allowed(checked.decision)
         refused = self._deliver(tool, call_id, checked.decision, args)
         if refused is not None:
@@ -1595,7 +1610,9 @@ class Firewall:
         An error message is attacker-controlled text too (a web server's error
         page, a file name), and agent loops commonly hand it back to the model.
         """
-        return self.scan_result(tool, _error_texts(exc), event="tool_error", log_clean=False, call_id=call_id)
+        return self.scan_result(
+            tool, _error_texts(exc), event="tool_error", log_clean=False, call_id=call_id, rendered_media=False,
+        )
 
     @staticmethod
     def _require_allowed(decision: Decision) -> None:
@@ -1729,15 +1746,17 @@ def _call_id_for(event: str, call_id: str | None) -> str | None:
     return new_call_id() if event == "call" else None
 
 
-def _views_of(content: Any) -> tuple[list[str], list[str]]:
+def _views_of(content: Any, rendered_media: bool = True) -> tuple[list[str], list[str]]:
     """What the detector reads of a result: (its text views, the data of the media blocks a client renders).
 
+    rendered_media: False for content that is no MCP message (what a Python
+    function returned): nothing in it is rendered, so nothing is set apart.
     Raises UnscannableError for content that cannot be read (textutil.text_views, strict).
     """
     if isinstance(content, str):
         return [without_field_breaks(content)], []  # as text_views reads the strings of a structured value
     media: list[str] = []
-    return text_views(content, strict=True, media=media), media
+    return text_views(content, strict=True, media=media if rendered_media else None), media
 
 
 def _parameter_names(names: Iterable[str]) -> tuple[str, ...]:
