@@ -159,7 +159,8 @@ hidden tool is still checked and refused.
 
 A list that comes in pages (nextCursor) is scanned across the boundary of
 two pages as well (_checked_page_boundary): the end of the page before is
-read with the start of the next.
+read with the start of the next, and again with what is left of the next
+whenever entries were removed from its start.
 
 With --pin-server the server itself is pinned too (pins.py, "The server
 itself"): how it is launched, before it starts, and the serverInfo of its
@@ -254,7 +255,15 @@ With limits.call_timeout_seconds, a tools/call, resources/read or
 prompts/get the server does not answer in time is answered with a JSON-RPC
 error (the neutral reason and a ref), cancelled at the server with
 notifications/cancelled, and recorded with event "timeout". The server's
-late reply is dropped, and the request's id stays in use until it comes.
+late reply is dropped, and the request's id stays in use until it comes:
+a request that reuses it is answered with an error. The proxy holds
+MAX_TIMED_OUT_IDS such ids; an older one is never given to a new request
+either (_forget_timed_out). The client's error is sent before the
+cancellation, and what goes to the server is written by a thread of its own
+(_ServerWriter), so a server that has stopped reading its input holds up
+neither the client's answer nor the client's later requests for longer than
+the limit; a request that cannot even be queued for such a server is
+answered with the same error.
 
 The audit log
 -------------
@@ -294,6 +303,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from secrets import token_hex
 from typing import Any, BinaryIO, Callable, Iterable, Mapping, Sequence
@@ -390,6 +400,19 @@ _MEMBER_OVERHEAD = 6  # what a kept value costs besides its path and its text: q
 _REPEATS_KEPT = 3  # as in textutil.text_views: a run of one text says nothing more after a few copies
 # Ends of pages kept at once, per list, by the cursor of the page after: the one used least recently goes first.
 MAX_OPEN_CURSORS = 8
+# How often entries are removed from the start of one page and its boundary scanned again; a page still
+# refused after that is not forwarded at all.
+MAX_BOUNDARY_ROUNDS = 8
+
+# limits.call_timeout_seconds: the messages that wait in memory for a server that has stopped reading its
+# input (_ServerWriter), at most; and, in bytes, at most --max-message-bytes besides the first.
+MAX_UNSENT_MESSAGES = 1_000
+_WRITER_IDLE_SECONDS = 2.0  # how long the thread that writes to the server stays with nothing to write
+# How long the cancellation of a call that timed out may wait for the server to take it.
+_CANCEL_PATIENCE_SECONDS = 0.25
+# The ids of calls that timed out are held until the server's late reply comes, this many at most (_hold_timed_out).
+MAX_TIMED_OUT_IDS = 1_000
+MAX_FORGOTTEN_TEXT_IDS = 10_000  # text ids no longer held, remembered as digests (_forget_timed_out)
 
 # limits.call_timeout_seconds applies to these requests: the ones the policy decides like a call.
 _TIMED_METHODS = ("tools/call", "resources/read", PROMPTS_GET)
@@ -483,6 +506,8 @@ _NAMES_NOT_SHOWN = " (names are not shown: they hold what looks like a secret)"
 _TIMEOUT_REFUSAL = "the server did not answer in time, so the request was cancelled"
 _TIMED_OUT_ID_REFUSAL = "the id of this request belongs to a request that timed out; send it with another id"
 _TEMPLATE_REFUSAL = "this resource cannot be read: its template was removed from the template list"
+# A request to a server quarantined for differing from its pin (quarantine_server). What changed is for the operator.
+_SERVER_QUARANTINE_REFUSAL = "this server is not available"
 # What a refused server is told: nothing about why.
 _SERVER_REFUSAL = "request refused"
 
@@ -627,13 +652,28 @@ def _tool_error(msg_id: Any, reason: str, modern: bool = False) -> JsonObject:
 
 
 def _with_notice(result: Any, notice: str) -> Any:
-    """A tools/call result with the firewall's warn notice as its first text item (unchanged if it has no content list).
+    """A tools/call result with the firewall's warn notice as the first text item of its content.
 
-    A client that reads only structuredContent does not see the notice.
+    The server chooses the shape of its result, and must not be able to
+    choose one that loses the notice: a result with no `content`, or with
+    null there, gets a content list that holds the notice; content that is
+    not a list (one block, or text, where MCP asks for an array) is put
+    after the notice in a list, text as a text item. A result that is not
+    an object at all is delivered the same way, as the content of one that
+    has the notice. A client that reads only structuredContent does not see
+    the notice.
     """
-    if not isinstance(result, dict) or not isinstance(result.get("content"), list):
-        return result
-    return {**result, "content": [{"type": "text", "text": notice}, *result["content"]]}
+    item = {"type": "text", "text": notice}
+
+    def after_notice(value: Any) -> list[Any]:
+        return [item, {"type": "text", "text": value} if isinstance(value, str) else value]
+
+    if not isinstance(result, dict):
+        return {"content": after_notice(result)}
+    content = result.get("content")
+    if content is None:
+        return {**result, "content": [item]}
+    return {**result, "content": [item, *content] if isinstance(content, list) else after_notice(content)}
 
 
 def _rpc_error(msg_id: Any, reason: str, code: int = -32000) -> JsonObject:
@@ -836,6 +876,7 @@ def _boundary_values(
     """
     found: dict[str, list[tuple[int, int, str]]] = {key: [] for key in (*_BOUNDARY_MEMBERS, *wanted)}
     cost = dict.fromkeys(found, 0)
+    run = dict.fromkeys(found, 0)  # how many of the last values kept of a member are the same text
     others = 0  # members found that were not looked for from the start
     full = 0  # members whose values cost PAGE_BOUNDARY_BYTES already
     room_for_others = MAX_BOUNDARY_MEMBERS - len(_BOUNDARY_MEMBERS)
@@ -850,13 +891,17 @@ def _boundary_values(
             if key not in found:
                 if others >= room_for_others:
                     continue
-                found[key], cost[key] = [], 0
+                found[key], cost[key], run[key] = [], 0, 0
                 others += 1
             values = found[key]
             if cost[key] >= PAGE_BOUNDARY_BYTES:
                 continue
-            if len(values) >= _REPEATS_KEPT and all(text == value for _, _, text in values[-_REPEATS_KEPT:]):
-                continue
+            if values and values[-1][2] == value:
+                if run[key] >= _REPEATS_KEPT:
+                    continue
+                run[key] += 1
+            else:
+                run[key] = 1
             values.append((index, position, value))
             cost[key] += _value_cost(key, value)
             full += cost[key] >= PAGE_BOUNDARY_BYTES
@@ -901,6 +946,35 @@ def _entry_texts(entry: Mapping[str, Any]) -> _KeptEntry:
 
 
 _TEXT_HOLDERS = (str, dict, list)  # what _entry_texts reads: JSON's text, objects and arrays
+
+
+class _PageTexts(Sequence):
+    """The entries of a page still read, as _boundary_view reads them: each one's texts, worked out once.
+
+    _checked_page_boundary reads the start of a page again each time it has
+    removed entries from it. The texts of an entry (_entry_texts) are worked
+    out the first time it is read and kept, so a round costs the walk over
+    them only. drop() takes entries out, by their index as read now.
+    """
+
+    def __init__(self, entries: Sequence[Any]) -> None:
+        self._entries = entries
+        self._positions = list(range(len(entries)))  # the entries still read, by their place in `entries`
+        self._texts: dict[int, _KeptEntry] = {}
+
+    def __len__(self) -> int:
+        return len(self._positions)
+
+    def __getitem__(self, index: Any) -> Any:
+        position = self._positions[index]
+        texts = self._texts.get(position)
+        if texts is None:
+            entry = self._entries[position]
+            texts = self._texts[position] = _entry_texts(entry) if isinstance(entry, dict) else ()
+        return texts
+
+    def drop(self, indexes: set[int]) -> None:
+        self._positions = [position for index, position in enumerate(self._positions) if index not in indexes]
 
 
 def _member_path(path: str, step: str) -> str:
@@ -996,6 +1070,129 @@ class _NameRegistry:
                     if name != first:
                         refused[name] = f"its name looks like that of '{printable(first, limit=80)}'"
         return refused
+
+
+# ---- writing to a server that may have stopped reading ---------------------------
+
+class _ServerWriter:
+    """Writes the messages for the server from a thread of its own, in the order they were given.
+
+    For limits.call_timeout_seconds (Proxy._send_to_server). A write to the
+    pipe of a process that does not read blocks once the pipe is full, and
+    nothing can end it. So the thread that has a message to send hands it
+    over and waits for it to be written, as it would wait for its own write,
+    but only as long as its `patience`: counted from when the write now
+    under way began, so that a server that keeps reading, however slowly,
+    is always waited for, and one that has stopped is waited for once and
+    not again for every message. A message not written in that time stays
+    queued and is written if the server ever reads again. The queue holds at
+    most MAX_UNSENT_MESSAGES messages, and at most `max_bytes` bytes besides
+    the one being written; a message there is no room for is refused.
+
+    The thread is started when there is something to write and ends after
+    _WRITER_IDLE_SECONDS with nothing to write. Once a write has failed (the
+    server is gone), every `send` raises OSError.
+    """
+
+    def __init__(self, stream: BinaryIO, max_bytes: int) -> None:
+        self._stream = stream
+        self._max_bytes = max_bytes
+        self._changed = threading.Condition()  # guards everything below
+        self._queue: deque[bytes] = deque()
+        self._queued_bytes = 0
+        self._taken = 0  # messages taken into the queue so far, and
+        self._written = 0  # how many of them were written
+        self._busy_since: float | None = None  # when the write under way began, on time.monotonic()
+        self._running = False
+        self._failure: BaseException | None = None
+
+    def send(self, data: bytes, patience: float | None, until: float | None = None) -> bool:
+        """Queue one message and wait for it to be written, at most `patience` seconds (None: without end).
+
+        True when it was written or is queued; False when there was no room
+        for it in that time. OSError when the server is gone. until: for a
+        request with a deadline (on time.monotonic()), the latest it may be
+        queued. Past it the request has timed out, and its cancellation may
+        be queued already: queued after that, the server would read the
+        request after its cancellation, and run it.
+        """
+        with self._changed:
+            while not self._has_room(len(data)):
+                if not self._wait(patience, until):
+                    return False
+            self._check()
+            if until is not None and time.monotonic() >= until:
+                return False
+            self._queue.append(data)
+            self._queued_bytes += len(data)
+            self._taken += 1
+            ticket = self._taken
+            if not self._running:
+                self._running = True
+                threading.Thread(target=self._run, name="agent-sentinel server writer", daemon=True).start()
+            self._changed.notify_all()
+            while self._written < ticket:
+                if not self._wait(patience):
+                    break  # it stays queued: the server is not reading
+            return True
+
+    def _has_room(self, size: int) -> bool:
+        self._check()
+        if not self._queue:
+            return True
+        waiting = self._queued_bytes - len(self._queue[0])  # the first one is being written
+        return len(self._queue) < MAX_UNSENT_MESSAGES and waiting + size <= self._max_bytes
+
+    def _check(self) -> None:
+        if self._failure is not None:
+            raise OSError(f"cannot write to the server: {self._failure}")
+
+    def _wait(self, patience: float | None, until: float | None = None) -> bool:
+        """Wait for the writer to get on, with `_changed` held; False when it has been stuck for `patience` seconds.
+
+        False as well once it is `until` (on time.monotonic()), if given.
+        """
+        self._check()
+        if patience is None:
+            self._changed.wait()
+            return True
+        now = time.monotonic()
+        left = (self._busy_since if self._busy_since is not None else now) + patience - now
+        if until is not None:
+            left = min(left, until - now)
+        if left <= 0:
+            return False
+        self._changed.wait(left)
+        self._check()
+        return True
+
+    def _run(self) -> None:
+        while True:
+            with self._changed:
+                if not self._queue:
+                    self._changed.wait(_WRITER_IDLE_SECONDS)
+                if not self._queue:
+                    self._running = False
+                    return
+                data = self._queue[0]
+                self._busy_since = time.monotonic()
+            try:
+                self._stream.write(data)
+                self._stream.flush()
+            except (OSError, ValueError) as exc:  # the pipe was closed under us
+                with self._changed:
+                    self._failure = exc
+                    self._queue.clear()
+                    self._queued_bytes = 0
+                    self._running = False
+                    self._changed.notify_all()
+                return
+            with self._changed:
+                self._queue.popleft()
+                self._queued_bytes -= len(data)
+                self._written += 1
+                self._busy_since = None
+                self._changed.notify_all()
 
 
 # ---- the proxy --------------------------------------------------------------
@@ -1094,6 +1291,15 @@ class Proxy:
         self._deadline_order = itertools.count()
         self._watching_deadlines = False
         self._deadline_wake = threading.Event()
+        # The ids of the calls that timed out and whose late reply has not come, oldest first (each is still
+        # among `_pending`, marked timed_out), MAX_TIMED_OUT_IDS at most; and what is remembered of the ids
+        # no longer held, so that none of them is taken by a new request (_forget_timed_out).
+        self._timed_out: dict[str | int, None] = {}
+        self._highest_forgotten_number: int | None = None
+        self._forgotten_text_ids: set[str] = set()
+        self._text_ids_overflowed = False
+        # With limits.call_timeout_seconds, what goes to the server is written by a thread of its own.
+        self._server_writer = _ServerWriter(server_in, max_message_bytes)
         self._tools_unverified = False  # set while the latest tools/list reply was malformed
         self._tool_lists_in_flight: set[str | int] = set()
         # What was already reported on stderr: a client that lists its tools often gets each line once.
@@ -1253,15 +1459,15 @@ class Proxy:
             # These are requests: a notification cannot ask for them, and one could not be
             # held for approval, cancelled or answered like a request.
             return self._refuse_malformed_request(message, "it has no id")
+        if "id" in message and self._id_timed_out(message["id"]):
+            # The first one of a request that timed out was answered already, so this one is.
+            return self._refuse_timed_out_id(message)
         if "id" in message and self._id_in_flight(message["id"]):
             # A reply is matched to its request by id, and checked as the reply to that kind
             # of request: under a reused id, a tool list could pass as a tool's result and
             # skip the list's checks (pins, quarantine, hiding), or a result could set the
             # flow marks of another tool. MCP forbids reusing an id; the request is dropped,
             # unanswered, because any answer under that id would be taken for the first one's.
-            # The first one of a request that timed out was answered already, so this one is.
-            if self._id_timed_out(message["id"]):
-                return self._refuse_timed_out_id(message)
             return self._dropped("a client request that reuses the id of a request still waiting for its reply")
 
         # What every request must pass first: the protocol revision's rules, then the
@@ -1307,8 +1513,10 @@ class Proxy:
             return None
         method = message["method"]
         reason = f"the whole server is quarantined: {quarantined}"
-        return self._refused(message, self._firewall.refuse(_label(method), reason, event="client_request",
-                                                            rule=RULE_QUARANTINE))
+        return self._refused(message, self._firewall.refuse(
+            _label(method), reason, event="client_request", public_reason=_SERVER_QUARANTINE_REFUSAL,
+            rule=RULE_QUARANTINE,
+        ))
 
     def _refuse_batch(self, batch: list[Any]) -> _Outcome:
         # MCP no longer uses JSON-RPC batches. Refusing them keeps every
@@ -1423,7 +1631,9 @@ class Proxy:
         prompt or a resource template: `argument.value` is that half-typed
         text and `context.arguments` what was typed before. A key pasted there
         would reach the server as it is typed, so the request is checked like
-        a call's arguments.
+        a call's arguments. Then what it asks completions for (`ref`): a
+        prompt or a resource template that was quarantined is no more
+        completed than it is fetched or read (_completion_of_quarantined).
         """
         if message["method"] != COMPLETION_COMPLETE:
             return None
@@ -1432,13 +1642,40 @@ class Proxy:
         except UnscannableError as exc:
             return self._refuse_malformed_request(message, str(exc))
         if not secrets:
-            return None
+            removed = self._completion_of_quarantined(message.get("params"))
+            return None if removed is None else self._refused(message, removed)
         reason = f"the completion request contains what looks like a secret ({_kinds(secrets)})"
         decision = self._firewall.block(
             COMPLETION_COMPLETE, reason, event="client_request", public_reason=_SECRET_REFUSAL,
             rule=secret_rule(secrets),
         )
-        return None if decision.allowed else self._refused(message, decision)  # allowed: monitor mode
+        if not decision.allowed:
+            return self._refused(message, decision)
+        removed = self._completion_of_quarantined(message.get("params"))  # monitor mode lifts the secret guard only
+        return None if removed is None else self._refused(message, removed)
+
+    def _completion_of_quarantined(self, params: Any) -> Decision | None:
+        """The refusal of a completion/complete for a quarantined prompt or resource template, or None.
+
+        `ref` names what the user is filling in: {"type": "ref/prompt",
+        "name"} or {"type": "ref/resource", "uri"}, the uri being a resource
+        template (or a URI). The server's answer would be suggestions for an
+        entry that was removed from its list, so the request is refused as
+        a prompts/get of that prompt or a read of that URI is. Both members
+        are looked at whatever the type says. A server quarantined as a
+        whole is refused all completions further on (_refused_by_server_quarantine).
+        """
+        ref = params.get("ref") if isinstance(params, dict) else None
+        if not isinstance(ref, dict) or self._whole_server_quarantined() is not None:
+            return None
+        uri, name = ref.get("uri"), ref.get("name")
+        if isinstance(uri, str) and uri:
+            refusal = self._template_refusal(uri)
+            if refusal is not None:
+                return refusal
+        if _is_name(name) and self._was_quarantined("prompts", name):
+            return self._refused_prompt(name)
+        return None
 
     def _check_client_request(self, message: JsonObject) -> _Outcome | None:
         """Apply the policy's client_requests section to the request's method; None when it may go on.
@@ -1632,6 +1869,10 @@ class Proxy:
 
         if not isinstance(name, str) or not name:
             decision = self._refusal("?", "malformed tools/call request: missing tool name")
+        elif len(name) > MAX_NAME_CHARS:
+            # No list shows a tool with such a name (_is_name), and the name of a call that waits is remembered.
+            decision = self._refusal(_label(name), "malformed tools/call request: the tool name is longer than "
+                                                   f"{MAX_NAME_CHARS} characters")
         elif arguments is not None and not isinstance(arguments, dict):
             decision = self._refusal(_label(name), "malformed tools/call request: arguments must be an object")
         elif name in _RESERVED_TOOL_NAMES:
@@ -1746,7 +1987,7 @@ class Proxy:
         quarantined = self._whole_server_quarantined()
         if quarantined is not None:
             return self._refusal(_label(uri), f"the whole server is quarantined: {quarantined}", RULE_QUARANTINE,
-                                 call_id=call_id)
+                                 public_reason=_SERVER_QUARANTINE_REFUSAL, call_id=call_id)
         return self._template_refusal(uri, call_id)
 
     def _template_refusal(self, uri: str, call_id: str | None = None) -> Decision | None:
@@ -1817,7 +2058,8 @@ class Proxy:
         quarantined = self._whole_server_quarantined()
         if quarantined is not None:  # a server that differs from its pin serves nothing (--pin-server)
             reason = f"the whole server is quarantined: {quarantined}"
-            return self._refused(message, self._refusal(protocol.SUBSCRIPTIONS_LISTEN, reason, RULE_QUARANTINE))
+            return self._refused(message, self._refusal(protocol.SUBSCRIPTIONS_LISTEN, reason, RULE_QUARANTINE,
+                                                        public_reason=_SERVER_QUARANTINE_REFUSAL))
         for uri in uris:
             decision = self._template_refusal(uri)  # a Decision is false when it refuses: compare with None
             if decision is None:
@@ -2099,8 +2341,10 @@ class Proxy:
         timeout = self._firewall.policy.call_timeout_seconds
         deadline = time.monotonic() + timeout if timeout is not None and method in _TIMED_METHODS else None
         with self._state:
-            # A request that reuses an id still in flight never gets here (_id_in_flight).
-            full = message["id"] not in self._pending and len(self._pending) >= MAX_PENDING_REQUESTS
+            # A request that reuses an id still in flight never gets here (_id_in_flight). The calls that
+            # timed out are held apart, with a limit of their own (_hold_timed_out).
+            waiting = len(self._pending) - len(self._timed_out)
+            full = message["id"] not in self._pending and waiting >= MAX_PENDING_REQUESTS
             if not full:
                 self._pending[message["id"]] = _PendingRequest(
                     method, label, marks, call_id, modern, tool, cursor=cursor, deadline=deadline
@@ -2128,17 +2372,70 @@ class Proxy:
             )
 
     def _id_timed_out(self, msg_id: Any) -> bool:
-        """Whether this id belongs to a forwarded request that timed out and whose late reply has not come."""
+        """Whether this id belongs to a forwarded request that timed out and whose late reply has not come.
+
+        Also true for an id that may be one of those the proxy no longer
+        holds (_forget_timed_out), unless a request with it waits now.
+        """
         with self._state:
             pending = self._pending.get(msg_id)
-            return pending is not None and pending.timed_out
+            if pending is not None:
+                return pending.timed_out
+        return not self._id_in_flight(msg_id) and self._id_forgotten(msg_id)
+
+    def _hold_timed_out(self, msg_id: Any) -> None:
+        """Keep the id of a call that just timed out until its late reply comes. Called with `_state` held.
+
+        The call stays among `_pending`, marked timed_out, so the reply is
+        recognised and dropped and the id is not given to a new request. A
+        server that honours the cancellation never sends that reply, so the
+        ids held are limited: past MAX_TIMED_OUT_IDS the oldest is let go
+        (_forget_timed_out), and none of them counts as a request waiting
+        for a reply (MAX_PENDING_REQUESTS).
+        """
+        self._timed_out.pop(msg_id, None)
+        self._timed_out[msg_id] = None
+        while len(self._timed_out) > MAX_TIMED_OUT_IDS:
+            oldest = next(iter(self._timed_out))
+            del self._timed_out[oldest]
+            self._pending.pop(oldest, None)
+            self._forget_timed_out(oldest)
+
+    def _forget_timed_out(self, msg_id: Any) -> None:
+        """Stop holding the id of a call that timed out, without ever giving it to a new request. `_state` held.
+
+        A late reply to it is dropped from now on like any reply that
+        matches no request. It must not match one: if the id went to a new
+        request, the old call's reply would be delivered as the new one's
+        result, with the new one's flow marks. So the id stays refused
+        (_id_forgotten), remembered in little room: for whole-number ids,
+        which clients count upwards, only the highest one let go, and every
+        id up to it is refused; for text ids a digest of each, and past
+        MAX_FORGOTTEN_TEXT_IDS every text id is refused.
+        """
+        if isinstance(msg_id, str):
+            if len(self._forgotten_text_ids) < MAX_FORGOTTEN_TEXT_IDS:
+                self._forgotten_text_ids.add(_digest(msg_id))
+            else:
+                self._text_ids_overflowed = True
+        elif self._highest_forgotten_number is None or msg_id > self._highest_forgotten_number:
+            self._highest_forgotten_number = msg_id
+
+    def _id_forgotten(self, msg_id: Any) -> bool:
+        """Whether this id may belong to a call that timed out and is no longer held (_forget_timed_out)."""
+        with self._state:
+            if isinstance(msg_id, str):
+                return self._text_ids_overflowed or _digest(msg_id) in self._forgotten_text_ids
+            highest = self._highest_forgotten_number
+            return highest is not None and msg_id <= highest
 
     def _refuse_timed_out_id(self, message: JsonObject) -> _Outcome:
         """Answer a request that reuses the id of one that timed out, with an error, without forwarding it.
 
         The client was told the first request timed out, so the id looks free
         to it; but the server may still answer the first, and that late reply
-        would be taken for this one's. The id is free again once it came.
+        would be taken for this one's. The id is free again once it came. An
+        id the proxy no longer holds (_forget_timed_out) is not free again.
         """
         method = message["method"]
         decision = self._firewall.refuse(
@@ -2216,11 +2513,11 @@ class Proxy:
     def _take_expired(self, now: float) -> list[tuple[Any, _PendingRequest]]:
         """The forwarded calls whose deadline has passed, each marked as timed out. Called with `_state` held.
 
-        A timed-out call stays among the requests waiting for a reply, so that
-        its id is not taken by a new request while the server may still
-        answer it (a late reply would be taken for the new request's), and so
-        that it counts against MAX_PENDING_REQUESTS. In monitor mode the call
-        is only recorded, and goes on waiting.
+        A timed-out call stays among `_pending`, so that its id is not taken
+        by a new request while the server may still answer it (a late reply
+        would be taken for the new request's); how many are held is limited
+        (_hold_timed_out). In monitor mode the call is only recorded, and
+        goes on waiting.
         """
         expired = []
         while self._deadlines and self._deadlines[0][0] <= now:
@@ -2230,6 +2527,8 @@ class Proxy:
                 continue  # answered in time, or the id now belongs to a later request
             changed = {"deadline": None} if self._firewall.monitor else {"timed_out": True}
             self._pending[msg_id] = dataclasses.replace(pending, **changed)
+            if not self._firewall.monitor:
+                self._hold_timed_out(msg_id)
             expired.append((msg_id, pending))
         return expired
 
@@ -2257,10 +2556,14 @@ class Proxy:
             if self._firewall.monitor and not self._time_out_after_all(msg_id, pending):
                 return  # the server answered meanwhile, and the client has its reply
             self._report_block(what, decision)
+            # The client is answered first, on its own. A server that hangs has often stopped reading its
+            # input as well, so the cancellation is then handed to the thread that writes to the server and
+            # waited for a moment at most, and not at all once the server has taken nothing for that long
+            # (_send_to_server): it must keep this thread from the calls that time out next.
+            self._send(_Outcome(to_client=_rpc_error(msg_id, decision.public_reason, code=TIMEOUT_ERROR_CODE)))
             cancel = {"jsonrpc": "2.0", "method": "notifications/cancelled",
                       "params": {"requestId": msg_id, "reason": "the request timed out"}}
-            self._send(_Outcome(to_server=cancel,
-                                to_client=_rpc_error(msg_id, decision.public_reason, code=TIMEOUT_ERROR_CODE)))
+            self._send_to_server(cancel, cancellation=True)
         except (OSError, ValueError):  # the client or the server has gone; the proxy is stopping
             pass
         except Exception as exc:  # a bug here must not stop the thread that times out the other calls
@@ -2280,6 +2583,7 @@ class Proxy:
             if self._pending.get(msg_id) != dataclasses.replace(pending, deadline=None):
                 return False
             self._pending[msg_id] = dataclasses.replace(pending, deadline=None, timed_out=True)
+            self._hold_timed_out(msg_id)
             return True
 
     def _wait_for_tool_lists(self) -> bool:
@@ -2341,6 +2645,8 @@ class Proxy:
         """Quarantine an entry by name; for a resource template, also the uriTemplates it is known by (templates)."""
         with self._state:
             for template in templates:
+                # One too long to read matches every URI (uri_template), cut or not: it is kept bounded.
+                template = template[:uri_template.MAX_TEMPLATE_CHARS + 1]
                 if template in self._quarantined_templates or self._templates_overflowed:
                     continue
                 if len(self._quarantined_templates) < MAX_QUARANTINED_TEMPLATES:
@@ -2433,7 +2739,8 @@ class Proxy:
                                refusal)
             return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL)) if is_request else _DROP
 
-        self._clean_metadata(message.get("params"), f"the server, in a '{printable(method, limit=100)}' message")
+        self._clean_metadata(message.get("params"), f"the server, in a '{printable(method, limit=100)}' message",
+                             offers_tools=method == SAMPLING_CREATE)
         verdict = self._firewall.policy.server_request_verdict(method)
         decision = None
         if verdict.action == "block":
@@ -2443,6 +2750,8 @@ class Proxy:
             decision = self._elicitation_refusal(label, message.get("params"))
         elif method == SAMPLING_CREATE:
             decision = self._sampling_refusal(label, message.get("params"))
+        if decision is None:
+            decision = self._remote_refs_refusal(label, method, message.get("params"))
         if decision is None:
             decision = self._firewall.scan_result(
                 label, message, event="server_request", log_clean=False, parameter_names=self._known_parameters()
@@ -2511,6 +2820,8 @@ class Proxy:
         msg_id = message.get("id")
         with self._state:
             pending = self._pending.pop(msg_id, None) if _valid_id(msg_id) else None
+            if pending is not None:
+                self._timed_out.pop(msg_id, None)  # a late reply frees the id of a call that timed out
         if pending is None:
             # A reply to a request we did not forward could not be attributed
             # to a method, so there is no safe way to deliver it.
@@ -2619,7 +2930,8 @@ class Proxy:
         """The policy's answer for one entry of an input_required result, then what an elicitation asks, then a scan."""
         method = entry["method"]
         label = _label(f"server:{method}")
-        self._clean_metadata(entry.get("params"), f"the server, in a '{printable(method, limit=100)}' inside a reply")
+        self._clean_metadata(entry.get("params"), f"the server, in a '{printable(method, limit=100)}' inside a reply",
+                             offers_tools=method == SAMPLING_CREATE)
         verdict = self._firewall.policy.server_request_verdict(method)
         decision = None
         if verdict.action == "block":
@@ -2631,6 +2943,8 @@ class Proxy:
             decision = self._elicitation_refusal(label, entry.get("params"), pending.call_id)
         elif method == SAMPLING_CREATE:
             decision = self._sampling_refusal(label, entry.get("params"), pending.call_id)
+        if decision is None:
+            decision = self._remote_refs_refusal(label, method, entry.get("params"), pending.call_id)
         if decision is None:
             decision = self._firewall.scan_result(
                 label, entry, event="server_request", log_clean=False, call_id=pending.call_id,
@@ -2827,7 +3141,7 @@ class Proxy:
         what = f"its serverInfo ({', '.join(changed)}) changed since it was pinned"
         reason = f"the server is quarantined: {what}. {server_change_advice(self._pins.path)}"
         decision = self._firewall.block(pending.label, reason, event="server_changed", rule=RULE_QUARANTINE,
-                                        call_id=pending.call_id)
+                                        public_reason=_SERVER_QUARANTINE_REFUSAL, call_id=pending.call_id)
         if decision.allowed:  # monitor mode: logged as what would have been blocked
             return None
         self.quarantine_server(what)
@@ -3164,7 +3478,7 @@ class Proxy:
         if dropped and self._first_report("icons", whose):
             self._report(f"dropped {len(dropped)} icon(s) of {whose}: {dropped[0]}")
 
-    def _clean_metadata(self, holder: Any, whose: str) -> None:
+    def _clean_metadata(self, holder: Any, whose: str, offers_tools: bool = False) -> None:
         """Clean what a result (or the params of a message from the server) says about the server and links to.
 
         * The server's own description in `_meta` (MCP 2026-07-28 puts
@@ -3172,6 +3486,10 @@ class Proxy:
           icons and an unsafe websiteUrl are dropped (_clean_server_info).
         * The icons of each resource_link in its content (a tool's result, or
           the messages of a prompt or a sampling request).
+        * With offers_tools (the params of a sampling request: since
+          2025-11-25 it may offer the client's model tools, which are Tool
+          objects like a listed tool's), the icons of each tool in its
+          `tools`. A tool list's own entries are cleaned with the list.
         Only those members change, in place, before the whole is scanned; a
         client could fetch them as soon as it shows the reply. whose: for the
         stderr line ("the server, in its reply to tools/call").
@@ -3185,6 +3503,48 @@ class Proxy:
         for block in _content_blocks(holder):
             if block.get("type") == "resource_link" and "icons" in block:
                 self._clean_icons_of(block, f"a resource link (from {whose})")
+        tools = holder.get("tools") if offers_tools else None
+        for tool in tools if isinstance(tools, list) else ():
+            if isinstance(tool, dict) and "icons" in tool:
+                self._clean_icons_of(tool, f"a tool offered (by {whose})")
+
+    def _remote_refs_refusal(self, label: str, method: str, params: Any, call_id: str | None = None) -> Decision | None:
+        """What schema_checks.remote_refs says about the schemas in a request from the server; the refusal, or None.
+
+        An elicitation's requestedSchema, and the inputSchema and outputSchema
+        of each tool a sampling request offers the client's model, are
+        schemas a client may resolve like those of a listed tool
+        (schema_check.remote_refs). The setting decides as it does for a
+        listed tool: "warn" (the default) reports the request once and lets
+        it go on; "quarantine" refuses it (rule schema.remote_refs, a block
+        that monitor mode lifts). A tool rule named like the method can set
+        it for these requests alone.
+        """
+        if not isinstance(params, dict):
+            return None
+        found: list[str] = []
+        if method == elicitation.ELICITATION_CREATE:
+            found = schema_check.remote_refs(params, ("requestedSchema",))
+        elif method == SAMPLING_CREATE and isinstance(params.get("tools"), list):
+            for tool in params["tools"]:
+                found += schema_check.remote_refs(tool)
+                if len(found) >= schema_check.MAX_REFERENCES_REPORTED:
+                    break
+        if not found:
+            return None
+        found = found[:schema_check.MAX_REFERENCES_REPORTED]
+        reason = f"a schema in the request refers outside itself: {', '.join(found)}"
+        if self._firewall.policy.schema_checks_for(method).remote_refs == "quarantine":
+            decision = self._firewall.block(label, reason, event="server_request", public_reason=_INPUT_REFUSAL,
+                                            rule=RULE_SCHEMA_REMOTE_REFS, call_id=call_id)
+            return None if decision.allowed else decision
+        if self._first_report("remote_refs", method, found[0]):
+            self._firewall.note(label, f"{reason} (let through: schema_checks.remote_refs is warn)",
+                                event="server_request", call_id=call_id)
+            self._report(f"a '{printable(method, limit=100)}' request from the server has a schema that refers "
+                         f"outside itself, which a client could fetch unchecked: {', '.join(found)}; it is let "
+                         "through (schema_checks.remote_refs \"quarantine\" would refuse it)", limit=1000)
+        return None
 
     def _clean_server_info(self, server_info: JsonObject, whose: str) -> None:
         """Drop the unsafe icons of a serverInfo (an MCP Implementation), and its websiteUrl unless a public https address.
@@ -3440,6 +3800,14 @@ class Proxy:
         quarantined (tools, prompts, resource templates: they cannot be used,
         and are left out of later lists). The page before was already
         forwarded: its entries stay in the client's list.
+
+        What is left of this page then starts with other entries, and the
+        client reads those after the same end: a server that sends the second
+        half of a phrase twice would have the copy delivered. So the boundary
+        is scanned again with what is left, and entries are removed again,
+        until the scan passes or nothing is left. A page still refused after
+        MAX_BOUNDARY_ROUNDS removals is not forwarded at all: every entry
+        left of it is removed and quarantined.
         """
         if pending.cursor is None or not entries:
             return entries
@@ -3451,35 +3819,49 @@ class Proxy:
         if tail is None or not tail.texts:
             return entries
         ended_with = dict.fromkeys(key for entry in reversed(tail.texts) for key, _ in reversed(entry))
-        head = _boundary_view(entries, from_end=False, wanted=ended_with)
-        start = [text for _, text in head]
-        if not start:
-            return entries
-        decision = self._firewall.scan_result(
-            pending.label, {items_key: _scannable([*tail.texts, *start])}, event="list_item", log_clean=False,
-            call_id=pending.call_id,
-        )
-        if decision.allowed:
-            return entries
-        removed, ended = self._boundary_entries(items_key, tail.texts, start)
-        if items_key in PINNED_LISTS:
-            for position in ended:
-                name = tail.names[position]
-                if name:
-                    listed = {"name": name, "uriTemplate": tail.templates[position] or None}
-                    self._quarantine(items_key, name, self._template_texts(items_key, listed))
-            for position in removed:
-                entry = entries[head[position][0]]
-                if _is_name(entry.get("name")):
-                    self._quarantine(items_key, entry["name"], self._template_texts(items_key, entry))
-        count = len(removed)
-        self._report_block(
-            f"removed {count} entr{'y' if count == 1 else 'ies'} near the start of a page of the {items_key} list: "
-            "read with the end of the page before (already forwarded), they were refused; both are quarantined",
-            decision,
-        )
-        dropped = {head[position][0] for position in removed}
-        return [entry for index, entry in enumerate(entries) if index not in dropped]
+        kept = entries
+        texts = _PageTexts(entries)  # what is left of the page, read again each round without being worked out again
+        refusal = None
+        for round_number in range(MAX_BOUNDARY_ROUNDS + 1):
+            head = _boundary_view(texts, from_end=False, wanted=ended_with)
+            start = [text for _, text in head]
+            if not start:
+                break
+            decision = self._firewall.scan_result(
+                pending.label, {items_key: _scannable([*tail.texts, *start])}, event="list_item", log_clean=False,
+                call_id=pending.call_id,
+            )
+            if decision.allowed:
+                break
+            refusal = decision
+            if round_number == MAX_BOUNDARY_ROUNDS:
+                # Removing a few entries at a time did not help. The entries of the end that took part
+                # were quarantined in the rounds before.
+                dropped, ended = set(range(len(kept))), []
+            else:
+                removed, ended = self._boundary_entries(items_key, tail.texts, start)
+                dropped = {head[position][0] for position in removed}
+            if items_key in PINNED_LISTS:
+                for position in ended:
+                    name = tail.names[position]
+                    if name:
+                        listed = {"name": name, "uriTemplate": tail.templates[position] or None}
+                        self._quarantine(items_key, name, self._template_texts(items_key, listed))
+                for index in sorted(dropped):
+                    entry = kept[index]
+                    if isinstance(entry, dict) and _is_name(entry.get("name")):
+                        self._quarantine(items_key, entry["name"], self._template_texts(items_key, entry))
+            kept = [entry for index, entry in enumerate(kept) if index not in dropped]
+            texts.drop(dropped)
+        if refusal is not None:
+            count = len(entries) - len(kept)
+            self._report_block(
+                f"removed {count} entr{'y' if count == 1 else 'ies'} near the start of a page of the {items_key} "
+                "list: read with the end of the page before (already forwarded), they were refused; both are "
+                "quarantined",
+                refusal,
+            )
+        return kept
 
     def _boundary_entries(
         self, items_key: str, end: Sequence[_KeptEntry], start: Sequence[_KeptEntry],
@@ -3533,7 +3915,8 @@ class Proxy:
         recently is forgotten first.
         """
         result = delivered.get("result")
-        entries = result.get(items_key) if isinstance(result, dict) else None
+        # A page with no list at all adds no entry, like an empty one: the end before it is kept for the next.
+        entries = result.get(items_key, []) if isinstance(result, dict) else None
         next_cursor = result.get("nextCursor") if isinstance(result, dict) else None
         with self._state:
             before = self._page_tails[items_key].get(pending.cursor) if pending.cursor is not None else None
@@ -3565,9 +3948,78 @@ class Proxy:
 
     def _send(self, outcome: _Outcome) -> None:
         if outcome.to_server is not None:
-            self._write(self._server_in, self._server_write_lock, outcome.to_server)
+            self._send_to_server(outcome.to_server)
         if outcome.to_client is not None:
             self._write(self._client_out, self._client_write_lock, outcome.to_client)
+
+    def _send_to_server(self, message: Any, cancellation: bool = False) -> None:
+        """Write a message to the server; with limits.call_timeout_seconds, without waiting for the server for ever.
+
+        A pipe to a server that has stopped reading fills up, and a write to
+        it then blocks for as long as the server likes. Without the limit
+        that is what happens, as before 0.6. With it, the message is written
+        by a thread of its own (_ServerWriter) and this call waits for that
+        at most the limit, counted from when the write that is under way
+        began; after that the message stays queued, in order, and the
+        proxy goes on: it reads the client's next request, whose own time
+        then runs, and it can answer the calls that time out. A message
+        there is no room to queue is not sent (_not_sent), and nor is a
+        timed request that is still waiting for room when its time runs out
+        (it is cancelled then). In monitor mode, which changes nothing, the
+        wait has no end.
+
+        cancellation: the message cancels a call that timed out. It waits
+        _CANCEL_PATIENCE_SECONDS at most (not at all once the server has
+        taken nothing for that long) and is given up when there is no room:
+        the thread that sends it (after answering the client) has other calls
+        to time out, and the call's late reply is dropped whether or not the
+        server heard of the cancellation.
+        """
+        patience = self._firewall.policy.call_timeout_seconds
+        if patience is None:
+            self._write(self._server_in, self._server_write_lock, message)
+            return
+        until = None
+        if cancellation:
+            patience = min(patience, _CANCEL_PATIENCE_SECONDS)
+        elif self._firewall.monitor:
+            patience = None
+        elif isinstance(message, dict) and "method" in message and _valid_id(message.get("id")):
+            with self._state:
+                pending = self._pending.get(message["id"])
+                until = pending.deadline if pending is not None else None
+        data = json.dumps(message).encode("utf-8") + b"\n"
+        if not self._server_writer.send(data, patience, until) and not cancellation:
+            self._not_sent(message)
+
+    def _not_sent(self, message: Any) -> None:
+        """Deal with a message the server did not take: it reads nothing, and too much waits for it already.
+
+        A request of the client's is answered with the error of a call that
+        timed out (the same neutral reason, a ref, event "timeout") and is
+        no longer waited for: the server never saw it. If its time ran out
+        meanwhile, it was answered already. Anything else (a notification,
+        an answer to a request of the server's) is dropped and recorded.
+        """
+        msg_id = message.get("id") if isinstance(message, dict) else None
+        if not isinstance(message, dict) or "method" not in message or "id" not in message:
+            self._dropped("a message for the server, which has stopped reading its input")
+            return
+        with self._state:
+            pending = self._pending.pop(msg_id, None)
+            self._timed_out.pop(msg_id, None)
+            self._tool_lists_in_flight.discard(msg_id)
+            self._state.notify_all()
+        if pending is None or pending.timed_out:
+            return
+        seconds = self._firewall.policy.call_timeout_seconds or 0
+        decision = self._firewall.refuse(
+            pending.label, f"the server has not read its input for {seconds:g} seconds, so the request was not sent",
+            event="timeout", public_reason=_TIMEOUT_REFUSAL, rule=RULE_CALL_TIMEOUT, call_id=pending.call_id,
+        )
+        self._report_block(f"did not send {_request_description(message)}", decision)
+        self._write(self._client_out, self._client_write_lock,
+                    _rpc_error(msg_id, decision.public_reason, code=TIMEOUT_ERROR_CODE))
 
     @staticmethod
     def _write(stream: BinaryIO, lock: threading.Lock, message: Any) -> None:
@@ -4026,7 +4478,8 @@ def _report_session_group(group: _JoinedGroup, firewall: Firewall, say: Callable
         say(line, limit=1000)
     if run.id == client_run.UNKNOWN:
         _warn(f"session group '{store.group}': the client process could not be told apart, so the group's flow "
-              "marks carry over from one run of the client to the next (stricter than needed, never laxer)", limit=500)
+              "marks carry over from one run of the client to the next, and the marks of every client run in the "
+              "group's file count for this proxy (stricter than needed, never laxer)", limit=500)
 
 
 def _report_policy_error(path: str, error: Exception) -> None:

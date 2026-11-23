@@ -368,6 +368,63 @@ class RemoteReferencesInSchemas(SchemaTest):
                 self.assertEqual([tool["name"] for tool in self.listed(h, PLAIN_TOOL, odd)], ["say", "odd"])
                 self.assertNotIn("internal error", h.warnings.getvalue())
 
+    # The schemas in what the server asks the client: an elicitation's form, the tools of a sampling request.
+    REMOTE = {"type": "object", "properties": {"q": {"$ref": "https://schemas.example/q.json"}}}
+
+    def asked(self, local=False):
+        plain = {"type": "object", "properties": {"q": {"type": "string"}}}
+        schema = plain if local else self.REMOTE
+        # A form's fields are plain ones (elicitation.py), so its reference is in the schema's own $id.
+        form = plain if local else {**plain, "$id": "https://schemas.example/form.json"}
+        elicitation = {"jsonrpc": "2.0", "id": "e1", "method": "elicitation/create",
+                       "params": {"mode": "form", "message": "Which one?", "requestedSchema": form}}
+        sampling = {"jsonrpc": "2.0", "id": "s1", "method": "sampling/createMessage", "params": {
+            "maxTokens": 10, "messages": [{"role": "user", "content": {"type": "text", "text": "Hello."}}],
+            "tools": [{"name": "plain", "inputSchema": {"type": "object"}}, {"name": "lookup", "inputSchema": schema}]}}
+        return elicitation, sampling
+
+    def test_by_default_a_remote_reference_in_a_request_from_the_server_is_reported_once(self):
+        h = self.proxy({"server_requests": {"sampling/createMessage": "allow"}})
+        for request_from_server in self.asked() * 2:
+            h.from_server(json.loads(json.dumps(request_from_server)))
+            (forwarded,) = h.sent_to_client()
+            self.assertEqual(forwarded["method"], request_from_server["method"])
+        self.assertEqual(h.warnings.getvalue().count("has a schema that refers outside itself"), 2)  # once each
+        notes = self.records(action="note", event="server_request")
+        self.assertEqual([note["tool"] for note in notes],
+                         ["server:elicitation/create", "server:sampling/createMessage"])
+        self.assertIn('$id "https://schemas.example/form.json"', notes[0]["reason"])
+        self.assertIn('$ref "https://schemas.example/q.json"', notes[1]["reason"])
+
+    def test_quarantine_refuses_such_a_request(self):
+        h = self.proxy({"server_requests": {"sampling/createMessage": "allow"},
+                        "schema_checks": {"remote_refs": "quarantine"}})
+        for request_from_server in self.asked():
+            with self.subTest(method=request_from_server["method"]):
+                h.from_server(request_from_server)
+                self.assertEqual(h.sent_to_client(), [])
+                (refusal,) = h.sent_to_server()
+                self.assertEqual(refusal["error"]["message"], "Blocked by agent-sentinel: request refused")
+        blocks = self.records(action="block", event="server_request")
+        self.assertEqual([record["rule"] for record in blocks], ["schema.remote_refs"] * 2)
+        for request_from_server in self.asked(local=True):  # a schema that refers to nothing outside passes
+            h.from_server(request_from_server)
+            self.assertEqual(len(h.sent_to_client()), 1)
+        monitored = self.proxy({"schema_checks": {"remote_refs": "quarantine"}}, monitor=True)
+        monitored.from_server(self.asked()[0])
+        self.assertEqual(len(monitored.sent_to_client()), 1)  # monitor mode lifts it
+
+    def test_a_reply_that_asks_for_input_with_such_a_schema_is_refused_too(self):
+        h = self.proxy({"schema_checks": {"remote_refs": "quarantine"}})
+        h.from_client(dict(call(1, "say", {}), params={"name": "say", "arguments": {}, "_meta": {
+            **MODERN_META, "io.modelcontextprotocol/clientCapabilities": {"elicitation": {}}}}))
+        h.sent_to_server()
+        entry = {key: self.asked()[0][key] for key in ("method", "params")}
+        h.from_server(reply(1, {"resultType": "input_required", "inputRequests": {"e": entry}}))
+        (answer,) = h.sent_to_client()
+        self.assertTrue(answer["result"]["isError"])
+        self.assertIn("the server asked for input that is not permitted", answer["result"]["content"][0]["text"])
+
 
 class ServerMetadata(SchemaTest):
     """PROXY-4: the serverInfo in every result's _meta, websiteUrl, and resource link icons."""
@@ -439,6 +496,31 @@ class ServerMetadata(SchemaTest):
         links = [block for block in blocks_in(forwarded) if block.get("type") == "resource_link"]
         self.assertEqual(len(links), 5)
         self.assertEqual([block["icons"] for block in links], [[GOOD_ICON]] * 5)
+
+    def test_the_icons_of_the_tools_a_sampling_request_offers_are_cleaned(self):
+        # Review of 0.6: a 2025-11-25 sampling request may offer the client's model tools, which are Tool
+        # objects with icons like a listed tool's; theirs reached the client as the server sent them.
+        def offered(*icons):
+            tool = {"name": "lookup", "description": "Look something up.", "inputSchema": {"type": "object"}}
+            return dict(tool, icons=list(icons)) if icons else tool
+
+        params = {"maxTokens": 10, "messages": [{"role": "user", "content": {"type": "text", "text": "Hello."}}],
+                  "tools": [offered(*BAD_ICONS, GOOD_ICON), offered(*BAD_ICONS), offered(), "not a tool"]}
+        h = self.proxy({"server_requests": {"sampling/createMessage": "allow"}})
+        h.from_server({"jsonrpc": "2.0", "id": "s1", "method": "sampling/createMessage",
+                       "params": json.loads(json.dumps(params))})
+        (forwarded,) = h.sent_to_client()
+        self.assertEqual(forwarded["params"]["tools"], [offered(GOOD_ICON), offered(), offered(), "not a tool"])
+        self.assertIn("dropped 4 icon(s) of a tool offered", h.warnings.getvalue())
+        # The same request inside a reply (2026-07-28).
+        h = self.proxy({"server_requests": {"sampling/createMessage": "allow"}})
+        h.from_client(dict(call(1, "say", {}), params={"name": "say", "arguments": {}, "_meta": {
+            **MODERN_META, "io.modelcontextprotocol/clientCapabilities": {"sampling": {}}}}))
+        h.sent_to_server()
+        h.from_server(reply(1, {"resultType": "input_required", "inputRequests": {
+            "s": {"method": "sampling/createMessage", "params": json.loads(json.dumps(params))}}}))
+        (asked,) = h.sent_to_client()
+        self.assertEqual(asked["result"]["inputRequests"]["s"]["params"]["tools"][:2], [offered(GOOD_ICON), offered()])
 
     def test_messages_from_the_server_are_cleaned_too(self):
         h = self.proxy({})
