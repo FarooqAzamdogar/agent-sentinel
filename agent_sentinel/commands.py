@@ -48,6 +48,11 @@ it reads or writes). That is:
     {.cl,x}aude), or in PowerShell from a wildcard, which matches a leading
     "." there (?claude, *sentinel). A read counts only when the part is a
     folder on the way to a file (?ssh/id_x);
+  * a part made only of such expansions with a wildcard after them, which the
+    shell looks for on the file system, so the expansion may put the start of
+    a hidden name there and the wildcard find the rest (p=~/.agent-s; cp x
+    $p*/policy.json). A wildcard in a part of its own (rm -rf $build/*) is
+    the ordinary case and does not count;
   * in PowerShell, a ( ) group with a word that is the start of such a
     folder's name: ('.agent-' + 'sentinel');
   * the variables that name agent-sentinel's folder or Claude Code's
@@ -1912,8 +1917,16 @@ def _may_be_hidden(word: str, shell: str, reading: bool = False) -> bool:
             return True  # .agent-s*, .e*, .cl$x: a hidden name the reader cannot tell
         if isinstance(first, str) or shell == "bash" and first in (_ANY_ONE, _ANY_GLOB):
             continue  # a plain first character, or a Bash wildcard, which does not match a leading "."
-        if reading and index == len(parts) - 1 or not any(isinstance(token, str) for token in tokens):
-            continue  # only listed, not read through; or nothing but expansions, which says nothing
+        if reading and index == len(parts) - 1:
+            continue  # only listed, not read through
+        # A part that is nothing but expansions says nothing about where it lands - unless a wildcard
+        # searches on from them (p=~/.agent-s; cp x $p*/policy.json), because then the shell really looks
+        # through the file system, and the text the expansion puts before the wildcard may be the start of
+        # a hidden name. The wildcard is not always a token of its own: _expansions folds a "*" into the
+        # expansion before it, so the part's own characters say whether one is there.
+        if not any(isinstance(token, str) for token in tokens) and not (
+                _ANY_TEXT in tokens and any(ch in part for ch in "*?[")):
+            continue
         if first == _ANY_GLOB and tokens[1] == "." and "." not in tokens[2:] and all(
                 isinstance(token, str) for token in tokens[1:]):
             continue  # *.json, *.md: a search by extension

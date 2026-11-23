@@ -131,8 +131,15 @@ class ShortenedOptions(unittest.TestCase):
                                         "--n", "b"])
         self.assertEqual((values["config"], values["server"], values["name"]), ("c.json", ["a"], "b"))
 
+    def test_the_hook_event_parser_offers_the_same_words_as_the_main_one(self):
+        """The exhaustive test above tries every 0.5.0 shortening against __main__'s parsers, but Claude
+        Code's own calls go through cli_hook.event_parser. An option on one of the two and not the other
+        would be seen on one path only, so an option added to either must break a shortening in both."""
+        self.assertEqual(sorted(cli_hook.event_parser()._option_string_actions),
+                         sorted(self.command_parser("hook claude-code")._option_string_actions))
+
     def test_the_hook_event_path_takes_the_kept_shortenings_too(self):
-        """`hook claude-code` builds its own parser (cli_hook.run_event), which must keep them as well.
+        """`hook claude-code` builds its own parser (cli_hook.event_parser), which must keep them as well.
 
         __main__ answers that command without building the parser of every
         command, so a shortening registered only there would be lost on the

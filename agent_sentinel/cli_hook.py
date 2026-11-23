@@ -163,17 +163,14 @@ def run(args: argparse.Namespace) -> int:
     return install_claude_code(args)
 
 
-def run_event(argv: list[str]) -> int:
-    """`hook claude-code` with these words after it, without the other commands being loaded.
+def event_parser() -> argparse.ArgumentParser:
+    """The parser `hook claude-code` answers an event with, built without the other commands being loaded.
 
-    __main__ comes here first for the command Claude Code runs for every
-    event. The options are those of add_arguments; a word that is not one of
-    them ends the process with exit code 2 (argparse), which blocks.
-
-    This parser is built here, not by __main__._build_parser, so the
-    shortened options 0.5.0 took are registered here too: a hook entry
-    written for 0.5.0 ("--au" for --audit) must keep working, and an
-    argparse error for it would block every tool call of the session.
+    It is built here, not by __main__._build_parser, so the options and the
+    shortened options 0.5.0 took have to be registered here too: a hook entry
+    written for 0.5.0 ("--au" for --audit) must keep working, and an argparse
+    error for it would block every tool call of the session. The options are
+    those of add_arguments, and a test compares the two parsers word for word.
     """
     parser = argparse.ArgumentParser(
         prog="agent-sentinel hook claude-code",
@@ -181,7 +178,17 @@ def run_event(argv: list[str]) -> int:
     )
     _add_paths(parser)
     shortened_options.keep("hook claude-code", parser)
-    return run_claude_code(parser.parse_args(argv))
+    return parser
+
+
+def run_event(argv: list[str]) -> int:
+    """`hook claude-code` with these words after it, without the other commands being loaded.
+
+    __main__ comes here first for the command Claude Code runs for every
+    event. The options are those of add_arguments; a word that is not one of
+    them ends the process with exit code 2 (argparse), which blocks.
+    """
+    return run_claude_code(event_parser().parse_args(argv))
 
 
 # ---- hook claude-code ------------------------------------------------------------------------------
@@ -454,18 +461,22 @@ def _print_header(policy_path: str, policy: Policy, audit: str, state: str, args
         if not {"untrusted", "sink"} <= set(policy.tool_labels("Monitor")):
             note += ' Label it "untrusted" and "sink" for the flow rules, or block it.'
         print(note)
+    # The two settings share one heading, and either may be the first line to carry it.
+    heading = "Settings:      "
     if policy.hook.config_changes == "block":
-        print("Settings:      a change to Claude Code's settings or skills during a session is refused "
+        print(heading + "a change to Claude Code's settings or skills during a session is refused "
               "(hook.config_changes); the file stays changed, and the next session reads it.")
+        heading = " " * len(heading)
     if policy.hook.policy_changes == "block":
-        print("               If the policy file changes during a session, that session's calls are refused until "
+        print(heading + "If the policy file changes during a session, that session's calls are refused until "
               "a new session starts (hook.policy_changes).")
     else:
-        print("               A change to the policy file during a session is only recorded, and applies at once "
+        print(heading + "A change to the policy file during a session is only recorded, and applies at once "
               '(hook.policy_changes is "audit").')
     print(f"Audit log:     {shown_path(audit)}")
     print(f"Session state: {shown_path(state)} (flow marks, rate-limit counts, session limits, the end of the last "
-          "output for the tail scan, and the settings snapshot; keep it out of the agent's reach)")
+          "output for the tail scan, the settings snapshot, and the hash of the policy each session began with; "
+          "keep it out of the agent's reach)")
     print('Needs Claude Code v2.1.295 or later: with "onFailure": "block", a hook that cannot start or times out '
           "blocks the call. Older versions let the call through.")
 

@@ -1283,6 +1283,11 @@ class RealHookProcess(IsolatedHomeTest):
         wildcard = {"command": "cp p.json ~/.agent-s*/policy.json"}
         self.assertEqual(self.run_hook(policy, "Bash", wildcard), "ask")
         self.assertEqual(self.run_hook(policy, "Bash", wildcard, "bypassPermissions"), "deny")
+        # And the same write with the start of the name in a variable, so that the command spells none of
+        # it and the shell's wildcard finds the folder.
+        from_variable = {"command": "p=~/.agent-s; cp p.json $p*/policy.json"}
+        self.assertEqual(self.run_hook(policy, "Bash", from_variable), "ask")
+        self.assertEqual(self.run_hook(policy, "Bash", from_variable, "bypassPermissions"), "deny")
         records = [json.loads(line) for line in (self.folder / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertIn("tools.Bash.command.install", [record.get("rule") for record in records])
 
@@ -1339,10 +1344,31 @@ class NamesTheShellExpands(unittest.TestCase):
         (r"'x' | Out-File ($HOME + '\.agent-' + 'sentinel\policy.json')", "powershell"),
         (r"""[IO.File]::WriteAllText("$HOME\.agent-s$x\policy.json", 'x')""", "powershell"),
         ("Remove-Item -Recurse ?claude", "powershell"),
+        # A part the shell makes of an expansion and a wildcard, so the word never spells any of the name:
+        # the expansion holds the start (".agent-s"), the wildcard finds the rest on the file system.
+        ("p=~/.agent-s; cp new.json $p*/policy.json", "bash"),
+        ("p=.agent-s; cp new.json ~/$p*/policy.json", "bash"),
+        ("h=$HOME/.agent-s; cp new.json $h*/policy.json", "bash"),
+        ("p=~/.agent-s; cp new.json ${p}*/policy.json", "bash"),
+        ("p=~/.agent-sentine; cp new.json $p?/policy.json", "bash"),
+        ("p=~/.agent-s; cp new.json $p[a-z]*/policy.json", "bash"),
+        ("cp new.json $(echo ~/.agent-s)*/policy.json", "bash"),
+        ("cp new.json `echo ~/.agent-s`*/policy.json", "bash"),
+        ("p=~/.agent-s; rm -f $p*/audit.jsonl", "bash"),
+        ("p=~/.agent-s; sed -i 's/block/allow/' $p*/policy.json", "bash"),
+        ("p=~/.agent-s; tee $p*/policy.json < new.json", "bash"),
+        ("q=~/.cl; cp new.json $q*/settings.json", "bash"),
+        ("p=~/.agent-s; cd $p* && cp /tmp/new.json policy.json", "bash"),
+        ("p=~/.agent-s; rm -rf $p*", "bash"),
+        (r"Set-Content $HOME\$p*\policy.json '{}'", "powershell"),
+        (r"Copy-Item new.json $env:USERPROFILE\$p*\policy.json", "powershell"),
     )
     READS = (
         ("cat ~/.agent-s*/policy.json", "bash"),
         ("cat ~/.agent-s*/audit.key", "bash"),
+        ("p=~/.agent-s; cat $p*/audit.key", "bash"),
+        ("p=~/.ss; cat $p?/config", "bash"),
+        (r"$p='.agent-s'; Get-Content $HOME\$p*\audit.key", "powershell"),
         ("cat .e*", "bash"),
         ("cat ~/.ss?/config", "bash"),
         ("head -c 100 ~/.a{ws,x}/cred", "bash"),
@@ -1369,6 +1395,10 @@ class NamesTheShellExpands(unittest.TestCase):
         ("Set-Content ($name + '.json') $x", "powershell"),
         ("(Get-Content f.txt) -replace 'a.*','b' | Set-Content f.txt", "powershell"),
         (r"Get-ChildItem $env:TEMP\*.log | Remove-Item", "powershell"),
+        # A wildcard in a part of its own stays ordinary: the expansion before it is a whole part, so
+        # nothing it holds can run into the wildcard (and in Bash a wildcard never matches a leading ".").
+        ("rm -rf $build/*", "bash"), ("cp $src/* /tmp/", "bash"), ("ls $dir*", "bash"),
+        ("grep -l TODO $src*", "bash"), (r"Remove-Item $build\*", "powershell"),
     )
 
     def test_a_write_to_a_name_the_shell_may_expand_to_a_protected_one_is_config_write(self):
@@ -1394,6 +1424,22 @@ class NamesTheShellExpands(unittest.TestCase):
         self.assertIn("config_write", kinds("find . -name '*.json' -exec sed -i 's/a/b/' {} +"))
         self.assertIn("config_write", kinds("find /tmp/build -type f -delete"))
         self.assertNotIn("config_write", kinds("find . -name '*.json' -exec cat {} +"))
+
+    def test_an_expansion_a_wildcard_searches_on_from_counts_as_a_hidden_name(self):
+        """p=~/.agent-s; cp x $p*/policy.json. The word holds none of the name: the variable puts the
+        start of it there and the shell's wildcard finds the rest on the file system. A part made only of
+        expansions says nothing on its own, but with a wildcard in it the shell really looks through the
+        file system, so such a part counts as any hidden protected folder."""
+        for text in ("p=~/.agent-s; cp x $p*/policy.json", "p=~/.agent-s; cat $p*/audit.key",
+                     "p=~/.agent-s; rm -f $p*/audit.jsonl", "q=~/.cl; cp x $q*/settings.json",
+                     "p=~/.agent-sentine; cp x $p?/policy.json", "p=~/.agent-s; cp x $p[a-z]*/policy.json"):
+            with self.subTest(text=text):
+                self.assertTrue({"config_write", "secret_read"} & kinds(text))
+                self.assertIn(STARTER.evaluate("Bash", {"command": text}).action, ("ask", "block"))
+                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "block")
+        # Without a wildcard, a path part made only of variables is the documented limit of the reader
+        # (the module docstring says so, and so does SECURITY.md): there is nothing to look through.
+        self.assertEqual(kinds("a=.age; b=nt-sentinel; cp x ~/$a$b/policy.json"), set())
 
     def test_both_hook_templates_ask_or_refuse_in_every_permission_mode(self):
         for text, shell in (*self.WRITES, *self.READS):

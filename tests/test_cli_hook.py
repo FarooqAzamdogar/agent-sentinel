@@ -128,7 +128,8 @@ class PrintingTheSnippet(InstallTest):
         self.assertIn("approval memory (approvals) does not apply", out)
         self.assertNotIn("injection.warn_severity", out)
         self.assertNotIn("server_labels", out)
-        self.assertIn("session limits, the end of the last output for the tail scan, and the settings snapshot", out)
+        self.assertIn("session limits, the end of the last output for the tail scan, the settings snapshot, and the "
+                      "hash of the policy each session began with", out)
         self.policy = self.write("policy.json", {"default": "block", "tools": {"Read": "allow"},
                                                  "injection": {"warn_severity": "medium"},
                                                  "server_labels": {"web": ["untrusted"]},
@@ -400,6 +401,20 @@ class WhatInstallSaysAboutClaudeCodesOwnTools(InstallTest):
                       "session starts (hook.policy_changes).", header)
         header = self.header({**POLICY, "hook": {"policy_changes": "audit"}})
         self.assertIn('is only recorded, and applies at once (hook.policy_changes is "audit")', header)
+
+    def test_the_two_hook_settings_share_one_heading_whichever_of_them_prints(self):
+        """Both lines stand under "Settings:". Whichever is printed first carries the heading, so a policy
+        that leaves hook.config_changes at its default never prints an indented line with nothing above it."""
+        for section in ({}, {"config_changes": "audit"}, {"policy_changes": "audit"},
+                        {"config_changes": "audit", "policy_changes": "audit"},
+                        {"config_changes": "block"}, {"config_changes": "block", "policy_changes": "audit"}):
+            with self.subTest(hook=section):
+                lines = self.header({**POLICY, "hook": section}).splitlines()
+                settings = [line for line in lines if "hook.config_changes" in line or "hook.policy_changes" in line]
+                self.assertTrue(settings)
+                self.assertTrue(settings[0].startswith("Settings:      "), settings[0])
+                for line in settings[1:]:
+                    self.assertTrue(line.startswith(" " * 15), line)
 
 
 class TheCommandClaudeCodeRuns(InstallTest):

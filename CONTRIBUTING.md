@@ -7,7 +7,7 @@ Thanks for helping. This page explains how the code is organized, how a message 
 There is nothing to install. You need Python 3.10 or newer. The package uses only the standard library.
 
 ```bash
-python -m unittest discover tests -v     # run all tests (ten minutes or more)
+python -m unittest discover tests -v     # run all tests (about eight minutes)
 python -m agent_sentinel demo            # see the library and the proxy at work
 ```
 
@@ -253,7 +253,7 @@ Every refusal names the rule that decided, and operators look it up with `explai
 4. Keep the order at startup (above): nothing may start the server before the checks that can still refuse it.
 5. Add it to the proxy options table in the README.
 
-The proxy takes no shortened option, so nothing more is needed for it. An option added to any **other** command can make a shortening that 0.5.0 read as one option ambiguous, and then a script or a hand-written hook entry stops working (a Claude Code hook that exits with an error blocks every tool call). `tests/test_shortened_options.py` tries every shortening 0.5.0 took against today's parsers; when it fails, add the shortening and the option it meant to `shortened_options.KEPT`. Never widen the table beyond that: a shortening that was already ambiguous in 0.5.0 must stay ambiguous.
+The proxy takes no shortened option, so nothing more is needed for it. An option added to any **other** command can make a shortening that 0.5.0 read as one option ambiguous, and then a script or a hand-written hook entry stops working (a Claude Code hook that exits with an error blocks every tool call). `tests/test_shortened_options.py` tries every shortening 0.5.0 took against today's parsers; when it fails, add the shortening and the option it meant to `shortened_options.KEPT`. Never widen the table beyond that: a shortening that was already ambiguous in 0.5.0 must stay ambiguous. `hook claude-code` builds a second parser of its own (`cli_hook.event_parser`, the one Claude Code's events go through); the same test holds the two parsers' option words equal, so an option added to either is tried on both.
 
 ## How to add an audit event
 

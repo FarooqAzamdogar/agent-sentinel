@@ -40,10 +40,17 @@ _NAME_START = r"(^|[\s\\/:@='\"`<>|;&(,{\u2018-\u201e])"
 # The quotes a setting's name may stand in: ' and ", and the typographic ones PowerShell also reads as quotes.
 _QUOTE = r"[\"'\u2018-\u201e]"
 
+# A name that only looks like a credential file: the example committed beside
+# it (".env.example", ".npmrc.sample"), which holds placeholders, not secrets.
+# Writing and naming one is ordinary work, so it is left out; the detector
+# leaves the same four endings out (_CREDENTIAL_FILE in detector.py).
+_EXAMPLE_FILE = r"(?!\.(example|sample|template|dist)\b)"
+
 # The credential preset of policy.example.json (a test keeps the two the same).
 CREDENTIAL_PATTERN = (
     _NAME_START + r"\.(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-credentials)\b"
-    r"|id_(rsa|dsa|ecdsa|ed25519)"
+    + _EXAMPLE_FILE
+    + r"|id_(rsa|dsa|ecdsa|ed25519)"
     r"|" + _NAME_START + r"(ssh|aws|azure|docker|gnupg|kube|env|netrc|npmrc|pypirc|pgpass|git-cr|id_ed2)~[0-9]"
     r"|" + _NAME_START + r"(\.config|config~[0-9]+)[\\/](gh|gcloud|github-copilot)\b"
     r"|(^|[\\/])proc[\\/][^\\/]+[\\/]environ\b"
