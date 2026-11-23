@@ -435,10 +435,13 @@ def _matching_views(
     candidates = [(plain if decoded == text else _normalize(decoded), "", True)]
     if "<" in decoded:
         candidates.append((_normalize(_TAG_RE.sub("", decoded)), "", True))
+    # The most decoded of them: without escapes, tags and invisible characters, compatibility forms folded.
+    most_decoded = candidates[-1][0]
     joined = _joined_words(decoded)
     if joined != decoded:
         candidates.append((_normalize(joined), "", True))
-    if len(text.translate(_WITHOUT_INVISIBLE)) != len(text):
+    invisible = len(text.translate(_WITHOUT_INVISIBLE)) != len(text)
+    if invisible:
         candidates.append((_normalize(text, _FOLD_SPACED), "", False))
         candidates.append((_normalize(decoded, _FOLD_SPACED), "", True))
         if TAG_CHARACTERS.search(text):
@@ -452,14 +455,24 @@ def _matching_views(
             yield view, marker, view != before
     if not decode:
         return
-    # Last, and one level only: a decoded run is not decoded again.
-    for run in context.encoded.decoded(text):
+    # Last, and one level only: a decoded run is not decoded again. Runs are looked for in the text as
+    # it arrived and, where something can stand inside a run that a reader looks through (an invisible
+    # character, a tag, an escape, full-width letters), in the most decoded view as well.
+    runs = context.encoded.decoded(text)
+    if invisible or decoded != text or "<" in decoded or not _ascii_but_for_field_breaks(text):
+        runs += context.encoded.decoded(most_decoded, read_before=text)
+    for run in runs:
         for spelled in _read_through(run.text):
             before = _normalize(spelled)
             view = _unglue(before)
             if view not in seen:
                 seen.add(view)
                 yield view, f"[{run.kind}]", view != before
+
+
+def _ascii_but_for_field_breaks(text: str) -> bool:
+    """Whether `text` is plain ASCII, the breaks textutil.text_views writes between fields aside."""
+    return text.isascii() or text.replace(FIELD_BREAK, "").isascii()
 
 
 # What a byte that is not UTF-8 becomes in decoded text (textutil: base64, hex, invisible carriers).

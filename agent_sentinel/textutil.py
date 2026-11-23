@@ -1444,6 +1444,41 @@ _MAX_SKIPPED_BYTES = 16
 # How many bytes of a binary run are returned as Latin-1 when they are asked
 # for (the secret guard: a token inside binary data).
 MAX_BINARY_BYTES = 4 * 1024
+# Base64 cut into pieces, read joined up (besides each piece that is long
+# enough, on its own: two values next to each other are not one).
+# _PIECES: pieces of 16 characters or more with a line break (and its indent),
+# a space or two, or a written-out "\n" between them; after a line break the
+# last piece may be shorter. Shorter pieces are the words of ordinary text. A
+# block starts only where a piece starts, so no character is read by more
+# than a few attempts.
+# _SHORT_LINES: three or more whole lines of 8 to 15 characters, as base64
+# wrapped at a short width, and a shorter last line. It starts with the line
+# break before the block (or the start of the text), which lets the regex
+# engine jump from one line break to the next.
+_BASE64_CHARS = "A-Za-z0-9+/_-"
+_PIECE_BREAK = r"(?:\r?\n[ \t]{0,8}|[ \t]{1,2}|\\r\\n|\\n)"
+_PIECES = re.compile(
+    rf"(?<![{_BASE64_CHARS}])[{_BASE64_CHARS}]{{16,}}(?:{_PIECE_BREAK}[{_BASE64_CHARS}]{{16,}})+"
+    rf"(?:\r?\n[ \t]{{0,8}}[{_BASE64_CHARS}]{{1,15}}(?![{_BASE64_CHARS}]))?={{0,2}}"
+)
+_LINES = (
+    rf"(?P<block>[{_BASE64_CHARS}]{{8,15}}(?:\r?\n[{_BASE64_CHARS}]{{8,15}}){{2,}}"
+    rf"(?:\r?\n[{_BASE64_CHARS}]{{1,7}}(?![{_BASE64_CHARS}]))?={{0,2}})"
+)
+_SHORT_LINES = re.compile(r"\n" + _LINES)
+_SHORT_LINES_FIRST = re.compile(_LINES)
+
+
+def _joined_up(run: str) -> str:
+    """A run without what stands between its pieces: line breaks, spaces, written-out line breaks.
+
+    The run itself when it is in one piece.
+    """
+    if "\\" in run:
+        run = run.replace("\\r\\n", "").replace("\\n", "")
+    if "\n" in run or " " in run or "\t" in run or "\r" in run:
+        return "".join(run.split())
+    return run
 
 
 class DecodedRun(NamedTuple):
@@ -1472,9 +1507,16 @@ class EncodedRuns:
     sample and the text found of the bytes, so a long binary run costs
     little. Every run that looks encoded costs an attempt, binary or not.
 
+    Base64 cut into pieces (lines, spaces, written-out line breaks between
+    them: `_PIECES`, `_SHORT_LINES`) is also read joined up. A run full of "/"
+    is tried out of a count of its own and kept only if it is text (a path is
+    no text). A run that is not text as it stands is also read from its second
+    character on (base64: also its third and fourth; hex: one digit in front),
+    at no further attempt; an odd number of hex digits is read without its last.
+
     The limits make the work bounded on hostile input, and they can be used to
     hide a payload: runs placed before it use up the attempts or the bytes, and
-    a payload encoded twice, split over runs, or written with separators
+    a payload encoded twice, split over runs, or hex written with separators
     ("48 65 6c", "\\x48") is not decoded. Runs shorter than the minimum
     lengths are not decoded either. Which runs are pictures is the caller's
     business: give the decoder only the text it should read (text_views' media).
@@ -1501,7 +1543,7 @@ class EncodedRuns:
         min_hex_chars: int = MIN_HEX_CHARS,
         binary: bool = False,
     ) -> None:
-        self.attempts_left = max_attempts
+        self.attempts_left = self._max_attempts = max_attempts
         self.kept_left = max_kept
         self.bytes_left = max_bytes
         self._max_run_bytes = max_run_bytes
@@ -1513,39 +1555,86 @@ class EncodedRuns:
         # several lines, as `base64` wraps its output. Hex is also looked for on
         # its own, because a letter or "/" before it ("example/6768...") makes
         # the longer run base64-shaped.
+        # A run starts where no base64 character stands before it: said in the
+        # pattern, so that the inside of each word is not tried as a start.
         shortest = min(min_base64_chars, min_hex_chars)
-        self._run_pattern = re.compile(rf"[A-Za-z0-9+/_-]{{{shortest},}}(?:\r?\n[A-Za-z0-9+/_-]+)*={{0,2}}")
+        self._run_pattern = re.compile(
+            rf"(?<![{_BASE64_CHARS}])[{_BASE64_CHARS}]{{{shortest},}}(?:\r?\n[{_BASE64_CHARS}]+)*={{0,2}}"
+        )
         self._hex_pattern = re.compile(rf"[0-9A-Fa-f]{{{min_hex_chars},}}")
         self._seen: set[str] = set()
+        # Runs full of "/" are paths far more often than base64. They are tried all the same (see
+        # `_attempt`), but out of a count of their own: a listing of files must not use up the attempts.
+        self._path_attempts_left = max_attempts
 
-    def decoded(self, text: str) -> list[DecodedRun]:
-        """Each new run in `text` that decodes to text: base64-shaped runs first, then hex ones."""
+    def decoded(self, text: str, *, read_before: str | None = None) -> list[DecodedRun]:
+        """Each new run in `text` that decodes to text: base64-shaped runs first, then hex ones, then base64
+        cut into pieces (`_PIECES`, `_SHORT_LINES`).
+
+        read_before: a text this decoder was given before, of which `text`
+        is another spelling (the same without invisible characters, say). A
+        run that stands in it as it does here was read there and is passed
+        over, and at most `max_attempts` runs that this decoder has not met
+        are looked at: only what the other spelling brings together is new.
+        """
         found: list[DecodedRun] = []
-        for match in itertools.chain(self._run_pattern.finditer(text), self._hex_pattern.finditer(text)):
+        unmet_left = self._max_attempts
+        for run in self._runs(text):
             if self.attempts_left <= 0 or self.kept_left <= 0 or self.bytes_left <= 0:
                 break
-            run = match.group()
             if run in self._seen:
                 continue
+            if read_before is not None:
+                if unmet_left <= 0:
+                    break
+                unmet_left -= 1
+                if run in read_before:
+                    continue
             self._seen.add(run)
-            compact = "".join(run.split()) if "\n" in run else run
+            compact = _joined_up(run)
+            if compact is not run:
+                if compact in self._seen:
+                    continue  # the same run with other breaks between its pieces
+                self._seen.add(compact)
+            attempts = self.attempts_left + self._path_attempts_left
             first = self._attempt(compact, run)
+            tried = self.attempts_left + self._path_attempts_left < attempts
             results = [first]
             if "/" in compact and (_not_clean_text(first) or _partly_text(first)):
                 # In a URL the path before a run is part of it ("example/Z2hw..."): try what follows the last "/".
                 tail = compact.rpartition("/")[2]
                 if tail not in self._seen:
                     self._seen.add(tail)
-                    from_tail = self._attempt(tail, tail)
-                    if _is_text(first) and _is_text(from_tail) and first.text.endswith(from_tail.text):
-                        results = [from_tail]  # the same text, without the path read as bytes in front of it
-                    else:
-                        results.append(from_tail)
+                    results.append(self._attempt(tail, tail))
+            if len(results) == 2:
+                results = _with_the_part_after_a_slash(*results)
+            if tried and not _is_text(first):
+                # Not text as it stands. A character or two written in front of a run shifts every
+                # byte of it: read from one of its next characters, it may be text from there on.
+                # Read as well, not instead: binary data as it stands may hold a token (the guard).
+                # Only a run that was tried: one past the limits is not read at all.
+                results.append(self._shifted(compact, run))
             for result in results:
                 if result is not None and self.kept_left > 0:
                     self.kept_left -= 1
                     found.append(result)
         return found
+
+    def _runs(self, text: str) -> Iterator[str]:
+        """The candidates in `text`, as they stand in it: runs, hex runs, then blocks of pieces and short lines."""
+        for match in self._run_pattern.finditer(text):
+            yield match.group()
+        for match in self._hex_pattern.finditer(text):
+            yield match.group()
+        if "\n" in text or " " in text or "\\" in text or "\t" in text:
+            for match in _PIECES.finditer(text):
+                yield match.group()
+        if "\n" in text:
+            first = _SHORT_LINES_FIRST.match(text)
+            if first is not None:
+                yield first.group("block")
+            for match in _SHORT_LINES.finditer(text):
+                yield match.group("block")
 
     def _attempt(self, compact: str, run: str) -> DecodedRun | None:
         """Decode one candidate, if it looks encoded and the limits allow; None if it is not text."""
@@ -1554,30 +1643,57 @@ class EncodedRuns:
         kind = self._kind(compact)
         if kind is None:
             return None
-        self.attempts_left -= 1
-        return self._decode(compact, kind, run)
+        # A run full of path separators is a path, unless it decodes to text: "?" at the right places
+        # of a text is written "/", and a payload must not escape decoding by holding many of them. A
+        # run of slashes counts once: it is how bytes 0xFF are written ("////").
+        path = kind == "base64" and len(_SLASHES.findall(compact)) * 16 > len(compact)
+        if path:
+            if self._path_attempts_left <= 0:
+                return None
+            self._path_attempts_left -= 1
+        else:
+            self.attempts_left -= 1
+        return self._decode(compact, kind, run, path)
 
     def _kind(self, run: str) -> str | None:
         """How to decode `run`, or None if it does not look like encoded text at all (which costs no attempt)."""
         bare = run.rstrip("=")
-        if len(bare) >= self._min_hex_chars and len(bare) % 2 == 0 and _HEX_DIGITS.fullmatch(bare):
-            return "hex"
+        if len(bare) >= self._min_hex_chars and _HEX_DIGITS.fullmatch(bare):
+            return "hex"  # with an odd number of digits too: one more digit must not switch decoding off
         if len(run) < self._min_base64_chars:
             return None
-        # Base64 of text has capitals and small letters, and rarely a "/": a
-        # run without both, or full of path separators, is a word, a path or an
-        # id. A run of slashes counts once: it is how bytes 0xFF are written
-        # ("////"), and a payload must not escape decoding by ending in them.
-        if not (_UPPER.search(run) and _LOWER.search(run)) or len(_SLASHES.findall(run)) * 16 > len(run):
+        # Base64 of text has capitals and small letters: a run without both is a word or an id.
+        if not (_UPPER.search(run) and _LOWER.search(run)):
             return None
         if ("+" in run or "/" in run) and ("-" in run or "_" in run):
             return None  # both alphabets at once: not base64
         return "base64"
 
-    def _decode(self, compact: str, kind: str, run: str) -> DecodedRun | None:
-        """Decode a run: first a sample, to tell text from binary data, then as much as the limits allow."""
+    def _shifted(self, compact: str, run: str) -> DecodedRun | None:
+        """A run that is not text as it stands, read from its second character on (base64: also its third
+        or fourth), if it is text from there; else None. See `_realigned`. It costs no further attempt."""
+        kind = self._kind(compact)
+        if kind is None or self.bytes_left <= 0:
+            return None
         limit = min(self._max_run_bytes, self.bytes_left)
-        bare = _without_padding(compact.rstrip("="), kind)
+        realigned = _realigned(compact.rstrip("="), kind, limit)
+        if realigned is None:
+            return None
+        bare, sample, sample_cut, whole, found = realigned
+        raw, cut = (sample, sample_cut) if whole else _raw_bytes(bare, kind, limit)
+        found_text = None if raw is None else _text_of(raw[found[0]:], truncated=cut < len(bare))
+        if raw is None or found_text is None or not found_text[1]:
+            return None  # text at its start only: the run as it stands is read for pieces of text already
+        self.bytes_left -= len(raw)
+        return DecodedRun(kind, found_text[0], run)
+
+    def _decode(self, compact: str, kind: str, run: str, path: bool = False) -> DecodedRun | None:
+        """Decode a run: first a sample, to tell text from binary data, then as much as the limits allow.
+
+        path: the run is full of "/" (see `_attempt`): it is returned only if text is found in it.
+        """
+        limit = min(self._max_run_bytes, self.bytes_left)
+        bare = _whole_groups(_without_padding(compact.rstrip("="), kind), kind)
         sample, sample_cut = _raw_bytes(bare, kind, min(limit, _SAMPLE_BYTES + _MAX_SKIPPED_BYTES))
         if sample is None:
             return None  # not valid base64 or hex
@@ -1599,6 +1715,9 @@ class EncodedRuns:
             found_text = _text_of(raw, truncated=cut < len(bare))
             # Charged for the sample and the text found: a binary run must not use up the bytes of the runs after it.
             charged = len(sample) + (len(found_text[0]) if found_text else 0)
+        if found_text is None and path:
+            self.bytes_left -= charged
+            return None  # a path after all
         if found_text is None or (not found_text[1] and self._binary):
             # Binary data, or text and binary data: the guard reads it all as Latin-1, so nothing in it is missed.
             return self._binary_run(bare, kind, run, raw, cut >= len(bare), limit, charged)
@@ -1651,6 +1770,69 @@ def _without_padding(bare: str, kind: str) -> str:
     rest = bare[repeated.end():] if repeated else bare
     shortest = 2 * _MIN_TEXT_CHARS if kind == "hex" else (_MIN_TEXT_CHARS * 4 + 2) // 3
     return rest if len(rest) >= shortest else bare
+
+
+_A_WORD = re.compile(r"[^\W\d_]{3}")  # three letters in a row
+_BOUNDARY_CHARS = 8  # how much of the text before a tail is looked at for bytes that are no text
+
+
+def _with_the_part_after_a_slash(first: DecodedRun | None, from_tail: DecodedRun | None) -> list[DecodedRun | None]:
+    """What is kept of a run and of the part after its last "/", each as decoded (None: not text).
+
+    Both, unless one says nothing the other does not: a tail whose text
+    stands inside the run's adds nothing. When the run's text ends with the
+    tail's, what stands before it in the run decides.
+
+      * No words (a URL's path read as base64): the tail alone, the same
+        text without those bytes in front of it. Unless they end in a letter
+        or digit and hold no control character: then they may be the start
+        of a word that a stray byte cut ("Ig", a byte, "nore all ..."), and
+        both are kept.
+      * Words: the run, which has all of the text; the tail is its end, cut
+        where a "/" happened to stand. With the tail when bytes that are no
+        text stand right before it in the run, so that its first word is
+        read clean as well.
+    """
+    if first is None or first.binary or from_tail is None or from_tail.binary:
+        return [first, from_tail]
+    if not first.text.endswith(from_tail.text):
+        return [first] if from_tail.text in first.text else [first, from_tail]
+    before = first.text[: len(first.text) - len(from_tail.text)]
+    if _A_WORD.search(before) is None:
+        cuts_a_word = before.rstrip(_REPLACEMENT)[-1:].isalnum() and all(ch.isprintable() for ch in before)
+        return [first, from_tail] if cuts_a_word else [from_tail]
+    near = before[-_BOUNDARY_CHARS:]
+    return [first, from_tail] if any(ch == _REPLACEMENT or not ch.isprintable() for ch in near) else [first]
+
+
+def _whole_groups(bare: str, kind: str) -> str:
+    """A run without the last digit of an odd number of hex digits: one digit cannot be a byte."""
+    return bare[:-1] if kind == "hex" and len(bare) % 2 else bare
+
+
+def _realigned(
+    bare: str, kind: str, limit: int
+) -> tuple[str, bytes, int, bool, tuple[int, bool]] | None:
+    """A run read from its second character on (base64: also its third or fourth), if it is text from there.
+
+    One to three characters in front of base64 text, or one digit in front of
+    hex, shift every byte of the run, and none of it reads as text any more.
+    Each shift is judged on a sample, as the run itself is, and counts only
+    if the sample is text throughout, _MIN_TEXT_CHARS characters or more:
+    binary data read four ways must not pass for text more often. Returns
+    the shifted run and what `_decode` knows of it (its sample, how many
+    characters that took, whether that is all of it, where its text starts).
+    """
+    for skipped in range(1, 2 if kind == "hex" else 4):
+        shifted = _whole_groups(bare[skipped:], kind)
+        sample, cut = _raw_bytes(shifted, kind, min(limit, _SAMPLE_BYTES + _MAX_SKIPPED_BYTES))
+        if sample is None:
+            continue
+        whole = cut >= len(shifted)
+        found = _start_of_text(sample, truncated=not whole)
+        if found is not None and found[1] and len(sample) - found[0] >= _MIN_TEXT_CHARS:
+            return shifted, sample, cut, whole, found
+    return None
 
 
 def _not_clean_text(found: DecodedRun | None) -> bool:
