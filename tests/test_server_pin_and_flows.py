@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest import mock
 
 from cli_support import SCRIPTED_SERVER, IsolatedHomeTest, TempFolderTest, run_cli
+from support import audit_records
 from test_cli_doctor import DoctorTest
 from test_end_to_end import EndToEndTest
 from test_proxy import Harness, call, initialize, request
@@ -49,7 +50,8 @@ HALF_B = {"name": "get_time", "inputSchema": {"type": "object"},
 
 
 def records(path):
-    return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
+    """The audit records about calls and checks (not the chain's and the session's own: support.audit_records)."""
+    return audit_records(path)
 
 
 def v1_fingerprint(tool):

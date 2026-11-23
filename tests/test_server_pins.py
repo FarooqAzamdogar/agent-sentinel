@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from cli_support import SCRIPTED_SERVER, TempFolderTest, run_cli
+from support import audit_records
 from test_end_to_end import EndToEndTest
 from test_protocol import MODERN, modern
 from test_proxy import Harness, call, initialize, request
@@ -155,7 +156,7 @@ class ThePinnedProxy(TempFolderTest):
                                             "serverInfo": {"name": "notes", "version": version}, **extra})
 
     def records(self):
-        return [json.loads(line) for line in self.audit.read_text(encoding="utf-8").splitlines()]
+        return audit_records(self.audit)  # without the chain's and the session's own records
 
     def tools(self, h):
         delivered = h.round_trip(request(2, "tools/list"), {"tools": [dict(TOOL)]})

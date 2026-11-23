@@ -100,6 +100,9 @@ class TheAuditTrailOfAProxy(EndToEndTest):
     def test_audit_required_refuses_calls_while_the_log_cannot_be_written(self):
         proxy = self.proxy("--policy", EXAMPLE_POLICY, "--audit", self.audit, "--audit-required")
         proxy.initialize()
+        # As a client does: with flow rules, a tool no checked list has shown counts as untrusted and a sink,
+        # and the second read below would be refused by the flow rule instead.
+        proxy.request(100, "tools/list")
         self.assertEqual(text_of(proxy.call(1, "read_file", {"path": "notes.txt"})), "contents of notes.txt")
         kept = self.folder / "kept.jsonl"
         shutil.move(str(self.audit), str(kept))
