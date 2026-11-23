@@ -188,6 +188,14 @@ class Suggesting(TempFolderTest):
         self.assertIn("ok_tool", out)
         self.assertNotIn("\x1b", out)
 
+    def test_a_blocked_line_whose_event_is_not_text_does_not_end_the_command(self):
+        # An object or a list is no key of the table of flagging events: the look-up must not raise.
+        odd = [{"event": value, "action": "would_block", "rule": "default", "tool": "odd_tool", "reason": "r"}
+               for value in ({"a": 1}, {}, [], ["result"], [[]], 5, None)]
+        out = self.suggest([*odd, call("ok_tool")])
+        self.assertIn("ok_tool", out)
+        self.assertNotIn("odd_tool", out)  # not a call, so nothing is proposed for it
+
     def test_a_real_monitor_log(self):
         audit = self.folder / "real.jsonl"
         monitor = Firewall(Policy.from_file(self.policy), audit_path=audit, monitor=True)

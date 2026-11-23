@@ -14,18 +14,27 @@ A reference is 32 random bits, so in a very long log two records can share
 one: every record with it is shown. A call that waited for approval and was
 refused has two records with the same reference (the "ask" and the answer).
 
+A reference that is not in the log is looked for in the files the log was
+rotated to (proxy --audit-max-bytes: FILE.1, FILE.2, ...), the newest
+MAX_ROTATED_SEARCHED of them, newest first: just after a rotation the record
+is there. The line that says where it was found also says that the chain of
+that file is not checked here.
+
 Exit codes: 0 something was explained, 1 nothing matched, 2 an error.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import stat
 from collections import deque
+from pathlib import Path
 from typing import Any, Callable
 
 from . import auditlog, fix_hints
-from .audit_chain import ChainChecker
+from .audit_chain import MAX_MAX_BYTES, ChainChecker, ChainReport, rotated_files
 from .auditlog import field_text, text_of
 from .cli_common import (
     EXIT_ERROR,
@@ -36,6 +45,7 @@ from .cli_common import (
     positive_int,
     print_field,
     shown_args,
+    shown_path,
 )
 from .cli_report import integrity_line
 from .firewall import shown_excerpt
@@ -61,6 +71,12 @@ exit codes:
 DEFAULT_LAST = 3
 # A reference is random, so a few records can share one; more than this is a log someone filled on purpose.
 MAX_REF_MATCHES = 20
+# A reference that is not in the log is looked for in the files the log was rotated to (FILE.N), newest
+# first: a block is usually explained soon after it happened. At most this many of them are read.
+MAX_ROTATED_SEARCHED = 5
+# A file larger than this is not one rotation wrote (a log is rotated before it passes --audit-max-bytes, give
+# or take a few records), and is not read in that search.
+MAX_ROTATED_FILE_BYTES = 2 * MAX_MAX_BYTES
 MAX_FINDINGS_SHOWN = 10
 _REF = re.compile(r"\(?\s*(?:ref\s+)?([0-9a-f]{8})\s*\)?")
 
@@ -101,16 +117,24 @@ def run(args: argparse.Namespace) -> int:
         if policy is None:
             return EXIT_ERROR
     ref = parse_ref(args.ref) if args.ref is not None else None
-    checker = ChainChecker()
-    checker.start_file()
-    records, unreadable, more = find_records(args.audit, ref, args.last or DEFAULT_LAST, on_line=checker.add)
+    (records, unreadable, more), integrity = _read_checked(args.audit, ref, args.last or DEFAULT_LAST)
     if unreadable:
         print(f"WARNING: {unreadable} line(s) of the log could not be read; a record there cannot be explained.")
-    integrity = checker.finish()
     if integrity.lines:
         print(integrity_line(args.audit, integrity))
+    if not records and ref is not None:
+        # Just after a rotation (--audit-max-bytes) the record is in the file the log was copied to.
+        records, more, where = _find_in_rotated(args.audit, ref)
+        if not records:
+            print(f"No record in the log has ref {ref}{where}.")
+            return EXIT_FAIL
+        print(f"Found in {where}, a file this log was rotated to. Its chain is not checked here: agent-sentinel "
+              "audit verify takes every file of the log, oldest first.")
     if not records:
-        print(f"No record in the log has ref {ref}." if ref else "The log has no blocked calls.")
+        rotated = rotated_files(args.audit)
+        older = (f" Older records are in the {len(rotated)} file(s) it was rotated to (the newest is "
+                 f"{shown_path(rotated[-1])}): run explain on one of them.") if rotated else ""
+        print(f"The log has no blocked calls.{older}")
         return EXIT_FAIL
     if ref is not None and len(records) > 1:
         shown = f"; the first {len(records)} are shown" if more else ""
@@ -120,6 +144,64 @@ def run(args: argparse.Namespace) -> int:
             print()
         explain_record(record, policy)
     return EXIT_OK
+
+
+def _read_checked(path: str, ref: str | None, last: int) -> tuple[tuple[list[dict[str, Any]], int, int], ChainReport]:
+    """find_records with a check of the log's chain in the same pass: (what it found, the chain's state).
+
+    A log that a writer rotates during the read is read again from its start
+    (auditlog.read_again_if_changed), each time with a check of its own.
+    """
+    def read() -> tuple[tuple[list[dict[str, Any]], int, int], ChainReport]:
+        checker = ChainChecker()
+        checker.start_file()
+        found = find_records(path, ref, last, on_line=checker.add)
+        return found, checker.finish()
+
+    return auditlog.read_again_if_changed(read)
+
+
+def _find_in_rotated(path: str, ref: str) -> tuple[list[dict[str, Any]], int, str]:
+    """Look for a reference in the files the log was rotated to (FILE.1, FILE.2, ...).
+
+    The newest MAX_ROTATED_SEARCHED of them are read, newest first, and the
+    search stops at the first that has the reference. Returns (the records,
+    how many more matched, words): the words are the file they were found in,
+    or, when there are none, what to add to "No record in the log has ref X":
+    which rotated files were read as well, and how many older ones were not.
+    A file that cannot be read, or that rotation cannot have written
+    (_rotation_wrote), is passed over.
+    """
+    rotated = rotated_files(path)
+    newest = rotated[::-1][:MAX_ROTATED_SEARCHED]
+    read = []
+    for file in newest:
+        try:
+            if not _rotation_wrote(file):
+                continue
+            records, _, more = auditlog.read_again_if_changed(lambda: find_records(str(file), ref, 1))
+        except OSError:
+            continue
+        if records:
+            return records, more, shown_path(file)
+        read.append(printable(file.name, limit=80))
+    words = f", nor do the rotated files that were read ({', '.join(read)})" if read else ""
+    older = len(rotated) - len(newest)
+    if older > 0:
+        words += (f"; {older} older rotated file(s) were not read: run explain on them (the oldest is "
+                  f"{shown_path(rotated[0])})")
+    return [], 0, words
+
+
+def _rotation_wrote(file: Path) -> bool:
+    """Whether a file named like a rotated one can be what rotation wrote: a regular file of a plausible size.
+
+    These files are found, not named by the user, and the log's folder may be
+    writable by the agent: a named pipe put there would never end, and a
+    device or a huge file would take for ever. Raises OSError.
+    """
+    info = os.stat(file)
+    return stat.S_ISREG(info.st_mode) and info.st_size <= MAX_ROTATED_FILE_BYTES
 
 
 def parse_ref(text: str) -> str:
@@ -139,6 +221,8 @@ def find_records(
     """(the records to explain, unreadable lines, how many more matched than are returned).
 
     on_line: called with each raw line (see auditlog.iter_records), for the chain check.
+    Raises OSError; auditlog.LogChangedError when the log was cut or rotated
+    during the read (what was found is then of no use: read again).
     """
     unreadable = more = 0
     if ref is not None:

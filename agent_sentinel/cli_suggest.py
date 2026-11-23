@@ -198,7 +198,14 @@ def run(args: argparse.Namespace) -> int:
 # ---- reading the log ------------------------------------------------------------------------
 
 def read_log(path: str, servers: tuple[str, ...] = ()) -> _Log:
-    """Sort the blocked calls of the log: blocked only by the default, or blocked for a reason."""
+    """Sort the blocked calls of the log: blocked only by the default, or blocked for a reason.
+
+    A log that a writer rotates during the read is read again from its start.
+    """
+    return auditlog.read_again_if_changed(lambda: _read_log_once(path, servers))
+
+
+def _read_log_once(path: str, servers: tuple[str, ...]) -> _Log:
     log = _Log()
     for record in auditlog.iter_records(path):
         if record is None:
@@ -208,7 +215,8 @@ def read_log(path: str, servers: tuple[str, ...] = ()) -> _Log:
             continue
         if not auditlog.is_block(record):
             continue
-        event, tool = record.get("event"), text_of(record, "tool")
+        # Both read as text: a line may hold any JSON there, and an object or a list is no key of a table.
+        event, tool = text_of(record, "event"), text_of(record, "tool")
         if tool is not None and len(tool) > MAX_KEPT_NAME_CHARS:
             # Kept short; such a name can never be proposed (see _PLAIN_NAME), only listed.
             tool = tool[:MAX_KEPT_NAME_CHARS] + "..."

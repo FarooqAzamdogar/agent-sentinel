@@ -8,7 +8,13 @@ chosen by the agent and by the server, so nothing read here is trusted:
     skipped and counted as unreadable, so one hostile line cannot fill memory;
   * a record is any JSON object, and its fields may hold any type. Callers
     read a field with `text_of` or `field_text`, never by assuming a type;
-  * everything shown to a person goes through `printable`.
+  * everything shown to a person goes through `printable`;
+  * the log may be written while it is read. A reader that finds it cut or
+    rotated under it (--audit-max-bytes copies the log aside and empties it)
+    has read part of an older file: it reads again from the start rather than
+    report on that (iter_whole_file, read_again_if_changed). On Windows a
+    writer's lock makes the start of the file unreadable for a moment: the
+    read waits for it, up to LOCKED_READ_SECONDS.
 
 A record, as firewall.py writes it, looks like this (keys in this order, the
 ones in brackets only when they apply):
@@ -29,13 +35,17 @@ of its counts.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
+import stat
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, BinaryIO, Callable, Iterator
+from typing import Any, BinaryIO, Callable, Iterator, TypeVar
 
+from .filelock import lock_file, unlock_file
 from .jsonutil import bounded_int
 from .policy import glob_matches
 from .policy_errors import quoted
@@ -44,6 +54,16 @@ from .textutil import printable
 # Longer than any record the firewall writes: arguments are left out of a record
 # past 100,000 characters, and even with every character escaped that stays far below.
 MAX_LINE_BYTES = 4 * 1024 * 1024
+# How much of the start of a log a reader remembers, to tell at the end whether what it read is still
+# that file: a rotation starts the log again with another first record.
+HEAD_BYTES = 4096
+# How many times in all a log is read from its start when it is cut or rotated during the read.
+READ_ATTEMPTS = 3
+# How long a read waits for a writer that holds the log's lock. Only Windows refuses to read a locked
+# byte; a writer holds the lock for one append, or for the copy a rotation makes.
+LOCKED_READ_SECONDS = 5.0
+
+_Read = TypeVar("_Read")
 
 BLOCK_ACTIONS = ("block", "would_block")
 # The "action" of an audit record (not policy.ACTIONS, which are what a rule may say): "note" is a
@@ -91,6 +111,120 @@ def _skip_rest_of_line(handle: BinaryIO) -> None:
             return
 
 
+class LogChangedError(OSError):
+    """The log was cut or rotated while it was read: what was read is part of a file that is no longer the log."""
+
+
+def _changed(path: str) -> LogChangedError:
+    return LogChangedError(
+        errno.EAGAIN, "the log changed while it was read (rotated, cut, or a record half written), run the command "
+                      "again; after a rotation the log has one more file (FILE.N)", str(path))
+
+
+def _despite_lock(read: Callable[[], bytes], path: str) -> bytes:
+    """What `read` returns, tried again for LOCKED_READ_SECONDS while a writer's lock refuses it (Windows).
+
+    Only a read is tried again, never an open: a file this user may not read
+    is refused at once. PermissionError, naming the lock, when the wait is over.
+    """
+    deadline = time.monotonic() + LOCKED_READ_SECONDS
+    pause = 0.001
+    while True:
+        try:
+            return read()
+        except PermissionError as exc:
+            if time.monotonic() >= deadline:
+                raise PermissionError(
+                    exc.errno, f"a writer held the log's lock for {LOCKED_READ_SECONDS:g} seconds, so it could not "
+                               "be read (Permission denied); try again", str(path)) from None
+        time.sleep(pause)
+        pause = min(pause * 2, 0.05)
+
+
+def file_head(path: str) -> bytes | None:
+    """The first bytes of the file at `path` (HEAD_BYTES at most; fewer from a shorter file). Raises OSError.
+
+    None for anything but a regular file, which is not opened here: what is
+    read from a pipe (`audit verify <(zcat FILE.1.gz) FILE`) is gone, and
+    nobody rotates a pipe.
+    """
+    if not stat.S_ISREG(os.stat(path).st_mode):
+        return None
+    with open(path, "rb") as handle:
+        return _despite_lock(lambda: handle.peek(1), path)[:HEAD_BYTES]
+
+
+def iter_whole_file(path: str, known_head: bytes | None = None) -> Iterator[bytes | None]:
+    """iter_lines over the file at `path`; LogChangedError at the end if it was cut or rotated meanwhile.
+
+    A rotation empties the log in place and starts it again, so a reader that
+    was part-way through gets the end of the file in the middle of a line, or
+    the middle of the new file: neither is what the log holds. It shows in
+    two ways, both looked at once the last line was read: the file is shorter
+    than what was read, or it no longer starts with the bytes it started with.
+    A third case is a reader that reaches the end while a record is being
+    appended and gets half of it: when the last line has no newline, the size
+    is looked at again under the writers' lock (_grew_since).
+    known_head: the start of the file as it was when the caller first looked
+    (file_head); the file must still start with it when it is opened here.
+    Raises OSError if the file cannot be opened or read.
+    """
+    with open(path, "rb") as handle:
+        if not handle.seekable():  # a pipe: nobody rotates it, and its start cannot be looked at twice
+            yield from iter_lines(handle)
+            return
+        # One read of the start of the file, kept in the handle's buffer: the lines below begin there.
+        head = _despite_lock(lambda: handle.peek(1), path)[:HEAD_BYTES]
+        if known_head is not None and not head.startswith(known_head):
+            raise _changed(path)
+        last: bytes | None = b"\n"
+        for last in iter_lines(handle):
+            yield last
+        read = handle.tell()
+        if os.fstat(handle.fileno()).st_size < read:
+            raise _changed(path)
+        if last is not None and not last.endswith(b"\n") and _grew_since(path, read):
+            raise _changed(path)
+        handle.seek(0)
+        if _despite_lock(lambda: handle.read(len(head)), path) != head:
+            raise _changed(path)
+
+
+def _grew_since(path: str, read: int) -> bool:
+    """Whether the file is longer than the `read` bytes a reader got, looked at while no writer is appending.
+
+    For a last line without a newline: either a writer was in the middle of
+    appending it (the file is longer once that writer is done), or a write
+    was cut short long ago and the line is damage to report. The size is
+    read under the lock every writer appends under (audit_chain.append_chained).
+    False when the lock cannot be had in LOCKED_READ_SECONDS: the line is
+    then judged as it was read.
+    """
+    try:
+        with open(path, "rb", buffering=0) as handle:
+            lock_file(handle, timeout=LOCKED_READ_SECONDS)
+            try:
+                return os.fstat(handle.fileno()).st_size > read
+            finally:
+                unlock_file(handle)
+    except OSError:
+        return False
+
+
+def read_again_if_changed(read: Callable[[], _Read]) -> _Read:
+    """What `read` returns; it is called again when it raises LogChangedError, READ_ATTEMPTS times in all.
+
+    read: reads a log from its start and keeps nothing from an earlier call.
+    The last LogChangedError is raised when every attempt found the log changed.
+    """
+    for _ in range(READ_ATTEMPTS - 1):
+        try:
+            return read()
+        except LogChangedError:
+            pass
+    return read()
+
+
 def parse_record(line: bytes) -> dict[str, Any] | None:
     """The record on one line of the log, or None if the line is not a JSON object.
 
@@ -109,20 +243,22 @@ def iter_records(
 ) -> Iterator[dict[str, Any] | None]:
     """Yield each record of the log at `path`, in order; None for each line that cannot be read.
 
-    Blank lines are skipped. Raises OSError if the file cannot be opened.
+    Blank lines are skipped. Raises OSError if the file cannot be opened, and
+    LogChangedError (an OSError) after the last record when the log was cut
+    or rotated while it was read: what was yielded is then no account of the
+    log, and the caller reads it again (read_again_if_changed).
     on_line: called with every line as it was read (blank ones too), before
     its record is yielded: for a check of the chain in the same pass
     (audit_chain.ChainChecker.add). When it returns a record, that record is
     yielded rather than reading the line a second time; it must be the record
     parse_record gives for the line (None: the line is read here).
     """
-    with open(path, "rb") as handle:
-        for line in iter_lines(handle):
-            record = on_line(line) if on_line is not None else None
-            if line is None:
-                yield None
-            elif line.strip():
-                yield record if record is not None else parse_record(line)
+    for line in iter_whole_file(path):
+        record = on_line(line) if on_line is not None else None
+        if line is None:
+            yield None
+        elif line.strip():
+            yield record if record is not None else parse_record(line)
 
 
 def follow_records(
@@ -142,7 +278,8 @@ def follow_records(
         pending = b""
         skipping = False  # inside a line that was too long, until its newline
         while not stop():
-            chunk = handle.readline(MAX_LINE_BYTES + 1 - len(pending))
+            # After a cut the read starts at the first byte again, which a writer's lock covers (Windows).
+            chunk = _despite_lock(lambda: handle.readline(MAX_LINE_BYTES + 1 - len(pending)), path)
             if chunk:
                 if skipping:
                     skipping = not chunk.endswith(b"\n")
@@ -193,8 +330,13 @@ def is_block(record: dict[str, Any]) -> bool:
 
 
 def is_meta(record: dict[str, Any]) -> bool:
-    """Whether the record starts a chain or describes the session, rather than a call or a check (META_EVENTS)."""
-    return record.get("event") in META_EVENTS and record.get("action") == "note"
+    """Whether the record starts a chain or describes the session, rather than a call or a check (META_EVENTS).
+
+    The event is read as text first: a line may hold any JSON there, and an
+    object or a list cannot be looked up in a set.
+    """
+    event = record.get("event")
+    return isinstance(event, str) and event in META_EVENTS and record.get("action") == "note"
 
 
 def parse_timestamp(text: str) -> tuple[datetime, bool] | None:

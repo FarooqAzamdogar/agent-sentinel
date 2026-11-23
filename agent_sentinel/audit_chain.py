@@ -21,7 +21,10 @@ A chain starts with a "chain_start" record ("start" says why):
   new      the first record of a new file (prev is 64 zeros, seq 0);
   rotated  the first record of the file after rotation (--audit-max-bytes):
            it continues the chain of the file that was moved aside (FILE.1,
-           FILE.2, ...), whose name it gives in "previous_file";
+           FILE.2, ...), whose name it gives in "previous_file". When that
+           file's last line could not be linked to, it starts a chain of its
+           own (seq 0) and names the last chained record found in the end of
+           that file, as a restart does ("after_seq", "after_hash", "scanned");
   restart  the last line of the log could not be linked to (damaged, cut
            short, or written by agent-sentinel 0.5 or earlier), or this
            process may append to the log but not read it: a new chain starts
@@ -64,6 +67,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Callable, Sequence
 
 from .auditlog import CHAIN_START, PROTOCOL, SESSION_END, SESSION_START, iter_lines, parse_record  # noqa: F401
+from .auditlog import file_head, iter_whole_file, read_again_if_changed
 from .filelock import lock_file, unlock_file
 from .jsonutil import loads as strict_json
 from .textutil import printable
@@ -106,6 +110,10 @@ MAX_KEY_FILE_BYTES = 1024
 _KEY_ID_LABEL = b"agent-sentinel audit key id"
 # How many problems a check keeps the text of (all of them are counted).
 MAX_PROBLEMS_KEPT = 20
+
+# The largest seq the chain fields hold: 18 digits (_TRAILER). The writer never links to a line whose seq
+# leaves no room for the records after it (see _read_tail), so it never writes a seq it could not read back.
+MAX_SEQ = 10**18 - 1
 
 _HEX64 = rb"[0-9a-f]{64}"
 # The chain fields at the end of a line: rfind(_TRAILER_START) finds where they begin.
@@ -226,11 +234,14 @@ def append_chained(
             tail = _read_tail(handle, size) if readable else _UNREAD if size else _Tail()
             start: dict[str, Any] | None = None
             if readable and max_bytes is not None and _should_rotate(size, len(line) + 400, max_bytes):
+                # Looked for before the log is emptied: a chain that cannot continue the file names the last
+                # chained record in its end, as a restart does, so that records removed from it are found.
+                unlinked = _last_link(handle, size) if tail.problem is not None else {}
                 rotated = _rotate(handle, path, size)
                 if rotated is not None:
                     size = 0
                     start = {"start": ROTATED, "reason": f"the log was rotated: the records before are in {rotated}",
-                             "previous_file": rotated}
+                             "previous_file": rotated, **unlinked}
             if start is None and size == 0:
                 start = {"start": NEW, "reason": "a new audit log"}
             elif start is None and tail.problem is not None:
@@ -328,6 +339,10 @@ def _read_tail(handle: BinaryIO, size: int) -> _Tail:
     if found is None:
         return _Tail(problem="the last line of the log has no chain fields (agent-sentinel 0.5 or earlier wrote it, "
                              "or it is damaged)")
+    # Two numbers are kept free after it: a rotation writes a chain_start and then the record.
+    if found.seq > MAX_SEQ - 2:
+        return _Tail(problem="the last line of the log has a seq at the end of the range, so no record can follow "
+                             "it (agent-sentinel did not write it, or it is damaged)")
     return _Tail(seq=found.seq, digest=found.digest)
 
 
@@ -412,8 +427,18 @@ def _next_rotated_number(path: Path) -> int | None:
     older rotated files were deleted, so the numbers stay in the order the
     files were written.
     """
+    numbers = _rotated_numbers(path)
+    if numbers is None:
+        return None
+    highest = max((int(number) for number in numbers), default=0)
+    return highest + 1 if highest < MAX_ROTATED_FILES else None
+
+
+def _rotated_numbers(path: Path) -> list[str] | None:
+    """The N of every FILE.N beside the log, as its name spells it; None when the folder cannot be listed
+    (or holds more than MAX_LISTED_ENTRIES entries)."""
     prefix = os.path.normcase(f"{path.name}.")
-    highest = 0
+    found = []
     try:
         with os.scandir(path.parent) as entries:
             for count, entry in enumerate(entries):
@@ -424,10 +449,22 @@ def _next_rotated_number(path: Path) -> int | None:
                     continue
                 number = name[len(prefix):]
                 if number.isascii() and number.isdigit() and len(number) <= 5 and int(number) <= MAX_ROTATED_FILES:
-                    highest = max(highest, int(number))
+                    found.append(number)
     except OSError:
         return None
-    return highest + 1 if highest < MAX_ROTATED_FILES else None
+    return found
+
+
+def rotated_files(path: str | Path) -> list[Path]:
+    """The files a log was rotated to (FILE.1, FILE.2, ...), oldest first; none when the folder cannot be listed.
+
+    Only the names rotation itself writes (FILE.7, not FILE.007). The log's
+    folder is listed once; nothing is opened.
+    """
+    log = Path(path)
+    numbers = _rotated_numbers(log) or []
+    return [log.with_name(f"{log.name}.{number}")
+            for number in sorted({int(text) for text in numbers if text == str(int(text)) and int(text) >= 1})]
 
 
 def _copy_aside(handle: BinaryIO, descriptor: int, target: Path, size: int) -> bool:
@@ -755,6 +792,10 @@ class ChainChecker:
             elif isinstance(previous, tuple):
                 if _could_not_read(record):  # a writer that may only append: it did not know the record before
                     self.report.unlinked += 1
+                elif previous[0] > MAX_SEQ - 2:
+                    # No seq is left after the record before it, so the writer could only start again (_read_tail).
+                    # That record did not follow what was before it, and was reported there.
+                    self._check_restart_follows(record)
                 else:
                     self._problem("a new chain starts although the record before it is intact: records may have "
                                   "been removed here")
@@ -770,11 +811,27 @@ class ChainChecker:
         fresh = trailer.seq == 0 and trailer.prev == GENESIS
         if not at_start:
             self._problem("a rotated file's first record is in the middle of a file")
-        elif isinstance(previous, tuple):
+        elif isinstance(previous, tuple) and not (fresh and previous[0] > MAX_SEQ - 2):
+            # (A file that ends in a record at the end of the seq range cannot be continued: the next one starts
+            # a chain of its own (_read_tail) and names that record, which is checked below.)
             if trailer.prev != previous[1] or trailer.seq != previous[0] + 1:
-                self._problem(f"it does not continue the file before it (whose last record is seq {previous[0]})")
+                named = record.get("previous_file")
+                expected = (f"; it names {printable(named, limit=80)} as the file before it" if isinstance(named, str)
+                            and named else "")
+                self._problem(f"it does not continue the file before it (whose last record is seq {previous[0]})"
+                              f"{expected}: give every file of the log, oldest first (FILE.1 FILE.2 ... FILE)")
+        elif fresh and previous is None and self._files == 1:  # the first file given: the older ones were not given
+            shown = printable(record.get("previous_file", "an older file"), limit=80)
+            self.report.notes.append(
+                f"the first file starts a chain of its own after {shown}, whose last line could not be linked to; "
+                "that file was not checked: give the older files first, oldest first, to check it too"
+            )
+        elif fresh and "after_hash" in record:
+            # The file before ended in a line that cannot be linked to (unchained, or damaged and reported
+            # there): the start names the last chained record its writer found before that line.
+            self._check_restart_follows(record, "a rotated file's first record that starts a chain")
         elif fresh or previous == "bad":
-            pass  # the file before ended in a line that cannot be linked to: unchained, or damaged (reported there)
+            pass  # as above, from a writer that named no record; or it continues a damaged line (reported there)
         elif trailer.seq == 0 or trailer.prev == GENESIS:
             self._problem("a rotated file's first record must continue the chain (seq above 0, with the hash "
                           "before it) or start one (seq 0, no previous hash)")
@@ -788,18 +845,19 @@ class ChainChecker:
             self._problem(f"it continues seq {trailer.seq - 1}, which is not in the files given before it: those "
                           "records were removed")
 
-    def _check_restart_follows(self, record: dict[str, Any]) -> None:
+    def _check_restart_follows(self, record: dict[str, Any], what: str = "a restart") -> None:
         """A restart after a damaged or unchained line names the last chained record its writer found before it
-        (after_seq, after_hash), or null when there was none in what it searched: that record must be here."""
+        (after_seq, after_hash), or null when there was none in what it searched: that record must be here.
+        The same holds for a rotated file's first record that starts a chain of its own (`what` names it)."""
         if "after_hash" not in record or "after_seq" not in record:
-            self._problem("a restart must name the record before it (after_seq and after_hash)")
+            self._problem(f"{what} must name the record before it (after_seq and after_hash)")
             return
         after_seq, after_hash = record["after_seq"], record["after_hash"]
         if after_hash is None and after_seq is None:
             return  # no chained record in the end of the log its writer searched (a log from 0.5, or a long line)
-        if (type(after_seq) is not int or not 0 <= after_seq < 10**18 or not isinstance(after_hash, str)
+        if (type(after_seq) is not int or not 0 <= after_seq <= MAX_SEQ or not isinstance(after_hash, str)
                 or not _HEX64_TEXT.fullmatch(after_hash)):
-            self._problem("a restart must name the record before it (after_seq and after_hash)")
+            self._problem(f"{what} must name the record before it (after_seq and after_hash)")
             return
         last = self._last_chained
         if last is None:
@@ -818,13 +876,27 @@ def _could_not_read(record: dict[str, Any]) -> bool:
 
 
 def check_files(paths: Sequence[str], key: bytes | None = None) -> ChainReport:
-    """Check one log, or several in order (oldest first). Raises OSError if one cannot be read."""
+    """Check one log, or several in order (oldest first). Raises OSError if one cannot be read.
+
+    A writer may rotate the log during the check. What a reader then holds is
+    part of a file that is no longer the log, and would look damaged, so it
+    is never judged: one file is read again from its start (auditlog.READ_ATTEMPTS
+    times at most). With several files the check stops with
+    auditlog.LogChangedError (an OSError): the log has one more file now, and
+    the caller has to list them again.
+    """
+    if len(paths) == 1:
+        return read_again_if_changed(lambda: _check_once(paths, [None], key))
+    # The start of every file as it is now: a log rotated before its turn comes no longer starts like this.
+    return _check_once(paths, [file_head(path) for path in paths], key)
+
+
+def _check_once(paths: Sequence[str], heads: Sequence[bytes | None], key: bytes | None) -> ChainReport:
     checker = ChainChecker(key)
-    for path in paths:
+    for path, head in zip(paths, heads):
         checker.start_file(printable(path, limit=200) if len(paths) > 1 else "")
-        with open(path, "rb") as handle:
-            for raw in iter_lines(handle):
-                checker.add(raw)
+        for raw in iter_whole_file(path, known_head=head):
+            checker.add(raw)
     return checker.finish()
 
 

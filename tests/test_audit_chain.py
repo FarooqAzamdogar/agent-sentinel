@@ -496,6 +496,36 @@ class Verifying(LogTest):
                 report, _ = self.tampered(self.lines + [b'{"note": "x"}\n', line])
                 self.assertTrue(any(words in problem for problem in report.problems), report.problems)
 
+    def test_a_forged_last_line_at_the_end_of_the_seq_range_does_not_discredit_the_records_after_it(self):
+        # The chain fields hold a seq of 18 digits. A writer that linked to the largest one would write a seq
+        # of 19 digits, which nothing reads as chain fields: a genuine, signed record would look inserted.
+        top = audit_chain.MAX_SEQ
+        self.assertEqual(len(str(top)), 18)
+        for seq in (top, top - 1, top - 2):
+            with self.subTest(seq=seq):
+                self.audit.write_bytes(b"".join(self.lines))
+                with open(self.audit, "ab") as handle:  # no key is needed for this line, and any hash will do
+                    handle.write(b'{"event": "call", "tool": "x", "action": "allow", "seq": %d, "prev": "%s", '
+                                 b'"hash": "%s"}\n' % (seq, b"a" * 64, b"b" * 64))
+                self.write_calls(2, audit_key_file=self.key_file)
+                self.write_calls(1, audit_key_file=self.key_file)
+                forged = len(self.lines) + 1
+                genuine = raw_lines(self.audit)[forged:]
+                for line in genuine:  # each can be read back as chained, and is signed
+                    trailer = parse_trailer(line.rstrip(b"\n"))
+                    self.assertIsNotNone(trailer, line[-200:])
+                    self.assertIsNotNone(trailer.mac)
+                    self.assertLessEqual(trailer.seq, top)
+                starts = [json.loads(line) for line in genuine if b'"event": "chain_start"' in line]
+                self.assertEqual([(start["start"], start["seq"]) for start in starts], [("restart", 0)])
+                self.assertIn("seq at the end of the range", starts[0]["reason"])
+                report = self.check(key=KEY)
+                self.assertEqual(report.state, "broken")
+                self.assertTrue(all(problem.startswith(f"line {forged}: ") for problem in report.problems),
+                                report.problems)  # only the forged line: nothing after it is called inserted
+                self.assertEqual(report.mac_mismatches, 1)
+                self.assertEqual(report.chained, len(self.lines) + 1 + len(genuine))
+
     def test_problems_are_counted_but_only_the_first_few_kept(self):
         lines = [line.replace(b'"action"', b'"action" ') for line in self.lines]  # every hash now wrong
         self.write_calls(40, audit_key_file=self.key_file)
@@ -624,6 +654,76 @@ class Rotation(LogTest):
         self.assertEqual((first["start"], first["seq"], first["prev"]), ("rotated", 0, GENESIS))
         report = self.check(*files)
         self.assertEqual((report.state, report.unchained_prefix), ("partial", 25), report.problems)
+
+    def test_a_file_that_starts_a_chain_of_its_own_says_that_the_file_before_it_was_not_checked(self):
+        old = {"time": "2020-01-01T00:00:00+00:00", "event": "call", "tool": "t", "action": "allow", "reason": "r"}
+        self.write_log("audit.jsonl", [{**old, "args": {"note": "o" * PAD}}] * 25)
+        self.fill(5)
+        alone = self.check()  # without audit.jsonl.1
+        self.assertEqual(alone.state, "intact", alone.problems)
+        self.assertIn("the first file starts a chain of its own after audit.jsonl.1", alone.notes[0])
+        self.assertIn("that file was not checked", alone.notes[0])
+        code, out, _ = run_cli("audit", "verify", self.audit)
+        self.assertEqual(code, 0)
+        self.assertIn("Note: the first file starts a chain of its own after audit.jsonl.1", out)
+        self.assertEqual(self.check(*self.rotated()).notes, [])  # every file given: nothing was left unchecked
+
+    def almost_full(self, **options):
+        """A log one call short of being rotated, and the firewall that wrote it."""
+        firewall = self.firewall(audit_max_bytes=ROTATE_AT, **options)
+        while not self.audit.exists() or self.audit.stat().st_size < ROTATE_AT - PAD - 1000:
+            firewall.check_call("read_file", {"path": "f", "note": "p" * PAD})
+        self.assertEqual(self.rotated(), [self.audit])
+        return firewall
+
+    def test_a_rotation_that_cannot_continue_the_chain_names_the_last_record_before_it(self):
+        # Someone who may write the log adds a line that is no record just before the log is rotated, so that
+        # the next file starts a chain of its own; then replaces the rotated file. The signed first record of
+        # the next file says which record came last, so the replacement is found.
+        firewall = self.almost_full(audit_key_file=self.key_file)
+        last = all_records(self.audit)[-1]
+        with open(self.audit, "ab") as handle:
+            handle.write(b'{"note": "x"}\n')
+        firewall.check_call("read_file", {"path": "f", "note": "p" * PAD})
+        rotated, log = self.rotated()
+        start = all_records(log)[0]
+        self.assertEqual((start["start"], start["seq"], start["prev"]), ("rotated", 0, GENESIS))
+        self.assertEqual((start["after_seq"], start["after_hash"]), (last["seq"], last["hash"]))
+        report = self.check(rotated, log, key=KEY)  # as it was written: only the added line is reported
+        self.assertEqual((report.state, report.problem_count), ("broken", 1), report.problems)
+        self.assertIn("it has no chain fields", report.problems[0])
+        old = json.dumps({"time": "2020-01-01T00:00:00+00:00", "event": "call", "tool": "read_file",
+                          "action": "allow", "reason": "r"}).encode() + b"\n"  # looks like a line from 0.5
+        kept = raw_lines(rotated)
+        cases = {"replaced by an unchained line": ([old], f"it follows seq {last['seq']}, which is not in the log"),
+                 "its last records removed": (kept[:-4] + kept[-1:], f"it follows seq {last['seq']}, but the last "
+                                                                      f"chained record before it is seq "
+                                                                      f"{last['seq'] - 3}")}
+        for name, (lines, words) in cases.items():
+            with self.subTest(name=name):
+                rotated.write_bytes(b"".join(lines))
+                report = self.check(rotated, log, key=KEY)
+                self.assertEqual(report.state, "broken")
+                self.assertTrue(any(words in problem for problem in report.problems), report.problems)
+                self.assertEqual(report.mac_mismatches, 0)  # every signed record left is genuine
+
+    def test_a_forged_line_at_the_end_of_the_seq_range_before_a_rotation_discredits_only_itself(self):
+        # The file after it cannot continue such a line, so it starts a chain of its own and names that line:
+        # its genuine, signed first record must not be reported as failing to continue the file before it.
+        firewall = self.almost_full(audit_key_file=self.key_file)
+        with open(self.audit, "ab") as handle:
+            handle.write(b'{"event": "call", "tool": "x", "action": "allow", "seq": %d, "prev": "%s", "hash": "%s"}\n'
+                         % (audit_chain.MAX_SEQ, b"a" * 64, b"b" * 64))
+        firewall.check_call("read_file", {"path": "f", "note": "p" * PAD})
+        rotated, log = self.rotated()
+        start = all_records(log)[0]
+        self.assertEqual((start["start"], start["seq"], start["after_seq"]), ("rotated", 0, audit_chain.MAX_SEQ))
+        forged = len(raw_lines(rotated))
+        report = self.check(rotated, log, key=KEY)
+        self.assertEqual(report.state, "broken")
+        self.assertTrue(all(f"audit.jsonl.1 line {forged}: " in problem for problem in report.problems),
+                        report.problems)
+        self.assertEqual(report.mac_mismatches, 1)  # the forged line's, which has none
 
     def test_records_larger_than_the_limit_do_not_each_get_a_file(self):
         # Review AUD2-2: arguments may be 100,000 characters, more than the smallest --audit-max-bytes.
@@ -864,6 +964,18 @@ class AuditRequired(LogTest):
         self.assertIn("what cannot be recorded is refused", stderr.getvalue())
         self.assertTrue(firewall.check_call("read_file", {"path": "a"}).allowed)  # writable again: back to normal
 
+    def test_a_value_that_is_neither_true_nor_false_is_refused_rather_than_taken_as_off(self):
+        # 1 or "yes" (from an environment variable, a configuration value) once meant "off", without a word.
+        for value in (1, 0, "yes", "no", "", None, [True]):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "audit_required must be True or False"):
+                    self.firewall(audit_required=value)
+                with self.assertRaisesRegex(ValueError, "audit_required must be True or False"):
+                    Firewall(POLICY, audit_required=value)  # without a log as well
+        self.assertIs(self.firewall(audit_required=True).audit_required, True)
+        self.assertIs(self.firewall(audit_required=False).audit_required, False)
+        self.assertIs(self.firewall().audit_required, False)
+
     def test_monitor_mode_does_not_lift_it(self):
         firewall = self.firewall(audit_required=True, monitor=True)
         with self.failing(), contextlib.redirect_stderr(io.StringIO()):
@@ -1027,6 +1139,310 @@ class Readers(LogTest):
         self.assertIn("WOULD BE BLOCKED", out)
 
 
+class ReadersOfARotatedLog(LogTest):
+    def rotated(self):
+        return sorted(self.folder.glob("audit.jsonl.*"), key=lambda path: int(path.suffix[1:]))
+
+    def test_explain_finds_a_reference_in_the_file_the_log_was_just_rotated_to(self):
+        firewall = self.firewall(audit_max_bytes=ROTATE_AT)
+        blocked = firewall.check_call("delete_file", {"path": "the one asked about"})
+        self.write_calls(40, firewall, pad=PAD)
+        rotated = self.rotated()
+        self.assertTrue(rotated)
+        self.assertNotIn(blocked.ref, self.audit.read_text(encoding="utf-8"))  # it is in audit.jsonl.1 now
+        code, out, err = run_cli("explain", self.audit, "--ref", blocked.ref)
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("audit.jsonl.1, a file this log was rotated to. Its chain is not checked here", out)
+        self.assertIn("BLOCKED  call delete_file", out)
+        self.assertIn("the one asked about", out)
+
+    def test_explain_reads_a_bounded_number_of_rotated_files_and_says_which(self):
+        from agent_sentinel.cli_explain import MAX_ROTATED_SEARCHED
+        firewall = self.firewall(audit_max_bytes=ROTATE_AT)
+        oldest = firewall.check_call("delete_file", {"path": "long ago"})
+        self.write_calls(30 * (MAX_ROTATED_SEARCHED + 2), firewall, pad=PAD)
+        rotated = self.rotated()
+        self.assertGreater(len(rotated), MAX_ROTATED_SEARCHED + 1)
+        code, out, _ = run_cli("explain", self.audit, "--ref", "00000000")
+        self.assertEqual(code, 1)
+        read = ", ".join(path.name for path in rotated[::-1][:MAX_ROTATED_SEARCHED])
+        self.assertIn(f"No record in the log has ref 00000000, nor do the rotated files that were read ({read}); "
+                      f"{len(rotated) - MAX_ROTATED_SEARCHED} older rotated file(s) were not read", out)
+        self.assertIn("audit.jsonl.1", out.split("the oldest is")[1])
+        code, out, _ = run_cli("explain", self.audit, "--ref", oldest.ref)  # too far back: said, not searched
+        self.assertEqual(code, 1)
+        self.assertIn("older rotated file(s) were not read", out)
+        code, out, _ = run_cli("explain", rotated[0], "--ref", oldest.ref)  # where it says to look
+        self.assertEqual(code, 0, out)
+
+    def test_explain_passes_over_what_rotation_cannot_have_written(self):
+        from agent_sentinel import cli_explain
+        self.write_log("audit.jsonl", [{"event": "call", "tool": "x", "action": "allow"}])
+        block = {"event": "call", "tool": "x", "action": "block", "ref": "0badf00d", "reason": "r"}
+        self.write_log("audit.jsonl.1", [block])
+        (self.folder / "audit.jsonl.2").mkdir()  # not a file
+        self.write_log("audit.jsonl.3", [{**block, "tool": "planted"}] * 3)
+        with mock.patch.object(cli_explain, "MAX_ROTATED_FILE_BYTES", 150):  # audit.jsonl.3 is "huge"
+            code, out, err = run_cli("explain", self.audit, "--ref", "0badf00d")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("audit.jsonl.1, a file this log was rotated to", out)
+        self.assertNotIn("planted", out)
+        if hasattr(os, "mkfifo"):  # a pipe would never end: it is not opened
+            os.mkfifo(self.folder / "audit.jsonl.4")
+            code, out, _ = run_cli("explain", self.audit, "--ref", "0badf00d")
+            self.assertEqual(code, 0, out)
+
+    def test_explain_without_blocks_says_where_the_older_records_are(self):
+        self.write_log("audit.jsonl", [{"event": "call", "tool": "x", "action": "allow"}])
+        code, out, _ = run_cli("explain", self.audit)
+        self.assertEqual((code, out.splitlines()[-1]), (1, "The log has no blocked calls."))
+        self.write_log("audit.jsonl.1", [{"event": "call", "tool": "x", "action": "block"}])
+        self.write_log("audit.jsonl.2", [{"event": "call", "tool": "x", "action": "block"}])
+        self.write_log("audit.jsonl.007", [])  # not a name rotation writes
+        code, out, _ = run_cli("explain", self.audit)
+        self.assertEqual(code, 1)
+        self.assertIn("The log has no blocked calls. Older records are in the 2 file(s) it was rotated to (the "
+                      "newest is ", out)
+        self.assertIn("audit.jsonl.2): run explain on one of them.", out)
+
+    def test_the_rotated_files_are_listed_oldest_first_by_number(self):
+        for name in ("audit.jsonl.10", "audit.jsonl.2", "audit.jsonl.1", "audit.jsonl.007", "audit.jsonl.x",
+                     "audit.jsonl.0", "other.jsonl.3", "audit.jsonl.99999"):
+            self.write(name, "")
+        self.assertEqual([path.name for path in audit_chain.rotated_files(self.audit)],
+                         ["audit.jsonl.1", "audit.jsonl.2", "audit.jsonl.10"])
+        self.assertEqual(audit_chain.rotated_files(self.folder / "missing" / "audit.jsonl"), [])
+        self.assertEqual(audit_chain._next_rotated_number(self.audit), 11)  # the highest number still counts
+
+
+class ReadingALogWhileItIsRotated(LogTest):
+    """A writer rotates the log (copies it aside, empties it, starts it again) while a reader is part-way through.
+
+    The reader then holds half of a file that is no longer the log. It must
+    read again, or say that the log changed: never call a healthy log broken.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.writer = self.firewall(audit_max_bytes=ROTATE_AT)
+        self.rotate()  # audit.jsonl.1 exists, and the log continues it
+
+    def rotated(self):
+        return sorted(self.folder.glob("audit.jsonl.*"), key=lambda path: int(path.suffix[1:]))
+
+    def call(self):
+        return self.writer.check_call("delete_file", {"path": "f", "note": "p" * PAD})
+
+    def rotate(self, more=0):
+        """Calls until the log has been rotated once more, then `more` calls into the new file."""
+        before = len(self.rotated())
+        for _ in range(200):
+            self.call()
+            if len(self.rotated()) > before:
+                break
+        else:
+            self.fail("the log was never rotated")
+        for _ in range(more):
+            self.call()
+
+    def fill(self):
+        """A log of several buffers' worth, short of being rotated."""
+        while self.audit.stat().st_size < ROTATE_AT // 2:
+            self.call()
+
+    def rotating_under_the_reader(self, times=1, more=0, line=3):
+        """While active, the log is rotated when a reader has read `line` lines of a file (the first `times`)."""
+        left = [times]
+        real = auditlog.iter_lines
+
+        def reading(handle, limit=auditlog.MAX_LINE_BYTES):
+            for number, raw in enumerate(real(handle, limit)):
+                if number == line and left[0] > 0:
+                    left[0] -= 1
+                    self.rotate(more)
+                yield raw
+
+        return mock.patch.object(auditlog, "iter_lines", reading)
+
+    def test_a_check_of_the_log_reads_it_again_and_finds_it_intact(self):
+        for more in (0, 12):  # 12: the new file is already longer than what the reader had read
+            with self.subTest(more=more):
+                self.fill()
+                files = len(self.rotated())
+                with self.rotating_under_the_reader(more=more):
+                    report = self.check()
+                self.assertEqual(len(self.rotated()), files + 1)  # it was rotated during the check
+                self.assertEqual((report.state, report.problems), ("intact", []))
+                self.assertEqual(report.lines, len(raw_lines(self.audit)))  # the log as it is now, all of it
+        self.assertEqual(self.check(*self.rotated(), self.audit).state, "intact")
+
+    def test_verify_report_and_explain_never_call_it_broken(self):
+        for command, words in ((("audit", "verify"), "INTACT: every record is as it was written"),
+                               (("report",), "Integrity: hash chain intact"),
+                               (("explain",), "Integrity: hash chain intact")):
+            with self.subTest(command=command):
+                self.fill()
+                with self.rotating_under_the_reader():
+                    code, out, err = run_cli(*command, self.audit)
+                self.assertEqual(code, 0, out + err)
+                self.assertIn(words, out)
+                self.assertNotIn("BROKEN", out)
+                self.assertNotIn("could not be read", out)  # the half line of the first read is not counted
+        policy_file = self.write("policy.json", {"default": "block"})
+        self.fill()
+        with self.rotating_under_the_reader():
+            code, out, err = run_cli("suggest", self.audit, "--policy", policy_file)
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("could not be read", out)
+
+    def test_report_counts_the_log_as_it_is_after_the_rotation(self):
+        self.fill()
+        with self.rotating_under_the_reader(more=2):
+            data = json.loads(run_cli("report", self.audit, "--format", "json")[1])
+        self.assertEqual(data["records"], len(audit_records(self.audit)))
+        self.assertEqual((data["unreadable_lines"], data["integrity"]["state"]), (0, "intact"))
+
+    def test_a_record_being_appended_as_the_check_reaches_the_end_is_not_a_write_cut_short(self):
+        self.fill()
+        whole = self.audit.read_bytes()
+        self.audit.write_bytes(whole[:-150])  # the reader will get half of the last record ...
+        real, left = auditlog.iter_lines, [whole[-150:]]
+
+        def reading(handle, limit=auditlog.MAX_LINE_BYTES):
+            yield from real(handle, limit)
+            if left:
+                with open(self.audit, "ab") as writer:  # ... which its writer then finishes
+                    writer.write(left.pop())
+
+        with mock.patch.object(auditlog, "iter_lines", reading):
+            report = self.check()
+        self.assertEqual((report.state, report.problems), ("intact", []))
+        self.audit.write_bytes(whole[:-150])  # a write that really was cut short is still reported
+        report = self.check()
+        self.assertEqual(report.state, "broken")
+        self.assertIn("it is incomplete: it has no newline at its end", report.problems[0])
+
+    def test_a_log_that_keeps_changing_is_an_error_not_a_verdict(self):
+        self.fill()
+        with self.rotating_under_the_reader(times=50, line=1):
+            with self.assertRaises(auditlog.LogChangedError):
+                self.check()
+        self.fill()
+        with self.rotating_under_the_reader(times=50, line=1):
+            code, out, err = run_cli("audit", "verify", self.audit)
+        self.assertEqual(code, 2, out)
+        self.assertIn("the log changed while it was read (rotated, cut, or a record half written), run the command "
+                      "again", err)
+        self.assertNotIn("BROKEN", out + err)
+        self.fill()
+        for command in ("report", "explain"):
+            with self.subTest(command=command), self.rotating_under_the_reader(times=50, line=1):
+                code, out, err = run_cli(command, self.audit)
+                self.assertEqual(code, 2, out)
+                self.assertIn("the log changed while it was read", err)
+                self.assertNotIn("Traceback", err)
+
+    def test_with_several_files_a_rotation_during_the_check_is_an_error_that_says_to_list_them_again(self):
+        self.fill()
+        files = [*self.rotated(), self.audit]
+        with self.rotating_under_the_reader():  # while the first file is read, the log gets one more file
+            with self.assertRaises(auditlog.LogChangedError) as raised:
+                self.check(*files)
+        self.assertEqual(raised.exception.filename, str(self.audit))
+        self.fill()
+        files = [*self.rotated(), self.audit]
+        with self.rotating_under_the_reader():
+            code, out, err = run_cli("audit", "verify", *files)
+        self.assertEqual(code, 2, out)
+        self.assertIn("after a rotation the log has one more file (FILE.N)", err)
+        self.assertNotIn("BROKEN", out + err)
+        self.assertEqual(self.check(*self.rotated(), self.audit).state, "intact")  # listed again: all is well
+
+    def test_with_several_files_one_read_through_a_pipe_is_opened_once(self):
+        # `audit verify <(zcat audit.jsonl.1.gz) audit.jsonl`: what was read from a pipe is gone, so the start
+        # of each file is looked at beforehand only for regular files.
+        files = [*self.rotated(), self.audit]
+        piped = str(files[0])
+        content, opened = files[0].read_bytes(), []
+        real_open, real_stat = open, os.stat
+
+        class Pipe(io.BytesIO):
+            def seekable(self):
+                return False
+
+        def fake_open(path, mode="r", *args, **kwargs):
+            if str(path) != piped:
+                return real_open(path, mode, *args, **kwargs)
+            opened.append(path)
+            return io.BufferedReader(Pipe(content if len(opened) == 1 else b""))  # once read, it is gone
+
+        def fake_stat(path, *args, **kwargs):
+            if str(path) != piped:
+                return real_stat(path, *args, **kwargs)
+            return os.stat_result((stat.S_IFIFO | 0o600, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+
+        with mock.patch.object(auditlog, "open", fake_open, create=True), mock.patch("os.stat", fake_stat):
+            report = self.check(*files)
+        self.assertEqual((report.state, report.problems), ("intact", []))
+        self.assertEqual(len(opened), 1)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "named pipes are a POSIX matter")
+    def test_with_several_files_named_pipes_are_read_once_through(self):
+        files = [*self.rotated(), self.audit]
+        pipes = []
+        for number, file in enumerate(files):
+            pipe = self.folder / f"pipe{number}"
+            os.mkfifo(pipe)
+            pipes.append((pipe, file.read_bytes()))
+
+        def feed(pipe, content):
+            try:
+                pipe.write_bytes(content)
+            except OSError:  # the reader went away
+                pass
+
+        def unblock():  # a reader still waiting in open() gets the end of the file
+            for pipe, _ in pipes:
+                try:
+                    os.close(os.open(pipe, os.O_WRONLY | os.O_NONBLOCK))
+                except OSError:
+                    pass
+
+        for pipe in pipes:
+            threading.Thread(target=feed, args=pipe, daemon=True).start()
+        found = []
+        checking = threading.Thread(target=lambda: found.append(self.check(*(str(pipe) for pipe, _ in pipes))),
+                                    daemon=True)
+        checking.start()
+        checking.join(timeout=60)
+        unblock()
+        self.assertFalse(checking.is_alive(), "the check waited for a pipe that had been read already")
+        self.assertEqual((found[0].state, found[0].problems), ("intact", []))
+
+    @unittest.skipUnless(sys.platform == "win32", "only Windows refuses to read a locked byte")
+    def test_on_windows_a_check_waits_for_a_writer_that_holds_the_lock(self):
+        from agent_sentinel.filelock import lock_file, unlock_file
+        with open(self.audit, "a+b", buffering=0) as writer:
+            lock_file(writer)
+            release = threading.Timer(0.3, lambda: unlock_file(writer))
+            release.start()
+            try:
+                code, out, err = run_cli("audit", "verify", self.audit)
+            finally:
+                release.join()
+        self.assertEqual(code, 0, out + err)
+        with open(self.audit, "a+b", buffering=0) as writer:
+            lock_file(writer)
+            try:
+                with mock.patch.object(auditlog, "LOCKED_READ_SECONDS", 0.2):
+                    code, out, err = run_cli("audit", "verify", self.audit)
+            finally:
+                unlock_file(writer)
+        self.assertEqual(code, 2, out)
+        self.assertIn("a writer held the log's lock", err)
+        self.assertIn("audit.jsonl", err)
+
+
 # ---- agent-sentinel audit verify ----------------------------------------------------------------------------
 
 class TheCommand(LogTest):
@@ -1072,6 +1488,37 @@ class TheCommand(LogTest):
         numbered = sorted(self.folder.glob("audit.jsonl.*"), key=lambda path: int(path.suffix[1:]))
         self.assertEqual(self.verify(*numbered, self.audit)[0], 0)
         self.assertEqual(self.verify(*reversed(numbered), self.audit)[0], 1)
+
+    def test_files_given_in_another_order_are_told_the_order_their_names_give(self):
+        from agent_sentinel.cli_audit import oldest_first
+        from agent_sentinel.cli_common import shown_path
+        self.write_calls(60, pad=PAD, audit_max_bytes=ROTATE_AT)
+        numbered = sorted(self.folder.glob("audit.jsonl.*"), key=lambda path: int(path.suffix[1:]))
+        self.assertGreater(len(numbered), 1)
+        in_order = " ".join(shown_path(path) for path in (*numbered, self.audit))
+        as_a_shell_lists_them = sorted([*numbered, self.audit], key=str)  # audit.jsonl first
+        code, out, _ = self.verify(*as_a_shell_lists_them)
+        self.assertEqual(code, 1)
+        self.assertIn("BROKEN", out)
+        self.assertIn("  The files are checked in the order given, and must be given oldest first. Going by their "
+                      f"names, that is: {in_order}", out)
+        code, out, _ = self.verify(*numbered[1:], self.audit, numbered[0])
+        self.assertIn(f"that is: {in_order}", out)
+        code, out, _ = self.verify(*numbered, self.audit)  # in order: nothing to say
+        self.assertEqual(code, 0)
+        self.assertNotIn("oldest first. Going by", out)
+        code, out, _ = self.verify(numbered[0], self.audit)  # in order, one missing: broken, and no hint
+        self.assertEqual(code, 1)
+        self.assertNotIn("oldest first. Going by", out)
+        self.assertIn(f"it names {numbered[-1].name} as the file before it: give every file of the log, oldest "
+                      "first (FILE.1 FILE.2 ... FILE)", out)
+        self.assertEqual(oldest_first(["a.jsonl", "a.jsonl.1", "a.jsonl.10", "a.jsonl.2"]),
+                         ["a.jsonl.1", "a.jsonl.2", "a.jsonl.10", "a.jsonl"])
+        self.assertEqual(oldest_first(["a.jsonl.10", "a.jsonl.9"]), ["a.jsonl.9", "a.jsonl.10"])
+        for names in (["a.jsonl"], ["a.jsonl", "b.jsonl"], ["a.1", "b.2"], ["a.jsonl", "a.jsonl"],
+                      ["a.jsonl", "a.jsonl.x"], ["a.jsonl.1", "a.jsonl.1"]):
+            with self.subTest(names=names):
+                self.assertIsNone(oldest_first(names))
 
     def test_usage_and_read_errors_exit_2(self):
         self.write_calls(1)
