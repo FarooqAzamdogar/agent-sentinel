@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import json
 import os
 import tempfile
 import time
@@ -16,6 +17,7 @@ from agent_sentinel.launch import (
     launch_identity,
     launch_risks,
     runner_package,
+    runner_packages,
     typosquat_of,
     version_before,
     within_one_edit,
@@ -55,7 +57,8 @@ class InlineCode(unittest.TestCase):
     def test_scripts_and_modules_are_not_inline_code(self):
         for words in (("pwsh", "-File", "server.ps1"), ("node", "-r", "dotenv/config", "server.js"),
                       ("python", "-m", "server", "-c", "config.toml"), ("python", "server.py", "-c", "x"),
-                      ("bash", "server.sh"), ("npx", "-y", "some-server@1.0.0")):
+                      ("bash", "server.sh"), ("npx", "-y", "some-server@1.0.0"),
+                      ("python", "-Wonce", "server.py"), ("python", "-Xtracemalloc", "server.py")):  # values, no -c
             with self.subTest(words=words):
                 self.assertEqual([risk for risk in risks(*words) if "code written" in risk], [])
 
@@ -138,10 +141,13 @@ class TheOtherRisks(unittest.TestCase):
                       ["bash"] + ["-" + "o" * 5000] * 4095,  # options that take values, of a shell
                       ["node", "x.js"] + ["/" + ".ssh/" * 2000] * 400):  # 4 MB that looks like credential paths
             started = time.perf_counter()
-            launch_risks(words, user_home=HOME)
+            found = launch_risks(words, user_home=HOME)
             runner_package(words)
             launch_identity("C:/x/" + words[0], words)
             self.assertLess(time.perf_counter() - started, 2)
+            # and where the reading stopped short, the risks say so
+            self.assertTrue([risk for risk in found if "only part of it was checked" in risk
+                             or "only its start was checked" in risk], found)
 
     def test_an_entry_as_large_as_a_configuration_is_checked_and_printed_quickly(self):
         from agent_sentinel.cli_doctor import full_command, launch_lines
@@ -284,11 +290,14 @@ class BehindWrappers(unittest.TestCase):
             deep = ["cmd", "/c", *deep]
         self.assertEqual(launch.runner_packages(deep), [])  # too deep to look behind: nothing is assumed
         self.assertTrue(any("cmd /c" in risk for risk in risks(*deep)))  # still inline code
+        self.assertIn("so only part of it was checked", risks(*deep)[0])  # and the cut is said
         many = ["bash", "-c", " ; ".join(f"npx -y p{number}-server@1.0.0" for number in range(100))]
         self.assertEqual(len(launch.commands_run(many)), launch.MAX_COMMANDS)
         self.assertLessEqual(len(launch.runner_packages(many)), launch.MAX_COMMANDS)
+        self.assertIn("so only part of it was checked", risks(*many)[0])
         long_string = ["bash", "-c", "npx -y x@1.0.0 " + "a" * 100_000]
         self.assertEqual(runner_package(long_string).name, "x")  # the start of a long string is still read
+        self.assertIn("so only part of it was checked", risks(*long_string)[0])
 
 
 class OtherSpellings(unittest.TestCase):
@@ -766,6 +775,395 @@ class WhatAServerPinHolds(unittest.TestCase):
         big.write_bytes(b"x" * 100)
         with mock.patch.object(launch, "MAX_HASHED_BYTES", 10):
             self.assertIsNone(launch.file_sha256(str(big)))
+
+
+class RunnerOptionsBeforeThePackage(unittest.TestCase):
+    """A runner's own option in front of the package must not hide the package from the checks."""
+
+    def findings(self, *words):
+        return [(level, text) for ref in runner_packages(list(words)) for level, text in advisory_findings(ref)]
+
+    def test_an_option_with_a_separate_value_does_not_hide_the_package(self):
+        for words in (
+            ("npx", "--prefix", "C:/tools/npm", "-y", "postmark-mcp@1.0.16"),
+            ("npx", "--loglevel", "error", "-y", "postmark-mcp@1.0.16"),
+            ("npx", "--tag", "latest", "postmark-mcp"),
+            ("npx", "--location", "user", "--script-shell", "/bin/sh", "postmark-mcp@1.0.16"),
+            ("npm", "exec", "--loglevel", "error", "--", "postmark-mcp@1.0.16"),
+            ("npm", "--prefix", "/srv", "exec", "--loglevel", "silent", "postmark-mcp@1.0.16"),
+            ("bunx", "--cwd", "/srv", "postmark-mcp@1.0.16"),
+            ("pnpm", "dlx", "-c", "postmark-mcp"),  # pnpm's -c is a flag (--shell-mode), not npx's -c STRING
+            ("pnpm", "dlx", "--reporter", "silent", "postmark-mcp@1.0.16"),
+            ("env", "-iu", "X", "npx", "-y", "postmark-mcp@1.0.16"),  # env's own options run together
+            ("env", "-C", "/srv", "-i", "npx", "-y", "postmark-mcp@1.0.16"),
+        ):
+            with self.subTest(words=words):
+                self.assertEqual([level for level, _ in self.findings(*words)], ["fail"])
+                self.assertIn("postmark-mcp", launch_identity("C:/x/" + words[0], list(words))["package"])
+        for words in (("uvx", "--color", "never", "mcp-server-git==2025.1.1"),
+                      ("uvx", "--allow-insecure-host", "h.example", "mcp-server-git==2025.1.1"),
+                      ("pipx", "run", "--index-url", "https://pypi.org/simple", "mcp-server-git==2025.1.1")):
+            with self.subTest(words=words):
+                self.assertEqual([level for level, _ in self.findings(*words)], ["warn"])
+
+    def test_after_an_option_not_known_here_the_next_two_plain_words_are_checked(self):
+        # --some-option may take "value" or take nothing: the package is one of the two words, and both are read.
+        taken = runner_packages(["npx", "--some-option", "value", "-y", "postmark-mcp@1.0.16", "argument"])
+        self.assertEqual([(ref.name, ref.unsure) for ref in taken], [("value", True), ("postmark-mcp", True)])
+        self.assertEqual([level for level, _ in self.findings("npx", "--some-option", "value", "postmark-mcp@1.0.16")],
+                         ["fail"])
+        self.assertEqual([level for level, _ in self.findings("npx", "--some-flag", "postmark-mcp@1.0.16", "x")],
+                         ["fail"])
+        self.assertEqual([level for level, _ in self.findings("uvx", "--some-option", "value",
+                                                              "mcp-server-git==2025.1.1")], ["warn"])
+        # a --package behind such a word is read too, and nothing is in doubt when every option is known
+        behind = runner_packages(["npx", "--some-option", "value", "-p", "postmark-mcp@1.0.16", "run-it"])
+        self.assertIn(("postmark-mcp", True), [(ref.name, ref.unsure) for ref in behind])
+        sure = runner_packages(["npx", "-y", "--registry", "https://r.example", "mcp-remote@0.1.16", "https://x"])
+        self.assertEqual([(ref.name, ref.unsure) for ref in sure], [("mcp-remote", False)])
+        self.assertEqual(launch_identity("C:/x/npx", ["npx", "--some-option", "value", "pkg@1.0.0"])["package"],
+                         "npx value; npx pkg@1.0.0")
+
+    def test_a_folder_given_to_an_option_not_known_here_is_no_repository(self):
+        quiet = risks("npx", "--some-option", "tools/npm", "-y", "some-server@1.0.0")
+        self.assertEqual([risk for risk in quiet if "git repository" in risk], [])
+        named = risks("npx", "--some-option", "git+https://x.example/y", "some-server@1.0.0")
+        self.assertEqual(len([risk for risk in named if "git repository" in risk]), 1)
+        self.assertEqual(len([risk for risk in risks("npx", "someone/some-server") if "git repository" in risk]), 1)
+        # such a word is said to be in doubt; one after options this check knows is not
+        (doubt,) = [risk for risk in risks("npx", "--some-flag", "mcp-remote@0.1.16", "https://remote.example/sse")
+                    if "git repository" in risk]
+        self.assertTrue(doubt.startswith("may run a package straight from a git repository or a web address"), doubt)
+        self.assertIn("so this word is that option's value or the package", doubt)
+        self.assertEqual([risk for risk in risks("npx", "-y", "mcp-remote@0.1.16", "https://remote.example/sse")
+                          if "git repository" in risk], [])
+        (sure,) = [risk for risk in risks("npx", "-y", "https://x.example/p.tgz") if "git repository" in risk]
+        self.assertTrue(sure.startswith("runs a package straight"), sure)
+
+
+class SecretsInWhatIsQuoted(unittest.TestCase):
+    """What launch.py quotes of a command, and what a pin keeps of it, holds no secret."""
+
+    TOKEN = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+
+    def test_a_token_in_a_package_address_is_masked_in_every_phrase(self):
+        for words in (
+            ("uvx", "--from", f"git+https://x-access-token:{self.TOKEN}@github.com/acme/private-mcp", "tool"),
+            ("npx", "-y", f"https://{self.TOKEN}@github.com/acme/private/archive/main.tgz"),
+            ("npx", "-y", f"https://user:{self.TOKEN}@registry.npmjs.org/postmark-mcp/-/postmark-mcp-1.0.16.tgz"),
+            ("node", "server.js", f"--config=/home/u/.aws/credentials?key={self.TOKEN}"),
+            ("docker", "run", "-v", f"/:/host/{self.TOKEN}", "img@sha256:" + "a" * 64),
+            ("docker", "run", "-i", f"registry.example/{self.TOKEN}/img:1"),
+            ("cmd", f"/ccurl-{self.TOKEN}"),
+        ):
+            with self.subTest(words=words):
+                said = risks(*words) + [text for ref in runner_packages(list(words))
+                                        for _, text in advisory_findings(ref)]
+                self.assertTrue(said)
+                self.assertNotIn(self.TOKEN, " ".join(said))
+                self.assertIn("[redacted", " ".join(said))
+
+    def test_a_password_in_an_address_is_masked_and_a_user_name_is_kept(self):
+        for text, expected in (
+            ("https://user:hunter2@host.example/x.tgz", "https://user:[redacted credential]@host.example/x.tgz"),
+            ("git+https://tok3n@host.example/r", "git+https://[redacted credential]@host.example/r"),
+            ("postgresql://admin:Sup3rSecretPw@db.internal/prod", "postgresql://admin:[redacted credential]@db.internal/prod"),
+            ("ssh://git@github.com/acme/r", "ssh://git@github.com/acme/r"),
+            ("git+ssh://git@github.com/acme/r", "git+ssh://git@github.com/acme/r"),
+            ("git@github.com:acme/r.git", "git@github.com:acme/r.git"),
+            ("https://host.example/path?mail=a@b.example", "https://host.example/path?mail=a@b.example"),
+            ("a://u:p@h b://v:q@i", "a://u:[redacted credential]@h b://v:[redacted credential]@i"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(launch.masked(text), expected)
+                self.assertEqual(launch.masked(launch.masked(text)), expected)  # masking again changes nothing
+        said = risks("npx", "-y", "https://user:hunter2@host.example/x.tgz")
+        self.assertNotIn("hunter2", " ".join(said))
+
+    def test_a_pin_holds_no_token_and_still_tells_a_changed_address(self):
+        def package(address):
+            return launch_identity("C:/x/uvx", ["uvx", "--from", address, "tool"])["package"]
+
+        pinned = package(f"git+https://x-access-token:{self.TOKEN}@github.com/acme/private-mcp")
+        self.assertNotIn(self.TOKEN, pinned)
+        self.assertIn("github.com/acme/private-mcp", pinned)
+        self.assertEqual(pinned, package("git+https://x-access-token:ghp_" + "Z9y8" * 9 + "@github.com/acme/private-mcp"))
+        self.assertNotEqual(pinned, package(f"git+https://x-access-token:{self.TOKEN}@github.com/evil/private-mcp"))
+
+    def test_masking_megabytes_stays_quick(self):
+        started = time.monotonic()
+        for text in ("://" * 400_000, "a://" + "b" * 1_000_000, "x://u:" + "p" * 600 + "@h " * 2000,
+                     ("https://user:pw@h.example/" + "a" * 50 + " ") * 20_000):
+            launch.masked(text)
+        self.assertLess(time.monotonic() - started, 5)
+
+
+class ContainerOptionsWrittenTogether(unittest.TestCase):
+    DIGEST = "img@sha256:" + "a" * 64
+
+    def test_a_cluster_of_short_options_hides_no_mount_and_no_privilege(self):
+        for words, expected in (
+            (("docker", "run", "-iv", "/:/host", self.DIGEST), "mounts a whole drive"),
+            (("docker", "run", "--rm", "-iv", "/:/h@sha256:x", self.DIGEST), "mounts a whole drive"),
+            (("docker", "run", "-itv", "/:/host", self.DIGEST), "mounts a whole drive"),
+            (("docker", "run", "-itv/:/host", self.DIGEST), "mounts a whole drive"),
+            (("docker", "run", "-v=/:/host", self.DIGEST), "mounts a whole drive"),
+            (("podman", "run", "-iv", "/var/run/docker.sock:/s", self.DIGEST), "mounts the container engine's socket"),
+            (("docker", "run", "-iv", "/srv:/data", "--privileged", self.DIGEST), "--privileged"),
+            (("docker", "run", "-ie", "A=1", "--privileged", self.DIGEST), "--privileged"),
+            (("docker", "run", "-c", "512", "--privileged", self.DIGEST), "--privileged"),
+            (("docker", "run", "-ic", "512", "--network", "host", self.DIGEST), "shares the host's network"),
+            # a letter not known here: what follows is still read, and a mount is never taken for the image
+            (("docker", "run", "-iZ", "/:/host", "--privileged", self.DIGEST), "mounts a whole drive"),
+            (("docker", "run", "-iZ", "/:/host", "--privileged", self.DIGEST), "--privileged"),
+            (("docker", "run", "--some-option", "/var/run/docker.sock:/s", self.DIGEST), "engine's socket"),
+        ):
+            with self.subTest(words=words):
+                found = risks(*words)
+                self.assertTrue([risk for risk in found if expected in risk], found)
+                self.assertEqual([risk for risk in found if "by a tag" in risk], [])
+
+    def test_flags_written_together_change_nothing_else(self):
+        self.assertEqual(risks("docker", "run", "-it", "--rm", self.DIGEST), [])
+        (only,) = risks("docker", "run", "-di", "ghcr.io/x/y:1")
+        self.assertIn("runs the image ghcr.io/x/y:1 by a tag", only)
+        (only,) = risks("docker", "run", "-ie", "A=1", "-w", "/srv", "localhost:5000/x/y")
+        self.assertIn("runs the image localhost:5000/x/y by a tag", only)
+
+
+class LongerThanTheBounds(unittest.TestCase):
+    """A command longer than a bound of the checks is reported: only part of it was checked."""
+
+    PART = "so only part of it was checked"
+
+    def test_padding_past_a_bound_is_said(self):
+        started = time.monotonic()
+        for words in (
+            ["npx", *["-y"] * 4100, "postmark-mcp@1.0.16"],
+            ["docker", "run", *["-i"] * 4100, "--privileged", "-v", "/:/host", "evil:latest"],
+            ["npm", *["--yes"] * 70, "exec", "postmark-mcp@1.0.16"],
+            ["env", *["A=1"] * 130, "npx", "-y", "postmark-mcp@1.0.16"],
+            ["sh", *["-x"] * 70, "-c", "npx -y postmark-mcp@1.0.16"],
+            ["sudo", *["-n"] * 70, "npx", "-y", "postmark-mcp@1.0.16"],
+            ["docker", *["--debug"] * 70, "run", "--privileged", "img"],
+            ["python", *["-B"] * 70, "-c", "import os"],
+            ["bash", "-c", "true; " * 40 + "npx -y postmark-mcp@1.0.16"],
+            ["bash", "-c", "x" * 9000 + "; npx -y postmark-mcp@1.0.16"],
+            ["env", "env", "env", "env", "env", "npx", "-y", "postmark-mcp@1.0.16"],
+        ):
+            with self.subTest(words=words[:3], count=len(words)):
+                found = launch_risks(words, user_home=HOME)
+                self.assertIn(self.PART, found[0], found)  # first: never among the risks left out
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_an_ordinary_command_is_not_called_too_long(self):
+        for words in (["npx", "-y", "mcp-remote@0.1.16", "https://x.example/mcp"],
+                      ["env", *["A=1"] * 20, "npx", "-y", "some-server@1.0.0"],
+                      ["docker", "run", "-i", "--rm", *["-e", "A=1"] * 30, "img@sha256:" + "a" * 64],
+                      ["cmd", "/c", "npx", "-y", "some-server@1.0.0"],
+                      ["bash", "-c", "cd /srv && exec node server.js"],
+                      ["node", "server.js", *["--flag"] * 200]):
+            with self.subTest(words=words[:4]):
+                self.assertEqual([risk for risk in launch_risks(words, user_home=HOME) if self.PART in risk], [])
+
+
+class VersionsAsTheRegistriesWriteThem(unittest.TestCase):
+    def levels(self, *words):
+        return [level for level, _ in advisory_findings(runner_package(list(words)))]
+
+    def test_an_exact_pypi_version_need_not_have_three_numbers(self):
+        for spec, version in (("some-pkg==1.0", "1.0"), ("some-pkg==2025.1", "2025.1"), ("some-pkg==1.2.3.4", "1.2.3.4"),
+                              ("some-pkg==1.0.0rc1", "1.0.0rc1"), ("some-pkg==2025.1.1.post1", "2025.1.1.post1"),
+                              ("some-pkg===2025.1.1", "2025.1.1"), ("some-pkg==1.0.dev3", "1.0.dev3"),
+                              ("some-pkg==1.0+local.1", "1.0+local.1"), ("some-pkg[extra]==1.0", "1.0"),
+                              ("some-pkg==1.0; python_version>'3'", "1.0"), ("some-pkg@1.0", "1.0")):
+            with self.subTest(spec=spec):
+                ref = runner_package(["uvx", spec])
+                self.assertEqual((ref.name, ref.version), ("some-pkg", version))
+                self.assertIsNone(launch.unpinned_spec(ref))
+        for spec in ("some-pkg", "some-pkg>=1.0", "some-pkg==1.*", "some-pkg==1.0,<2", "some-pkg~=1.0", "some-pkg==x"):
+            with self.subTest(spec=spec):
+                ref = runner_package(["uvx", spec])
+                self.assertIsNone(ref.version)
+                self.assertIsNotNone(launch.unpinned_spec(ref))
+
+    def test_such_a_version_is_compared_with_the_fixed_one(self):
+        for spec in ("mcp-server-git==2025.1", "mcp-server-git==2025.1.1.post1", "mcp-server-git==2025.12.18rc1",
+                     "mcp-server-git===2025.1.1", "mcp-server-git==2025.1.1; python_version>'3'",
+                     "mcp-server-git==2026.1.14rc1", "mcp-server-git==2026.1.14.dev1"):
+            with self.subTest(spec=spec):
+                self.assertEqual(self.levels("uvx", spec), ["warn"])
+        for spec in ("mcp-server-git==2026.1.14", "mcp-server-git==2026.1.14.post1", "mcp-server-git==2026.2"):
+            with self.subTest(spec=spec):
+                self.assertEqual(self.levels("uvx", spec), [])
+        self.assertTrue(version_before("2025.12.18rc1", "2025.12.18"))
+        self.assertTrue(version_before("2026.1.14.dev1", "2026.1.14"))
+
+    def test_npm_reads_an_equals_sign_as_an_exact_version(self):
+        ref = runner_package(["npx", "-y", "mcp-remote@=0.1.15"])
+        self.assertEqual(ref.version, "0.1.15")
+        self.assertEqual(self.levels("npx", "-y", "mcp-remote@=0.1.15"), ["warn"])
+        self.assertEqual(self.levels("npx", "-y", "mcp-remote@=0.1.16"), [])
+        self.assertEqual(self.levels("npx", "-y", "postmark-mcp@=1.0.16"), ["fail"])
+
+    def test_a_range_that_allows_only_vulnerable_versions_warns(self):
+        for spec in ("mcp-remote@<0.1.16", "mcp-remote@<=0.1.15", "mcp-remote@0.1.15||0.1.14",
+                     "mcp-remote@0.1.15 || 0.1.14", "mcp-remote@>=0.1.0 <0.1.16", "mcp-remote@0.1.0 - 0.1.15",
+                     "mcp-remote@~0.0.9", "mcp-remote@^0.0.9", "mcp-remote@0.0.x", "mcp-remote@< 0.1.10",
+                     "@modelcontextprotocol/server-filesystem@~2025.6.0", "@modelcontextprotocol/server-filesystem@2024"):
+            with self.subTest(spec=spec):
+                (found,) = advisory_findings(runner_package(["npx", "-y", spec]))
+                self.assertEqual(found[0], "warn")
+                self.assertIn("can only fetch versions before", found[1])
+        for spec in ("mcp-remote@<0.1.17", "mcp-remote@<=0.1.16", "mcp-remote@~0.1.14", "mcp-remote@^0.1.14",
+                     "mcp-remote@0.1.x", "mcp-remote@0.1.15||0.1.16", "mcp-remote@0.1.15||latest", "mcp-remote@>=0.1.0",
+                     "mcp-remote@*", "mcp-remote@latest", "mcp-remote@0.1.0 - 0.1", "mcp-remote@<" + "9" * 400):
+            with self.subTest(spec=spec):
+                self.assertEqual(self.levels("npx", "-y", spec), [])
+        for spec in ("mcp-server-git<=2025.12.18", "mcp-server-git<2026.1.14", "mcp-server-git~=2025.1.1",
+                     "mcp-server-git==2025.1.*", "mcp-server-git>=2025.1,<2026"):
+            with self.subTest(spec=spec):
+                (found,) = advisory_findings(runner_package(["uvx", spec]))
+                self.assertIn("can only fetch versions before 2026.1.14", found[1])
+        for spec in ("mcp-server-git>=2025.1", "mcp-server-git<2026.2", "mcp-server-git~=2026.1", "mcp-server-git",
+                     "mcp-server-git!=2025.1.1", "mcp-server-git<=2026.1.14"):
+            with self.subTest(spec=spec):
+                self.assertEqual(self.levels("uvx", spec), [])
+
+    def test_names_that_are_the_same_package_are_no_typosquats(self):
+        # PyPI compares names without case and with "-", "_" and "." alike: these are the popular packages.
+        for words in (("uvx", "mcp_server_git"), ("uvx", "MCP-Server-Git"), ("uvx", "mcp.server.git==2026.1.14"),
+                      ("uvx", "FastMCP"), ("npx", "MCP-Remote")):
+            with self.subTest(words=words):
+                self.assertIsNone(typosquat_of(runner_package(list(words))))
+        # Another name is another package: on npm "_" is not "-", and a letter or a sign more is a new name.
+        for words, popular in ((("uvx", "fast-mcp"), "fastmcp"), (("uvx", "fast_mcp"), "fastmcp"),
+                               (("npx", "mcp_remote"), "mcp-remote"), (("npx", "mcp-remote2"), "mcp-remote")):
+            with self.subTest(words=words):
+                self.assertEqual(typosquat_of(runner_package(list(words))), popular)
+
+
+class MoreCodeOnTheCommandLine(unittest.TestCase):
+    def test_other_interpreters_and_runners_given_code(self):
+        for words, flag in (
+            (("perl", "-e", "print 1"), "perl -e"), (("perl", "-Mstrict", "-ne", "print"), "perl -ne"),
+            (("ruby", "-e", "puts 1"), "ruby -e"), (("php", "-r", "echo 1;"), "php -r"),
+            (("php8.3", "-d", "x=1", "-r", "echo 1;"), "php8.3 -r"), (("php", "--run", "echo 1;"), "php --run"),
+            (("lua", "-e", "print(1)"), "lua -e"), (("Rscript", "-e", "1"), "rscript -e"),
+            (("osascript", "-e", "beep"), "osascript -e"),
+            (("deno", "-q", "eval", "1"), "deno eval"), (("bun", "run", "-e", "1"), "bun -e"),
+            (("npx", "-c", "node evil.js"), "npx -c"), (("npm", "exec", "-c", "node evil.js"), "npm -c"),
+            (("npx", "-y", "--call", "node evil.js"), "npx --call"), (("pnpm", "dlx", "-c", "x"), "pnpm -c"),
+            (("pwsh", "-ExecutionPolicy:Bypass", "-Command", "x"), "pwsh -Command"),
+            (("pwsh", "-ep:Bypass", "-c", "x"), "pwsh -c"),
+            (("python", "-Wonce", "-c", "1"), "python -c"), (("python", "-X", "utf8", "-Bc", "1"), "python -Bc"),
+        ):
+            with self.subTest(words=words):
+                self.assertIn(f"runs code written on the command line ({flag})", risks(*words))
+
+    def test_a_letter_in_another_options_value_is_no_code(self):
+        for words in (("python", "-Wonce", "server.py"), ("python", "-Xtracemalloc", "server.py"),
+                      ("python", "-W", "ignore::DeprecationWarning", "server.py"), ("python", "-uB", "server.py"),
+                      ("perl", "-Ilib", "server.pl"), ("ruby", "-Ilib", "server.rb"), ("php", "-f", "server.php"),
+                      ("php", "-d", "error_reporting=0", "server.php"), ("lua", "server.lua", "-e"),
+                      ("deno", "run", "-A", "server.ts"), ("bun", "run", "server.ts"), ("npx", "-y", "eval@1.0.0"),
+                      ("npm", "exec", "--", "some-server@1.0.0", "-c", "x"), ("npm", "run", "start")):
+            with self.subTest(words=words):
+                self.assertEqual([risk for risk in risks(*words) if "code written" in risk], [])
+
+    def test_uv_run_of_a_web_address_is_a_download(self):
+        for words in (("uv", "run", "https://evil.example/server.py"),
+                      ("uv", "run", "--script", "https://evil.example/server.py"),
+                      ("uv", "--quiet", "run", "--with", "mcp", "http://evil.example/s.py"),
+                      ("cmd", "/c", "uv", "run", "https://evil.example/server.py")):
+            with self.subTest(words=words):
+                self.assertTrue([risk for risk in risks(*words) if "downloads a script from a web address" in risk])
+        for words in (("uv", "run", "server.py"), ("uv", "run", "mcp-server", "--url", "https://x.example"),
+                      ("uv", "sync", "https://x.example")):
+            with self.subTest(words=words):
+                self.assertEqual([risk for risk in risks(*words) if "downloads a script" in risk], [])
+
+
+class TheWholeLaunchIsPinned(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = Path(self.tmp.name).resolve()
+
+    def identity(self, *words):
+        return launch_identity("C:/x/" + words[0], list(words), cwd=str(self.folder))
+
+    def test_any_other_word_of_the_command_is_a_change(self):
+        for before, after in (
+            (("python", "-m", "good"), ("python", "-m", "evil")),
+            (("docker", "run", "-i", "a@sha256:" + "1" * 64), ("docker", "run", "-i", "--privileged", "evil")),
+            (("cmd", "/c", "run.bat"), ("cmd", "/c", "evil.bat")),
+            (("npx", "-y", "pkg@1.0.0"), ("npx", "-y", "--registry", "https://evil.example", "pkg@1.0.0")),
+            (("node", "server.js"), ("node", "--require", "./evil.js", "server.js")),
+            (("node", "server.js"), ("node", "server.js", "--allow-everything")),
+            (("java", "-jar", "server.jar"), ("java", "-jar", "other.jar")),
+        ):
+            with self.subTest(before=before):
+                one, other = self.identity(*before), self.identity(*after)
+                self.assertRegex(one["command_sha256"], r"\A[0-9a-f]{64}\Z")
+                self.assertNotEqual(one["command_sha256"], other["command_sha256"])
+                self.assertEqual(one, self.identity(*before))
+        self.assertEqual(set(self.identity("node", "server.js")), set(launch.LAUNCH_FIELDS))
+
+    def test_a_new_token_is_no_change_and_no_secret_is_hashed(self):
+        def with_token(token):
+            return self.identity("node", "server.js", "--token", token, f"https://user:{token}@api.example/v1")
+
+        one, other = with_token("ghp_" + "a1B2" * 9), with_token("ghp_" + "c3D4" * 9)
+        self.assertEqual(one["command_sha256"], other["command_sha256"])
+        self.assertNotEqual(one["command_sha256"], self.identity("node", "server.js", "--token")["command_sha256"])
+
+    def test_a_folder_or_a_name_without_its_ending_is_hashed_as_what_runs(self):
+        (self.folder / "dist").mkdir()
+        index = self.folder / "dist" / "index.js"
+        index.write_bytes(b"v1")
+        (self.folder / "pkg").mkdir()
+        main = self.folder / "pkg" / "__main__.py"
+        main.write_bytes(b"v1")
+        (self.folder / "app").mkdir()
+        (self.folder / "app" / "package.json").write_text(json.dumps({"main": "lib/start.js"}), encoding="utf-8")
+        (self.folder / "app" / "lib").mkdir()
+        start = self.folder / "app" / "lib" / "start.js"
+        start.write_bytes(b"v1")
+        for words, changes in ((("node", "dist/index"), index), (("node", "dist"), index), (("python", "pkg"), main),
+                               (("node", "app"), start), (("bun", "run", "dist/index"), index)):
+            with self.subTest(words=words):
+                changes.write_bytes(b"v1")
+                before = self.identity(*words)
+                self.assertRegex(before["script_sha256"] or "", r"\A[0-9a-f]{64}\Z")
+                self.assertIsNone(launch.unhashed_code(before))
+                changes.write_bytes(b"v2: rewritten")
+                after = self.identity(*words)
+                self.assertNotEqual(before["script_sha256"], after["script_sha256"])
+                self.assertEqual(before["script"], after["script"])
+        (self.folder / "app" / "package.json").write_text(json.dumps({"main": "lib/other.js"}), encoding="utf-8")
+        self.assertNotEqual(self.identity("node", "app")["script_sha256"], after["script_sha256"])
+
+    def test_a_script_that_cannot_be_hashed_is_said_to_be_unpinned(self):
+        (self.folder / "empty").mkdir()
+        big = self.folder / "big.js"
+        big.write_bytes(b"x" * 100)
+        for words in (("node", "missing.js"), ("node", "empty"), ("python", "empty")):
+            with self.subTest(words=words):
+                identity = self.identity(*words)
+                self.assertIsNone(identity["script_sha256"])
+                self.assertIn("could not be hashed", launch.unhashed_code(identity))
+        with mock.patch.object(launch, "MAX_HASHED_BYTES", 10):
+            identity = self.identity("node", "big.js")
+        self.assertIsNone(identity["script_sha256"])
+        self.assertIn("only its path is pinned", launch.unhashed_code(identity))
+        for words in (("python", "-m", "server"), ("docker", "run", "-i", "img"), ("cmd", "/c", "run.bat")):
+            with self.subTest(words=words):
+                self.assertIn("names no local script", launch.unhashed_code(self.identity(*words)))
+        self.assertIsNone(launch.unhashed_code(self.identity("npx", "-y", "mcp-remote@0.1.16")))
+        script = self.folder / "server.js"
+        script.write_bytes(b"1")
+        self.assertIsNone(launch.unhashed_code(self.identity("node", "server.js")))
 
 
 if __name__ == "__main__":

@@ -54,6 +54,7 @@ from typing import Any
 
 from .cli_common import EXIT_ERROR, EXIT_FAIL, EXIT_OK, CommandError, load_policy, shell_line, shown_path
 from .firewall import Firewall
+from .launch import masked, unhashed_code
 from .pins import (
     INFO_FIELDS,
     INSTRUCTIONS,
@@ -65,6 +66,7 @@ from .pins import (
     PinsFileError,
     ServerPin,
     fingerprint,
+    launch_changes,
     now,
     pending_path,
     read_pins_file,
@@ -577,14 +579,15 @@ def _server_waiting(pins: PinsFile, pending: PinsFile) -> ServerPin | None:
     if new is None:
         return None
     old = pins.server
-    if old is not None and not server_changes(old.launch, new.launch) and (
+    if old is not None and not launch_changes(old.launch, new.launch, masked) and (
             new.info is None or (old.info is not None and not server_changes(old.info, new.info))):
         return None  # accepted already
     return new
 
 
 def _shown_value(value: str | None) -> str:
-    return "(none)" if value is None else repr(printable(value, limit=1000))
+    """A pinned value to print. A pin written before credentials were masked may hold one: it is masked here."""
+    return "(none)" if value is None else repr(printable(masked(value), limit=1000))
 
 
 def _print_server_summary(pin: ServerPin | None, changed: bool) -> None:
@@ -597,6 +600,11 @@ def _print_server_summary(pin: ServerPin | None, changed: bool) -> None:
             if pin.info is not None else ", has not answered a handshake yet")
     print(f"  first seen {printable(pin.first_seen or '?', limit=40)}: launched as {_shown_value(launch)}{says}"
           + ("  CHANGED: a new identity waits (pins diff --server)" if changed else ""))
+    unhashed = unhashed_code(pin.launch)
+    if unhashed:
+        print(f"  note: {unhashed}")
+    if pin.launch.get("command_sha256") is None:
+        print("  note: pinned before the whole command line was; the proxy completes the pin at its next start")
 
 
 def _print_server_change(old: ServerPin | None, new: ServerPin) -> None:
@@ -607,7 +615,8 @@ def _print_server_change(old: ServerPin | None, new: ServerPin) -> None:
         if seen is None:
             print(f"  {section}: not seen yet (the proxy pins it at the next start once this is accepted)")
             continue
-        changed = set(server_changes(pinned, seen)) if pinned is not None else set(fields)
+        changed = set(fields) if pinned is None else set(
+            launch_changes(pinned, seen, masked) if section == "launch" else server_changes(pinned, seen))
         for name in fields:
             after = _shown_value(seen.get(name))
             if name in changed:

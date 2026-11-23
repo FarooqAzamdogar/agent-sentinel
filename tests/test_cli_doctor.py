@@ -478,7 +478,8 @@ class WhyAServerIsBroken(DoctorTest):
         self.assertEqual(status, "broken")
         self.assertIn("is not an ordinary pins file", text)
         pins = self.write("user/.agent-sentinel/pins/big.json", {"version": 1, "tools": {}})
-        with mock.patch.object(cli_doctor, "MAX_CHECKED_FILE_BYTES", 5):
+        with mock.patch.object(cli_doctor, "MAX_CHECKED_FILE_BYTES", 5), \
+                mock.patch.object(cli_doctor, "MAX_CHECKED_PINS_BYTES", 5):  # a pins file has the proxy's own bound
             status, text = self.reasons(self.wrapped("s", pins=pins))
             self.assertIn("is not an ordinary pins file", text)
             status, text = self.reasons(self.wrapped("s"))

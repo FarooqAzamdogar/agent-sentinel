@@ -324,7 +324,8 @@ from .firewall import (
     secret_rule,
 )
 from .jsonutil import finite_float, no_constant
-from .launch import launch_identity
+from .launch import launch_identity, unhashed_code
+from .launch import masked as masked_command_text
 from .leaks import Found
 from .mcp_protocol import ShapeError
 from .pins import (
@@ -2812,7 +2813,9 @@ class Proxy:
         The first serverInfo is pinned (pins.ToolPins.check_server_info). One
         that differs quarantines the whole server (quarantine_server), and
         with --on-server-change refuse (the default) the reply is refused
-        too. In monitor mode the change is logged and nothing happens.
+        too. So does a first serverInfo whose pin cannot be saved: it would
+        be compared with nothing at the next start. In monitor mode either
+        is logged and nothing happens.
         """
         meta = result.get("_meta")
         server_info = result.get("serverInfo")
@@ -2821,11 +2824,21 @@ class Proxy:
         server_info = server_info if isinstance(server_info, dict) else {}
         status, changed = self._pins.check_server_info({"name": server_info_value(server_info.get("name")),
                                                         "version": server_info_value(server_info.get("version"))})
-        self._save_pins()
-        if status != CHANGED:
+        not_saved = None
+        try:
+            self._pins.save()
+        except OSError as exc:
+            _warn(f"cannot save the pins file: {exc}")
+            not_saved = exc if status == NEW else None
+        if status != CHANGED and not_saved is None:
             return None
-        what = f"its serverInfo ({', '.join(changed)}) changed since it was pinned"
-        reason = f"the server is quarantined: {what}. {server_change_advice(self._pins.path)}"
+        if not_saved is not None:
+            what = "its serverInfo could not be pinned: the pins file cannot be saved"
+        else:
+            what = f"its serverInfo ({', '.join(changed)}) changed since it was pinned"
+        advice = ("Make the pins file and its folder writable, and restart the proxy" if not_saved is not None
+                  else server_change_advice(self._pins.path))
+        reason = f"the server is quarantined: {what}. {advice}"
         decision = self._firewall.block(pending.label, reason, event="server_changed", rule=RULE_QUARANTINE,
                                         call_id=pending.call_id)
         if decision.allowed:  # monitor mode: logged as what would have been blocked
@@ -4052,6 +4065,10 @@ def server_change_advice(pins_path: Any) -> str:
             "--server, and restart the proxy")
 
 
+class _ServerPinNotSaved(Exception):
+    """With --pin-server: the server's pin could not be written to the pins file (the OSError is its argument)."""
+
+
 def _check_server_launch(pins: ToolPins, firewall: Firewall, executable: str, command: list[str],
                          label: str, say: Callable[..., None]) -> str | None:
     """With --pin-server: compare how the server is about to be launched with its pin (pins.py).
@@ -4059,14 +4076,32 @@ def _check_server_launch(pins: ToolPins, firewall: Firewall, executable: str, co
     The first launch is pinned. Returns what changed when it differs and
     the change is not lifted by monitor mode (the caller then refuses to
     start, or quarantines the server), else None.
+
+    Raises _ServerPinNotSaved when the pin cannot be written to the pins
+    file: a launch is compared only at the next start, so a pin kept in
+    memory protects nothing, and every start would be the first.
     """
-    status, changed = pins.check_server_launch(launch_identity(executable, command))
+    launch = launch_identity(executable, command)
+    earlier = pins.server_pin
+    status, changed = pins.check_server_launch(launch, masked=masked_command_text)
     try:
         pins.save()
     except OSError as exc:
+        if status == NEW:
+            raise _ServerPinNotSaved(exc) from exc
+        # A pin that is on disk already still holds; what is lost is the copy of a change for `pins diff`.
         _warn(f"cannot save the pins file: {exc}")
     if status == NEW:
         say("--pin-server: pinned how the server is launched; it is compared at every later start")
+    elif status != CHANGED and earlier is not None and earlier.launch.get("command_sha256") is None:
+        # A pin of an earlier form matched by what it holds: what it lacked is taken from this launch.
+        script = (" and the SHA-256 of its script" if earlier.launch.get("script_sha256") is None
+                  and launch.get("script_sha256") else "")
+        say(f"--pin-server: the server's pin, written by an earlier version, lacked the SHA-256 of the whole "
+            f"command line{script}; it now holds them as they are at this start")
+    unhashed = unhashed_code(launch)
+    if unhashed and status != CHANGED:  # said at every start, also with --quiet: such a pin matches whatever runs
+        _warn(f"--pin-server: {unhashed}", limit=1000)
     if status != CHANGED:
         return None
     what = f"its launch ({', '.join(changed)}) changed since it was pinned"
@@ -4184,7 +4219,13 @@ def main(argv: list[str] | None = None) -> int:
     # From here on, a proxy that does not start its server says why in a session_end record.
     server_changed = None
     if args.pin_server:
-        server_changed = _check_server_launch(pins, firewall, executable, command, args.name or "server", say)
+        try:
+            server_changed = _check_server_launch(pins, firewall, executable, command, args.name or "server", say)
+        except _ServerPinNotSaved as exc:  # in monitor mode too: this is no decision about a call
+            _warn(f"not starting: --pin-server was given, and the server's pin cannot be saved in the pins file "
+                  f"({exc}). A pin that is not saved is compared with nothing at the next start", limit=1000)
+            firewall.provenance(audit_chain.SESSION_END, "the server's pin could not be saved, so it was not started")
+            return 2
         if server_changed is not None and on_server_change == SERVER_CHANGE_REFUSE:
             _warn("refusing to start the server (--on-server-change refuse)")
             firewall.provenance(audit_chain.SESSION_END, "the server differs from its pin, so it was not started")

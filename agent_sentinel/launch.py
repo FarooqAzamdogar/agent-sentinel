@@ -20,18 +20,24 @@
                        mounted, or without an image digest, and arguments
                        that name credential files, a whole drive or the whole home folder
     launch_identity    what proxy --pin-server pins of a launch (pins.py): the program, the runners'
-                       packages as written, and the SHA-256 of the local script it starts, found
-                       past the interpreter's options as that interpreter reads them
-                       (_ScriptOptions); every file that may be the script is pinned when an
-                       option in front of it is not known here
+                       packages as written (secrets masked), the SHA-256 of the local script it
+                       starts, found past the interpreter's options as that interpreter reads them
+                       (_ScriptOptions), and the SHA-256 of the whole command line; every file
+                       that may be the script is pinned when an option in front of it is not
+                       known here
+    masked             a piece of a command with its secrets taken out, as every message here
+                       quotes it and as a pin keeps it
 
 doctor (cli_doctor.launch_lines), clients, wrap and inspect report these;
 none of them starts a program or touches the network. launch_identity reads
-one local file, the script, which the proxy is about to start anyway.
+local files only: the script, which the proxy is about to start anyway (for
+a folder, the few files an interpreter runs for it).
 
 Everything is bounded: MAX_WORDS_LINTED words of a command, MAX_LINTED_CHARS
-characters of its text scanned by patterns (a longer command is reported as
-such), MAX_WRAPPERS wrappers in a row and MAX_COMMANDS commands behind them.
+characters of its text scanned by patterns, MAX_OPTIONS_SCANNED options in a
+row, MAX_WRAPPERS wrappers in a row and MAX_COMMANDS commands behind them. A
+command that goes past one of these bounds is reported as such by
+launch_risks: only part of it was checked.
 
 Everything returned that holds text from a configuration is already
 printable (textutil.printable).
@@ -41,7 +47,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import contextvars
 import hashlib
+import json
 import os
 import posixpath
 import re
@@ -51,6 +59,7 @@ from dataclasses import dataclass, replace
 
 from . import advisories, home
 from .advisories import NPM, PYPI
+from .leaks import redact
 from .templates import CREDENTIAL_PATTERN
 from .textutil import printable
 
@@ -62,6 +71,67 @@ MAX_LINTED_CHARS = 64 * 1024
 MAX_RISKS = 12
 # No program's path (and no path doctor compares) is longer than this; a longer word names neither.
 MAX_PATH_CHARS = 4096
+# Of one piece of a command quoted in a message, this much is read for secrets before it is cut to fit.
+MAX_QUOTED_CHARS = 4096
+
+# ---- secrets in a command, and bounds that end a reading early --------------------------------
+
+MASKED_CREDENTIAL = "[redacted credential]"
+# What may stand before the "@" of an address: "user:password", or a token alone.
+_USERINFO = re.compile(r"([^\s/?#@\\:]{0,256})(:[^\s/?#@\\]{0,512})?@")
+_SCHEME_END = re.compile(r"[A-Za-z][A-Za-z0-9+.-]{0,30}\Z")
+
+
+def masked(text: str) -> str:
+    """A command's text with its secrets taken out, for a message and for a pin.
+
+    The built-in secret formats become their markers (leaks.redact), and so
+    does a credential written into an address (without_address_credentials).
+    Masking the result again changes nothing.
+    """
+    return without_address_credentials(redact(text))
+
+
+def without_address_credentials(text: str) -> str:
+    """Text with the credentials written into its addresses replaced by MASKED_CREDENTIAL: the password of
+    "https://user:password@host", and the token of "https://TOKEN@host" (the user of "ssh://git@host" is no
+    secret, and is kept)."""
+    at = text.find("://")
+    if at == -1:
+        return text
+    pieces, start = [], 0
+    while at != -1:
+        found = _USERINFO.match(text, at + 3)
+        if found is not None:
+            user, password = found.group(1), found.group(2)
+            scheme = _SCHEME_END.search(text, max(start, at - 31), at)
+            over_ssh = scheme is not None and scheme.group().lower().endswith("ssh")
+            if password:
+                pieces += [text[start:found.start(2) + 1], MASKED_CREDENTIAL, "@"]
+                start = found.end()
+            elif user and not over_ssh:
+                pieces += [text[start:found.start(1)], MASKED_CREDENTIAL, "@"]
+                start = found.end()
+        at = text.find("://", at + 3)
+    pieces.append(text[start:])
+    return "".join(pieces)
+
+
+def _quoted(text: str, limit: int) -> str:
+    """A piece of a command to quote in a message: its secrets masked, printable, at most `limit` characters."""
+    return printable(masked(text[:MAX_QUOTED_CHARS]), limit=limit)
+
+
+# While launch_risks reads a command, a bound that ends some reading before the command's end notes it here.
+_CUTS: contextvars.ContextVar[list[bool] | None] = contextvars.ContextVar("agent_sentinel_launch_cuts", default=None)
+
+
+def _cut_short() -> None:
+    """Note that a bound ended the reading of a command early; launch_risks then says that only part was checked."""
+    noted = _CUTS.get()
+    if noted is not None and not noted:
+        noted.append(True)
+
 
 # ---- the program a word names -----------------------------------------------------------------
 
@@ -103,7 +173,8 @@ _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _SPACE = re.compile(r"\s")
 # cmd reads each "/" and the character after it as a switch; /C, /K or /R gives the command (also "/d/s/c").
 _CMD_SWITCH = re.compile(r"/(.)", re.DOTALL)
-_ENV_VALUE_OPTIONS = frozenset({"-u", "--unset", "-C", "--chdir"})
+_ENV_VALUE_OPTIONS = frozenset({"-u", "--unset", "-C", "--chdir", "-a", "--argv0", "-P"})
+_ENV_VALUE_LETTERS = "uCaP"  # env's short options that take a value: the rest of their word, else the next word
 _ELEVATE_VALUE_OPTIONS = frozenset({"-u", "--user", "-g", "--group", "-C", "--close-from", "-D", "--chdir", "-p",
                                     "--prompt", "-R", "--chroot", "-T", "--command-timeout", "-U", "--other-user",
                                     "-r", "--role", "-t", "--type"})
@@ -144,11 +215,23 @@ def commands_run(words: list[str]) -> list[list[str]]:
             continue
         inner = _behind(command) if depth < MAX_WRAPPERS and looked < MAX_LOOKED_BEHIND else None
         if inner is None:
+            if (depth >= MAX_WRAPPERS or looked >= MAX_LOOKED_BEHIND) and _is_wrapper(command[0]):
+                _cut_short()  # a wrapper that was not looked behind
             found.append(command)
             continue
         looked += 1
         queue.extend((each, depth + 1) for each in inner[:MAX_COMMANDS])
+    if queue:
+        _cut_short()
     return found
+
+
+def _is_wrapper(word: str) -> bool:
+    """Whether a word names a program that _behind looks behind."""
+    program = program_name(word)
+    return (program in ("cmd", "env", "wsl", "exec", "start", "iex", "invoke-expression")
+            or (program in _SHELLS and program != "busybox") or program in _POWERSHELL or program in _ELEVATE
+            or program in _SIMPLE_WRAPPERS)
 
 
 def _without_assignments(words: list[str]) -> list[str]:
@@ -156,6 +239,8 @@ def _without_assignments(words: list[str]) -> list[str]:
     index = 0
     while index < len(words) and index < MAX_OPTIONS_SCANNED and _ASSIGNMENT.match(words[index]):
         index += 1
+    if MAX_OPTIONS_SCANNED <= index < len(words):
+        _cut_short()
     return words[index:]
 
 
@@ -204,6 +289,8 @@ def _behind_cmd(args: list[str]) -> list[list[str]] | None:
     if found is None:
         return None  # an interactive cmd
     index, start = found
+    if len(args[index]) - start > MAX_COMMAND_STRING_CHARS:
+        _cut_short()
     piece, rest = args[index][start:start + MAX_COMMAND_STRING_CHARS], args[index + 1:]
     if not piece.strip():
         text = _joined(rest)
@@ -259,6 +346,8 @@ def _behind_start(args: list[str]) -> list[list[str]]:
         index = skip
         while index < min(len(args), MAX_OPTIONS_SCANNED) and args[index].startswith("/"):
             index += 2 if args[index].lower() in _START_VALUE_OPTIONS else 1
+        if MAX_OPTIONS_SCANNED <= index < len(args):
+            _cut_short()
         if index < len(args) and args[index:] not in found:
             found.append(args[index:])
     return found
@@ -280,15 +369,26 @@ def _behind_env(args: list[str]) -> list[list[str]]:
                 text, after = word[2:], index + 1
             else:
                 text, after = (args[index + 1] if index + 1 < len(args) else ""), index + 2
+            if len(text) > MAX_COMMAND_STRING_CHARS:
+                _cut_short()
             command = shell_words(text[:MAX_COMMAND_STRING_CHARS]) + args[after:]
             return [command] if command else []
         if word.startswith("-"):
-            index += 2 if word in _ENV_VALUE_OPTIONS else 1
+            index += 2 if word in _ENV_VALUE_OPTIONS or _env_cluster_takes_next(word) else 1
         elif _ASSIGNMENT.match(word):
             index += 1
         else:
             break
+    if MAX_OPTIONS_SCANNED <= index < len(args):
+        _cut_short()
     return [args[index:]] if index < len(args) else []
+
+
+def _env_cluster_takes_next(word: str) -> bool:
+    """Whether a cluster of env's short options ends in one that takes the next word: "-iu NAME", "-iC DIR"
+    ("-uNAME" carries its value)."""
+    return (not word.startswith("--") and len(word) > 2 and word[-1] in _ENV_VALUE_LETTERS
+            and not any(letter in _ENV_VALUE_LETTERS for letter in word[1:-1]))
 
 
 def _behind_shell(args: list[str]) -> list[list[str]] | None:
@@ -300,6 +400,8 @@ def _behind_shell(args: list[str]) -> list[list[str]] | None:
     after = index + 1
     while after < len(options) and options[after].startswith(("-", "+")) and options[after] not in ("-", "--"):
         after += 2 if _shell_takes_value(options[after]) else 1
+    if MAX_OPTIONS_SCANNED <= after < len(args):
+        _cut_short()
     if after < len(args) and args[after] == "--":
         after += 1
     return _split_text(args[after]) if after < len(args) else []
@@ -323,6 +425,8 @@ def _behind_elevation(program: str, args: list[str]) -> list[list[str]]:
         index = 0
         while index < min(len(args), MAX_OPTIONS_SCANNED) and args[index].startswith("/"):
             index += 1
+        if MAX_OPTIONS_SCANNED <= index < len(args):
+            _cut_short()
         return _split_text(args[index]) if index < len(args) else []
     index = _after_options(args, _GSUDO_VALUE_OPTIONS if program == "gsudo" else _ELEVATE_VALUE_OPTIONS)
     return [args[index:]] if index < len(args) else []
@@ -341,6 +445,8 @@ def _behind_wsl(args: list[str]) -> list[list[str]]:
         if not word.startswith("-"):
             break
         index += 2 if word in _WSL_VALUE_OPTIONS else 1
+    if MAX_OPTIONS_SCANNED <= index < len(args):
+        _cut_short()
     return _split_text(_joined(args[index:])) if index < len(args) else []
 
 
@@ -349,6 +455,7 @@ def _after_options(args: list[str], value_options: frozenset[str]) -> int:
     index = 0
     while index < len(args):
         if index >= MAX_OPTIONS_SCANNED:
+            _cut_short()
             return len(args)
         word = args[index]
         if word == "--":
@@ -366,6 +473,8 @@ def _joined(words: list[str]) -> str:
     word with a space was one argument (cmd /c "C:\\Program Files\\x.cmd" -y).
     """
     if len(words) == 1:
+        if len(words[0]) > MAX_COMMAND_STRING_CHARS:
+            _cut_short()
         return words[0][:MAX_COMMAND_STRING_CHARS]
     return _quoted_words(words)
 
@@ -374,6 +483,8 @@ def _quoted_words(words: list[str]) -> str:
     """Words as one command line, a word with a space quoted (at most about MAX_COMMAND_STRING_CHARS)."""
     pieces, length = [], 0
     for word in words:
+        if length > MAX_COMMAND_STRING_CHARS or len(word) > MAX_COMMAND_STRING_CHARS:
+            _cut_short()
         if length > MAX_COMMAND_STRING_CHARS:
             break
         word = word[:MAX_COMMAND_STRING_CHARS]
@@ -386,7 +497,10 @@ def _quoted_words(words: list[str]) -> str:
 def _split_text(text: str) -> list[list[str]]:
     """The commands of a command string: split at shell operators, each into words (roughly as a shell would)."""
     commands = []
-    for part in _OPERATORS_IN_TEXT.split(text[:MAX_COMMAND_STRING_CHARS], maxsplit=MAX_COMMANDS):
+    parts = _OPERATORS_IN_TEXT.split(text[:MAX_COMMAND_STRING_CHARS], maxsplit=MAX_COMMANDS)
+    if len(text) > MAX_COMMAND_STRING_CHARS or len(parts) > MAX_COMMANDS:
+        _cut_short()
+    for part in parts:
         words = shell_words(_ungrouped(part))
         if words:
             commands.append(words)
@@ -419,6 +533,7 @@ def shell_words(text: str) -> list[str]:
 def _decoded_powershell(value: str) -> str | None:
     """The command an -EncodedCommand value holds (base64 of UTF-16LE text), or None."""
     if len(value) > MAX_COMMAND_STRING_CHARS * 3:
+        _cut_short()
         value = value[: MAX_COMMAND_STRING_CHARS * 3 // 4 * 4]
     try:
         return base64.b64decode(value, validate=True).decode("utf-16-le", "replace")
@@ -431,8 +546,44 @@ def _decoded_powershell(value: str) -> str | None:
 _EXACT_VERSION = re.compile(r"v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?")
 # Where a PyPI package's name ends in a requirement such as "pkg>=1.0" or "pkg[extra]".
 _PYPI_NAME_END = re.compile(r"[=<>~!@ \[;]")
-_NPX_VALUE_OPTIONS = frozenset({"-p", "--package", "-c", "--call", "--cache", "--registry", "--userconfig", "-w",
-                                "--workspace", "--node-options"})
+_NPX_VALUE_OPTIONS = frozenset({
+    "-p", "--package", "-c", "--call", "--cache", "--registry", "--userconfig", "-w", "--workspace", "--node-options",
+    # npm's own settings that take a value, which npx and npm exec take too
+    "--prefix", "--loglevel", "--tag", "--location", "--script-shell", "--globalconfig", "--otp", "--before",
+    "--cafile", "--proxy", "--https-proxy", "--noproxy", "--scope", "--fetch-retries", "--fetch-timeout",
+    "--maxsockets", "--local-address", "--user-agent", "--shell",
+    # pnpm's, yarn's and bun's
+    "--cwd", "--dir", "-C", "--reporter", "--allow-build", "--filter",
+})
+# What pnpm dlx and yarn dlx read otherwise: their -c is --shell-mode, a flag, and they have no --workspace NAME.
+_NOT_DLX_VALUE_OPTIONS = frozenset({"-c", "--call", "-w", "--workspace"})
+# The options of these runners that take no value. An option that is in neither list is not known here: the
+# word after it may be its value or the package (_runner_words).
+_NPX_FLAGS = frozenset({
+    "-y", "--yes", "--no", "-q", "--quiet", "-s", "--silent", "-d", "-dd", "-ddd", "--verbose", "--no-install",
+    "--ignore-existing", "--prefer-online", "--prefer-offline", "--offline", "--json", "--workspaces", "-ws",
+    "--include-workspace-root", "--ignore-scripts", "--foreground-scripts", "--no-audit", "--no-fund",
+    "--no-update-notifier", "--no-progress", "--legacy-peer-deps", "--force", "-f", "--global", "-g", "--no-color",
+    "--unicode", "--no-unicode", "--bun", "--shell-mode", "-c", "--help", "-h", "--version", "-v",
+})
+# The programs whose own options may hand a string to a shell (_runner_code_option).
+_RUNNER_PROGRAMS = frozenset({"npx", "bunx", "pnpx", "npm", "pnpm", "yarn"})
+_UVX_FLAGS = frozenset({
+    "-q", "--quiet", "-qq", "-v", "--verbose", "-vv", "-n", "--no-cache", "--offline", "--no-progress",
+    "--native-tls", "--no-native-tls", "--system-certs", "--no-config", "--no-python-downloads",
+    "--allow-python-downloads", "--managed-python", "--no-managed-python", "--refresh", "-U", "--upgrade",
+    "--reinstall", "--force-reinstall", "--no-index", "--no-build", "--no-binary", "--no-build-isolation",
+    "--compile-bytecode", "--no-compile-bytecode", "--no-sources", "--no-env-file", "--isolated",
+    "--show-resolution", "--lfs", "--no-color", "--preview", "--no-preview", "--no-installer-metadata", "--help",
+    "-h", "--version", "-V",
+})
+_UV_RUN_FLAGS = _UVX_FLAGS | frozenset({
+    "--no-sync", "--frozen", "--locked", "--no-project", "--exact", "--inexact", "--no-dev", "--dev", "--only-dev",
+    "--all-extras", "--all-groups", "--all-packages", "--no-default-groups", "--script", "-s", "--gui-script",
+    "--active", "--no-active", "--no-editable", "--no-install-project", "--no-install-workspace", "-m", "--module",
+})
+_PIPX_FLAGS = frozenset({"--no-cache", "--pypackages", "--verbose", "-v", "--quiet", "-q", "--system-site-packages",
+                         "--path", "--global", "--help", "-h"})
 _UVX_VALUE_OPTIONS = frozenset({
     "--from", "--with", "-w", "--with-editable", "--with-requirements", "-p", "--python", "--index", "--index-url",
     "-i", "--extra-index-url", "--default-index", "--find-links", "-f", "--constraint", "--constraints", "-c",
@@ -441,11 +592,11 @@ _UVX_VALUE_OPTIONS = frozenset({
     "--config-file", "--env-file", "--index-strategy", "--keyring-provider", "--resolution", "--prerelease",
     "--exclude-newer", "--exclude-newer-package", "--link-mode", "-C", "--config-setting", "--config-settings-package",
     "--no-binary-package", "--no-build-package", "--python-platform", "--torch-backend", "--fork-strategy",
-    "--with-executables-from",
+    "--with-executables-from", "--color", "--allow-insecure-host",
 })
 # uv's own options and those of `uv run` that take a value (for the script `uv run` starts).
 _UV_VALUE_OPTIONS = _UVX_VALUE_OPTIONS | frozenset({
-    "--color", "--allow-insecure-host", "--package", "--extra", "--no-extra", "--group", "--only-group", "--no-group",
+    "--package", "--extra", "--no-extra", "--group", "--only-group", "--no-group",
 })
 _PIPX_VALUE_OPTIONS = frozenset({"--spec", "--python", "--index-url", "-i", "--pip-args", "--suffix"})
 _GIT_SOURCES = ("git+", "git:", "github:", "gitlab:", "bitbucket:", "gist:")
@@ -483,6 +634,12 @@ class PackageRef:
     version: str | None  # the exact version the spec pins, if it pins one
     source: str  # "registry", "git", "url" or "path"
     role: str = "run"  # "run": a package the runner runs; "with": a requirement beside it (uvx --with)
+    # Whether the word may be something else: an option in front of it is not known here, so it may be that
+    # option's value, or an argument of the package that is (_runner_words).
+    unsure: bool = False
+    # Without an exact version: the highest version the spec can fetch, when the spec bounds it ("<0.1.16",
+    # "0.1.15 || 0.1.14", "~=2025.1.0"): (its numbers, whether that version itself can be fetched).
+    highest: tuple[tuple[int, ...], bool] | None = None
 
     @property
     def written(self) -> str:
@@ -561,6 +718,8 @@ def _subcommand_at(words: list[str], start: int, names: tuple[str, ...]) -> int 
         else:
             return None
         index += 1
+    if index < len(words):
+        _cut_short()
     return None
 
 
@@ -574,16 +733,25 @@ def _direct_packages(words: list[str]) -> list[PackageRef]:
     runner, ecosystem, start = found
     args = words[start:MAX_WORDS_LINTED]
     if ecosystem == NPM:
-        return [_npm_ref(runner, spec) for spec in _runner_specs(args, _NPX_VALUE_OPTIONS, _PACKAGE_OPTIONS)]
+        return [replace(_npm_ref(runner, spec), unsure=unsure)
+                for spec, unsure in _runner_specs(args, _npx_value_options(runner), _NPX_FLAGS, _PACKAGE_OPTIONS)]
     if runner == "pipx run":
-        return [_pypi_ref(runner, spec) for spec in _runner_specs(args, _PIPX_VALUE_OPTIONS, ("--spec",))]
+        return [replace(_pypi_ref(runner, spec), unsure=unsure)
+                for spec, unsure in _runner_specs(args, _PIPX_VALUE_OPTIONS, _PIPX_FLAGS, ("--spec",))]
     refs = []
     if runner != "uv run":  # uv run's command is the project's own (its script is pinned, see _uv_run_script)
-        refs = [_pypi_ref(runner, spec) for spec in _runner_specs(args, _UVX_VALUE_OPTIONS, ("--from",))]
+        refs = [replace(_pypi_ref(runner, spec), unsure=unsure)
+                for spec, unsure in _runner_specs(args, _UVX_VALUE_OPTIONS, _UVX_FLAGS, ("--from",))]
     value_options = _UV_VALUE_OPTIONS if runner == "uv run" else _UVX_VALUE_OPTIONS
-    for value in _option_values(args, value_options, _WITH_OPTIONS):
-        refs += [_pypi_ref(runner, spec, role="with") for spec in _requirements(value)]
+    flags = _UV_RUN_FLAGS if runner == "uv run" else _UVX_FLAGS
+    for value, sure in _option_values(args, value_options, flags, _WITH_OPTIONS):
+        refs += [replace(_pypi_ref(runner, spec, role="with"), unsure=not sure) for spec in _requirements(value)]
     return refs
+
+
+def _npx_value_options(runner: str) -> frozenset[str]:
+    """The options that take a value for npx, npm exec and bunx, or as pnpm dlx and yarn dlx read them."""
+    return _NPX_VALUE_OPTIONS - _NOT_DLX_VALUE_OPTIONS if runner in ("pnpm dlx", "yarn dlx") else _NPX_VALUE_OPTIONS
 
 
 def _deno_packages(words: list[str]) -> list[PackageRef]:
@@ -626,36 +794,85 @@ def _jsr_ref(runner: str, spec: str) -> PackageRef:
     return PackageRef(runner, JSR, spec, name, version, "registry")
 
 
-def _runner_specs(args: list[str], value_options: frozenset[str], package_options: tuple[str, ...]) -> list[str]:
-    """The packages a runner runs: every value of its --package (--from, --spec), or else its first plain word."""
-    named = _option_values(args, value_options, package_options)
-    if named:
-        return named
-    index = _first_plain_index(args, value_options | frozenset(package_options))
-    return [args[index]] if index is not None else []
+def _runner_words(args: list[str], value_options: frozenset[str], flags: frozenset[str]
+                  ) -> tuple[list[tuple[str, str | None, bool]], list[int], bool]:
+    """A runner's own options, and where the words are that may be its package:
+    ([(option, its value or None, whether it is surely the runner's own)], [index, ...], whether the package
+    is in doubt).
 
-
-def _option_values(args: list[str], value_options: frozenset[str], wanted: tuple[str, ...]) -> list[str]:
-    """Every value given to the `wanted` options among a runner's own options (before its first plain word)."""
-    found, index = [], 0
-    while index < len(args) and len(found) < MAX_COMMANDS:
+    The package is the runner's first word that is no option. An option in
+    neither `value_options` nor `flags` is not known here: it may take the
+    next word as its value (npx --some-option VALUE pkg) or take none (npx
+    --some-flag pkg), which cannot be told from the words. So the plain word
+    after such an option is taken and the reading goes on to the next plain
+    word: the package is one of the words taken (at most
+    MAX_SCRIPT_CANDIDATES), and an option read after the first of them may
+    be the package's own.
+    """
+    options: list[tuple[str, str | None, bool]] = []
+    plain: list[int] = []
+    index, maybe_value, in_doubt = 0, False, False
+    while index < len(args):
         word = args[index]
-        name, equals, value = word.partition("=")
-        if word == "--" or not word.startswith("-") or word == "-":
+        if word == "--":
+            if index + 1 < len(args):
+                plain.append(index + 1)
             break
-        if name in wanted:
-            if equals:
-                found.append(value)
-            elif index + 1 < len(args):
-                found.append(args[index + 1])
-        index += 2 if not equals and (word in value_options or word in wanted) else 1
-    return [value for value in found if value]
+        if not word.startswith("-"):
+            plain.append(index)
+            in_doubt = in_doubt or maybe_value
+            if not maybe_value or len(plain) >= MAX_SCRIPT_CANDIDATES:
+                break
+            maybe_value = False
+            index += 1
+            continue
+        name, equals, value = word.partition("=")
+        if equals:
+            options.append((name, value, not plain))
+            maybe_value = False
+        elif word in value_options:
+            options.append((word, args[index + 1] if index + 1 < len(args) else None, not plain))
+            maybe_value = False
+            index += 1
+        else:
+            options.append((word, None, not plain))
+            maybe_value = word not in flags and word != "-"
+        index += 1
+    return options, plain, in_doubt
+
+
+def _runner_specs(args: list[str], value_options: frozenset[str], flags: frozenset[str],
+                  package_options: tuple[str, ...]) -> list[tuple[str, bool]]:
+    """The packages a runner runs, each with whether it is unsure (PackageRef.unsure): every value of its
+    --package (--from, --spec), or else its first plain word (see _runner_words for the words taken when an
+    option in front of it is not known here)."""
+    options, plain, in_doubt = _runner_words(args, value_options | frozenset(package_options), flags)
+    named = [(value, sure) for name, value, sure in options if name in package_options and value]
+    if len(named) > MAX_COMMANDS:
+        _cut_short()
+    specs = [(value, not sure) for value, sure in named[:MAX_COMMANDS]]
+    if not any(sure for _, sure in named):  # no --package for sure: a plain word is the package
+        specs += [(args[index], in_doubt) for index in plain]
+    return specs
+
+
+def _option_values(args: list[str], value_options: frozenset[str], flags: frozenset[str],
+                   wanted: tuple[str, ...]) -> list[tuple[str, bool]]:
+    """Every value given to the `wanted` options among a runner's own options, each with whether the option is
+    surely the runner's own (it stands before the first plain word: _runner_words)."""
+    options, _, _ = _runner_words(args, value_options | frozenset(wanted), flags)
+    found = [(value, sure) for name, value, sure in options if name in wanted and value]
+    if len(found) > MAX_COMMANDS:
+        _cut_short()
+    return found[:MAX_COMMANDS]
 
 
 def _requirements(value: str) -> list[str]:
     """The requirements of one --with value, as uv splits it: at commas outside brackets that start no version
     ("a,b[x,y]>=1,<2" is "a" and "b[x,y]>=1,<2")."""
     found, depth, start = [], 0, 0
+    if len(value) > MAX_COMMAND_STRING_CHARS:
+        _cut_short()
     text = value[:MAX_COMMAND_STRING_CHARS]
     for index, char in enumerate(text):
         if char == "[":
@@ -682,6 +899,115 @@ def _first_plain_index(args: list[str], value_options: frozenset[str]) -> int | 
     return None
 
 
+# ---- the version a spec names, or the highest it allows ------------------------------------------
+
+# A PEP 440 version written in full (no "*", no range): 2025.1, 1.2.3.4, 1.0.0rc1, 2025.1.1.post1, 1.0+local.
+_PYPI_EXACT = re.compile(
+    r"(?i)v?(?:[0-9]{1,18}!)?[0-9]{1,18}(?:\.[0-9]{1,18}){0,7}"
+    r"(?:[-_.]?(?:a|b|c|rc|alpha|beta|pre|preview)[-_.]?[0-9]{0,18})?"
+    r"(?:[-_.]?(?:post|rev|r)[-_.]?[0-9]{0,18}|-[0-9]{1,18})?(?:[-_.]?dev[-_.]?[0-9]{0,18})?"
+    r"(?:\+[a-z0-9]{1,64}(?:[-_.][a-z0-9]{1,64}){0,16})?")
+# The numbers of a version or of part of one, npm's wildcards too: "1.2.3", "v1.2", "1.x", "1.2.*", "1.2.3-rc.1".
+_VERSION_NUMBERS = re.compile(r"v?([0-9]{1,18})(?:\.([0-9]{1,18}|[xX*]))?(?:\.([0-9]{1,18}|[xX*]))?(?:[-+].*)?")
+_COMPARATOR = re.compile(r"(<=|>=|<|>|=|~>|~|\^)?\s*([^\s<>=~^]\S*)")
+MAX_RANGE_CHARS = 256  # of a version range that is read for its highest version
+
+
+def _numbers(text: str) -> list[int] | None:
+    """The leading numbers a version names, up to three, without wildcards: "1.2.x" -> [1, 2]; None if it is none."""
+    found = _VERSION_NUMBERS.fullmatch(text)
+    if found is None:
+        return None
+    numbers = []
+    for part in found.groups():
+        if part is None or part in "xX*":
+            break
+        numbers.append(int(part))
+    return numbers
+
+
+def _next_after(numbers: list[int], kept: int) -> tuple[tuple[int, ...], bool]:
+    """The first version after every one that begins with the first `kept` numbers: ([1, 2, 3], 2) -> 1.3.0, itself
+    not allowed."""
+    head = numbers[:kept]
+    return (*head[:-1], head[-1] + 1, *([0] * (3 - kept))), False
+
+
+def _comparator_bound(operator: str, version: str) -> tuple[tuple[int, ...], bool] | None:
+    """The highest version one npm comparator allows, or None when it sets no upper limit (">=1.0.0", "*", a tag)."""
+    numbers = _numbers(version)
+    if not numbers or operator in (">", ">="):
+        return None
+    whole = len(numbers) == 3
+    padded = tuple(numbers + [0] * (3 - len(numbers)))
+    if operator == "<":
+        return padded, False
+    if operator in ("~", "~>"):
+        return _next_after(numbers, min(len(numbers), 2))
+    if operator == "^":  # up to the next change of the first number that is not 0
+        kept = next((at + 1 for at, number in enumerate(numbers) if number), len(numbers))
+        return _next_after(numbers, kept)
+    # "<=", "=" or none: the version itself, or every version that begins with these numbers ("1.2", "1.2.x")
+    return (padded, True) if whole else _next_after(numbers, len(numbers))
+
+
+def _lower(one: tuple[tuple[int, ...], bool], other: tuple[tuple[int, ...], bool]) -> bool:
+    """Whether one upper limit is below another (the same numbers: the one that leaves the version itself out)."""
+    return (one[0], one[1]) < (other[0], other[1])
+
+
+def _npm_highest(wanted: str) -> tuple[tuple[int, ...], bool] | None:
+    """The highest version an npm range can fetch, or None when it has no upper limit or is not understood.
+
+    "A || B" allows what either does; the comparators of one alternative
+    ("<2.0.0 >=1.2.0", "1.0.0 - 1.2.3", "~1.2.3", "^0.1.14", "1.2.x") all hold.
+    """
+    if not wanted or len(wanted) > MAX_RANGE_CHARS:
+        return None
+    highest = None
+    for alternative in wanted.split("||"):
+        low, hyphen, high = alternative.partition(" - ")
+        text = "<=" + high.strip() if hyphen else alternative
+        limit = None
+        for operator, version in _COMPARATOR.findall(text):
+            bound = _comparator_bound(operator, version)
+            if bound is not None and (limit is None or _lower(bound, limit)):
+                limit = bound
+        if limit is None:
+            return None
+        if highest is None or _lower(highest, limit):
+            highest = limit
+    return highest
+
+
+def _pypi_highest(specifiers: str) -> tuple[tuple[int, ...], bool] | None:
+    """The highest version a PyPI requirement's version part can fetch ("<2025.12", "==2025.1.*", "~=2025.1.0"),
+    or None when it has no upper limit or is not understood. Every clause between commas holds."""
+    if not specifiers or len(specifiers) > MAX_RANGE_CHARS:
+        return None
+    limit = None
+    for clause in specifiers.split(","):
+        found = re.fullmatch(r"\s*(<=|<|===|==|~=)\s*([0-9A-Za-z.*+!_-]+)\s*", clause)
+        if found is None:
+            continue
+        operator, version = found.groups()
+        numbers = _numbers(version[:-2] if version.endswith(".*") else version)
+        if not numbers:
+            continue
+        padded = tuple(numbers + [0] * (3 - len(numbers)))
+        if operator == "<":
+            bound = (padded, False)
+        elif operator == "~=":
+            bound = _next_after(numbers, max(len(numbers) - 1, 1))
+        elif version.endswith(".*"):
+            bound = _next_after(numbers, len(numbers))
+        else:
+            bound = (padded, True)
+        if limit is None or _lower(bound, limit):
+            limit = bound
+    return limit
+
+
 def _npm_ref(runner: str, spec: str) -> PackageRef:
     """What an npm spec names. An alias ("npm:real@1.0.0", "alias@npm:real@1.0.0") names the real package."""
     written, lowered = spec, spec.lower()
@@ -704,8 +1030,11 @@ def _npm_ref(runner: str, spec: str) -> PackageRef:
     if spec.startswith((".", "/", "~")) or ":" in spec or "\\" in spec:
         return PackageRef(runner, NPM, written, "", None, "path")
     name = (spec if at == -1 else spec[:at]).lower()
-    version = spec[at + 1:] if at != -1 and _EXACT_VERSION.fullmatch(spec[at + 1:]) else None
-    return PackageRef(runner, NPM, written, name, version, "registry")
+    wanted = spec[at + 1:].strip() if at != -1 else ""
+    exact = wanted[1:].strip() if wanted.startswith("=") else wanted  # "=1.2.3" is npm's own way to say 1.2.3
+    version = exact if _EXACT_VERSION.fullmatch(exact) else None
+    return PackageRef(runner, NPM, written, name, version, "registry",
+                      highest=None if version else _npm_highest(wanted))
 
 
 def _tarball_package(url: str) -> tuple[str, str | None] | None:
@@ -741,12 +1070,18 @@ def _pypi_ref(runner: str, spec: str, role: str = "run") -> PackageRef:
     if spec.startswith((".", "/", "~")) or "\\" in spec:
         return PackageRef(runner, PYPI, spec, "", None, "path", role)
     name = pypi_name(_PYPI_NAME_END.split(spec, maxsplit=1)[0])
+    requirement = spec.split(";", 1)[0].strip()  # without an environment marker: 'pkg==1.0; python_version>"3"'
     version = None
-    if "==" in spec and _EXACT_VERSION.fullmatch(spec.split("==", 1)[1].strip()):
-        version = spec.split("==", 1)[1].strip()
-    elif "==" not in spec and "@" in spec and _EXACT_VERSION.fullmatch(spec.split("@", 1)[1].strip()):
-        version = spec.split("@", 1)[1].strip()  # uv's "package@1.2.3"
-    return PackageRef(runner, PYPI, spec, name, version, "registry", role)
+    if "==" in requirement:
+        pinned = requirement.split("==", 1)[1].lstrip("=").strip()  # "===" pins the very text
+        version = pinned if _PYPI_EXACT.fullmatch(pinned) else None
+    elif "@" in requirement and _PYPI_EXACT.fullmatch(requirement.split("@", 1)[1].strip()):
+        version = requirement.split("@", 1)[1].strip()  # uv's "package@1.2.3"
+    highest = None
+    if version is None:
+        end = re.search(r"[=<>~!]", requirement)
+        highest = _pypi_highest(requirement[end.start():]) if end is not None else None
+    return PackageRef(runner, PYPI, spec, name, version, "registry", role, highest=highest)
 
 
 def pypi_name(name: str) -> str:
@@ -814,7 +1149,7 @@ def _same_package(ref: PackageRef, advisory: advisories.Advisory) -> bool:
 def advisory_findings(ref: PackageRef) -> list[tuple[str, str]]:
     """("fail" or "warn", what to say) for each advisory of advisories.py that concerns this package."""
     found = []
-    shown = printable(ref.written, limit=200)
+    shown = _quoted(ref.written, 200)
     for advisory in advisories.MALICIOUS:
         if not _same_package(ref, advisory):
             continue
@@ -827,10 +1162,26 @@ def advisory_findings(ref: PackageRef) -> list[tuple[str, str]]:
             found.append(("fail", f"{shown} {how}: {advisory.summary} ({advisory.ids}; {advisory.source}). "
                                   "Remove this server, and treat what it could reach as exposed"))
     for advisory in advisories.VULNERABLE:
-        if _same_package(ref, advisory) and ref.version and version_before(ref.version, advisory.fixed or ""):
+        if not _same_package(ref, advisory):
+            continue
+        if ref.version and version_before(ref.version, advisory.fixed or ""):
             found.append(("warn", f"{shown} has a known vulnerability, fixed in {advisory.fixed}: {advisory.summary} "
                                   f"({advisory.ids}; {advisory.source}). Update it to {advisory.fixed} or later"))
+        elif not ref.version and ref.highest is not None and _all_before(ref.highest, advisory.fixed or ""):
+            found.append(("warn", f"{shown} can only fetch versions before {advisory.fixed}, which have a known "
+                                  f"vulnerability: {advisory.summary} ({advisory.ids}; {advisory.source}). Allow "
+                                  f"{advisory.fixed} or later"))
     return found
+
+
+def _all_before(highest: tuple[tuple[int, ...], bool], fixed: str) -> bool:
+    """Whether every version up to `highest` (PackageRef.highest) comes before the version `fixed`."""
+    key = _version_key(fixed, 8)
+    if key is None:
+        return False
+    numbers, allowed = highest
+    padded = tuple(numbers) + (0,) * (8 - len(numbers))
+    return padded < key[0] or (padded == key[0] and not allowed)
 
 
 def within_one_edit(one: str, other: str) -> bool:
@@ -885,7 +1236,7 @@ _CONTAINER_VALUE_OPTIONS = frozenset({
     "--dns", "--dns-search", "--security-opt", "--tmpfs", "--ulimit", "--log-driver", "--log-opt", "--runtime",
     "--gpus", "--shm-size", "--stop-signal", "--stop-timeout", "--cidfile", "--volumes-from", "--expose", "--link",
     "--health-cmd", "--mac-address", "--ip", "--ip6", "-a", "--attach", "--group-add", "--isolation",
-    "--network-alias", "--annotation", "--sysctl", "--device-cgroup-rule", "--storage-opt", "--domainname",
+    "--network-alias", "--annotation", "--sysctl", "--device-cgroup-rule", "--storage-opt", "--domainname", "-c",
     # and the rarer ones
     "--pids-limit", "--cpu-period", "--cpu-quota", "--cpu-rt-period", "--cpu-rt-runtime", "--cpuset-mems",
     "--cpu-count", "--cpu-percent", "--blkio-weight", "--blkio-weight-device", "--device-read-bps",
@@ -917,7 +1268,13 @@ _CONTAINER_GLOBAL_VALUE_OPTIONS = frozenset({
     "--conmon", "--out", "-n", "--namespace", "-a", "--address", "--snapshotter", "--cni-path", "--cni-netconfpath",
     "--data-root", "--host-gateway-ip", "--hosts-dir",
 })
+# The one-letter options of `docker run`: those that take a value (the rest of their word, else the next word)
+# and those that take none. They can be written together: -it, -iv HOST:/c, -itv/:/host.
+_CONTAINER_VALUE_LETTERS = "vepwulmhac"
+_CONTAINER_FLAG_LETTERS = "ditPq"
 _A_NUMBER = re.compile(r"[0-9][0-9.]*[A-Za-z%]{0,3}")
+# A word that is a mount or a path and never an image: "/:/host", "C:\\x:/x", "~/x", "./x", "vol:/data".
+_NEVER_AN_IMAGE = re.compile(r"[/\\~.]|[A-Za-z]:[/\\]|[^:]*:[/\\]")
 MAX_MOUNTS_CHECKED = 64  # mounts of one container checked for the host's root, home folder or engine socket
 # A container engine's socket (or Windows pipe), and the folders that hold one: a container given it can start
 # containers of its own on the host, privileged and with the host's root mounted.
@@ -933,6 +1290,7 @@ def launch_risks(words: list[str], user_home: str | None = None) -> list[str]:
     `user_home`: the user's own folder, to recognise an argument that names
     it whole (default: this user's, from the environment).
     """
+    more_words = len(words) > MAX_WORDS_LINTED
     words = words[:MAX_WORDS_LINTED]
     if not words:
         return []
@@ -940,17 +1298,27 @@ def launch_risks(words: list[str], user_home: str | None = None) -> list[str]:
         folder = home.user_folder()
         user_home = str(folder) if folder is not None else None
     read, too_long = _read_part(words)
-    commands = commands_run(words)
-    risks: list[str] = []
-    risks += _inline_code(words)
-    risks += _shell_operators(words[1:])
-    risks += _elevation(read)
-    if _piped_download(" ".join(read)):
-        risks.append("downloads something and runs it (a download piped to a shell or interpreter)")
-    risks += _package_from_git(commands)
-    for command in (words, *commands):
-        risks += _container_risks(command, user_home)
-    risks += _sensitive_arguments(read[1:], user_home)
+    cuts: list[bool] = []
+    noting = _CUTS.set(cuts)
+    try:
+        commands = commands_run(words)
+        risks: list[str] = []
+        risks += _inline_code(words)
+        risks += _shell_operators(words[1:])
+        risks += _elevation(read)
+        if _piped_download(" ".join(read)):
+            risks.append("downloads something and runs it (a download piped to a shell or interpreter)")
+        risks += _package_from_git(commands)
+        for command in (words, *commands):
+            risks += _container_risks(command, user_home)
+        risks += _sensitive_arguments(read[1:], user_home)
+    finally:
+        _CUTS.reset(noting)
+    if more_words or cuts:  # first, so that it is never among the risks left out
+        risks.insert(0, "is longer than this check reads (more than "
+                        f"{MAX_WORDS_LINTED} words, {MAX_OPTIONS_SCANNED} options in a row, {MAX_COMMANDS} commands, "
+                        f"{MAX_WRAPPERS} wrappers in a row or {MAX_COMMAND_STRING_CHARS} characters of a command "
+                        "string), so only part of it was checked: read the rest yourself")
     if too_long:
         risks.append(f"is longer than {MAX_LINTED_CHARS} characters, more than any real command line, so only its "
                      "start was checked for credential files, raised privileges and downloads")
@@ -993,15 +1361,73 @@ def _inline_code(words: list[str]) -> list[str]:
             flag = options[command[0]] if command is not None else None
         elif program in _NODE:
             flag = _first_option(options, _is_node_eval, values=_NODE_VALUE_OPTIONS)
-        elif program == "deno" and options[:1] == ["eval"]:
-            flag = "eval"
+            if flag is None and program == "bun":  # bun run -e CODE
+                at = _first_plain_at(options, _BUN_OPTIONS)
+                if at is not None and options[at] == "run":
+                    flag = _code_option(options[at + 1:], _BUN_OPTIONS, "ep", frozenset({"--eval", "--print"}))
+        elif program == "deno":
+            at = _first_plain_at(options, _DENO_OPTIONS)  # deno -q eval CODE
+            flag = "eval" if at is not None and options[at] == "eval" else None
         elif _PYTHON.fullmatch(program):
-            flag = _first_option(options, lambda option: not option.startswith("--") and option[1:].isalpha()
-                                 and "c" in option[1:], values=_PYTHON_VALUE_OPTIONS, stops=("-m",))
+            flag = _code_option(options, _PYTHON_OPTIONS, "c")
+        elif program in _RUNNER_PROGRAMS:
+            flag = _runner_code_option(words[index:index + 1 + MAX_OPTIONS_SCANNED])
+        else:
+            if program == "cmd":
+                _cut_short()  # more words named cmd than are read
+            known = _CODE_OPTIONS.get(program) or _CODE_OPTIONS.get(program.rstrip("0123456789."))  # php8.3
+            flag = _code_option(options, *known) if known is not None else None
         if flag is not None:
             found.append(f"runs code written on the command line ({printable(program, limit=40)} "
-                         f"{printable(flag, limit=40)})")
+                         f"{_quoted(flag, 40)})")
     return found
+
+
+def _code_option(options: list[str], spec: _ScriptOptions, letters: str,
+                 names: frozenset[str] = frozenset()) -> str | None:
+    """The option that hands an interpreter code on the command line, or None when a script, a module or
+    nothing of the kind comes first.
+
+    The options are read as the interpreter reads them (_read_option): a
+    letter of a cluster counts ("-Ic"), a letter inside another option's
+    value does not ("-Wonce", "-Xtracemalloc"). `letters` and `names` are the
+    short and the long options that take code, among those after which no
+    script runs.
+    """
+    index, maybe_value = 0, False
+    while index < len(options):
+        word = options[index]
+        if word == "--":
+            return None
+        if not _is_option(word, spec):
+            if not maybe_value:
+                return None
+            maybe_value = False  # perhaps the value of an option not known here
+            index += 1
+            continue
+        kind, taken, _ = _read_option(word, None, spec)
+        if kind == _STOP:
+            if word.startswith("--"):
+                return word if word.partition("=")[0] in names else None
+            stopped_at = next(letter for letter in word[1:] if letter in spec.short_stops)
+            return word if stopped_at in letters else None
+        if kind == _SCRIPT:
+            return None
+        maybe_value = kind == _UNKNOWN
+        index += taken
+    if len(options) >= MAX_OPTIONS_SCANNED:
+        _cut_short()
+    return None
+
+
+def _runner_code_option(words: list[str]) -> str | None:
+    """The option that makes a package runner hand a string to a shell: npx -c "...", npm exec --call "...",
+    pnpm dlx --shell-mode (-c); None for a runner without one, or a command that is no runner."""
+    runner = _runner_of(words)
+    if runner is None or runner[1] != NPM:
+        return None
+    options, _, _ = _runner_words(words[runner[2]:], _npx_value_options(runner[0]), _NPX_FLAGS)
+    return next((name for name, _, sure in options if sure and name in ("-c", "--call", "--shell-mode")), None)
 
 
 def _is_c_cluster(option: str) -> bool:
@@ -1040,6 +1466,8 @@ def _option_index(options: list[str], wanted, prefixes: tuple[str, ...] = ("-",)
         if option in stops:
             return None
         index += 2 if option in values or (takes_value is not None and takes_value(option)) else 1
+    if len(options) >= MAX_OPTIONS_SCANNED:
+        _cut_short()
     return None
 
 
@@ -1079,7 +1507,11 @@ def _powershell_command(program: str, options: list[str]) -> tuple[int, str] | N
             return None
         takes_value = name in _POWERSHELL_VALUE_ALIASES or (
             len(name) >= 2 and any(full.startswith(name) for full in _POWERSHELL_VALUE_PARAMETERS))
-        index += 2 if takes_value else 1
+        # "-ExecutionPolicy:Bypass" carries what follows the colon: the next word is read for itself
+        # (Windows PowerShell does not take the form as a parameter at all, and runs the rest as a command).
+        index += 2 if takes_value and ":" not in option else 1
+    if len(options) >= MAX_OPTIONS_SCANNED:
+        _cut_short()
     return None
 
 
@@ -1117,14 +1549,31 @@ def _piped_download(text: str) -> bool:
 
 def _package_from_git(commands: list[list[str]]) -> list[str]:
     for command in commands:
-        ref = next((ref for ref in _direct_packages(command) if ref.source in ("git", "url")), None)
+        ref = next((ref for ref in _direct_packages(command) if ref.source in ("git", "url")
+                    and (not ref.unsure or _names_an_address(ref.spec))), None)
+        if ref is not None and ref.unsure:  # the word may be the value of an option in front of it
+            return [f"may run a package straight from a git repository or a web address, unreviewed and unpinned "
+                    f"({_quoted(ref.written, 120)}: an option before it is not one this check knows, so this word "
+                    "is that option's value or the package)"]
         if ref is not None:
             return [f"runs a package straight from a git repository or a web address, unreviewed and unpinned "
-                    f"({printable(ref.written, limit=120)})"]
+                    f"({_quoted(ref.written, 120)})"]
+        if program_name(command[0]) == "uv":  # uv run https://host/server.py downloads the script and runs it
+            target = _uv_run_target(command[1:MAX_WORDS_LINTED])[0]
+            if target is not None and target.lower().startswith(("http://", "https://")):
+                return [f"downloads a script from a web address and runs it, unreviewed and unpinned "
+                        f"(uv run {_quoted(target, 120)})"]
         if program_name(command[0]) in ("uvx", "uv", "pipx") and any(
                 word[:4].lower() == "git+" for word in command[1:]):
             return ["installs a package straight from a git repository (git+...), unreviewed and unpinned"]
     return []
+
+
+def _names_an_address(spec: str) -> bool:
+    """Whether a spec says outright that it is a repository or a web address (not merely "word/word", which
+    npm reads as a GitHub repository but which may as well be a folder given to an option)."""
+    lowered = spec.lower()
+    return lowered.startswith(_GIT_SOURCES) or "://" in spec or "git+" in lowered or bool(_SCP_ADDRESS.match(spec))
 
 
 def _container_risks(words: list[str], user_home: str | None) -> list[str]:
@@ -1146,6 +1595,8 @@ def _after_container_options(args: list[str]) -> list[str]:
     index = 0
     while index < min(len(args), MAX_OPTIONS_SCANNED) and args[index].startswith("-") and args[index] != "--":
         index += 2 if args[index] in _CONTAINER_GLOBAL_VALUE_OPTIONS else 1
+    if MAX_OPTIONS_SCANNED <= index < len(args):
+        _cut_short()
     return args[index:]
 
 
@@ -1153,19 +1604,34 @@ def _run_options(args: list[str], user_home: str | None) -> list[str]:
     risks, index, image, mounts = [], 0, None, 0
     while index < len(args):
         word = args[index]
-        if not word.startswith("-") or word == "--":
-            image = args[index + 1] if word == "--" and index + 1 < len(args) else (None if word == "--" else word)
+        if word == "--":
+            image = args[index + 1] if index + 1 < len(args) else None
             break
-        name, equals, value = word.partition("=")
-        if not equals and name in _CONTAINER_VALUE_OPTIONS:
-            value = args[index + 1] if index + 1 < len(args) else ""
+        if not word.startswith("-"):
+            if not _NEVER_AN_IMAGE.match(word):
+                image = word
+                break
+            # No image is written so: it is the value of an option not known here. Read as a mount, in case.
+            name, value = "-v", word
             index += 1
-        elif not equals and name[:2] == "-v" and len(name) > 2:  # -v/:/host
-            name, value = "-v", name[2:]
-        elif (not equals and name.startswith("--") and name not in _CONTAINER_FLAGS and index + 1 < len(args)
-              and _only_a_value(args[index + 1])):
-            index += 1  # an option not known here, followed by what can only be its value (no image looks so)
-        index += 1
+        else:
+            name, equals, value = word.partition("=")
+            clustered = _short_options(word) if not word.startswith("--") and len(word) > 2 else None
+            if clustered is not None:  # -it, -iv HOST:/c, -v/:/host: the last letter read is the option
+                name, value = clustered
+                if value is None and name[1] in _CONTAINER_VALUE_LETTERS:
+                    value = args[index + 1] if index + 1 < len(args) else ""
+                    index += 1
+                elif value == "" and index + 1 < len(args) and _only_a_value(args[index + 1]):
+                    index += 1  # a letter not known here, followed by what can only be its value
+                value = value or ""
+            elif not equals and name in _CONTAINER_VALUE_OPTIONS:
+                value = args[index + 1] if index + 1 < len(args) else ""
+                index += 1
+            elif (not equals and name not in _CONTAINER_FLAGS and index + 1 < len(args)
+                  and _only_a_value(args[index + 1])):
+                index += 1  # an option not known here, followed by what can only be its value (no image looks so)
+            index += 1
         if name == "--privileged" and value.lower() not in ("false", "0"):
             risks.append("runs a container with --privileged (it has the run of the host)")
         elif name in ("--network", "--net", "--pid", "--ipc", "--uts", "--userns") and value.lower() == "host":
@@ -1178,7 +1644,7 @@ def _run_options(args: list[str], user_home: str | None) -> list[str]:
                 continue
             source = _mount_source(value) if name == "--mount" else _volume_source(value)
             what = _whole_folder(source, user_home) if source else None
-            shown = f"({printable(name, limit=20)} {printable(value, limit=120)})"
+            shown = f"({printable(name, limit=20)} {_quoted(value, 120)})"
             if what:
                 risks.append(f"mounts {what} into the container {shown}")
             elif source and _engine_socket(source):
@@ -1187,15 +1653,33 @@ def _run_options(args: list[str], user_home: str | None) -> list[str]:
         risks.append(f"mounts {mounts} folders or files into the container, more than any real one needs, so only the "
                      f"first {MAX_MOUNTS_CHECKED} were checked")
     if image is not None and "@sha256:" not in image.lower():
-        risks.append(f"runs the image {printable(image, limit=120)} by a tag, not pinned by digest (@sha256:...): a "
+        risks.append(f"runs the image {_quoted(image, 120)} by a tag, not pinned by digest (@sha256:...): a "
                      "new image can be pushed under the same tag")
     return risks
 
 
+def _short_options(word: str) -> tuple[str, str | None]:
+    """A word of one-letter options of `docker run`, read as docker reads it: (the last option read, its value
+    if the word carries it, else None).
+
+    "-it" -> ("-t", None); "-iv" -> ("-v", None), which takes the next word;
+    "-v/:/host" and "-itv=/:/host" -> ("-v", "/:/host"). A letter not known
+    here ends the reading: ("-" + letter, "").
+    """
+    for position, letter in enumerate(word[1:1 + MAX_CLUSTER_LETTERS], start=1):
+        if letter in _CONTAINER_VALUE_LETTERS:
+            rest = word[position + 1:]
+            return "-" + letter, (rest[1:] if rest.startswith("=") else rest) or None
+        if letter not in _CONTAINER_FLAG_LETTERS:
+            return "-" + letter, ""
+    return "-" + word[-1], None
+
+
 def _only_a_value(word: str) -> bool:
-    """A word that is an option's value and never an image: a number or size, true/false, KEY=VALUE, a path."""
-    return (bool(_A_NUMBER.fullmatch(word[:64])) or word.lower() in ("true", "false") or "=" in word
-            or word.startswith(("/", "\\", "~", ".")))
+    """A word that is an option's value and never an image: a number or size, true/false, KEY=VALUE. (A path
+    is none either, but it is not passed over: _run_options reads it as a mount, in case it is one.)"""
+    return bool(_A_NUMBER.fullmatch(word[:64])) or word.lower() in ("true", "false") or (
+        "=" in word and not _NEVER_AN_IMAGE.match(word))
 
 
 def _volume_source(value: str) -> str:
@@ -1269,18 +1753,25 @@ def _sensitive_arguments(args: list[str], user_home: str | None) -> list[str]:
         value = arg.split("=", 1)[1] if arg.startswith("-") and "=" in arg else arg
         if _CREDENTIAL.search(arg):
             found.append(f"names a credential or client configuration file in an argument "
-                         f"({printable(arg, limit=120)})")
+                         f"({_quoted(arg, 120)})")
         whole = _whole_folder(value, user_home)
         if whole:
-            found.append(f"gives the server {whole} in an argument ({printable(arg, limit=120)})")
+            found.append(f"gives the server {whole} in an argument ({_quoted(arg, 120)})")
     return found
 
 
 # ---- what proxy --pin-server pins ----------------------------------------------------------------
 
-LAUNCH_FIELDS = ("executable", "package", "script", "script_sha256")
+LAUNCH_FIELDS = ("executable", "package", "script", "script_sha256", "command_sha256")
 # The largest script (or program) whose SHA-256 is taken; a larger one is pinned by its path only.
 MAX_HASHED_BYTES = 64 * 1024 * 1024
+# What an interpreter runs when its script is a folder, or a name without its ending: `python DIR` runs
+# DIR/__main__.py, `node DIR` the "main" of DIR/package.json or DIR/index.js, `node dist/index` dist/index.js.
+# Every one of these files that exists is hashed (_files_run), so no interpreter's own rules are guessed.
+_FOLDER_SCRIPTS = ("__main__.py", "package.json", "index.js", "index.mjs", "index.cjs", "index.ts", "index.mts",
+                   "index.cts", "index.tsx", "index.jsx", "index.json", "index.node")
+_SCRIPT_ENDINGS = (".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".tsx", ".jsx", ".json", ".node")
+MAX_PACKAGE_JSON_BYTES = 1024 * 1024  # of a package.json read for its "main"
 # The longest text of the packages pinned as it is; a longer one is pinned as "sha256:<hex>" of it.
 MAX_PINNED_PACKAGE_CHARS = 1024
 # Packages that a runner fetches to start a local script: npx -y tsx@4 server.ts.
@@ -1452,9 +1943,20 @@ _BUN_COMMANDS = frozenset({
     "install", "link", "outdated", "patch", "patch-commit", "pm", "publish", "remove", "repl", "rm", "test",
     "unlink", "update", "upgrade", "why", "x",
 })
-# For _inline_code, which looks for node -e and python -c past the options that take a value.
+# For _inline_code, which looks for node -e past the options that take a value.
 _NODE_VALUE_OPTIONS = (*sorted(_NODE_OPTIONS.values), "-r", "-C")
-_PYTHON_VALUE_OPTIONS = ("-X", "-W", "--check-hash-based-pycs")
+_OSASCRIPT_OPTIONS = _ScriptOptions(short_values="ls", short_flags="i", short_stops="e")
+# The other interpreters that take code on the command line (_code_option): how their options are read, the
+# one-letter options that take code, and the long ones.
+_CODE_OPTIONS: dict[str, tuple[_ScriptOptions, str, frozenset[str]]] = {
+    "perl": (_PERL_OPTIONS, "eE", frozenset()),
+    "ruby": (_RUBY_OPTIONS, "e", frozenset()),
+    "php": (_PHP_OPTIONS, "rBRE", frozenset({"--run", "--process-begin", "--process-code", "--process-end"})),
+    "lua": (_LUA_OPTIONS, "e", frozenset()),
+    "luajit": (_LUA_OPTIONS, "e", frozenset()),
+    "rscript": (_RSCRIPT_OPTIONS, "e", frozenset()),
+    "osascript": (_OSASCRIPT_OPTIONS, "e", frozenset()),
+}
 
 # What an option is to an interpreter (_read_option).
 _KNOWN, _UNKNOWN, _STOP, _SCRIPT = "known", "unknown", "stop", "script"
@@ -1532,6 +2034,8 @@ def _script_words(args: list[str], spec: _ScriptOptions) -> list[str]:
             return found + ([script] if script else [])
         maybe_value = kind == _UNKNOWN
         index += taken
+    if MAX_OPTIONS_SCANNED <= index < len(args):
+        _cut_short()
     return found
 
 
@@ -1548,6 +2052,8 @@ def _first_plain_at(args: list[str], spec: _ScriptOptions) -> int | None:
         if kind in (_STOP, _SCRIPT):
             return None
         index += taken
+    if MAX_OPTIONS_SCANNED <= index < len(args):
+        _cut_short()
     return None
 
 
@@ -1646,8 +2152,9 @@ def _runner_script(words: list[str]) -> list[str]:
     return _interpreter_scripts(ref.name, args[index + 1:]) or []
 
 
-def _uv_run_script(args: list[str], cwd: str | None) -> tuple[list[str], str | None]:
-    """(the script, the folder it is read against) of `uv [options] run [options] SCRIPT.py` (or `... run python S`)."""
+def _uv_run_target(args: list[str]) -> tuple[str | None, list[str], str | None]:
+    """(what `uv [options] run [options] TARGET ...` runs, the words after it, uv's --directory); a target of
+    None for another uv command, for a module (-m) or when nothing is named."""
     directory = None
     index = 0
     seen_run = False
@@ -1660,23 +2167,30 @@ def _uv_run_script(args: list[str], cwd: str | None) -> tuple[list[str], str | N
             if seen_run:
                 break
             if word != "run":
-                return [], None  # another uv command (uv tool run is a runner, see _runner_of)
+                return None, [], None  # another uv command (uv tool run is a runner, see _runner_of)
             seen_run = True
             index += 1
             continue
         if word in ("-m", "--module"):
-            return [], None
+            return None, [], None
         name, equals, value = word.partition("=")
         takes_value = not equals and word in _UV_VALUE_OPTIONS
         if name == "--directory":
             directory = value if equals else (args[index + 1] if index + 1 < len(args) else None)
         index += 2 if takes_value else 1
     if not seen_run or index >= len(args):
+        return None, [], None
+    return args[index], args[index + 1:], directory
+
+
+def _uv_run_script(args: list[str], cwd: str | None) -> tuple[list[str], str | None]:
+    """(the script, the folder it is read against) of `uv [options] run [options] SCRIPT.py` (or `... run python S`)."""
+    target, rest, directory = _uv_run_target(args)
+    if target is None:
         return [], None
     base = os.path.join(cwd or os.getcwd(), directory) if directory else cwd
-    target = args[index]
     if _PYTHON.fullmatch(program_name(target)):
-        return _script_words(args[index + 1:], _PYTHON_OPTIONS), base
+        return _script_words(rest, _PYTHON_OPTIONS), base
     if target.lower().endswith((".py", ".pyw")):
         return [target], base
     return [], None
@@ -1705,38 +2219,145 @@ def file_sha256(path: str) -> str | None:
 
 def launch_identity(executable: str, words: list[str], cwd: str | None = None) -> dict[str, str | None]:
     """What --pin-server pins of a launch (LAUNCH_FIELDS): the program found, the runners' packages as
-    written (behind wrappers too, joined with "; "), and the local script with its SHA-256 (None for each
-    that does not apply).
+    written (behind wrappers too, joined with "; "), the local script with its SHA-256 (None for each
+    that does not apply), and the SHA-256 of the whole command line (command_sha256).
 
-    When several files may be the script (an option in front of it is not
-    known here: _script_words), "script" holds their paths joined with "; "
-    and "script_sha256" the SHA-256 of their own SHA-256s, so that a change
-    to any of them is seen.
+    A secret in a package's address is masked (masked): the pin still tells
+    a changed address, and holds no token. When several files may be the
+    script (an option in front of it is not known here: _script_words),
+    "script" holds their paths joined with "; " and "script_sha256" the
+    SHA-256 of their own SHA-256s, so that a change to any of them is seen.
+    A script that is a folder, or a name without its ending, is hashed as
+    the files an interpreter runs for it (_files_run). "script_sha256" is
+    None when nothing could be hashed: unhashed_code says so in words.
     """
-    packages = "; ".join(ref.written for ref in runner_packages(words)) or None
+    packages = "; ".join(_pinned_package(ref.written) for ref in runner_packages(words)) or None
     if packages is not None and len(packages) > MAX_PINNED_PACKAGE_CHARS:
         packages = "sha256:" + hashlib.sha256(packages.encode("utf-8", "surrogatepass")).hexdigest()
     script, script_sha256 = _pinned_scripts(launch_targets(executable, words, cwd))
+    program = os.path.abspath(executable)
+    if len(program) > MAX_PATH_CHARS:  # longer than a pins file keeps
+        program = "sha256:" + hashlib.sha256(program.encode("utf-8", "surrogatepass")).hexdigest()
     return {
-        "executable": os.path.abspath(executable),
+        "executable": program,
         "package": packages,
         "script": script,
         "script_sha256": script_sha256,
+        "command_sha256": command_sha256(executable, words),
     }
+
+
+def _pinned_package(written: str) -> str:
+    """A runner's package as a pin keeps it: as written with its secrets masked, or the SHA-256 of a text too
+    long to be a real one (never the text itself, which may hold a secret)."""
+    if len(written) <= MAX_QUOTED_CHARS:
+        return masked(written)
+    return "sha256:" + hashlib.sha256(written.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def command_sha256(executable: str, words: list[str]) -> str:
+    """The SHA-256 that stands for a whole launch command in a server's pin.
+
+    Taken of the program found and of every argument as written, so that
+    any change of the launch is a change: another module after -m, another
+    image, a registry option, a second script. Secrets are masked first
+    (masked), so that a new token is no change of the launch. That is done
+    for the first MAX_LINTED_CHARS characters of the arguments, more than a
+    real command line has; what lies beyond is hashed as it is written.
+    """
+    digest = hashlib.sha256()
+    left = MAX_LINTED_CHARS
+    for word in (os.path.normcase(os.path.abspath(executable)), *words[1:]):
+        if len(word) <= left:
+            left -= len(word)
+            word = masked(word)
+        else:
+            left = 0
+        digest.update(word.encode("utf-8", "surrogatepass") + b"\0")
+    return digest.hexdigest()
+
+
+def unhashed_code(launch: dict[str, str | None]) -> str | None:
+    """What to tell the operator when a server's pin (LAUNCH_FIELDS) holds the SHA-256 of none of the server's
+    code; None when it holds one, or pins a runner's package by its spec."""
+    if launch.get("script_sha256"):
+        return None
+    script = launch.get("script")
+    if script:
+        return (f"the script {printable(script, limit=300)} could not be hashed (it is missing, a folder with no "
+                f"file an interpreter runs, unreadable, or larger than {MAX_HASHED_BYTES} bytes), so only its path "
+                "is pinned: a change to the server's code will not be seen")
+    if launch.get("package"):
+        return None
+    return ("this launch names no local script (it runs a module, a container image, a command string or a "
+            "program that another program finds), so only the program and the command line are pinned: a change "
+            "to the server's code will not be seen unless it changes the command line (an image's digest does, "
+            "a module's files or an image behind a tag do not)")
+
+
+def _package_main(path: str) -> str | None:
+    """The "main" of a package.json (at most MAX_PACKAGE_JSON_BYTES), or None when it has none that can be read."""
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) > MAX_PACKAGE_JSON_BYTES:
+            return None
+        with open(path, "rb") as handle:
+            document = json.loads(handle.read(MAX_PACKAGE_JSON_BYTES).decode("utf-8-sig"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    main = document.get("main") if isinstance(document, dict) else None
+    return main if isinstance(main, str) and 0 < len(main) <= MAX_PATH_CHARS and "\0" not in main else None
+
+
+def _files_run(path: str) -> list[str]:
+    """The ordinary files an interpreter may run for a script path: the file itself; for a folder, its
+    __main__.py, its package.json with the "main" that names, and its index file; for a name that is no file,
+    the name with a script's ending (`node dist/index` runs dist/index.js). Empty when there is none."""
+    try:
+        if os.path.isfile(path):
+            return [path]
+        if os.path.isdir(path):
+            candidates = [os.path.join(path, name) for name in _FOLDER_SCRIPTS]
+            main = _package_main(os.path.join(path, "package.json"))
+            if main is not None:
+                target = os.path.join(path, main)
+                candidates += [target, *(target + ending for ending in _SCRIPT_ENDINGS),
+                               os.path.join(target, "index.js")]
+        else:
+            candidates = [path + ending for ending in _SCRIPT_ENDINGS]
+        return list(dict.fromkeys(each for each in candidates if os.path.isfile(each)))
+    except (OSError, ValueError):
+        return []
+
+
+def _script_sha256(path: str) -> str | None:
+    """The SHA-256 pinned for one script path: the file's own, or for a folder or a name without its ending
+    the SHA-256 of the SHA-256s of the files run for it (_files_run); None when none of them could be hashed."""
+    files = _files_run(path)
+    if files == [path]:
+        return file_sha256(path)
+    digests = [(file_sha256(each), each[len(path):]) for each in files]
+    if not any(digest for digest, _ in digests):
+        return None
+    combined = hashlib.sha256()
+    for digest, name in digests:
+        combined.update(f"{digest or '-'} {name}\n".encode("utf-8", "surrogatepass"))
+    return combined.hexdigest()
 
 
 def _pinned_scripts(paths: list[str]) -> tuple[str | None, str | None]:
     """The "script" and "script_sha256" pinned of the files that may be the script (see launch_identity)."""
     if not paths:
         return None, None
+    digest: str | None
     if len(paths) == 1:
-        script, digest = paths[0], file_sha256(paths[0])
+        script, digest = paths[0], _script_sha256(paths[0])
     else:
         script = "; ".join(paths)
+        digests = [_script_sha256(path) for path in paths]
         combined = hashlib.sha256()
-        for path in paths:
-            combined.update(f"{file_sha256(path) or '-'} {path}\n".encode("utf-8", "surrogatepass"))
-        digest = combined.hexdigest()
+        for path, each in zip(paths, digests):
+            combined.update(f"{each or '-'} {path}\n".encode("utf-8", "surrogatepass"))
+        digest = combined.hexdigest() if any(digests) else None
     if len(script) > MAX_PATH_CHARS:  # longer than a pins file keeps: pinned by its SHA-256
         script = "sha256:" + hashlib.sha256(script.encode("utf-8", "surrogatepass")).hexdigest()
     return script, digest

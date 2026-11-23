@@ -55,6 +55,7 @@ from .cli_common import (
 from .cli_doctor import config_scope, launch_lines, project_of
 from .clients import CLIENTS
 from .config_file import ConfigFile, edited_text, read_config, write_config
+from .launch import without_address_credentials
 from .leaks import redact_value
 from .policy import Policy
 from .textutil import printable
@@ -306,7 +307,7 @@ def _wrap_step(config: ConfigFile, client: str, name: str, entry: Any, settings:
         return Step(name, entry, None, "skipped: already wrapped")
     words = command_line(entry)
     assert words is not None
-    shown = shown_command(words, limit=120)
+    shown = shown_command([without_address_credentials(word) for word in words], limit=120)
     executable = mcp_proxy._resolve_executable(words[0])
     if executable is not None:
         unsafe = mcp_proxy._unsafe_for_batch_file(executable, words[1:])
@@ -388,6 +389,12 @@ def shown_entry(entry: Any) -> str:
             key: ({name: HIDDEN for name in value} if key in ("env", "headers") and isinstance(value, dict) else value)
             for key, value in entry.items()
         }
+        for key in ("command", "args", "url", "serverUrl"):  # a password written into an address
+            if isinstance(entry.get(key), str):
+                entry[key] = without_address_credentials(entry[key])
+            elif isinstance(entry.get(key), list):
+                entry[key] = [without_address_credentials(word) if isinstance(word, str) else word
+                              for word in entry[key]]
     return json.dumps(redact_value(entry), indent=2, ensure_ascii=False)
 
 

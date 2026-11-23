@@ -5,6 +5,7 @@ this process (test_proxy.Harness); then the real proxy runs in front of a
 copy of tests/scripted_mcp_server.py whose code or serverInfo changes.
 """
 
+import io
 import json
 import shutil
 import sys
@@ -17,7 +18,7 @@ from support import audit_records
 from test_end_to_end import EndToEndTest
 from test_protocol import MODERN, modern
 from test_proxy import Harness, call, initialize, request
-from agent_sentinel import Firewall, Policy, cli_pins, mcp_proxy, wrapping
+from agent_sentinel import Firewall, Policy, cli_pins, launch, mcp_proxy, wrapping
 from agent_sentinel.pins import (
     LAUNCH_FIELDS,
     PinsFileError,
@@ -28,7 +29,7 @@ from agent_sentinel.pins import (
 )
 
 LAUNCH = {"executable": "C:/nodejs/node.exe", "package": None, "script": "C:/srv/server.js",
-          "script_sha256": "a" * 64}
+          "script_sha256": "a" * 64, "command_sha256": "d" * 64}
 INFO = {"name": "notes", "version": "1.0.0"}
 TOOL = {"name": "read_note", "description": "Read a note.", "inputSchema": {"type": "object"}}
 
@@ -132,6 +133,267 @@ class TheServerSection(TempFolderTest):
         pins = ToolPins(self.pins, enabled=False)
         self.assertEqual(pins.check_server_launch(LAUNCH), ("same", []))
         self.assertEqual(pins.check_server_info(INFO), ("same", []))
+
+
+class WhatTheFileKeepsIsReadBack(TempFolderTest):
+    """Whatever the proxy pins of a server, the pins file it writes loads again."""
+
+    def setUp(self):
+        super().setUp()
+        self.pins = self.folder / "pins.json"
+
+    def test_a_server_info_value_of_any_length_round_trips(self):
+        for length in (1, 71, 72, 100, 255, 256, 257, 1000, 100_000):
+            with self.subTest(length=length):
+                if self.pins.exists():
+                    self.pins.unlink()
+                info = {"name": server_info_value("n" * length), "version": server_info_value("1." * (length // 2) + "0")}
+                pins = ToolPins(self.pins)
+                self.assertEqual(pins.check_server_launch(LAUNCH), ("new", []))
+                self.assertEqual(pins.check_server_info(info), ("new", []))
+                pins.save()
+                again = ToolPins(self.pins)  # the next start: the file must load
+                self.assertEqual(again.check_server_launch(dict(LAUNCH)), ("same", []))
+                self.assertEqual(again.check_server_info(dict(info)), ("same", []))
+                self.assertLessEqual(len(read_pins_file(self.pins).server.info["name"]), 256)
+                # and so must the file of the changes that wait, when a long value is the change
+                changed = dict(info, version=server_info_value("9" * length))
+                self.assertEqual(again.check_server_info(changed), ("changed", ["version"]))
+                again.save()
+                self.assertEqual(read_pins_file(pending_path(self.pins)).server.info, changed)
+
+    def test_a_file_written_with_a_value_of_72_to_256_characters_loads(self):
+        # What a proxy wrote for a server with a long version, before the loader took what the writer keeps.
+        self.write("pins.json", {"version": 2, "tools": {}, "server": {
+            "first_seen": "2026-11-20T12:00:00Z", "launch": {name: LAUNCH[name] for name in LAUNCH},
+            "info": {"name": "notes", "version": "1.0.0+build." + "a" * 100}}})
+        pin = ToolPins(self.pins).server_pin
+        self.assertEqual(len(pin.info["version"]), 112)
+        code, out, _ = run_cli("pins", "list", "--pins", self.pins)
+        self.assertEqual(code, 0, out)
+
+    def test_values_handed_over_unbounded_are_kept_bounded(self):
+        pins = ToolPins(self.pins)
+        long_launch = dict(LAUNCH, executable="C:/" + "x" * 5000, package="npx " + "p" * 9000)
+        self.assertEqual(pins.check_server_launch(long_launch), ("new", []))
+        self.assertEqual(pins.check_server_info({"name": "n" * 5000, "version": 7}), ("new", []))
+        pins.save()
+        kept = read_pins_file(self.pins).server
+        self.assertRegex(kept.launch["executable"], r"\Asha256:[0-9a-f]{64}\Z")
+        self.assertRegex(kept.info["name"], r"\Asha256:[0-9a-f]{64}\Z")
+        self.assertIsNone(kept.info["version"])
+        again = ToolPins(self.pins)
+        self.assertEqual(again.check_server_launch(long_launch), ("same", []))
+        self.assertEqual(again.check_server_launch(dict(long_launch, executable="C:/" + "y" * 5000)),
+                         ("changed", ["executable"]))
+
+
+class APinFromBeforeTheCommandLineWasPinned(TempFolderTest):
+    """A "server" section without "command_sha256" is still read, compared by what it holds, and completed."""
+
+    OLD = {name: LAUNCH[name] for name in ("executable", "package", "script", "script_sha256")}
+
+    def setUp(self):
+        super().setUp()
+        self.pins = self.folder / "pins.json"
+
+    def old_file(self, **launch):
+        self.write("pins.json", {"version": 2, "tools": {}, "server": {
+            "first_seen": "2026-11-20T12:00:00Z", "launch": dict(self.OLD, **launch), "info": INFO}})
+
+    def test_it_matches_the_same_launch_and_is_completed(self):
+        self.old_file()
+        pins = ToolPins(self.pins)
+        self.assertEqual(pins.check_server_launch(LAUNCH), ("same", []))
+        self.assertEqual(pins.check_server_info(INFO), ("same", []))
+        pins.save()
+        kept = read_pins_file(self.pins).server
+        self.assertEqual(kept.launch, LAUNCH)
+        self.assertEqual((kept.info, kept.first_seen), (INFO, "2026-11-20T12:00:00Z"))
+        # from now on the command line is compared too
+        self.assertEqual(ToolPins(self.pins).check_server_launch(dict(LAUNCH, command_sha256="e" * 64)),
+                         ("changed", ["command_sha256"]))
+
+    def test_what_it_holds_is_still_compared(self):
+        self.old_file()
+        for change, field in (({"script_sha256": "b" * 64}, "script_sha256"), ({"script": "C:/srv/other.js"}, "script"),
+                              ({"executable": "C:/evil/node.exe"}, "executable"), ({"package": "npx evil"}, "package")):
+            with self.subTest(field=field):
+                self.assertEqual(ToolPins(self.pins).check_server_launch(dict(LAUNCH, **change)), ("changed", [field]))
+
+    def test_a_package_pinned_with_its_token_matches_the_masked_one_and_the_token_goes(self):
+        token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        written = f"uvx git+https://x-access-token:{token}@github.com/acme/private-mcp"
+        self.old_file(package=written, script=None, script_sha256=None)
+        seen = dict(LAUNCH, package=launch.masked(written), script=None, script_sha256=None)
+        pins = ToolPins(self.pins)
+        self.assertEqual(pins.check_server_launch(seen, masked=launch.masked), ("same", []))
+        pins.save()
+        self.assertNotIn(token, self.pins.read_text(encoding="utf-8"))
+        self.assertEqual(read_pins_file(self.pins).server.launch["package"], seen["package"])
+        # another address is still a change
+        self.old_file(package=written, script=None, script_sha256=None)
+        other = dict(seen, package=launch.masked(written.replace("acme", "evil")))
+        self.assertEqual(ToolPins(self.pins).check_server_launch(other, masked=launch.masked), ("changed", ["package"]))
+
+    def test_a_script_it_could_not_hash_gets_its_sha256(self):
+        self.old_file(script_sha256=None)  # a folder, before folders were hashed
+        pins = ToolPins(self.pins)
+        self.assertEqual(pins.check_server_launch(LAUNCH), ("same", []))
+        pins.save()
+        self.assertEqual(read_pins_file(self.pins).server.launch["script_sha256"], "a" * 64)
+
+    def test_a_pin_of_today_with_no_sha256_does_not_take_one_silently(self):
+        pins = ToolPins(self.pins)
+        pins.check_server_launch(dict(LAUNCH, script_sha256=None))
+        pins.save()
+        self.assertEqual(ToolPins(self.pins).check_server_launch(LAUNCH), ("changed", ["script_sha256"]))
+
+    def test_the_proxy_says_that_it_completed_the_pin(self):
+        script = self.write("server.py", "print(1)\n")
+        seen = launch.launch_identity(sys.executable, [sys.executable, str(script)])
+        firewall = Firewall(Policy.from_dict({"default": "allow"}))
+        for old, also in (({}, ""), ({"script_sha256": None}, " and the SHA-256 of its script")):
+            with self.subTest(old=old):
+                self.write("pins.json", {"version": 2, "tools": {}, "server": {
+                    "launch": dict({name: seen[name] for name in self.OLD}, **old), "info": INFO}})
+                said = []
+                with mock.patch.object(mcp_proxy, "_warn"):
+                    self.assertIsNone(mcp_proxy._check_server_launch(
+                        ToolPins(self.pins), firewall, sys.executable, [sys.executable, str(script)], "notes",
+                        said.append))
+                self.assertEqual(said, [f"--pin-server: the server's pin, written by an earlier version, lacked the "
+                                        f"SHA-256 of the whole command line{also}; it now holds them as they are at "
+                                        "this start"])
+                self.assertEqual(read_pins_file(self.pins).server.launch, seen)
+                said.clear()
+                with mock.patch.object(mcp_proxy, "_warn"):  # the next start: nothing more to say
+                    mcp_proxy._check_server_launch(ToolPins(self.pins), firewall, sys.executable,
+                                                   [sys.executable, str(script)], "notes", said.append)
+                self.assertEqual(said, [])
+
+    def test_the_pins_command_shows_it_with_secrets_masked(self):
+        token = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        self.old_file(package=f"npx https://user:hunter2@host.example/{token}/x.tgz", script=None, script_sha256=None)
+        code, out, _ = run_cli("pins", "list", "--pins", self.pins)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn(token, out)
+        self.assertNotIn("hunter2", out)
+        self.assertIn("pinned before the whole command line was", out)
+
+
+class APinThatCannotBeSaved(TempFolderTest):
+    """With --pin-server a pin that exists only in memory protects nothing: the proxy does not go on with it."""
+
+    def setUp(self):
+        super().setUp()
+        self.pins = self.folder / "no-such-folder" / "pins.json"
+        self.audit = self.folder / "audit.jsonl"
+        self.script = self.write("server.py", "print('x')\n")
+        self.said = []
+
+    def firewall(self, monitor=False):
+        return Firewall(Policy.from_dict({"default": "allow"}), audit_path=self.audit, monitor=monitor)
+
+    def check(self, pins, monitor=False):
+        with mock.patch.object(mcp_proxy, "_warn", lambda text, **_: self.said.append(text)):
+            return mcp_proxy._check_server_launch(pins, self.firewall(monitor), sys.executable,
+                                                  [sys.executable, str(self.script)], "notes", self.said.append)
+
+    def test_the_first_launch_pin_must_reach_the_file(self):
+        for monitor in (False, True):
+            with self.subTest(monitor=monitor), self.assertRaises(mcp_proxy._ServerPinNotSaved):
+                self.check(ToolPins(self.pins), monitor)
+        self.assertEqual([text for text in self.said if "pinned how the server is launched" in text], [])
+
+    def test_a_pin_that_is_on_disk_still_holds_when_the_file_cannot_be_written(self):
+        pins_file = self.folder / "pins.json"
+        self.assertIsNone(self.check(ToolPins(pins_file)))
+        self.assertTrue(pins_file.exists())
+        again = ToolPins(pins_file)
+        with mock.patch.object(ToolPins, "save", side_effect=OSError("read-only")):
+            self.assertIsNone(self.check(again))  # the same server: nothing to save, and it starts
+            self.script.write_text("print('changed')\n", encoding="utf-8")
+            self.assertIn("script_sha256", self.check(ToolPins(pins_file)))  # a changed one is still held back
+
+    def test_the_real_proxy_does_not_start_the_server(self):
+        marker = self.folder / "started.txt"
+        self.script.write_text(f"open({str(marker)!r}, 'w').close()\n", encoding="utf-8")
+        policy = self.write("policy.json", {"default": "allow"})
+        for extra in ((), ("--on-server-change", "quarantine"), ("--monitor",)):
+            with self.subTest(extra=extra):
+                stderr = io.StringIO()
+                with mock.patch("sys.stderr", stderr):
+                    code = mcp_proxy.main(["--policy", str(policy), "--pins", str(self.pins), "--pin-server",
+                                           "--audit", str(self.audit), *extra, "--", sys.executable,
+                                           str(self.script)])
+                err = stderr.getvalue()
+                self.assertEqual(code, 2, err)
+                self.assertIn("not starting: --pin-server was given, and the server's pin cannot be saved", err)
+                self.assertFalse(marker.exists())
+                self.assertFalse(self.pins.exists())
+        records = [json.loads(line) for line in self.audit.read_text(encoding="utf-8").splitlines()]
+        ends = [record for record in records if record.get("event") == "session_end"]
+        self.assertTrue(ends and all("pin could not be saved" in record["reason"] for record in ends), ends)
+
+    def test_a_first_server_info_that_cannot_be_pinned_quarantines_the_server(self):
+        pins_file = self.folder / "pins.json"
+        for on_change, refused in ((mcp_proxy.SERVER_CHANGE_REFUSE, True), (mcp_proxy.SERVER_CHANGE_QUARANTINE, False)):
+            with self.subTest(on_change=on_change):
+                h = Harness(self.firewall(), pins=ToolPins(pins_file), pin_server=True, on_server_change=on_change)
+                with mock.patch.object(ToolPins, "save", side_effect=OSError("read-only")):
+                    delivered = h.round_trip(initialize(1), {"protocolVersion": "2025-06-18",
+                                                             "capabilities": {"tools": {}},
+                                                             "serverInfo": {"name": "notes", "version": "1.0.0"}})
+                    self.assertEqual("error" in delivered, refused)
+                    listed = h.round_trip(request(2, "tools/list"), {"tools": [dict(TOOL)]})
+                self.assertEqual(listed["result"]["tools"], [])
+                self.assertIn("its serverInfo could not be pinned", h.warnings.getvalue())
+        # in monitor mode it is logged, and nothing is held back
+        h = Harness(self.firewall(monitor=True), pins=ToolPins(pins_file), pin_server=True)
+        with mock.patch.object(ToolPins, "save", side_effect=OSError("read-only")):
+            delivered = h.round_trip(initialize(1), {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                                                     "serverInfo": {"name": "notes", "version": "1.0.0"}})
+        self.assertIn("result", delivered)
+
+
+class WhatThePinDoesNotCoverIsSaid(TempFolderTest):
+    def setUp(self):
+        super().setUp()
+        self.pins = self.folder / "pins.json"
+        self.said, self.warned = [], []
+
+    def check(self, *command):
+        firewall = Firewall(Policy.from_dict({"default": "allow"}))
+        with mock.patch.object(mcp_proxy, "_warn", lambda text, **_: self.warned.append(text)):
+            return mcp_proxy._check_server_launch(ToolPins(self.pins), firewall, sys.executable,
+                                                  [sys.executable, *command], "notes", self.said.append)
+
+    def test_a_launch_with_no_hashed_code_is_said_at_every_start(self):
+        for _ in range(2):  # when it is pinned, and when it matches its pin
+            self.warned.clear()
+            self.assertIsNone(self.check("-m", "some_server"))
+            (line,) = self.warned
+            self.assertIn("--pin-server: this launch names no local script", line)
+            self.assertIn("a change to the server's code will not be seen", line)
+        self.assertIn("command_sha256", self.check("-m", "another_server"))  # but another module is a change
+
+    def test_a_script_that_cannot_be_hashed_is_said_and_a_hashed_one_is_not(self):
+        self.assertIsNone(self.check(str(self.folder / "missing.py")))
+        self.assertIn("could not be hashed", self.warned[0])
+        self.pins.unlink()
+        self.warned.clear()
+        script = self.write("server.py", "print(1)\n")
+        self.assertIsNone(self.check(str(script)))
+        self.assertEqual(self.warned, [])
+        code, out, _ = run_cli("pins", "list", "--pins", self.pins)
+        self.assertNotIn("note:", out)
+
+    def test_pins_list_says_it_too(self):
+        self.check("-m", "some_server")
+        code, out, _ = run_cli("pins", "list", "--pins", self.pins)
+        self.assertEqual(code, 0, out)
+        self.assertIn("note: this launch names no local script", out)
 
 
 class ThePinnedProxy(TempFolderTest):

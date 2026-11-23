@@ -90,17 +90,24 @@ section of the same file:
     "server": {
       "first_seen": "2026-11-20T12:00:00Z",
       "launch": {"executable": "C:\\\\nodejs\\\\npx.cmd", "package": "npx mcp-remote@0.1.16",
-                 "script": null, "script_sha256": null},
+                 "script": null, "script_sha256": null, "command_sha256": "<64 hex>"},
       "info": {"name": "mcp-remote", "version": "0.1.16"}
     }
 
 * "launch" (launch.LAUNCH_FIELDS) is taken before the server starts: the
   program found for the command, the package a runner (npx, uvx, ...) runs
-  as written, and the local script it starts with that file's SHA-256 (or
-  the program file itself, when it is no interpreter). Each may be null.
+  as written (a credential in its address masked), the local script it
+  starts with that file's SHA-256 (or the program file itself, when it is
+  no interpreter), and the SHA-256 of the whole command line, its secrets
+  masked (launch.command_sha256), so that any other change of the launch is
+  a change too. Each may be null. A script with a null SHA-256 could not be
+  hashed: the proxy says so at every start (launch.unhashed_code).
 * "info" is the name and version of the serverInfo the server sends in its
   handshake; absent until it has answered once. A value longer than
   MAX_SERVER_INFO_CHARS is kept as "sha256:<64 hex>" of it.
+* A pin written before the command line was pinned has no
+  "command_sha256". It is still read: the launch is compared by its other
+  members (launch_changes), and the pin is then completed with what is seen.
 
 A launch that differs from its pin makes the proxy refuse to start (or, with
 --on-server-change quarantine, start with every tool, prompt and template
@@ -136,7 +143,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import jsonutil
 from .filelock import replace_file
@@ -156,10 +163,11 @@ PINNED_LISTS = tuple(PINNED_FIELDS)
 INSTRUCTIONS = "instructions"
 SERVER = "server"
 # What the "server" section pins (see "The server itself"), and how long one value may be.
-LAUNCH_FIELDS = ("executable", "package", "script", "script_sha256")
+LAUNCH_FIELDS = ("executable", "package", "script", "script_sha256", "command_sha256")
 INFO_FIELDS = ("name", "version")
 MAX_SERVER_VALUE_CHARS = 4096
 MAX_SERVER_INFO_CHARS = 256
+_HASHED = "sha256:"  # in front of the SHA-256 that stands for a value too long to keep
 # How the pins command names each section (agent-sentinel pins ... --kind WORD).
 KIND_WORDS = {"tools": "tool", "prompts": "prompt", "resourceTemplates": "template", INSTRUCTIONS: INSTRUCTIONS}
 
@@ -217,11 +225,26 @@ class ServerPin:
 
 def server_info_value(value: Any) -> str | None:
     """A serverInfo name or version as the pin keeps it: text as it is, a long one as its SHA-256, else None."""
+    return _kept_value(value, MAX_SERVER_INFO_CHARS)
+
+
+def _kept_value(value: Any, longest: int) -> str | None:
+    """A value of the "server" section as the file keeps it: text of at most `longest` characters as it is, a
+    longer one as "sha256:<64 hex>" of it, anything else None. What the loader reads back is never longer."""
     if not isinstance(value, str):
         return None
-    if len(value) <= MAX_SERVER_INFO_CHARS:
+    if len(value) <= longest:
         return value
-    return "sha256:" + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+    return _HASHED + hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _kept_launch(launch: dict[str, str | None]) -> dict[str, str | None]:
+    """A launch as the file keeps it: every member of LAUNCH_FIELDS, each of a length the loader reads back."""
+    return {name: _kept_value(launch.get(name), MAX_SERVER_VALUE_CHARS) for name in LAUNCH_FIELDS}
+
+
+def _kept_info(info: dict[str, str | None]) -> dict[str, str | None]:
+    return {name: server_info_value(info.get(name)) for name in INFO_FIELDS}
 
 
 def server_changes(pinned: dict[str, str | None] | None, seen: dict[str, str | None] | None) -> list[str]:
@@ -236,6 +259,30 @@ def server_changes(pinned: dict[str, str | None] | None, seen: dict[str, str | N
         if old != new:
             changed.append(name)
     return changed
+
+
+def launch_changes(pinned: dict[str, str | None], seen: dict[str, str | None],
+                   masked: Callable[[str], str] | None = None) -> list[str]:
+    """The members of a launch that differ from its pin (server_changes), for a pin of any age.
+
+    A pin written before the command line was pinned has no
+    "command_sha256". For such a pin the command line is not compared; a
+    package pinned as it was written matches the same text with its
+    credentials masked (`masked`, launch.masked: what is pinned now); and a
+    script pinned without a SHA-256 matches once one can be taken (a folder
+    is hashed now). ToolPins.check_server_launch then completes the pin. A
+    pin with a "command_sha256" is compared member by member.
+    """
+    changed = server_changes(pinned, seen)
+    if pinned.get("command_sha256") is not None:
+        return changed
+    passed = {"command_sha256"}
+    package = pinned.get("package")
+    if isinstance(package, str) and masked is not None and masked(package) == seen.get("package"):
+        passed.add("package")
+    if pinned.get("script_sha256") is None and pinned.get("script") is not None:
+        passed.add("script_sha256")
+    return [name for name in changed if name not in passed]
 
 
 @dataclass
@@ -381,12 +428,15 @@ def _server_pin_from(entry: Any) -> ServerPin:
     if "launch" not in entry:
         raise PinsFileError("\"server\" needs a \"launch\"")
     launch = _server_values(entry["launch"], LAUNCH_FIELDS, "server.launch", MAX_SERVER_VALUE_CHARS)
-    sha = launch.get("script_sha256")
-    if sha is not None and not _SHA256.fullmatch(sha):
-        raise PinsFileError("\"server.launch\": \"script_sha256\" must be 64 lowercase hex digits or null")
+    for name in ("script_sha256", "command_sha256"):
+        sha = launch.get(name)
+        if sha is not None and not _SHA256.fullmatch(sha):
+            raise PinsFileError(f"\"server.launch\": \"{name}\" must be 64 lowercase hex digits or null")
     info = None
     if "info" in entry:
-        info = _server_values(entry["info"], INFO_FIELDS, "server.info", len("sha256:") + 64)
+        # As long as server_info_value keeps a value: a shorter limit here would refuse a file the proxy wrote.
+        info = _server_values(entry["info"], INFO_FIELDS, "server.info",
+                              max(MAX_SERVER_INFO_CHARS, len(_HASHED) + 64))
     return ServerPin(launch=launch, info=info, first_seen=first_seen)
 
 
@@ -532,6 +582,7 @@ class ToolPins:
         # the launch it saw differs from the pin (its serverInfo is then never written into the pin).
         self._server_added = False
         self._server_launch_changed = False
+        self._masked: Callable[[str], str] | None = None  # for launch_changes, as check_server_launch was given it
 
     @property
     def path(self) -> Path | None:
@@ -623,22 +674,32 @@ class ToolPins:
         with self._lock:
             return self._pins.server
 
-    def check_server_launch(self, launch: dict[str, str | None]) -> tuple[str, list[str]]:
+    def check_server_launch(self, launch: dict[str, str | None],
+                            masked: Callable[[str], str] | None = None) -> tuple[str, list[str]]:
         """Compare how the server is launched (launch.launch_identity) with its pin.
 
         (NEW, []) pins it, (SAME, []), or (CHANGED, the fields that differ):
-        the launch seen then waits in the pending file for `pins accept --server`.
+        the launch seen then waits in the pending file for `pins accept
+        --server`. `masked` (launch.masked) lets a pin written before
+        credentials were masked match the launch it was taken of
+        (launch_changes); such a pin, and one without the command line's
+        SHA-256, is completed with the launch seen.
         """
         if not self._enabled:
             return SAME, []
+        launch = _kept_launch(launch)
         with self._lock:
+            self._masked = masked
             pin = self._pins.server
             if pin is None:
-                self._pins.server = ServerPin(launch=dict(launch), first_seen=now())
+                self._pins.server = ServerPin(launch=launch, first_seen=now())
                 self._server_added = self._unsaved = True
                 return NEW, []
-            changed = server_changes(pin.launch, launch)
+            changed = launch_changes(pin.launch, launch, masked)
             if not changed:
+                if server_changes(pin.launch, launch):  # a pin of an earlier form: completed
+                    self._pins.server = ServerPin(launch=launch, info=pin.info, first_seen=pin.first_seen)
+                    self._server_added = self._unsaved = True
                 return SAME, []
             self._server_launch_changed = True
             self._note_server_pending(launch=launch)
@@ -653,6 +714,7 @@ class ToolPins:
         """
         if not self._enabled:
             return SAME, []
+        info = _kept_info(info)
         with self._lock:
             pin = self._pins.server
             if self._server_launch_changed:
@@ -763,10 +825,12 @@ class ToolPins:
             elif len(merged.lists[kind]) < MAX_PINS_PER_LIST or theirs is not None:
                 merged.lists[kind][name or ""] = ours
         ours_server, theirs_server = self._pins.server, merged.server
-        # The server pin this process made, or completed with its serverInfo, goes in where the disk has none,
-        # or has the same launch without an info yet; one the operator accepted meanwhile is kept.
+        # The server pin this process made, or completed (with its serverInfo, or with what a pin of an
+        # earlier form lacked), goes in where the disk has none, or has the same launch and no other
+        # serverInfo; one the operator accepted meanwhile is kept.
         if self._server_added and ours_server is not None and (theirs_server is None or (
-                theirs_server.info is None and not server_changes(theirs_server.launch, ours_server.launch))):
+                not launch_changes(theirs_server.launch, ours_server.launch, self._masked)
+                and (theirs_server.info is None or not server_changes(theirs_server.info, ours_server.info)))):
             merged.server = ours_server
         return merged
 

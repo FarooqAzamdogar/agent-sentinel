@@ -12,8 +12,12 @@ How doctor, clients, wrap and inspect use it (launch.py does the matching):
                  A run that does not pin an exact version may fetch one of them,
                  so it fails too.
     VULNERABLE   a package version with a published vulnerability, fixed in
-                 `fixed`. doctor warns about a pinned version below it. A run
+                 `fixed`. doctor warns about a pinned version below it, and about
+                 a range that allows only versions below it ("<0.1.16"). A run
                  without a pinned version fetches the newest one, which has the fix.
+                 `fixed` is the release the sources name; a version from an older
+                 release line that got a fix of its own is below it and is warned
+                 about all the same, which the entry's summary then says.
     POPULAR      the names of well-known MCP server packages. A package whose name
                  is one edit (a letter added, left out, changed, or two letters
                  swapped) from one of them is reported as a possible typosquat:
@@ -21,7 +25,7 @@ How doctor, clients, wrap and inspect use it (launch.py does the matching):
                  too. An exact match never warns, nor does a name in LOOKALIKES_OK.
 
 Versions are compared as dotted numbers (1.0.16, 2025.7.1); a pre-release
-(1.0.16-beta.1) comes before its release.
+(1.0.16-beta.1, 2025.12.18rc1) comes before its release.
 """
 
 from __future__ import annotations
@@ -58,11 +62,14 @@ VULNERABLE: tuple[Advisory, ...] = (
              "remote code execution through the Inspector's unauthenticated local proxy",
              "https://feedly.com/cve/CVE-2025-49596"),
     Advisory(NPM, "@modelcontextprotocol/server-filesystem", None, "2025.7.1", "CVE-2025-53109, CVE-2025-53110",
-             "escapes from the allowed folders (a path prefix match, and symbolic links)",
+             "escapes from the allowed folders (a path prefix match, and symbolic links); the sources name "
+             "2025.7.1 as the release with the fix, so an older release line that has a fix of its own is "
+             "warned about too (check the advisory for it)",
              "https://cymulate.com/blog/cve-2025-53109-53110-escaperoute-anthropic/"),
     Advisory(PYPI, "mcp-server-git", None, "2026.1.14",
              "CVE-2026-27735, CVE-2025-68143, CVE-2025-68144, CVE-2025-68145",
-             "path traversal and argument injection in the git tools (the last fixed in 2026.1.14)",
+             "path traversal and argument injection in the git tools (the three 2025 CVEs were fixed by "
+             "2025.12.18, CVE-2026-27735 in 2026.1.14)",
              "https://thehackernews.com/2026/01/three-flaws-in-anthropic-mcp-git-server.html"),
 )
 
