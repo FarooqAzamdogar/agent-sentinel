@@ -113,6 +113,74 @@ class TheLifecycle(GroupStoreTest):
         self.assertFalse(Firewall(flows, session_store=mail).check_call("send_email", {"to": "x"}).allowed)
         self.assertTrue(Firewall(flows, session_store=second).check_call("send_email", {"to": "x"}).allowed)
 
+    def test_a_proxy_that_cannot_find_its_client_shares_marks_with_every_run(self):
+        # Review of 0.6: "unknown" was one more run beside the others, so when one proxy of a client found
+        # the client and another did not, neither saw the other's marks, and a sink call passed.
+        files = self.store("files", run="4242@1")  # its client was found
+        mail = self.store("mail", run=client_run.UNKNOWN)  # the same client, not found
+        other = self.store("files", run="77@7")  # another client altogether
+        for store in (files, mail, other):
+            self.assertEqual(store.join().status, NEW_RUN)
+        files.add(["private"], "read_file")
+        self.assertEqual(mail.read().labels, {"private"})  # may be its own client's: it counts
+        self.assertEqual(mail.read().marks["private"].server, "files")
+        self.assertEqual(other.read().labels, frozenset())  # two known runs stay apart
+        answer = mail.add(["untrusted"], "fetch_page")
+        self.assertEqual(answer.labels, {"private", "untrusted"})
+        self.assertEqual(files.read().labels, {"private", "untrusted"})  # and the unknown one's count for every run
+        self.assertEqual(other.read().labels, {"untrusted"})
+        flows = Policy.from_dict(FLOWS)
+        for store in (files, mail):
+            decision = Firewall(flows, session_store=store).check_call("send_email", {"to": "x"})
+            self.assertEqual((decision.allowed, decision.rule), (False, "flows[0]"))
+        self.assertTrue(Firewall(flows, session_store=other).check_call("send_email", {"to": "x"}).allowed)
+        # Each run's own marks are what the file holds: nothing is copied from one run to another.
+        self.assertEqual({run["run"]: sorted(run["marks"]) for run in self.document()["runs"]},
+                         {"4242@1": ["private"], "unknown": ["untrusted"], "77@7": []})
+        # A mark a run only had from the unknown one is still recorded as its own when it sets it itself.
+        files.add(["untrusted"], "fetch_page")
+        self.assertEqual(sorted(self.run_in_file(0)["marks"]), ["private", "untrusted"])
+
+    def test_a_mark_seen_from_another_run_stays_when_that_run_is_removed(self):
+        files = self.store("files", run="4242@1")
+        mail = self.store("mail", run=client_run.UNKNOWN)
+        files.join()
+        mail.join()
+        mail.add(["untrusted"], "fetch_page")
+        self.assertEqual(files.read().labels, {"untrusted"})
+        document = self.document()
+        document["runs"] = [run for run in document["runs"] if run["run"] != client_run.UNKNOWN]
+        files.path.write_text(json.dumps(document), encoding="ascii")  # as when later client runs made room
+        marks = files.read()
+        self.assertEqual((marks.everything, marks.labels), (False, {"untrusted"}))
+        self.assertTrue(mail.read().everything)  # its own run is gone: it fails closed, as any run does
+
+    def test_more_marks_from_other_runs_than_can_be_kept_count_as_every_mark_for_good(self):
+        files = self.store("files", run="4242@1")
+        mail = self.store("mail", run=client_run.UNKNOWN)
+        files.join()
+        mail.join()
+        mail.add(["untrusted"], "fetch_page")
+
+        def unknown_run_marks(labels):
+            document = self.document()
+            unknown = next(run for run in document["runs"] if run["run"] == client_run.UNKNOWN)
+            mark = next(iter(unknown["marks"].values()))
+            unknown["marks"] = {label: mark for label in labels}
+            files.path.write_text(json.dumps(document), encoding="ascii")  # a file someone tampered with
+
+        unknown_run_marks([f"first{number}" for number in range(session.MAX_MARKS)])
+        self.assertEqual(len(files.read().labels), session.MAX_MARKS)  # kept: as many as can be
+        unknown_run_marks([f"second{number}" for number in range(3)])
+        self.assertTrue(files.read().everything)  # seen, and no room to keep them
+        unknown_run_marks(["untrusted"])
+        self.assertTrue(files.read().everything)  # and so it stays: a mark seen is never forgotten
+        self.assertTrue(files.add(["private"], "read_file").everything)
+
+    def test_the_unknown_run_is_the_one_client_run_names(self):
+        # The library does not load client_run (it starts programs), so the name is written out in session.
+        self.assertEqual(session.UNKNOWN_RUN, client_run.UNKNOWN)
+
     def test_past_the_limit_the_run_begun_first_is_removed_and_its_members_fail_closed(self):
         oldest = self.store("files", run="run-0")
         oldest.join()
@@ -239,6 +307,9 @@ class FailingClosed(GroupStoreTest):
             dict(good, extra=1),
             dict(good, group="other"),
             dict(good, version=2),
+            dict(good, version=True),  # equal to 1 in Python, and not a version
+            dict(good, version=1.0),
+            dict(good, version="1"),
             dict(good, runs=[]),
             dict(good, runs=[run, run]),
             dict(good, runs=[dict(run, run=f"r{index}") for index in range(MAX_GROUP_RUNS + 1)]),
@@ -364,6 +435,85 @@ class TheClientRun(unittest.TestCase):
     def test_it_never_raises(self):
         with mock.patch.object(client_run, "_walk_up", side_effect=RuntimeError("bug")):
             self.assertEqual(client_run.find_client_run().id, client_run.UNKNOWN)
+
+    # ---- Linux: /proc, read from a folder laid out like it ---------------------------------------------
+
+    @staticmethod
+    def system_stat(processors, interrupts):
+        """The text of /proc/stat in the kernel's layout: the btime line comes after the processors and intr."""
+        lines = ["cpu  2255 34 2290 22625563 6290 127 456 0 0 0"]
+        lines += [f"cpu{n} 113244 3412 144123 113117181 367512 12712 43811 0 0 0" for n in range(processors)]
+        lines.append("intr 114930548 " + " ".join(str(n * 7919 % 100000) for n in range(interrupts)))
+        lines += ["ctxt 1990473", "btime 1762191376", "processes 2915", "procs_running 1", "procs_blocked 0"]
+        return "\n".join(lines) + "\n"
+
+    def proc(self, system_stat, processes):
+        """A folder like /proc: `stat`, the boot id, and <pid>/stat for {pid: (name, parent, start in ticks)}."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "stat").write_text(system_stat, encoding="ascii")
+        (root / "sys" / "kernel" / "random").mkdir(parents=True)
+        (root / "sys" / "kernel" / "random" / "boot_id").write_text("0f0e0d0c-1111-2222-3333-444455556666\n")
+        for pid, (name, parent, ticks) in processes.items():
+            (root / str(pid)).mkdir()
+            fields = ["S", str(parent), *["0"] * 17, str(ticks), *["0"] * 30]
+            (root / str(pid) / "stat").write_text(f"{pid} ({name}) " + " ".join(fields) + "\n", encoding="ascii")
+        return str(root)
+
+    PROCESSES = {10: ("python3", 9, 5000), 9: ("bash", 8, 4000), 8: ("node (x) y", 1, 3000)}
+
+    def test_the_boot_time_is_found_however_far_into_proc_stat_it_is(self):
+        # Review of 0.6: only the first 4096 bytes were read, and on a machine with many processors or
+        # interrupt counters the btime line is past them. The boot time then read as 0.
+        for processors, interrupts in ((2, 20), (16, 600), (512, 20_000)):
+            with self.subTest(processors=processors):
+                text = self.system_stat(processors, interrupts)
+                root = self.proc(text, {})
+                self.assertEqual(client_run._boot_time(f"{root}/stat"), 1762191376.0)
+        self.assertGreater(self.system_stat(16, 600).index("btime"), 4096)
+        # The line of interrupt counts may be longer than one read: it is read in pieces.
+        self.assertGreater(len(self.system_stat(512, 20_000).splitlines()[513]), client_run._MAX_STAT_LINE_BYTES)
+
+    def test_without_a_boot_time_the_start_is_not_taken_for_a_date(self):
+        for text in ("cpu 1 2 3\nctxt 5\n", "", "cpu 1 2 3\nbtime\n", "cpu 1\nbtime soon\n", "xbtime 5\n",
+                     "intr " + "9 " * 40_000 + "btime 1762191376\n",  # in the middle of a line: not the line
+                     "x" * (client_run._MAX_SYSTEM_STAT_BYTES + 10) + "\nbtime 1762191376\n"):  # too far to read
+            with self.subTest(text=text[:30]):
+                root = self.proc(text, self.PROCESSES)
+                self.assertIsNone(client_run._boot_time(f"{root}/stat"))
+                reader = client_run._ProcProcesses(root)
+                self.assertFalse(reader.since_epoch)
+                with mock.patch.object(os, "getpid", return_value=10):
+                    run = client_run._walk_up(reader, time.monotonic() + 5)
+                # The run is still told (by the boot id and the ticks), but when it started is not known:
+                # a damaged group file is then never judged older than the client, so it is never replaced.
+                self.assertEqual((run.id, run.started, run.program), ("8@0f0e0d0c-3000", None, "node (x) y"))
+        self.assertIsNone(client_run._boot_time(str(Path(root) / "no such file")))
+
+    def test_the_processes_of_proc_are_read(self):
+        root = self.proc(self.system_stat(16, 600), self.PROCESSES)
+        reader = client_run._ProcProcesses(root)
+        self.assertTrue(reader.since_epoch)
+        ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+        found = reader.process(8)
+        self.assertEqual((found.parent, found.name, found.start_key), (1, "node (x) y", "0f0e0d0c-3000"))
+        self.assertEqual(found.started, 1762191376.0 + 3000 / ticks)
+        self.assertIsNone(reader.process(4242))
+        with mock.patch.object(os, "getpid", return_value=10):
+            run = client_run._walk_up(reader, time.monotonic() + 5)
+        self.assertEqual((run.id, run.started), ("8@0f0e0d0c-3000", 1762191376.0 + 3000 / ticks))
+
+    def test_a_group_file_is_not_judged_by_a_start_that_is_not_a_date(self):
+        folder = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, folder, True)
+        (folder / "desk.json").write_bytes(b"{damaged")
+        old = time.time() - 3600
+        os.utime(folder / "desk.json", (old, old))
+        # Seconds since the system started, taken for a date, would be 1970: the file never looked older.
+        unknown_start = GroupSessionStore(folder, "desk", "8@0f0e0d0c-3000", "files", run_started=None)
+        self.assertEqual(unknown_start.join().status, UNUSABLE)
+        known_start = GroupSessionStore(folder, "desk", "8@0f0e0d0c-3000", "files", run_started=time.time() - 60)
+        self.assertEqual(known_start.join().status, REPLACED)
 
     def test_two_proxies_of_one_client_find_the_same_run(self):
         script = "import sys; sys.path.insert(0, sys.argv[1]); from agent_sentinel import client_run; " \

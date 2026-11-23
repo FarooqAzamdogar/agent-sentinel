@@ -11,11 +11,12 @@ import sys
 import tempfile
 import threading
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 
 import support  # noqa: F401  (puts the project on the path)
-from agent_sentinel import session
+from agent_sentinel import Firewall, Policy, session
 from agent_sentinel.session import (
     FileSessionStore,
     Mark,
@@ -103,6 +104,95 @@ class MemoryStore(unittest.TestCase):
         with mock.patch.object(session, "MAX_MARKS", 2):
             store.add(["a", "b", "c"], "x")
         self.assertTrue(store.read().everything)
+
+
+class StoresWrittenForAnEarlierVersion(unittest.TestCase):
+    """0.5 documented a session store as two operations, read() and add(labels, tool), and asked for no base class."""
+
+    POLICY = {
+        "default": "block",
+        "tools": {"read_file": {"action": "allow", "labels": ["private"]},
+                  "fetch": {"action": "allow", "labels": ["untrusted"]},
+                  "send": {"action": "allow", "labels": ["sink"]}},
+        "flows": [{"after": ["untrusted", "private"], "then": "sink", "action": "block"}],
+    }
+
+    class TwoOperations:
+        """Written against the 0.5 documentation, without subclassing SessionStore."""
+
+        def __init__(self):
+            self.inner = MemorySessionStore()
+            self.added = []
+
+        def read(self):
+            return self.inner.read()
+
+        def add(self, labels, tool):
+            self.added.append((sorted(labels), tool))
+            return self.inner.add(labels, tool)
+
+    def firewall(self, store, **policy):
+        return Firewall(Policy.from_dict({**self.POLICY, **policy}), session_store=store)
+
+    def test_a_store_with_the_two_operations_still_works_with_one_warning(self):
+        # Review of 0.6: every result raised AttributeError ('... has no attribute read_state').
+        store = self.TwoOperations()
+        with self.assertWarns(RuntimeWarning) as caught:
+            firewall = self.firewall(store)
+        self.assertIn("TwoOperations has read() and add() but not add_marks(), read_state() and update_state()",
+                      str(caught.warning))
+        self.assertEqual(caught.filename, __file__)  # it points at the program that made the Firewall
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # nothing more is warned about, whatever is checked
+            for tool, text in (("read_file", "the memo"), ("fetch", "a page")):
+                self.assertTrue(firewall.check_call(tool, {"path": "a"}).allowed)
+                self.assertTrue(firewall.check_result(tool, text, cross_message=True).decision.allowed)
+                firewall.mark_delivered(tool)
+            refused = firewall.check_call("send", {"to": "x"})
+            self.assertEqual((refused.allowed, refused.rule), (False, "flows[0]"))
+            self.assertEqual(firewall.run("fetch", {"url": "https://example.com"}, lambda **kw: "page text"),
+                             "page text")
+        self.assertEqual(store.added[:2], [(["private"], "read_file"), (["untrusted"], "fetch")])
+        self.assertEqual(firewall.session_marks().labels, {"private", "untrusted"})
+
+    def test_what_such_a_store_cannot_hold_is_skipped_or_refused_never_an_error(self):
+        store = self.TwoOperations()
+        with self.assertWarns(RuntimeWarning):
+            firewall = self.firewall(store, limits={"max_calls_per_session": 5})
+        # A session limit cannot be counted, so the call it counts is refused (fail closed), with a reason.
+        refused = firewall.check_call("fetch", {"url": "https://example.com"})
+        self.assertFalse(refused.allowed)
+        self.assertIn("could not be counted", refused.reason)
+        with self.assertRaises(SessionStateError):
+            firewall.session_store.read_state()
+        self.assertEqual(firewall._kept_tail("result"), ())  # no tail: text split over two results is not looked for
+
+    def test_a_session_store_is_used_as_it_is_and_one_with_every_operation_gets_no_warning(self):
+        own = MemorySessionStore()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self.assertIs(self.firewall(own).session_store, own)
+
+            class Complete(self.TwoOperations):
+                def add_marks(self, marks, tail=None):
+                    return self.inner.add_marks(marks, tail)
+
+                def read_state(self):
+                    return self.inner.read_state()
+
+                def update_state(self, change):
+                    return self.inner.update_state(change)
+
+            firewall = self.firewall(Complete(), limits={"max_calls_per_session": 1})
+            self.assertTrue(firewall.check_call("fetch", {"url": "a"}).allowed)
+            self.assertFalse(firewall.check_call("fetch", {"url": "b"}).allowed)  # counted in the store's own state
+            self.assertTrue(firewall.session_store.read_state().counts)
+
+    def test_an_object_that_is_no_store_is_refused_when_the_firewall_is_made(self):
+        for store in (object(), "memory", {"read": 1}, type("OnlyRead", (), {"read": lambda self: None})()):
+            with self.subTest(store=store), self.assertRaises(TypeError) as caught:
+                self.firewall(store)
+            self.assertIn("read() and add(labels, tool)", str(caught.exception))
 
 
 class FileStoreSetup(unittest.TestCase):

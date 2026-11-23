@@ -80,6 +80,12 @@ have their own. When a proxy starts (GroupSessionStore.join), under the lock:
   written before this client started (so it cannot belong to this run);
   otherwise every mark counts as set until the file is deleted.
 
+A proxy that cannot find its client is in the run "unknown"
+(UNKNOWN_RUN, client_run.UNKNOWN). It may belong to any client run, so the marks of every
+run in the file count for it, and the marks of the run "unknown" count for
+every other run (GroupSessionStore._visible): stricter than needed, never
+laxer.
+
 After joining, a file that is missing, damaged, too large or of another
 group, or from which this run was removed or in which it was begun again,
 counts as every mark set. A proxy that cannot take the lock in time gets
@@ -109,6 +115,7 @@ import os
 import re
 import threading
 import time
+import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -174,6 +181,9 @@ MAX_GROUP_MEMBERS = 64
 # The client runs a group file holds at once; past it, the run begun first is removed to make room.
 MAX_GROUP_RUNS = 32
 MAX_RUN_ID_CHARS = 200
+# The run of a proxy whose client could not be found: client_run.UNKNOWN, written out here because this
+# module is part of the library, which does not load the command line's modules (client_run starts programs).
+UNKNOWN_RUN = "unknown"
 # The largest a group file may be. It holds marks only, and every proxy of the group reads it under the
 # group's lock before a call a flow rule may apply to, so it is kept smaller than a session file
 # (MAX_STATE_FILE_BYTES, which also holds the tails and counts of a hook session). One run with
@@ -468,8 +478,11 @@ class SessionStore:
     A store written before 0.6 implements read() and add() only: add_marks
     then goes through add() (the server, the channel and the tail are not
     kept), and the session state cannot be read, so the session limits
-    refuse the calls they count. GroupSessionStore keeps the marks in a file
-    several proxies share, and the rest of the state in memory.
+    refuse the calls they count. A store with those two operations that is
+    no SessionStore (0.5 did not ask for the base class) is wrapped by the
+    Firewall and behaves the same (as_session_store). GroupSessionStore keeps
+    the marks in a file several proxies share, and the rest of the state in
+    memory.
     """
 
     def read(self) -> SessionMarks:
@@ -493,6 +506,69 @@ class SessionStore:
 
     def update_state(self, change: Callable[[SessionState], _T]) -> _T:
         raise SessionStateError("this session store keeps no session state")
+
+
+_NEWER_OPERATIONS = ("add_marks", "read_state", "update_state")
+
+
+class _WrappedStore(SessionStore):
+    """A session store that is no SessionStore but has its operations: the 0.5 ones, or all of them.
+
+    read() and add() go to the store. So do add_marks(), read_state() and
+    update_state() when it has them; when it does not (a store written for
+    0.5, whose documentation asked for the two operations only), they are
+    SessionStore's own: marks go through add(), and there is no session
+    state.
+    """
+
+    def __init__(self, store: Any) -> None:
+        self.store = store
+        self.complete = all(callable(getattr(store, name, None)) for name in _NEWER_OPERATIONS)
+
+    def read(self) -> SessionMarks:
+        return self.store.read()
+
+    def add(self, labels: Iterable[str], tool: str) -> SessionMarks:
+        return self.store.add(labels, tool)
+
+    def add_marks(self, marks: Iterable[Mark], tail: ChannelTail | None = None) -> SessionMarks:
+        return self.store.add_marks(marks, tail) if self.complete else super().add_marks(marks, tail)
+
+    def read_state(self) -> SessionState:
+        return self.store.read_state() if self.complete else super().read_state()
+
+    def update_state(self, change: Callable[[SessionState], _T]) -> _T:
+        return self.store.update_state(change) if self.complete else super().update_state(change)
+
+
+def as_session_store(store: Any) -> SessionStore:
+    """`store` as the SessionStore a Firewall works with; TypeError if it has no read() and add().
+
+    A SessionStore is returned as it is. Any other object with the
+    operations is wrapped. One written for 0.5, with read() and add() only,
+    keeps working as far as it can, and a warning (once, a RuntimeWarning)
+    says what it cannot do: marks are recorded through add(), without the
+    server and the channel of their cause; the end of a result is not kept,
+    so text split over two results is not looked for; approval memory
+    remembers nothing; and a call that one of the policy's session limits
+    counts is refused, since it cannot be counted.
+    """
+    if isinstance(store, SessionStore):
+        return store
+    if not callable(getattr(store, "read", None)) or not callable(getattr(store, "add", None)):
+        raise TypeError("a session store needs read() and add(labels, tool): subclass "
+                        "agent_sentinel.session.SessionStore")
+    wrapped = _WrappedStore(store)
+    if not wrapped.complete:
+        warnings.warn(
+            f"the session store {type(store).__name__} has read() and add() but not add_marks(), read_state() and "
+            "update_state(), which agent-sentinel uses since 0.6. It still records the flow marks, through add(); "
+            "text split over two results is not looked for, approval memory is off, and a call that a session limit "
+            "of the policy counts is refused. Subclass agent_sentinel.session.SessionStore and add the three "
+            "operations to get them.",
+            RuntimeWarning, stacklevel=3,
+        )
+    return wrapped
 
 
 def _checked_tail(tail: ChannelTail | None) -> tuple[str, list[str]] | None:
@@ -899,6 +975,10 @@ class GroupSessionStore(SessionStore):
         self._lock_timeout = lock_timeout
         self._thread_lock = threading.Lock()
         self._seen: dict[str, Mark] = {}  # every mark this object has read or written: for spotting lost ones
+        # The marks of other runs that count for this proxy too (_visible), once seen: they stay, like any mark.
+        # Past MAX_MARKS of them, every mark counts as set from then on.
+        self._borrowed: dict[str, Mark] = {}
+        self._borrowed_overflowed = False
         self._instance: str | None = None  # the instance of the run joined; None until join() has succeeded
         # The tails, the session limits' counts and approval memory: this proxy's own, never in the file.
         self._state = SessionState()
@@ -966,7 +1046,7 @@ class GroupSessionStore(SessionStore):
             return SessionMarks.untrusted(self._why_unusable)
         try:
             with self._exclusive():
-                return self._checked()[0]
+                return self._visible(*self._checked())
         except OSError as exc:  # includes a lock not had in time
             return SessionMarks.untrusted(f"the session group file cannot be read ({type(exc).__name__}: {exc})")
 
@@ -1019,9 +1099,10 @@ class GroupSessionStore(SessionStore):
         try:
             with self._exclusive():
                 current, found = self._checked()
+                # Against the marks of this run alone: one that only another run has (_visible) is recorded here too.
                 new = [mark for mark in wanted if mark.label not in current.marks]
                 if found is None or current.everything or not new:
-                    return current  # nothing to add; and a broken file is never repaired
+                    return self._visible(current, found)  # nothing to add; and a broken file is never repaired
                 marks = dict(current.marks)
                 for mark in new:
                     if len(marks) >= MAX_MARKS:
@@ -1031,7 +1112,7 @@ class GroupSessionStore(SessionStore):
                 assert mine is not None  # _checked found it
                 self._write(found.with_run(dataclasses.replace(mine, marks=marks)))
                 self._seen.update(marks)
-                return SessionMarks(marks)
+                return self._visible(SessionMarks(marks), found)
         except FileNotFoundError:
             # The folder is gone: every mark counts as set when it is read, so nothing needs recording.
             return SessionMarks.untrusted("the session group folder disappeared")
@@ -1069,6 +1150,35 @@ class GroupSessionStore(SessionStore):
         except OSError:
             return False
         return written < self._run_started - _MTIME_SLACK_SECONDS
+
+    def _visible(self, own: SessionMarks, found: _GroupFile | None) -> SessionMarks:
+        """The marks that count for this proxy: its run's, and those of the runs it cannot be told from.
+
+        A proxy whose client could not be found (the run "unknown") may
+        belong to any client run of the group, so the marks of every run in
+        the file count for it. For the same reason the marks of the run
+        "unknown" count for every other run: one of its members may be a
+        proxy of this client. Too strict, never too lax. A mark seen once
+        stays for this proxy, also when the run it came from is removed from
+        the file later. `own` is what _checked gave (returned as it is when
+        the file cannot be used), `found` the file. Called with the lock held.
+        """
+        if found is None or own.everything:
+            return own
+        too_many = SessionMarks.untrusted("the session group file holds more marks than can be tracked")
+        for run in found.runs:
+            if run.run != self.run_id and UNKNOWN_RUN in (run.run, self.run_id):
+                for label, mark in run.marks.items():
+                    if label not in self._borrowed and len(self._borrowed) >= MAX_MARKS:
+                        self._borrowed_overflowed = True  # a mark seen and not kept: for good, every mark counts
+                    if not self._borrowed_overflowed:
+                        self._borrowed.setdefault(label, mark)
+        if self._borrowed_overflowed:
+            return too_many
+        if not self._borrowed:
+            return own
+        marks = {**self._borrowed, **own.marks}
+        return too_many if len(marks) > MAX_MARKS else SessionMarks(marks)
 
     def _checked(self) -> tuple[SessionMarks, _GroupFile | None]:
         """The marks of this proxy's run, or every mark set when it is not the run this proxy joined. Lock held."""
@@ -1169,7 +1279,9 @@ def _parse_group_file(data: bytes) -> tuple[_GroupFile | None, str | None]:
         return None, "it is not JSON"
     if not isinstance(document, dict) or set(document) != _GROUP_KEYS:
         return None, "unexpected contents"
-    if document["format"] != GROUP_FILE_FORMAT or document["version"] != GROUP_FILE_VERSION:
+    # The version is a whole number: `true` and 1.0 compare equal to 1, and are not what this program writes.
+    version = document["version"]
+    if document["format"] != GROUP_FILE_FORMAT or type(version) is not int or version != GROUP_FILE_VERSION:
         return None, "unknown format or version"
     group, entries = document["group"], document["runs"]
     if not isinstance(group, str) or not GROUP_NAME.fullmatch(group):

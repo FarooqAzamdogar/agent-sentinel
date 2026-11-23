@@ -126,6 +126,7 @@ from .session import (
     SessionMarks,
     SessionStateError,
     SessionStore,
+    as_session_store,
     labels_from_annotations,
 )
 from .textutil import (
@@ -426,6 +427,9 @@ class Firewall:
         session_store: where the marks of flow rules are kept (see session.py).
                        Default: a new MemorySessionStore, so the session lasts as
                        long as this Firewall. Hook mode passes a FileSessionStore.
+                       A store with read() and add() only, as 0.5 asked for, still
+                       works, with a warning (session.as_session_store); TypeError
+                       for an object without them.
         rate_limiter:  where calls are counted for the rate limits. Default: in
                        memory, for this Firewall alone. Hook mode, where every
                        call is checked by a new process, passes one that keeps
@@ -472,7 +476,10 @@ class Firewall:
         self.monitor = monitor
         self.server_name = server_name
         self.session_id = session_id if session_id is not None else token_hex(8)
-        self.session_store: SessionStore = session_store if session_store is not None else MemorySessionStore()
+        # A store written for 0.5 (read() and add() only, no SessionStore) is wrapped, and keeps working.
+        self.session_store: SessionStore = (
+            as_session_store(session_store) if session_store is not None else MemorySessionStore()
+        )
         self._limiter = rate_limiter if rate_limiter is not None else _RateLimiter()
         self._audit_failed = False
         # Wall-clock seconds, for approval memory (every hook process agrees on it), and the seconds the
