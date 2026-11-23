@@ -639,5 +639,133 @@ class SessionGroups(WrapTest):
         self.assertEqual(args[args.index("--session-group") + 1], "vscode")
 
 
+class EntriesWrappedBeforeSessionGroups(WrapTest):
+    """A configuration wrapped by 0.5.0 has no --session-group. wrap says so, and offers the option as a change
+    to each such entry; --apply writes it after the usual backup, and nothing else of the entry changes."""
+
+    def wrapped_as_0_5_0_did(self):
+        self.place()
+        self.assertEqual(self.wrap("--apply", "--no-session-group")[0], 0)  # what 0.5.0 wrote: no group
+        for backup in self.backups():
+            backup.unlink()
+        return self.servers()
+
+    def servers(self):
+        return json.loads(self.config.read_text(encoding="utf-8"))["mcpServers"]
+
+    def with_group(self, entry, group="claude-desktop"):
+        at = entry["args"].index("--")
+        return dict(entry, args=[*entry["args"][:at], "--session-group", group, *entry["args"][at:]])
+
+    def test_the_change_is_shown_and_nothing_is_written_without_apply(self):
+        self.wrapped_as_0_5_0_did()
+        before = self.config.read_bytes()
+        code, out, err = self.wrap()
+        self.assertEqual(code, 0, err)
+        for name in ("files", "github"):
+            self.assertRegex(out, name + r"\s+already wrapped, without a session group \(as versions before 0\.6 "
+                                         r"wrapped\): --session-group claude-desktop will be added; nothing else of "
+                                         r"the entry changes")
+        self.assertIn("+++ files (given the session group)", out)
+        self.assertRegex(out, r'\+\s+"--session-group",\n\+\s+"claude-desktop",')
+        self.assertNotIn("skipped: already wrapped", out)
+        self.assertIn("Nothing was changed. To make this change, run the same command with --apply.", out)
+        self.assertNotIn(TOKEN, out + err)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(self.backups(), [])
+
+    def test_apply_adds_the_group_to_each_entry_and_touches_nothing_else(self):
+        old = self.wrapped_as_0_5_0_did()
+        original = self.config.read_bytes()
+        code, out, err = self.wrap("--apply")
+        self.assertEqual(code, 0, err)
+        (backup,) = self.backups()
+        self.assertEqual(backup.read_bytes(), original)
+        self.assertIn("0 server(s) wrapped, 2 given the session group.", out)
+        self.assertIn("The servers share their flow marks as session group 'claude-desktop'", out)
+        new = self.servers()
+        for name in ("files", "github"):
+            self.assertEqual(new[name], self.with_group(old[name]))
+            self.assertEqual(list(new[name]), list(old[name]))  # the keys, in their order
+        for name in ("remote-api", "broken"):
+            self.assertEqual(new[name], old[name])
+        document = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertEqual(document["zUnknownSetting"], ORIGINAL["zUnknownSetting"])
+        # the entries read back as wrapped, in the group, and doctor has nothing to say about groups
+        code, out, _ = run_cli("doctor", "--config", self.config)
+        self.assertNotIn("session-group", out)
+        # run again: now there is nothing to do, and wrap says what is true
+        code, out, err = self.wrap("--apply")
+        self.assertRegex(out, r"files\s+skipped: already wrapped\n")
+        self.assertIn("Nothing to wrap.", out)
+        self.assertIn("The servers share their flow marks as session group 'claude-desktop'", out)
+        self.assertEqual(self.servers(), new)
+
+    def test_unwrap_gives_the_original_entries_back(self):
+        self.wrapped_as_0_5_0_did()
+        self.assertEqual(self.wrap("--apply")[0], 0)
+        self.assertEqual(run_cli("unwrap", "--client", "claude-desktop", "--apply")[0], 0)
+        self.assertEqual(self.servers(), ORIGINAL["mcpServers"])
+
+    def test_without_a_group_nothing_is_offered_and_nothing_is_claimed(self):
+        old = self.wrapped_as_0_5_0_did()
+        code, out, err = self.wrap("--apply", "--no-session-group")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(out, r"files\s+skipped: already wrapped\n")
+        self.assertIn("Nothing to wrap.", out)
+        self.assertNotIn("share their flow marks", out)
+        self.assertEqual(self.servers(), old)
+
+    def test_a_new_server_is_wrapped_and_the_old_ones_join_its_group(self):
+        old = self.wrapped_as_0_5_0_did()
+        document = json.loads(self.config.read_text(encoding="utf-8"))
+        document["mcpServers"]["notes"] = {"command": "npx", "args": ["-y", "notes-server@1.0.0"]}
+        self.place(document)
+        code, out, err = self.wrap("--apply", "--session-group", "work")
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 server(s) wrapped, 2 given the session group.", out)
+        new = self.servers()
+        self.assertEqual(new["files"], self.with_group(old["files"], "work"))
+        self.assertIn("--session-group", new["notes"]["args"])
+        # only the servers asked for
+        self.place(document)
+        code, out, err = self.wrap("--apply", "--server", "files")
+        self.assertIn("0 server(s) wrapped, 1 given the session group.", out)
+        self.assertEqual(self.servers()["github"], old["github"])
+
+    def test_an_entry_another_python_starts_is_left_alone_and_said_to_be_alone(self):
+        old = self.wrapped_as_0_5_0_did()
+        document = json.loads(self.config.read_text(encoding="utf-8"))
+        other = "C:\\other\\python.exe" if sys.platform == "win32" else "/opt/other/bin/python3"
+        for name in ("files", "github"):
+            document["mcpServers"][name]["command"] = other  # perhaps an agent-sentinel that knows no groups
+        unnamed = document["mcpServers"]["files"]["args"]
+        self.place(document)
+        code, out, err = self.wrap("--apply")
+        self.assertEqual(code, 0, err)
+        self.assertRegex(out, r"files\s+skipped: already wrapped, without a session group, so its flow marks stay its "
+                              r"own: it does not start the proxy with the Python that runs this command")
+        self.assertIn("unwrap it, then wrap again", out)
+        self.assertNotIn("share their flow marks", out)  # no entry is, or would be, in the group
+        self.assertIn("Nothing to wrap.", out)
+        self.assertEqual(self.servers(), document["mcpServers"])
+        self.assertEqual(self.backups(), [])
+        # an entry without --name cannot be given a group either: the proxy would refuse to start
+        document["mcpServers"]["files"]["command"] = old["files"]["command"]
+        at = unnamed.index("--name")
+        del unnamed[at:at + 2]
+        self.place(document)
+        code, out, err = self.wrap("--apply")
+        self.assertRegex(out, r"files\s+skipped: already wrapped, without a session group, so its flow marks stay its "
+                              r"own: it has no --name")
+
+    def test_an_entry_of_another_group_is_named(self):
+        self.place()
+        self.assertEqual(self.wrap("--apply", "--session-group", "other")[0], 0)
+        code, out, err = self.wrap()
+        self.assertRegex(out, r"files\s+skipped: already wrapped, in session group 'other' \(not 'claude-desktop'")
+        self.assertNotIn("share their flow marks", out)
+
+
 if __name__ == "__main__":
     unittest.main()

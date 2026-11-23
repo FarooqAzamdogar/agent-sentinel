@@ -241,6 +241,7 @@ def run(args: argparse.Namespace) -> int:
     for report in reports:
         for server in report.servers:
             _add_policy_result(server, policies)
+        report.lines += no_group_lines(report, policies)
     shared = shared_pins(reports)
     settings = control_plane.claude_settings()
     extras = Extras(control_plane=check_control_plane(reports, policies, settings), advisory_list=advisories_line())
@@ -378,9 +379,39 @@ def session_group_lines(servers: list[ServerReport], sessions: Path | None = Non
         what = "some wrapped servers have a --session-group and some do not"
     else:
         what = "the wrapped servers name different session groups"
+    names = sorted(group for group in groups if group)
+    if None in groups and len(names) == 1:  # wrap adds the option to an entry that has none, and to no other
+        fix = (f"run wrap again with {printable(shell_line(['--session-group', names[0]]), limit=100)} (it adds the "
+               "option to each wrapped entry that has none, and shows the change first)")
+    else:
+        fix = ("wrap keeps the group a wrapped entry names, so unwrap the servers of the other groups, then wrap "
+               "them again with one --session-group")
     return [Line("warn", f"{what}: {named}. Flow rules see only what the servers of one group delivered, so a "
                          "server outside it can send out what another read. Give every server of this client the "
-                         "same --session-group (wrap does)")]
+                         f"same --session-group: {fix}")]
+
+
+def no_group_lines(report: ConfigReport, policies: dict[str, PolicyReport]) -> list[Line]:
+    """A warning when the wrapped servers of one configuration have no --session-group at all, and a policy
+    of theirs has flow rules.
+
+    That is how a version before 0.6 wrapped them (and wrap --no-session-group
+    does): each proxy keeps its own flow marks, so a flow rule never sees
+    what another server of the same client delivered.
+    """
+    wrapped = [server for server in report.servers if server.proxied]
+    if len(wrapped) < 2 or any(server.session_group for server in wrapped):
+        return []  # one server shares with no one; mixed groups are session_group_lines' warning
+    loaded = [policies.get(os.path.normcase(server.policy)) for server in wrapped if server.policy]
+    if not any(found is not None and found.policy is not None and found.policy.flows for found in loaded):
+        return []  # no flow rules: there are no marks to share
+    fix = (f"agent-sentinel wrap --client {report.client} --policy POLICY" if report.client
+           else "agent-sentinel wrap --client CLIENT --config FILE --policy POLICY")
+    return [Line("warn", f"the {len(wrapped)} wrapped servers here have no --session-group (they were wrapped by a "
+                         "version before 0.6, or with --no-session-group), and the policy has flow rules: each "
+                         "proxy keeps its own flow marks, so a flow rule does not see what another server "
+                         f"delivered. To share them, run: {fix} (it shows the --session-group it would add to "
+                         "each wrapped entry, and --apply writes it)")]
 
 
 def advisories_line() -> Line:

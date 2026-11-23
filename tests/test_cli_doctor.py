@@ -790,6 +790,51 @@ class SessionGroups(DoctorTest):
         (finding,) = report["configs"][0]["findings"]
         self.assertIn("different session groups", finding["text"])
 
+    def test_servers_wrapped_without_any_group_are_pointed_out_when_a_policy_has_flow_rules(self):
+        # As 0.5.0 wrapped them: no --session-group at all. The starter policy has a flow rule.
+        self.assertTrue(templates.template("starter")["flows"])
+        path = self.config({"a": self.wrapped("a"), "b": self.wrapped("b"),
+                            "plain": {"command": "npx", "args": ["x@1.0.0"]}})
+        _, out, _ = self.doctor(path)
+        self.assertRegex(out, r"\[warn\]\s+the 2 wrapped servers here have no --session-group \(they were wrapped by "
+                              r"a version before 0\.6, or with --no-session-group\), and the policy has flow rules")
+        self.assertIn("agent-sentinel wrap --client CLIENT --config FILE --policy POLICY", out)
+        _, _, report = self.statuses(path)
+        (finding,) = report["configs"][0]["findings"]
+        self.assertEqual(finding["level"], "warn")
+        self.assertEqual(report["exit_code"], 1)  # for the unwrapped server only: the warning fails nothing
+        self.assertEqual(self.statuses(self.config({"a": self.wrapped("a"), "b": self.wrapped("b")}))[0], 0)
+        # Without flow rules there are no marks to share; and one server shares with no one.
+        no_flows = self.write("user/.agent-sentinel/no-flows.json", {"default": "block", "tools": {"read_file": "allow"}})
+        quiet = self.config({"a": self.wrapped("a", policy=no_flows), "b": self.wrapped("b", policy=no_flows)},
+                            name="quiet.json")
+        self.assertEqual(self.statuses(quiet)[2]["configs"][0]["findings"], [])
+        alone = self.config({"a": self.wrapped("a"), "plain": {"command": "npx", "args": ["x@1.0.0"]}}, name="one.json")
+        self.assertEqual(self.statuses(alone)[2]["configs"][0]["findings"], [])
+        # A client's own file: the advice names the client.
+        desktop = self.write("appdata/Claude/claude_desktop_config.json",
+                             {"mcpServers": {"a": self.wrapped("a"), "b": self.wrapped("b")}})
+        with mock.patch("agent_sentinel.clients.client_for_file", return_value="claude-desktop"):
+            _, out, _ = self.doctor(desktop)
+        self.assertIn("run: agent-sentinel wrap --client claude-desktop --policy POLICY (it shows the "
+                      "--session-group it would add to each wrapped entry, and --apply writes it)", out)
+
+    def test_the_advice_for_mixed_groups_is_what_wrap_does(self):
+        mixed = self.config({"a": self.wrapped("a", "--session-group", "desk"), "b": self.wrapped("b")})
+        _, out, _ = self.doctor(mixed)
+        self.assertIn("run wrap again with --session-group desk (it adds the option to each wrapped entry that has "
+                      "none, and shows the change first)", out)
+        self.assertNotIn("(wrap does)", out)
+        self.assertNotIn("have no --session-group (they were wrapped", out)  # one warning, not two
+        # wrap leaves an entry of another group as it is: the advice says what to do instead
+        for groups in (("desk", "other", None), ("desk", "other", "other")):
+            with self.subTest(groups=groups):
+                servers = {name: self.wrapped(name, *(("--session-group", group) if group else ()))
+                           for name, group in zip("abc", groups)}
+                _, out, _ = self.doctor(self.config(servers, name="-".join(map(str, groups)) + ".json"))
+                self.assertIn("wrap keeps the group a wrapped entry names, so unwrap the servers of the other groups, "
+                              "then wrap them again with one --session-group", out)
+
     def test_a_lone_member_of_the_latest_run_is_pointed_out(self):
         from agent_sentinel.session import GroupSessionStore
 

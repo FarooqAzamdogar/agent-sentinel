@@ -11,7 +11,10 @@ the proxy in front of it (see wrapping.py), with absolute --policy, --audit,
 --pins (one file per server) and --name, and a --pass-env for each name in
 its "env" (and --contain, with wrap --contain: see containment.py). Remote
 servers, entries already wrapped, and Claude Desktop
-Extensions are listed and left alone: none of them can be wrapped. In a
+Extensions are listed and left alone: none of them can be wrapped. One
+thing is offered for an entry that is wrapped already: when it has no
+--session-group (0.5.0 wrote none), wrap shows the option as a change to
+that entry, and --apply adds it (wrapping.add_session_group). In a
 project's configuration (cli_doctor.config_scope), a Python that imports
 agent_sentinel only without -I (a pip --user install) is not written in:
 the client starts it in the project, which could hold an agent_sentinel
@@ -63,6 +66,7 @@ from .wrapping import (
     ProxySettings,
     PythonCheck,
     WrapError,
+    add_session_group,
     check_python,
     command_line,
     kind_of,
@@ -146,7 +150,7 @@ def run(args: argparse.Namespace) -> int:
     python = this_python()
     settings = _settings(args, loaded[0], python)
     plan = plan_wrap(config, args.client, servers, names, settings)
-    _print_header(config, args.client, settings, *loaded)
+    _print_header(config, args.client, settings, *loaded, shares=_shares_the_group(plan, settings))
     exposed = control_plane.writable_warning(loaded[1], config.path, "this configuration file")
     if exposed:
         print(f"Warning: {exposed}")
@@ -166,7 +170,9 @@ def run(args: argparse.Namespace) -> int:
         print(f"Created the folder {shown_path(folder)}")
     backup = apply_changes(config, args.client, changes)
     print(f"\nBackup of the original: {shown_path(backup)}")
-    print(f"Wrote {shown_path(config.path)}: {len(changes)} server(s) wrapped.")
+    grouped = sum(1 for step in plan if step.new is not None and step.done is not None)
+    print(f"Wrote {shown_path(config.path)}: {len(changes) - grouped} server(s) wrapped"
+          + (f", {grouped} given the session group" if grouped else "") + ".")
     print(f"Next: {CLIENTS[args.client].restart}")
     print("Check the result: agent-sentinel doctor"
           + (f" --config {shown_path(config.path)}" if args.config else ""))
@@ -232,6 +238,7 @@ class Step:
     old: Any
     new: dict[str, Any] | None  # None: left as it is
     says: str  # one line for the user
+    done: str | None = None  # what the diff calls the new entry, when it is not the command's usual word
 
 
 def _policy(path: str) -> tuple[str, Policy] | None:
@@ -304,7 +311,7 @@ def _wrap_step(config: ConfigFile, client: str, name: str, entry: Any, settings:
     if kind == "broken":
         return Step(name, entry, None, "skipped: the entry has no usable \"command\" and \"args\"")
     if proxy_command_of(entry) is not None:
-        return Step(name, entry, None, "skipped: already wrapped")
+        return _wrapped_already_step(name, entry, settings)
     words = command_line(entry)
     assert words is not None
     shown = shown_command([without_address_credentials(word) for word in words], limit=120)
@@ -334,6 +341,39 @@ def _wrap_step(config: ConfigFile, client: str, name: str, entry: Any, settings:
     return Step(name, entry, new, says)
 
 
+def _wrapped_already_step(name: str, entry: Any, settings: ProxySettings) -> Step:
+    """An entry that is wrapped already. It is left alone, except that one without a session group (as
+    versions before 0.6 wrapped) is given this run's group: that one option is the whole change."""
+    group = proxy_command_of(entry).value("--session-group")
+    if settings.session_group is None:
+        return Step(name, entry, None, "skipped: already wrapped")
+    if group is not None:
+        other = "" if group.lower() == settings.session_group.lower() else (
+            f", in session group '{printable(group, limit=64)}' (not '{settings.session_group}': it does not "
+            "share flow marks with the servers of that group)")
+        return Step(name, entry, None, "skipped: already wrapped" + other)
+    try:
+        new = add_session_group(entry, settings.session_group, settings.python)
+    except WrapError as exc:
+        return Step(name, entry, None, f"skipped: already wrapped, without a session group, so its flow marks "
+                                       f"stay its own: {exc}")
+    return Step(name, entry, new, f"already wrapped, without a session group (as versions before 0.6 wrapped): "
+                                  f"--session-group {settings.session_group} will be added; nothing else of the "
+                                  "entry changes", done="given the session group")
+
+
+def _shares_the_group(plan: list[Step], settings: ProxySettings) -> bool:
+    """Whether any entry is, or would be, in this run's session group."""
+    if settings.session_group is None:
+        return False
+    for step in plan:
+        found = proxy_command_of(step.new if step.new is not None else step.old)
+        group = found.value("--session-group") if found is not None else None
+        if group is not None and group.lower() == settings.session_group.lower():
+            return True
+    return False
+
+
 def launch_warnings(words: list[str]) -> list[str]:
     """doctor's launch checks of a server command, as warnings: wrap protects a server, not how it starts."""
     return [("WARNING (doctor fails this): " if line.level == "fail" else "warning: ") + line.text
@@ -342,7 +382,8 @@ def launch_warnings(words: list[str]) -> list[str]:
 
 # ---- showing ---------------------------------------------------------------------------------------
 
-def _print_header(config: ConfigFile, client: str, settings: ProxySettings, policy_path: str, policy: Policy) -> None:
+def _print_header(config: ConfigFile, client: str, settings: ProxySettings, policy_path: str, policy: Policy,
+                  shares: bool = True) -> None:
     print(f"{CLIENTS[client].label} configuration: {shown_path(config.path)}")
     warnings = policy.warnings()
     note = f"; {len(warnings)} warning(s): agent-sentinel validate {shown_path(policy_path)}" if warnings else ""
@@ -351,7 +392,7 @@ def _print_header(config: ConfigFile, client: str, settings: ProxySettings, poli
         print("  Its 'ask' rules are refused by the proxy unless it is started with an approver (--approve-with).")
     print(f"Each wrapped server logs to {shown_path(settings.audit)}")
     print(f"and keeps its tool pins in its own file in {shown_path(settings.pins_folder)}")
-    if settings.session_group is not None:
+    if settings.session_group is not None and shares:  # only when an entry is, or would be, in the group
         print(f"The servers share their flow marks as session group '{settings.session_group}' "
               "(--no-session-group keeps each server's own)")
     exposed = clients.files_inside_project(
@@ -406,7 +447,8 @@ def print_diffs(plan: list[Step], done: str) -> None:
             continue
         name = printable(step.name, limit=60)
         for line in difflib.unified_diff(shown_entry(step.old).splitlines(), shown_entry(step.new).splitlines(),
-                                         fromfile=f"{name} (now)", tofile=f"{name} ({done})", lineterm="", n=2):
+                                         fromfile=f"{name} (now)", tofile=f"{name} ({step.done or done})",
+                                         lineterm="", n=2):
             print(printable(line, limit=1000))
 
 
