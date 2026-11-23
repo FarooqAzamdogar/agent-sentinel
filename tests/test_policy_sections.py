@@ -379,6 +379,14 @@ class ValidateShowsTheNewSettings(unittest.TestCase):
         self.assertIn("Claude Code hook: changes to Claude Code's settings during a session are refused; an 'ask' "
                       "in auto mode is refused.", output)
 
+    def test_a_policy_that_lets_itself_be_changed_mid_session_says_so(self):
+        # hook.policy_changes defaults to "block", so only "audit" is worth a line: it turns the check down,
+        # and a summary that leaves it out would show a weaker policy as if it were the default one.
+        output = self.validate('{"hook": {"policy_changes": "audit"}}')
+        self.assertIn("Claude Code hook: a policy file that changes during a session is only recorded, not "
+                      'refused (hook.policy_changes is "audit").', output)
+        self.assertNotIn("Claude Code hook", self.validate('{"hook": {"policy_changes": "block"}}'))
+
     def test_every_security_setting_is_listed(self):
         # Approval memory switched off, require_labels, a command section's classes, deny entries that ask,
         # schema_checks, server_requests and classify_by_annotations false were not in the summary at all.

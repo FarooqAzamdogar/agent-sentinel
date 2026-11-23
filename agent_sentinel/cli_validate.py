@@ -114,6 +114,10 @@ def _print_new_settings(policy: Policy) -> None:
         hook.append("changes to Claude Code's settings during a session are refused")
     if policy.hook.treat_auto_as_non_prompting:
         hook.append("an 'ask' in auto mode is refused")
+    if policy.hook.policy_changes == "audit":
+        # The default is "block", so this line says a protection has been turned down, not turned on.
+        hook.append("a policy file that changes during a session is only recorded, not refused "
+                    "(hook.policy_changes is \"audit\")")
     if hook:
         print(f"Claude Code hook: {'; '.join(hook)}.")
     _print_session_settings(policy)
