@@ -379,6 +379,39 @@ class ValidateShowsTheNewSettings(unittest.TestCase):
         self.assertIn("Claude Code hook: changes to Claude Code's settings during a session are refused; an 'ask' "
                       "in auto mode is refused.", output)
 
+    def test_every_security_setting_is_listed(self):
+        # Approval memory switched off, require_labels, a command section's classes, deny entries that ask,
+        # schema_checks, server_requests and classify_by_annotations false were not in the summary at all.
+        output = self.validate("""{
+          "default": "block", "classify_by_annotations": false, "require_labels": true,
+          "deny_args": [{"arg": "p", "type": "path", "roots": ["~/.ssh"], "action": "ask"}],
+          "tools": {"a": {"action": "allow", "labels": ["sink"], "schema_checks": {"arguments": "enforce"},
+                          "deny_args": [{"arg": "x", "contains": "y", "action": "ask"}, {"arg": "z", "contains": "w"}],
+                          "command": {"deny_classes": ["obfuscation"], "ask_classes": ["network"],
+                                      "unreadable": "block"}}},
+          "server_requests": {"sampling/createMessage": "block"},
+          "secrets": {"known_values_from_env": ["DB_PASSWORD"], "known_values_ignore_case": ["DB_PASSWORD"]},
+          "approvals": {"refusal_window_seconds": 0},
+          "schema_checks": {"arguments": "warn", "remote_refs": "quarantine"}
+        }""")
+        for expected in (
+            "Policy-wide deny rules: 1 (1 of them ask).", "2 deny rule(s) (1 of them ask)",
+            "schema checks: arguments enforce",
+            "tools.a.command  bash command in argument 'command': refuses obfuscation; asks for network; an "
+            "unreadable command: block",
+            "Server requests: sampling/createMessage block.",
+            "MCP tool annotations add no flow labels (classify_by_annotations is false).",
+            "Every rule that allows or asks must say its flow labels (require_labels).",
+            "Approval memory: off (approvals.refusal_window_seconds is 0).",
+            "Schema checks (the proxy), unless a tool rule says otherwise: arguments warn, remote_refs quarantine.",
+            "(matched ignoring case: DB_PASSWORD)",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, output)
+        paused = self.validate('{"approvals": {"refusal_window_seconds": 60, "max_refusals_per_tool": 0}}')
+        self.assertIn("refused without asking for 60 seconds; the asks of a tool are never paused", paused)
+        self.assertNotIn("Approval memory", self.validate('{"approvals": {"refusal_window_seconds": 600}}'))
+
 
 if __name__ == "__main__":
     unittest.main()

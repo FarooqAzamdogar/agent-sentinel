@@ -54,7 +54,15 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-from .cli_check import HistoryStep, check_mark, outcome_of, parse_history, replay_history
+from .cli_check import (
+    HistoryStep,
+    check_mark,
+    check_server_name,
+    deliver_server_marks,
+    outcome_of,
+    parse_history,
+    replay_history,
+)
 from .cli_check import MAX_HISTORY_STEPS as MAX_STEPS_PER_CASE
 from .cli_common import (
     EXIT_ERROR,
@@ -100,7 +108,7 @@ MAX_SCAN_FILE_BYTES = 64 * 1024 * 1024
 # The history steps of all the cases of one file together (each case: at most MAX_STEPS_PER_CASE).
 MAX_HISTORY_STEPS = 20_000
 
-_CALL_KEYS = ("name", "tool", "args", "marks", "proxy", "expect", "expect_rule", "history")
+_CALL_KEYS = ("name", "tool", "args", "marks", "proxy", "server", "expect", "expect_rule", "history")
 _SCAN_KEYS = ("name", "scan", "scan_file", "as", "expect", "history")
 _SCAN_EXPECT = ("block", "pass")
 # A scan case's "as": how the text is read, and the scan_result event that reads it that way.
@@ -118,6 +126,7 @@ class Case:
     args: dict[str, Any] = field(default_factory=dict)
     marks: tuple[str, ...] = ()
     proxy: bool = False
+    server: str | None = None  # a call case: checked as by a proxy started with --name SERVER
     expect_rule: str | None = None
     text: str | None = None  # a scan case
     source: str | None = None  # "scan" or the scan_file path as written
@@ -234,9 +243,12 @@ def _call_case(entry: dict[str, Any], where: str, name: str | None) -> Case:
     proxy = entry.get("proxy", False)
     if not isinstance(proxy, bool):
         raise CommandError(f"{where}.proxy must be true or false, got {quoted(proxy)}")
+    server = entry.get("server")
+    check_server_name(server, f"{where}.server")
     return Case(
         where, _choice(entry["expect"], f"{where}.expect", ACTIONS), name=name, tool=tool, args=args,
-        marks=tuple(dict.fromkeys(marks)), proxy=proxy, expect_rule=_optional_text(entry, "expect_rule", where, 600),
+        marks=tuple(dict.fromkeys(marks)), proxy=proxy, server=server,
+        expect_rule=_optional_text(entry, "expect_rule", where, 600),
     )
 
 
@@ -321,10 +333,15 @@ def run_case(policy: Policy, case: Case) -> Outcome:
     store = MemorySessionStore()
     if case.marks:
         store.add(case.marks, "the case's marks")
-    firewall = Firewall(policy, session_store=store)
-    replay_history(firewall, list(case.history))
+    firewall = Firewall(policy, session_store=store, server_name=case.server)
+    # As `check` does: the marks of server_labels come from a proxy (proxy or server), and a proxy with no
+    # way to ask refuses an ask at once.
+    proxied = case.proxy or case.server is not None
+    if proxied:
+        deliver_server_marks(firewall)
+    replay_history(firewall, list(case.history), as_proxy=case.proxy, server_marks=proxied)
     if case.tool is not None:
-        decision = firewall.check_call(case.tool, case.args, defer_ask=True)
+        decision = firewall.check_call(case.tool, case.args, defer_ask=not case.proxy)
         got = outcome_of(decision, as_proxy=case.proxy)
         passed = got == case.expect and (case.expect_rule is None or decision.rule == case.expect_rule)
         return Outcome(passed, got, decision.rule, decision.reason)
@@ -343,6 +360,8 @@ def _what(case: Case) -> str:
             extras.append(f"marks {', '.join(case.marks)}")
         if case.proxy:
             extras.append("as the proxy")
+        if case.server is not None:
+            extras.append(f"server {printable(case.server, limit=64)}")
         return call + (f" [{'; '.join(extras)}]" if extras else "") + history
     read_as = "" if case.read_as == "result" else f" as {case.read_as}"
     if case.source == "scan":

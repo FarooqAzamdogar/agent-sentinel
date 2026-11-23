@@ -11,7 +11,14 @@ from __future__ import annotations
 import argparse
 
 from .cli_common import EXIT_ERROR, EXIT_OK, load_policy, shown_path
-from .policy import Policy
+from .policy import (
+    DEFAULT_MAX_REFUSALS_PER_TOOL,
+    DEFAULT_REFUSAL_WINDOW_SECONDS,
+    SCHEMA_CHECK_CHOICES,
+    ArgRule,
+    Policy,
+    SchemaChecks,
+)
 from .textutil import printable
 
 HELP = "check a policy file"
@@ -28,13 +35,13 @@ def run(args: argparse.Namespace) -> int:
         return EXIT_ERROR
     print(f"Policy is valid. Default action: {policy.default}. Blocks injection findings at: {policy.block_severity}.")
     print(f"Secrets in tool arguments: {policy.secrets_in_arguments}.", end=" ")
-    print(f"Policy-wide deny rules: {len(policy.deny_args)}.", end=" ")
+    print(f"Policy-wide deny rules: {len(policy.deny_args)}{_asking(policy.deny_args)}.", end=" ")
     limit = policy.max_calls_per_minute
     print(f"Limit for all tools: {f'{limit} call(s) per minute' if limit else 'none'}.")
     for rule in policy.tools:
         notes = []
         if rule.deny_args:
-            notes.append(f"{len(rule.deny_args)} deny rule(s)")
+            notes.append(f"{len(rule.deny_args)} deny rule(s){_asking(rule.deny_args)}")
         if rule.allow_args:
             notes.append(f"{len(rule.allow_args)} allow rule(s)")
         if rule.other_args == "block":
@@ -45,7 +52,12 @@ def run(args: argparse.Namespace) -> int:
             notes.append(f"labels {', '.join(rule.labels)}")
         if rule.command is not None:
             notes.append(f"{rule.command.shell} command checks")
+        if rule.schema_checks is not None and _schema_settings(rule.schema_checks):
+            notes.append(f"schema checks: {_schema_settings(rule.schema_checks)}")
         print(f"  {printable(rule.name):24} {rule.action:6} {', '.join(notes)}")
+        if rule.command is not None:  # which classes it refuses or asks about, as check --show-rules lists it
+            described = printable(rule.command.describe(), limit=400)
+            print(f"    tools.{printable(rule.name, limit=120)}.command  {described}")
     _print_new_settings(policy)
     for warning in policy.warnings():
         print(f"Warning: {printable(warning)}")
@@ -65,7 +77,10 @@ def _print_new_settings(policy: Policy) -> None:
     if policy.secrets_patterns:
         extra.append(f"Custom secret formats: {', '.join(printable(p.name) for p in policy.secrets_patterns)}.")
     if policy.secrets_known_values_from_env:
-        extra.append(f"Values never sent, from the environment: {', '.join(policy.secrets_known_values_from_env)}.")
+        ignoring = policy.secrets_known_values_ignore_case
+        case = f" (matched ignoring case: {', '.join(ignoring)})" if ignoring else ""
+        extra.append(f"Values never sent, from the environment: {', '.join(policy.secrets_known_values_from_env)}"
+                     f"{case}.")
     if policy.secrets_canaries:
         extra.append(f"Canaries: {len(policy.secrets_canaries)}.")
     if policy.call_timeout_seconds is not None:
@@ -73,12 +88,17 @@ def _print_new_settings(policy: Policy) -> None:
                      "seconds.")
     if extra:
         print(" ".join(extra))
+    if policy.server_requests:
+        rules = ", ".join(f"{printable(rule.name)} {rule.action}" for rule in policy.server_requests)
+        print(f"Server requests: {rules}.")
     if policy.flows:
         print("Flow rules:")
         for index, flow in enumerate(policy.flows):
             print(f"  flows[{index}]  {flow.describe()}")
         if policy.classify_by_annotations:
             print("  MCP tool annotations add labels: openWorldHint -> untrusted, sink; destructiveHint -> sink.")
+    if not policy.classify_by_annotations:
+        print("MCP tool annotations add no flow labels (classify_by_annotations is false).")
     if policy.client_requests is not None:
         rules = ", ".join(f"{printable(rule.name)} {rule.action}" for rule in policy.client_requests) or "none"
         print(f"Client requests: {rules}.")
@@ -100,12 +120,21 @@ def _print_new_settings(policy: Policy) -> None:
 
 
 def _print_session_settings(policy: Policy) -> None:
-    """The settings added in 0.6, each only when the policy sets it (approval memory is on by default: not shown)."""
+    """The settings added in 0.6, each only when the policy sets it (approval memory: when it differs from the
+    default, which is on)."""
     extra = []
     if policy.warn_severity is not None:
         extra.append(f"Notice for findings at or above: {policy.warn_severity}.")
     if policy.mark_at is not None:
         extra.append(f"Findings at or above {policy.mark_at} mark the session '{policy.injection_mark}'.")
+    if policy.require_labels:
+        extra.append("Every rule that allows or asks must say its flow labels (require_labels).")
+    approvals = _approval_memory(policy)
+    if approvals:
+        extra.append(approvals)
+    if _schema_settings(policy.schema_checks):
+        extra.append(f"Schema checks (the proxy), unless a tool rule says otherwise: "
+                     f"{_schema_settings(policy.schema_checks)}.")
     if extra:
         print(" ".join(extra))
     for rule in policy.server_labels:
@@ -121,3 +150,27 @@ def _print_session_settings(policy: Policy) -> None:
         print("Session limits:")
         for rule_id in limits:
             print(f"  {printable(rule_id, limit=200)}  {printable(policy.describe_rule(rule_id) or '', limit=300)}")
+
+
+def _asking(entries: tuple[ArgRule, ...]) -> str:
+    """How many of these deny entries send a call to a person instead of refusing it: " (2 of them ask)", or ""."""
+    asks = sum(1 for entry in entries if entry.action == "ask")
+    return f" ({asks} of them ask)" if asks else ""
+
+
+def _schema_settings(checks: SchemaChecks) -> str:
+    """The schema_checks settings a section sets, such as "arguments enforce, remote_refs quarantine"."""
+    given = [(key, getattr(checks, key)) for key in SCHEMA_CHECK_CHOICES]
+    return ", ".join(f"{key} {value}" for key, value in given if value is not None)
+
+
+def _approval_memory(policy: Policy) -> str:
+    """What the approvals section changes in approval memory; empty when it keeps the defaults."""
+    window, most = policy.refusal_window_seconds, policy.max_refusals_per_tool
+    if (window, most) == (DEFAULT_REFUSAL_WINDOW_SECONDS, DEFAULT_MAX_REFUSALS_PER_TOOL):
+        return ""
+    if window == 0:
+        return "Approval memory: off (approvals.refusal_window_seconds is 0)."
+    pause = (f"after {most} refusal(s) of one tool within that time, its asks are refused too" if most
+             else "the asks of a tool are never paused (approvals.max_refusals_per_tool is 0)")
+    return f"Approval memory: a call a person refused is refused without asking for {window} seconds; {pause}."
