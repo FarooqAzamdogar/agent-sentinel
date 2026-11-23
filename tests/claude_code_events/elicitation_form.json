@@ -1,0 +1,15 @@
+{
+  "session_id": "abc123",
+  "transcript_path": "/home/user/.claude/projects/my-project/00893aaf-19fa-41d2-8238-13269b9b3ca0.jsonl",
+  "cwd": "/home/user/my-project",
+  "hook_event_name": "Elicitation",
+  "mcp_server_name": "issue-tracker",
+  "message": "Which project should the issue go to?",
+  "mode": "form",
+  "requested_schema": {
+    "type": "object",
+    "properties": {
+      "project_key": { "type": "string", "title": "Project key" }
+    }
+  }
+}

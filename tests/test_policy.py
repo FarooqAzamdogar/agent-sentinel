@@ -97,12 +97,15 @@ class OverlappingGlobs(unittest.TestCase):
         self.assertIn("'*_file'", rules({"*_file": "block", "delete_*": "block"}).evaluate("delete_file", {}).reason)
         self.assertIn("'delete_*'", rules({"delete_*": "block", "*_file": "block"}).evaluate("delete_file", {}).reason)
 
-    def test_exact_name_beats_a_stricter_glob_and_ignores_its_arguments(self):
+    def test_exact_name_beats_a_stricter_glob_but_keeps_its_deny_args(self):
+        # 0.6 (POL-8): a wildcard's deny_args still hold under an exact rule, as its labels and limits do.
         policy = rules({
             "delete_*": {"action": "block", "deny_args": [{"arg": "*", "pattern": "draft"}]},
             "delete_draft": "allow",
         })
-        self.assertEqual(policy.evaluate("delete_draft", {"name": "draft 1"}).action, "allow")
+        verdict = policy.evaluate("delete_draft", {"name": "draft 1"})
+        self.assertEqual((verdict.action, verdict.rule), ("block", "tools.delete_*.deny_args[0]"))
+        self.assertEqual(policy.evaluate("delete_draft", {"name": "old notes"}).action, "allow")
 
 
 class GlobSyntax(unittest.TestCase):

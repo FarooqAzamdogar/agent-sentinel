@@ -289,6 +289,42 @@ class SecretSettings(unittest.TestCase):
         self.assertIn("'A2_UNSET_VAR' is not set in this environment", warnings[0])
 
 
+# ---- hook (0.6) ------------------------------------------------------------------------------
+
+class HookSection(unittest.TestCase):
+    def test_it_is_optional_and_its_defaults_change_nothing(self):
+        policy = Policy.from_dict({})
+        self.assertEqual((policy.hook.config_changes, policy.hook.treat_auto_as_non_prompting), ("audit", False))
+        self.assertEqual(Policy.from_dict({"hook": {}}).hook, policy.hook)
+        self.assertEqual(POLICY.hook, policy.hook)
+
+    def test_both_settings_load(self):
+        policy = Policy.from_dict({"hook": {"config_changes": "block", "treat_auto_as_non_prompting": True}})
+        self.assertEqual((policy.hook.config_changes, policy.hook.treat_auto_as_non_prompting), ("block", True))
+        self.assertIn('hook.config_changes is "block"', policy.describe_rule("hook.config_changes"))
+
+    def test_mistakes_are_errors(self):
+        for data, expected in (
+            ({"hook": []}, "hook must be a JSON object"),
+            ({"hook": {"config_change": "block"}}, "did you mean 'config_changes'?"),
+            ({"hook": {"config_changes": "deny"}}, "hook.config_changes must be 'audit' or 'block'"),
+            ({"hook": {"config_changes": None}}, "hook.config_changes must be"),
+            ({"hook": {"treat_auto_as_non_prompting": "yes"}},
+             "hook.treat_auto_as_non_prompting must be true or false"),
+            ({"hooks": {}}, "did you mean 'hook'?"),
+        ):
+            with self.subTest(data=data):
+                self.assertIn(expected, load_error(data))
+
+    def test_a_policy_built_in_code_is_checked_too(self):
+        from agent_sentinel.policy import HookOptions
+
+        with self.assertRaises(PolicyError):
+            HookOptions(config_changes="Block")
+        with self.assertRaises(PolicyError):
+            Policy(hook={"config_changes": "block"})
+
+
 # ---- unknown top-level keys still fail ----------------------------------------------------
 
 class TopLevelKeys(unittest.TestCase):
@@ -335,8 +371,13 @@ class ValidateShowsTheNewSettings(unittest.TestCase):
 
     def test_an_older_policy_prints_nothing_new(self):
         output = self.validate('{"tools": {"read_file": "allow"}}')
-        for absent in ("Flow rules", "Client requests", "Hidden", "Canaries", "prompts/get"):
+        for absent in ("Flow rules", "Client requests", "Hidden", "Canaries", "prompts/get", "Claude Code hook"):
             self.assertNotIn(absent, output)
+
+    def test_the_hook_settings_are_listed(self):
+        output = self.validate('{"hook": {"config_changes": "block", "treat_auto_as_non_prompting": true}}')
+        self.assertIn("Claude Code hook: changes to Claude Code's settings during a session are refused; an 'ask' "
+                      "in auto mode is refused.", output)
 
 
 if __name__ == "__main__":

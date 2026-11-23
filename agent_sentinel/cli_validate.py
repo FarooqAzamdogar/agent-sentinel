@@ -43,6 +43,8 @@ def run(args: argparse.Namespace) -> int:
             notes.append(f"{rule.max_calls_per_minute} call(s) per minute")
         if rule.labels:
             notes.append(f"labels {', '.join(rule.labels)}")
+        if rule.command is not None:
+            notes.append(f"{rule.command.shell} command checks")
         print(f"  {printable(rule.name):24} {rule.action:6} {', '.join(notes)}")
     _print_new_settings(policy)
     for warning in policy.warnings():
@@ -84,3 +86,35 @@ def _print_new_settings(policy: Policy) -> None:
         if policy.default == "block":
             hidden.append("every tool without a rule")
         print(f"Hidden from the tool list (blocked outright): {', '.join(hidden) or 'none'}.")
+    hook = []
+    if policy.hook.config_changes == "block":
+        hook.append("changes to Claude Code's settings during a session are refused")
+    if policy.hook.treat_auto_as_non_prompting:
+        hook.append("an 'ask' in auto mode is refused")
+    if hook:
+        print(f"Claude Code hook: {'; '.join(hook)}.")
+    _print_session_settings(policy)
+
+
+def _print_session_settings(policy: Policy) -> None:
+    """The settings added in 0.6, each only when the policy sets it (approval memory is on by default: not shown)."""
+    extra = []
+    if policy.warn_severity is not None:
+        extra.append(f"Notice for findings at or above: {policy.warn_severity}.")
+    if policy.mark_at is not None:
+        extra.append(f"Findings at or above {policy.mark_at} mark the session '{policy.injection_mark}'.")
+    if extra:
+        print(" ".join(extra))
+    for rule in policy.server_labels:
+        print(f"  server_labels.{printable(rule.name, limit=80)}  marks {', '.join(rule.labels)}")
+    limits = [rule_id for rule_id in ("limits.max_calls_per_session", "limits.max_sink_bytes_per_session",
+                                      "limits.max_identical_calls") if policy.describe_rule(rule_id)]
+    limits += [f"limits.max_distinct[{index}]" for index in range(len(policy.max_distinct))]
+    for rule in policy.tools:
+        if rule.max_calls_per_session is not None:
+            limits.append(f"tools.{rule.name}.max_calls_per_session")
+        limits += [f"tools.{rule.name}.max_distinct[{index}]" for index in range(len(rule.max_distinct))]
+    if limits:
+        print("Session limits:")
+        for rule_id in limits:
+            print(f"  {printable(rule_id, limit=200)}  {printable(policy.describe_rule(rule_id) or '', limit=300)}")

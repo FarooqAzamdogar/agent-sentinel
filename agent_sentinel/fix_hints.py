@@ -19,9 +19,14 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from .elicitation import RULE_FORM as RULE_ELICITATION_FORM, RULE_URL as RULE_ELICITATION_URL
 from .policy import (
+    IDENTICAL_CALLS_LIMIT,
+    SESSION_CALLS_LIMIT,
+    SINK_BYTES_LIMIT,
     RULE_CALLER,
     RULE_DEFAULT,
+    RULE_HOOK_CONFIG_CHANGES,
     RULE_HOOK_FAILED,
     RULE_INDEX,
     RULE_INJECTION,
@@ -42,12 +47,20 @@ MAX_RULE_ID_CHARS = 600
 
 # A position as rule ids write it (policy.RULE_INDEX): "[3]", no leading zeros, at most nine digits.
 _INDEX = RULE_INDEX
-_TOOL_PART = re.compile(rf"tools\.(.+)\.(deny_args{_INDEX}|allow_args{_INDEX}|other_args|max_calls_per_minute)")
+_TOOL_PART = re.compile(
+    rf"tools\.(.+)\.(deny_args{_INDEX}|allow_args{_INDEX}|other_args|max_calls_per_minute|max_calls_per_session"
+    rf"|max_distinct{_INDEX})"
+)
+# A tool rule's command section: tools.Bash.command.network, tools.Bash.command.unreadable.
+_TOOL_COMMAND = re.compile(r"tools\.(.+)\.command\.([a-z_]{1,20})")
 
 # The fixed rule ids (policy.RULE_*) and the kind of hint each gets.
 _FIXED_KINDS = {
     RULE_DEFAULT: "default",
     "limits.max_calls_per_minute": "limit_global",
+    SESSION_CALLS_LIMIT: "session_limit",
+    SINK_BYTES_LIMIT: "session_limit",
+    IDENTICAL_CALLS_LIMIT: "session_limit",
     RULE_SECRETS: "secrets",
     RULE_SECRETS_IN_RESULTS: "secrets_results",
     RULE_SECRETS_CANARIES: "canary",
@@ -59,19 +72,26 @@ _FIXED_KINDS = {
     RULE_SESSION: "session",
     RULE_CALLER: "caller",
     RULE_HOOK_FAILED: "hook_failed",
+    RULE_HOOK_CONFIG_CHANGES: "config_change",
+    RULE_ELICITATION_URL: "elicitation",
+    RULE_ELICITATION_FORM: "elicitation",
 }
 _INDEXED_KINDS = (
     (re.compile(rf"deny_args{_INDEX}"), "deny_global"),
     (re.compile(rf"flows{_INDEX}"), "flow"),
+    (re.compile(rf"flows{_INDEX}\.(unless_args{_INDEX}|other_args)"), "flow_exception"),
+    (re.compile(rf"limits\.max_distinct{_INDEX}"), "session_limit"),
     (re.compile(rf"secrets\.patterns{_INDEX}"), "secret_pattern"),
 )
-_PART_KINDS = {"other_args": "other_args", "max_calls_per_minute": "limit_tool"}
+_PART_KINDS = {"other_args": "other_args", "max_calls_per_minute": "limit_tool",
+               "max_calls_per_session": "session_limit"}
 
 # Kinds whose block protects against an attack rather than reflecting a gap in the
 # policy. `suggest` never proposes to loosen them; `report` says so next to them.
 PROTECTIVE_KINDS = frozenset({
     "deny_global", "deny_tool", "secrets", "secrets_results", "canary", "known_value", "secret_pattern",
-    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "hook_failed",
+    "injection", "unscannable", "malformed", "quarantine", "session", "flow", "flow_exception", "hook_failed",
+    "command", "config_change", "elicitation",
 })
 
 
@@ -101,10 +121,16 @@ def classify(rule: Any) -> RuleId:
     for section, kind in (("server_requests.", "server_request"), ("client_requests.", "client_request")):
         if rule.startswith(section) and len(rule) > len(section):
             return RuleId(kind, text, name=rule[len(section):])
+    command = _TOOL_COMMAND.fullmatch(rule)
+    if command:
+        return RuleId("command", text, tool_rule=command.group(1), name=command.group(2))
     part = _TOOL_PART.fullmatch(rule)
     if part:
         tool_rule, which = part.group(1), part.group(2)
-        kind = _PART_KINDS.get(which) or ("deny_tool" if which.startswith("deny_args") else "allow_tool")
+        kind = _PART_KINDS.get(which)
+        if kind is None:
+            kind = ("deny_tool" if which.startswith("deny_args") else
+                    "session_limit" if which.startswith("max_distinct") else "allow_tool")
         return RuleId(kind, text, tool_rule=tool_rule)
     if rule.startswith("tools.") and len(rule) > len("tools."):
         return RuleId("tool", text, tool_rule=rule[len("tools."):])
@@ -139,6 +165,13 @@ def fix_hint(
                  person asked, or nobody could be asked ("unavailable")
     """
     rule_id = classify(rule)
+    if approval == "refused (repeat)":
+        return (
+            "The policy sends this call to a person, and it was refused without asking: a person refused this "
+            "same call a short while ago, or refused several calls of this tool (approvals.refusal_window_seconds, "
+            "approvals.max_refusals_per_tool). That stops a hijacked agent from asking until someone gives in. "
+            "If a refusal was a mistake, start a new session (restart the client or the proxy), or wait."
+        )
     if approval == "refused":
         return (
             "The policy sends this call to a person, and it was refused there: the person said no, or did not "
@@ -148,7 +181,8 @@ def fix_hint(
         return (
             "The policy sends this call to a person, and nobody could be asked; the reason says why. The proxy "
             "needs an approver that can ask (--approve-with), and refuses when it fails or too many calls wait; "
-            "the Claude Code hook refuses in a permission mode that shows no prompt, such as bypassPermissions. "
+            "the Claude Code hook refuses in a permission mode that shows no prompt, such as bypassPermissions, "
+            "and for a call a mode runs without one (SubagentHandback in auto mode). "
             "Make sure someone can be asked rather than allowing the call."
         )
     argument = f" in argument {_name(matched_arg)}" if isinstance(matched_arg, str) else ""
@@ -195,7 +229,33 @@ def fix_hint(
         )
     if kind == "flow":
         return _flow_hint(rule_id.text, rule, policy)
+    if kind == "command":
+        return _command_hint(rule_id)
+    if kind == "flow_exception":
+        return _flow_exception_hint(rule_id.text, rule, matched_arg, policy)
+    if kind == "session_limit":
+        whose = f"the tool rule {_name(rule_id.tool_rule)}" if rule_id.tool_rule else "the policy's limits"
+        return (
+            f"The call reached the session limit {rule_id.text} of {whose}. It counts for as long as the session "
+            "lasts (a proxy's process; a Claude Code session), so a slow or piecemeal leak cannot stay under a "
+            "rate limit. Raise it if such a session is normal; a new session starts the count again."
+        )
     return _FIXED_HINTS.get(kind, _FIXED_HINTS["unknown"])
+
+
+def _command_hint(rule_id: RuleId) -> str:
+    rule = _name(rule_id.tool_rule)
+    if rule_id.name == "unreadable":
+        return (
+            f"The command section of the tool rule {rule} could not read the command with certainty (an unclosed "
+            "quote, a heredoc, a program chosen at run time, a very long or deeply nested command). Write the "
+            'command more plainly; "unreadable": "ask" in that section sends such commands to a person instead.'
+        )
+    return (
+        f"The command section of the tool rule {rule} found a command in the class {_name(rule_id.name)}. If it is "
+        "harmless, move the class from deny_classes to ask_classes, or (for network and install only) add the "
+        'program to allow_programs, such as "git push"; if not, the block is doing its job.'
+    )
 
 
 def _default_hint(tool: Any) -> str:
@@ -278,6 +338,24 @@ def _flow_hint(text: str, rule: Any, policy: Policy | None) -> str:
     )
 
 
+def _flow_exception_hint(text: str, rule: Any, matched_arg: Any, policy: Policy | None) -> str:
+    entry = None
+    if policy is not None and isinstance(rule, str) and ".unless_args[" in rule:
+        flow_index, entry_index = re.findall(r"\[(\d+)\]", rule)[:2]
+        flows = policy.flows
+        flow = flows[int(flow_index)] if int(flow_index) < len(flows) else None
+        if flow is not None and int(entry_index) < len(flow.unless_args):
+            entry = flow.unless_args[int(entry_index)].describe()
+    what = f" ({printable(entry, limit=200)})" if entry else ""
+    argument = f" argument {_name(matched_arg)}" if isinstance(matched_arg, str) else " an argument"
+    return (
+        f"A flow rule applied because{argument} did not meet its exception {text}{what}. The flow narrows a sink "
+        "after the agent has read such content: only calls that meet its unless_args go through. If the value is "
+        "a safe destination, widen that unless_args entry (try it with `agent-sentinel check --history`); if "
+        "not, the block is doing its job."
+    )
+
+
 _FIXED_HINTS = {
     "secrets": (
         "The call carried what looks like a key or token, so it was not made. That is what the guard is for: keep "
@@ -324,6 +402,17 @@ _FIXED_HINTS = {
         "The Claude Code hook could not finish its checks, so it refused (the reason says why: often a policy "
         "that does not load, or a state folder that cannot be written). Fix that cause; no policy rule changes "
         "this."
+    ),
+    "config_change": (
+        "A Claude Code settings file or skill changed during the session, and hook.config_changes is \"block\", so "
+        "the running session did not apply it; the file itself stays changed, and the next session reads it. If "
+        "you made the change, start a new session; if not, find out what wrote the file and undo it. "
+        '"audit" records such changes without refusing them.'
+    ),
+    "elicitation": (
+        "An MCP server asked the user for something an elicitation may not ask: an address that is not a public "
+        "https one, or a password, key or card number in a form. The request was declined. Look at the server; no "
+        "policy setting allows this."
     ),
     "none": (
         "This record names no rule: it was written by agent-sentinel before 0.5, or edited. Its reason says what "

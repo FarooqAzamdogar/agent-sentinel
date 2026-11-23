@@ -181,7 +181,7 @@ class FileStore(FileStoreSetup):
             "a list": b"[]",
             "an extra key": json.dumps({**good, "extra": 1}).encode(),
             "a missing key": json.dumps({k: v for k, v in good.items() if k != "started"}).encode(),
-            "another version": json.dumps({**good, "version": 2}).encode(),
+            "another version": json.dumps({**good, "version": 3}).encode(),
             "marks not an object": json.dumps({**good, "marks": []}).encode(),
             "a bad label": json.dumps({**good, "marks": {"Bad Label": {"tool": "x", "time": "t"}}}).encode(),
             "sink as a mark": json.dumps({**good, "marks": {"sink": {"tool": "x", "time": "t"}}}).encode(),
@@ -246,13 +246,16 @@ class FileStore(FileStoreSetup):
         with self.assertRaises(SessionStateError):
             FileSessionStore(blocker / "state", "s").begin()
 
-    def test_the_file_holds_no_more_than_labels_tool_names_and_times(self):
+    def test_the_file_holds_no_more_than_labels_causes_and_hashed_state(self):
+        # Changed in 0.6: version 2 adds the server and channel of a cause, and the session state.
         store = self.store()
         store.begin()
         store.add(["private"], "read_file")
         document = json.loads(store.path.read_text(encoding="ascii"))
-        self.assertEqual(set(document), {"format", "version", "session", "started", "marks"})
-        self.assertEqual(set(document["marks"]["private"]), {"tool", "time"})
+        self.assertEqual(set(document), {"format", "version", "session", "started", "marks", "tails", "counts",
+                                         "distinct", "identical", "refusals"})
+        self.assertEqual(document["version"], 2)
+        self.assertEqual(set(document["marks"]["private"]), {"tool", "time", "server", "channel"})
 
     def test_a_tool_name_that_utf8_cannot_encode_is_still_written(self):
         store = self.store()

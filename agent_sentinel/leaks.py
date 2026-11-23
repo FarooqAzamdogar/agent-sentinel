@@ -38,11 +38,20 @@ Three uses, with different needs:
 
 Every use reads through simple disguises: percent-encoding (up to three
 rounds), and base64 or hex, one level deep and within fixed limits (see
-`_MAX_ENCODED_RUNS`): a hijacked agent can wrap a key in either to get it past
-a pattern. A known value or canary is also looked for in its own base64 and
-hex spellings, wherever it sits inside a longer encoded text. A key encoded
-twice, split up (except over the arguments of one call, see the firewall),
-or placed after enough other encoded runs to use up the limits still passes.
+`_MAX_ENCODED_RUNS`): a hijacked agent can wrap a key in either to get it
+past a pattern. Base64 or hex that decodes to binary data, a token behind a
+few NUL bytes or inside a file, is read as Latin-1, up to
+textutil.MAX_BINARY_BYTES of it. A known value or canary is also looked for
+in its own base64 and hex spellings, wherever it sits inside a longer
+encoded text (and in blocks of base64 wrapped over lines, joined up), and in
+a folded spelling of each text (NFKC, without format characters: full-width
+letters and zero-width spaces do not hide it).
+Canaries, and known values made only of hex digits and "-" (or named in
+secrets.known_values_ignore_case), are matched with case ignored. Numbers
+are read as JSON writes them, and a known value or canary of digits only is
+found inside one (`find_in_numbers`). A key encoded twice, split up (except
+over the arguments of one call, see the firewall), or placed after enough
+other encoded runs to use up the limits still passes.
 
 Adding a built-in format: anchor it on a literal prefix and give it explicit
 length bounds, and make sure it cannot match a double quote. Do not use "\\b":
@@ -58,13 +67,22 @@ hostile-input tests.
 from __future__ import annotations
 
 import base64
+import itertools
 import re
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, NamedTuple
 
-from .textutil import MAX_CONTAINERS, EncodedRuns, UnscannableError, percent_decoded, texts_in
+from .textutil import (
+    MAX_CONTAINERS,
+    EncodedRuns,
+    UnscannableError,
+    folded_text,
+    number_text,
+    percent_decoded,
+    texts_in,
+)
 
 _NOT_AFTER = r"(?<![A-Za-z0-9])"  # the token does not continue a longer word
 _NOT_BEFORE = r"(?![A-Za-z0-9])"
@@ -258,8 +276,23 @@ _MIN_HEX_CHARS = 40
 # A text without a run this long of base64 (or hex) characters has nothing to
 # decode: checked before a decoder is made for each of many small strings.
 _MAY_BE_ENCODED = re.compile(f"[A-Za-z0-9+/_-]{{{min(_MIN_BASE64_CHARS, _MIN_HEX_CHARS)}}}")
-# A run of base64 that goes on after a line break, as the base64 tool wraps it.
-_WRAPPED_RUN = re.compile(r"[A-Za-z0-9+/_-]{24}\r?\n[A-Za-z0-9+/_-]")
+# Two or more lines that hold nothing but base64 characters: base64 wrapped
+# over lines, as the base64 tool writes it (every 76 characters) or as anyone
+# can (every 5). Each such block is also read with its line breaks taken out,
+# so that a value or token wrapped before its 24th character is seen whole.
+# At most _MAX_WRAPPED_BLOCKS blocks, and the first _MAX_UNWRAPPED_CHARS
+# characters of each (as much as a call's arguments are read joined).
+_WRAPPED_BLOCK = re.compile(
+    r"^[A-Za-z0-9+/_-]{1,1000}(?:\r?\n[A-Za-z0-9+/_-]{1,1000}){1,100000}={0,2}\r?$", re.MULTILINE
+)
+_MAX_WRAPPED_BLOCKS = 64
+_MAX_UNWRAPPED_CHARS = 100_000
+# A known value made only of hex digits and "-" (a hex key, a UUID): matched
+# with case ignored, since upper-casing it loses nothing for whoever receives it.
+_HEX_VALUE = re.compile(r"[0-9A-Fa-f-]+")
+
+# The characters a number's JSON text can hold ("-12.5e+30", "NaN", "-Infinity").
+_NUMBER_TEXT_CHARS = frozenset("0123456789+-.eE" + "NaNInfinity")
 
 # Exact values (canaries, values of environment variables) shorter than this are
 # not looked for: they would match ordinary text. A canary is checked for this
@@ -495,6 +528,9 @@ class SecretGuard:
     custom_formats: CustomFormat entries, in the policy's order (Found.index).
     known_values:   environment variable name -> value (see known_values_from_environment).
     canaries:       strings planted in private files; matched ignoring case.
+    ignore_case:    names of known values that are matched ignoring case as
+                    well (secrets.known_values_ignore_case). A value made only
+                    of hex digits and "-" always is.
 
     Values shorter than MIN_VALUE_CHARS or longer than MAX_VALUE_CHARS are
     left out. Thread-safe: nothing in it changes after it is built, except a
@@ -506,10 +542,13 @@ class SecretGuard:
         custom_formats: Sequence[CustomFormat] = (),
         known_values: Mapping[str, str] | None = None,
         canaries: Sequence[str] = (),
+        ignore_case: Iterable[str] = (),
     ) -> None:
         self._custom = tuple(custom_formats)
+        caseless = frozenset(ignore_case)
         values = [
-            _Value(value, f"value of {name}", KNOWN_VALUE, ignore_case=False)
+            _Value(value, f"value of {name}", KNOWN_VALUE,
+                   ignore_case=name in caseless or _HEX_VALUE.fullmatch(value) is not None)
             for name, value in (known_values or {}).items()
             if MIN_VALUE_CHARS <= len(value) <= MAX_VALUE_CHARS
         ]
@@ -519,6 +558,10 @@ class SecretGuard:
             if MIN_VALUE_CHARS <= len(canary) <= MAX_VALUE_CHARS
         ]
         self._values = tuple(values)
+        # The values a number can carry: those of ASCII digits only (a PIN, an account number).
+        self._digit_values = tuple(value for value in values if value.plain.isascii() and value.plain.isdigit())
+        # The custom formats a number can carry: those whose prefix could stand in a number's JSON text.
+        self._number_formats = tuple(custom for custom in self._custom if _NUMBER_TEXT_CHARS.issuperset(custom.prefix))
         # The values in the form `shows_a_value` compares them in: (the fold function, the folded values).
         self._folded: tuple[Callable[[str], str], tuple[str, ...]] | None = None
 
@@ -526,6 +569,16 @@ class SecretGuard:
     def has_values(self) -> bool:
         """True when the guard has known values or canaries to look for."""
         return bool(self._values)
+
+    @property
+    def reads_numbers(self) -> bool:
+        """True when a number can carry something the guard looks for, so that numbers are worth reading.
+
+        A known value or canary of digits only, or a custom format whose prefix
+        could stand in a number's JSON text ("4111"). No built-in format can:
+        each has letters in it.
+        """
+        return bool(self._digit_values or self._number_formats)
 
     # ---- finding ---------------------------------------------------------------
 
@@ -546,8 +599,13 @@ class SecretGuard:
         So are base64 and hex runs, decoded once (see the module docstring).
         """
         found: list[Found] = []
-        for spelling in _spellings(text):
-            for item in self._found_in(spelling, formats=formats, canaries=canaries, redaction_only=redaction_only):
+        spellings = [(spelling, True) for spelling in _spellings(text)]
+        if self._values:
+            spellings += [(block, False) for block in _unwrapped_blocks(text)]
+        for spelling, any_kind in spellings:
+            for item in self._found_in(
+                spelling, formats=formats and any_kind, canaries=canaries, redaction_only=redaction_only
+            ):
                 if item not in found:
                     found.append(item)
         return found
@@ -562,6 +620,36 @@ class SecretGuard:
                 if item not in found:
                     found.append(item)
         return found
+
+    def find_in_numbers(self, numbers: Iterable[str], *, formats: bool = True, canaries: bool = True) -> list[Found]:
+        """What would make a call refused in its numbers, each written as JSON (textutil.numbers_in).
+
+        A known value or canary counts only if it is made of digits alone (and,
+        like every value, has at least MIN_VALUE_CHARS of them): it is then
+        found inside a number's digits, as "4485039271" is inside 4485039271
+        or 4485039271.5. A custom format whose prefix is digits is found too.
+        No other value can be spelled by a number, so none is looked for.
+        """
+        joined = "\n".join(numbers)  # a line break is in no value or format: nothing matches across two numbers
+        if not joined:
+            return []
+        found = self._found_in(joined, formats=formats, canaries=canaries, redaction_only=False, values=False)
+        found += [
+            Found(value.kind, value.source)
+            for value in self._digit_values
+            if (canaries or value.source != CANARY) and value.plain in joined
+        ]
+        return list(dict.fromkeys(found))
+
+    def _number_kind(self, number: str) -> tuple[str, str] | None:
+        """(kind, source) of the known value, canary or custom format a number's JSON text carries, or None."""
+        for value in self._digit_values:
+            if value.plain in number:
+                return value.kind, value.source
+        for custom in self._number_formats:
+            if custom.found_in(number):
+                return custom.name, CUSTOM
+        return None
 
     def shows_a_value(self, text: str, fold: Callable[[str], str], shortest_part: int = 6) -> bool:
         """Whether `text` shows a known value or canary in another spelling, or a part of one cut off at either end.
@@ -595,7 +683,9 @@ class SecretGuard:
             self._folded = cached  # one assignment: another thread sees the old pair or the new one
         return cached[1]
 
-    def _found_in(self, text: str, *, formats: bool, canaries: bool, redaction_only: bool) -> list[Found]:
+    def _found_in(
+        self, text: str, *, formats: bool, canaries: bool, redaction_only: bool, values: bool = True
+    ) -> list[Found]:
         found: list[Found] = []
         if formats:
             if _holds_a_private_key(text):
@@ -607,12 +697,15 @@ class SecretGuard:
             ]
             found += [Found(custom.name, CUSTOM, index) for index, custom in enumerate(self._custom)
                       if custom.found_in(text)]
-        if self._values:
-            spelling = _Spelling(text)
+        if self._values and values:
+            spellings = [_Spelling(text)]
+            folded = folded_text(text)  # full-width letters, zero-width spaces between them
+            if folded != text:
+                spellings.append(_Spelling(folded))
             found += [
                 Found(value.kind, value.source)
                 for value in self._values
-                if (canaries or value.source != CANARY) and value.found_in(spelling)
+                if (canaries or value.source != CANARY) and any(value.found_in(spelling) for spelling in spellings)
             ]
         return found
 
@@ -633,18 +726,24 @@ class SecretGuard:
         on the JSON text instead would be wrong twice over: an escape such as
         "\\n" puts a letter in front of a token and hides it from the patterns, and
         a replacement that eats part of an escape leaves a line that is not JSON.
-        Values of other types are kept as they are (the log writes them through
-        `redact(str(value))`). Iterative, because the value can be nested deeply.
+        A number (an int or a float, never true or false) whose JSON text carries
+        a known value or canary of digits, or a custom format, becomes the marker
+        text. Values of other types are kept as they are (the log writes them
+        through `redact(str(value))`). Iterative, because the value can be nested deeply.
         """
         # Collecting the texts first costs a walk; it pays only when there are values to rule out.
         within = texts_in(value, keys=True) if self._values else None
         redaction = _Redaction(self, for_agent=False, within=within)
+        numbers = self.reads_numbers
         holder: list[Any] = [None]
         stack: list[tuple[Any, Any, Any]] = [(value, holder, 0)]
         while stack:
             item, parent, key = stack.pop()
             if isinstance(item, str):
                 parent[key] = redaction.text(item)
+            elif numbers and type(item) in (int, float):
+                carried = self._number_kind(number_text(item))
+                parent[key] = item if carried is None else redaction._marker(*carried)
             elif isinstance(item, dict):
                 copy: dict[Any, Any] = {}
                 parent[key] = copy
@@ -992,14 +1091,14 @@ def _values_present(values: Sequence[_Value], texts: Iterable[str]) -> list[_Val
 
     A value that a string holds, written out or in base64 or hex, is a piece
     of all the strings joined; one that is percent-encoded is a piece of the
-    joined text decoded. When a run of base64 goes on over a line break, the
-    joined text is also read without its line breaks, because a base64
-    spelling can be wrapped over several lines.
+    joined text decoded. Blocks of wrapped base64 are also read joined up,
+    and the joined text in its folded spelling.
     """
     joined = "\n".join(texts)
-    spellings = _spellings(joined)
-    if _WRAPPED_RUN.search(joined):
-        spellings.append(joined.replace("\r", "").replace("\n", ""))
+    spellings = _spellings(joined) + _unwrapped_blocks(joined)
+    folded = folded_text(joined)
+    if folded != joined:
+        spellings.append(folded)
     present: set[int] = set()
     for text in spellings:
         spelling = _Spelling(text)
@@ -1019,7 +1118,8 @@ def _percent_decoded(text: str) -> str:
 
 
 def _spellings(text: str) -> list[str]:
-    """`text`, its percent-decoded spellings, and the text of its base64 and hex runs (see the module docstring)."""
+    """`text`, its percent-decoded spellings, and the text of its base64 and hex runs (see the module docstring);
+    binary runs as Latin-1."""
     spellings = [text]
     for _ in range(_DECODE_ROUNDS):
         if not _PERCENT_ESCAPE.search(spellings[-1]):
@@ -1031,11 +1131,28 @@ def _spellings(text: str) -> list[str]:
     return spellings
 
 
+def _unwrapped_blocks(text: str) -> list[str]:
+    """Each block of wrapped base64 in `text` that is long enough to hold a secret, with its line breaks taken out.
+
+    For exact values only: their base64 spellings are found anywhere in a
+    block once it is joined up. Not for the formats, which would read the
+    arguments of a call glued to their names.
+    """
+    if "\n" not in text:
+        return []
+    blocks = []
+    for match in itertools.islice(_WRAPPED_BLOCK.finditer(text), _MAX_WRAPPED_BLOCKS):
+        joined = match.group()[: 2 * _MAX_UNWRAPPED_CHARS].replace("\r", "").replace("\n", "")[:_MAX_UNWRAPPED_CHARS]
+        if len(joined) >= _MIN_BASE64_CHARS:
+            blocks.append(joined)
+    return blocks
+
+
 def _decoder() -> EncodedRuns:
-    """A decoder of base64 and hex runs with the limits of one text."""
+    """A decoder of base64 and hex runs with the limits of one text; binary runs come back as Latin-1."""
     return EncodedRuns(
         max_attempts=_MAX_ENCODED_RUNS, max_kept=_MAX_ENCODED_RUNS, max_bytes=_MAX_DECODED_BYTES,
-        min_base64_chars=_MIN_BASE64_CHARS, min_hex_chars=_MIN_HEX_CHARS,
+        min_base64_chars=_MIN_BASE64_CHARS, min_hex_chars=_MIN_HEX_CHARS, binary=True,
     )
 
 

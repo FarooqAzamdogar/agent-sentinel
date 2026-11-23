@@ -151,13 +151,14 @@ class Marks(TempFolderTest):
 
 
 class ShowRules(TempFolderTest):
-    def test_the_exact_rule_decides_and_the_wildcard_is_shown_as_not_used(self):
+    def test_the_exact_rule_decides_and_the_wildcard_keeps_only_its_restrictions(self):
         policy = self.write("p.json", {"tools": {"send_*": "allow", "send_email": {
             "action": "block", "max_calls_per_minute": 3}}, "limits": {"max_calls_per_minute": 60}})
         code, out, _ = check(policy, "send_email", "--show-rules")
         self.assertEqual(code, 1)
         self.assertIn("tools.send_email  action block; exact rule: decides", out)
-        self.assertIn("tools.send_*  action allow; wildcard: not used", out)
+        # 0.6: a wildcard under an exact rule still applies its deny rules and command checks (POL-8).
+        self.assertIn("tools.send_*  action allow; wildcard: the exact rule decides, so only its deny rules", out)
         self.assertIn("tools.send_email.max_calls_per_minute  at most 3 call(s) per minute", out)
         self.assertIn("limits.max_calls_per_minute  at most 60 call(s) per minute", out)
         self.assertIn("Decided by: tools.send_email", out)

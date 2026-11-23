@@ -65,7 +65,7 @@ _REF = re.compile(r"\(?\s*(?:ref\s+)?([0-9a-f]{8})\s*\)?")
 # Kinds of rule whose answer depends only on the policy and the call's arguments, so the
 # logged call can be checked again. Not flows (they depend on the session), not rate
 # limits (on the time), not the secret guard (secrets are redacted in the log).
-_POLICY_KINDS = frozenset({"default", "tool", "deny_global", "deny_tool", "allow_tool", "other_args"})
+_POLICY_KINDS = frozenset({"default", "tool", "deny_global", "deny_tool", "allow_tool", "other_args", "command"})
 
 _HEADINGS = {
     "block": "BLOCKED",
@@ -77,6 +77,7 @@ _HEADINGS = {
 _REFUSED_HEADINGS = {
     "refused": "REFUSED when a person was asked",
     "unavailable": "REFUSED: nobody could be asked",
+    "refused (repeat)": "REFUSED without asking: a person refused it, or its tool, a short while ago",
 }
 _BLOCKED_AFTER_APPROVAL = "BLOCKED after it was approved"
 
@@ -157,6 +158,8 @@ def explain_record(record: dict[str, Any], policy: Policy | None) -> None:
     heading = _HEADINGS.get(action, printable(action, limit=20).upper())
     if record.get("event") == "approval":
         heading = "APPROVED" if action == "allow" else _REFUSED_HEADINGS.get(approval or "", _BLOCKED_AFTER_APPROVAL)
+    elif action == "block" and approval == "refused (repeat)":
+        heading = _REFUSED_HEADINGS[approval]
     ref = f"ref {field_text(record, 'ref', 20)}  " if "ref" in record else ""
     print(f"{ref}{field_text(record, 'time', 40)}  {heading}  {field_text(record, 'event', 40)} "
           f"{field_text(record, 'tool', 120)}")
@@ -218,3 +221,8 @@ def _print_policy_now(record: dict[str, Any], policy: Policy) -> None:
     verdict = policy.evaluate(tool, args)
     rule = f" ({printable(verdict.rule, limit=200)})" if verdict.rule else ""
     print_field("policy now", f"{verdict.action.upper()}{rule}, for the arguments as logged")
+    from_command = policy.command_labels(tool, args)
+    if from_command:
+        # labels_by_class: what the logged command does adds flow labels to this call.
+        labels = ", ".join(sorted(policy.tool_labels(tool) | from_command))
+        print_field("flow labels", f"{labels} (from what its command does: {', '.join(sorted(from_command))})")

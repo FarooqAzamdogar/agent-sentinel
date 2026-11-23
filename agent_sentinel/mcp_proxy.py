@@ -170,6 +170,21 @@ worked out when the call was let through), so a later call can be refused by
 a flow rule. Marks are set just before the reply is sent, and only for a
 reply that is sent; a reply that is blocked sets none. The labels implied by
 each listed tool's MCP annotations are passed to the firewall as well.
+
+Also set on delivery: the policy's server_labels for this server (--name),
+for every reply, notification and request the server sends; and the
+injection.mark for content at or above injection.mark_at.
+
+Warn notices and the tail scan
+------------------------------
+A tools/call result whose worst finding is at or above injection.warn_severity
+(and below block_severity) gets a text item before its content: the
+firewall's notice (firewall.NOTICE), which names no rule. A client that reads
+only structuredContent does not see it. The end of the text the model reads
+of each delivered tools/call, resources/read and prompts/get reply, and of
+each notification and request from the server, is kept (in the session
+store) and read together with the start of the next one on the same channel
+(tail_scan.py), so an injection cut in two at that boundary is seen whole.
 """
 
 from __future__ import annotations
@@ -227,7 +242,7 @@ from .policy import (
 )
 from .policy_errors import file_error_message, type_name
 from .session import SessionStateError
-from .textutil import UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable
+from .textutil import UnscannableError, clean_for_forwarding, clean_value_for_forwarding, printable, tool_parameters
 
 # How long a tool call waits for an in-flight tools/list reply to be checked.
 TOOL_LIST_WAIT_SECONDS = 15
@@ -257,6 +272,8 @@ MAX_APPROVAL_TIMEOUT = 3600
 # argument, "uri". A policy rule for it looks like a rule for a tool.
 RESOURCE_READ = "resources/read"
 _RESOURCE_METHODS = (RESOURCE_READ, "resources/subscribe")
+# The replies the model reads as results: read with the end of the last one (the tail scan), and kept.
+_RESULT_METHODS = ("tools/call", RESOURCE_READ, PROMPTS_GET)
 # Names a tool may not have: the policy checks these requests under them, and a tool must not borrow their rules.
 _RESERVED_TOOL_NAMES = (*_RESOURCE_METHODS, PROMPTS_GET)
 # The client requests the policy decides. Each must have an id: sent as a notification, it is refused.
@@ -431,6 +448,16 @@ def _tool_error(msg_id: Any, reason: str, modern: bool = False) -> JsonObject:
     return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
 
+def _with_notice(result: Any, notice: str) -> Any:
+    """A tools/call result with the firewall's warn notice as its first text item (unchanged if it has no content list).
+
+    A client that reads only structuredContent does not see the notice.
+    """
+    if not isinstance(result, dict) or not isinstance(result.get("content"), list):
+        return result
+    return {**result, "content": [{"type": "text", "text": notice}, *result["content"]]}
+
+
 def _rpc_error(msg_id: Any, reason: str, code: int = -32000) -> JsonObject:
     return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": agent_text(reason)}}
 
@@ -578,6 +605,9 @@ class Proxy:
         # Every tool name this server has listed (at most MAX_KNOWN_NAMES), so that a description that
         # names one of the server's own tools is not taken for shadowing (_foreign_tools). Guarded by `_state`.
         self._listed_tools: set[str] = set()
+        # The parameter names of the tools let through (at most MAX_KNOWN_NAMES): a result or error that orders
+        # a credential file into one of them is high (Firewall.check_result's parameter_names). Guarded by `_state`.
+        self._parameter_names: set[str] = set()
 
         # `_state` guards the collections below. It is a Condition so that
         # tool calls can wait for tool lists to finish being checked.
@@ -1180,7 +1210,7 @@ class Proxy:
         """
         method = message["method"]
         if method == "tools/call":
-            return self._firewall.marks_for(message["params"]["name"])
+            return self._firewall.marks_for(message["params"]["name"], message["params"].get("arguments"))
         if method in (RESOURCE_READ, PROMPTS_GET):
             return self._firewall.marks_for(method)
         return frozenset()
@@ -1195,10 +1225,12 @@ class Proxy:
         Nothing is sent now. The client is not kept waiting on its other
         messages: they are handled while the person decides.
         """
-        # The person is told why the policy asks; that the call is waiting, they can see.
+        # The person is told why the policy asks; that the call is waiting, they can see. Also what the
+        # session has read, and where the call would send data.
         reason = pending.reason.removesuffix(WAITING_FOR_APPROVAL)
+        marks, destinations = self._firewall.approval_context(tool, arguments)
         request = ApprovalRequest(tool, arguments, reason, pending.ref or "", self._firewall.server_name,
-                                  method=message["method"])
+                                  method=message["method"], marks=marks, destinations=destinations)
         waiting = _WaitingCall(
             message, pending, request, label, _request_description(message),
             deadline=time.monotonic() + self._approval_timeout,
@@ -1226,8 +1258,10 @@ class Proxy:
             try:
                 answer, who = self._ask_someone(waiting)
                 approved = answer.approved is True
+                # A call the client withdrew was not refused by a person: approval memory leaves it out.
                 final = self._firewall.finish_approval(
-                    waiting.pending, approved, f"{who} ({answer.detail})", asked=answer.asked
+                    waiting.pending, approved, f"{who} ({answer.detail})", asked=answer.asked,
+                    remember_refusal=answer is not _CANCELLED,
                 )
                 outcome = self._released(waiting, final)
             except Exception as exc:  # a bug must not let the call through
@@ -1574,7 +1608,11 @@ class Proxy:
         elif method == elicitation.ELICITATION_CREATE:
             decision = self._elicitation_refusal(label, message.get("params"))
         if decision is None:
-            decision = self._firewall.scan_result(label, message, event="server_request", log_clean=False)
+            decision = self._firewall.scan_result(
+                label, message, event="server_request", log_clean=False, parameter_names=self._known_parameters()
+            )
+        if decision.allowed:
+            decision = self._mark_server_message(label, decision, "server_request" if is_request else "notification")
         if decision.allowed:
             if is_request:
                 self._expect_client_reply(msg_id, method)
@@ -1586,6 +1624,18 @@ class Proxy:
             # Answer so the server is not left waiting, without saying which check it failed.
             return _Outcome(to_server=_rpc_error(msg_id, _SERVER_REFUSAL))
         return _DROP
+
+    def _mark_server_message(self, label: str, decision: Decision, channel: str) -> Decision:
+        """Set what a request or notification from the server gives the session once delivered; a refusal if it cannot.
+
+        The marks of server_labels, the injection.mark of content at or above
+        injection.mark_at, and the end of its text for the tail scan.
+        """
+        try:
+            self._firewall.mark_delivered(label, frozenset(), decision=decision, channel=channel, server_marks=True)
+        except SessionStateError as exc:
+            return self._firewall.withhold(label, exc)
+        return decision
 
     def _server_request_problem(self, method: str, msg_id: str | int) -> str | None:
         """Why the protocol does not let the server send this request, or None (then the policy decides).
@@ -1733,7 +1783,8 @@ class Proxy:
             decision = self._elicitation_refusal(label, entry.get("params"), pending.call_id)
         if decision is None:
             decision = self._firewall.scan_result(
-                label, entry, event="server_request", log_clean=False, call_id=pending.call_id
+                label, entry, event="server_request", log_clean=False, call_id=pending.call_id,
+                parameter_names=self._known_parameters(),
             )
         if not decision.allowed:
             self._report_block(
@@ -1860,6 +1911,11 @@ class Proxy:
         self._report(f"blocked a reply to {pending.method}: {reason} {proxy_report.rule_and_ref(decision)}")
         return _rpc_error(msg_id, decision.public_reason, code=code)
 
+    def _known_parameters(self) -> frozenset[str]:
+        """The parameter names of the server's tools let through so far, for the output-poisoning rules."""
+        with self._state:
+            return frozenset(self._parameter_names)
+
     def _deliver_or_block(
         self, pending: _PendingRequest, msg_id: Any, member: str, value: Any, log_clean: bool = True
     ) -> JsonObject:
@@ -1869,9 +1925,13 @@ class Proxy:
         secrets.in_results, which with "redact" gives a copy with the secrets
         replaced. It is then cleaned of hidden characters (_checked_for_forwarding).
         The reply holds that checked copy, never `value` itself. The flow
-        marks of the request are set just before the reply is returned.
+        marks of the request are set just before the reply is returned. A
+        tools/call result with a warn notice gets it as a first text item.
         """
-        checked = self._checked_for_forwarding(pending.label, value, "result", log_clean, pending.call_id)
+        checked = self._checked_for_forwarding(
+            pending.label, value, "result", log_clean, pending.call_id, parameter_names=self._known_parameters(),
+            cross_message=pending.method in _RESULT_METHODS,
+        )
         decision = checked.decision
         if not decision.allowed:
             self._report_block(f"blocked {_reply_description(pending)}", decision)
@@ -1879,14 +1939,18 @@ class Proxy:
             if decision.redacted:
                 self._report(f"replaced what looks like a secret ({', '.join(decision.redacted)}) in "
                              f"{_reply_description(pending)} [rule {RULE_SECRETS_IN_RESULTS}]")
-            decision = self._mark_delivered(pending)  # reports a reply it withholds
+            delivered = self._mark_delivered(pending, decision)  # reports a reply it withholds
+            decision = delivered if not delivered.allowed else decision
         if decision.allowed:
-            return {"jsonrpc": "2.0", "id": msg_id, member: checked.content}
+            content = checked.content
+            if decision.notice and member == "result" and pending.method == "tools/call":
+                content = _with_notice(content, decision.notice)
+            return {"jsonrpc": "2.0", "id": msg_id, member: content}
         return _refusal_reply(pending.method, msg_id, decision.public_reason, pending.modern)
 
     def _checked_for_forwarding(
         self, label: str, value: Any, event: str, log_clean: bool, call_id: str | None = None,
-        foreign_tools: Iterable[str] = (),
+        foreign_tools: Iterable[str] = (), parameter_names: Iterable[str] = (), cross_message: bool = False,
     ) -> CheckedResult:
         """Check something the server sent (Firewall.check_result), and return the copy that may be forwarded.
 
@@ -1898,10 +1962,17 @@ class Proxy:
         cleaning changed anything, the cleaned copy is checked as well, since
         removing a character joins the text on either side of it: what is
         forwarded is always what was checked. (Pins are taken earlier, of
-        what the server sent.)
+        what the server sent.) What the first check found for the agent and
+        the session (the warn notice, the content's marks) is kept, and a
+        notice keeps one ref: the second check's "note" record carries the
+        first's.
+
+        cross_message: the content is a result the model reads after the last
+        one (Firewall.check_result's tail scan).
         """
         checked = self._firewall.check_result(
-            label, value, event=event, log_clean=log_clean, call_id=call_id, foreign_tools=foreign_tools
+            label, value, event=event, log_clean=log_clean, call_id=call_id, foreign_tools=foreign_tools,
+            parameter_names=parameter_names, cross_message=cross_message,
         )
         if not checked.decision.allowed:
             return checked
@@ -1916,21 +1987,32 @@ class Proxy:
         if cleaned == checked.content:
             return checked
         again = self._firewall.check_result(
-            label, cleaned, event=event, log_clean=False, call_id=call_id, foreign_tools=foreign_tools
+            label, cleaned, event=event, log_clean=False, call_id=call_id, foreign_tools=foreign_tools,
+            parameter_names=parameter_names, cross_message=cross_message,
+            notice_ref=checked.decision.ref if checked.decision.notice else None,
         )
-        if not again.decision.allowed or not checked.decision.redacted:
+        if not again.decision.allowed:
             return again
+        first, second = checked.decision, again.decision
         # Both checks replaced secrets, or only the first: the reply should name every kind replaced.
-        kinds = tuple(dict.fromkeys([*checked.decision.redacted, *again.decision.redacted]))
-        return CheckedResult(dataclasses.replace(again.decision, redacted=kinds), again.content)
+        kinds = tuple(dict.fromkeys([*first.redacted, *second.redacted]))
+        notice, ref = (second.notice, second.ref) if second.notice else (first.notice, first.ref)
+        decision = dataclasses.replace(second, redacted=kinds, notice=notice, ref=ref, marks=first.marks | second.marks)
+        return CheckedResult(decision, again.content)
 
-    def _mark_delivered(self, pending: _PendingRequest) -> Decision:
+    def _mark_delivered(self, pending: _PendingRequest, decision: Decision | None = None) -> Decision:
         """Set the flow marks of a reply that is about to be delivered; a refusal if they cannot be recorded.
 
         An error reply sets them too: its text reaches the agent like a result.
+        Besides the request's marks: the server's (server_labels), and those of
+        the checked content (`decision`: injection.mark_at), whose end is kept
+        for the tail scan.
         """
+        channel = "result" if pending.method in _RESULT_METHODS else f"reply to {_label(pending.method)}"
         try:
-            self._firewall.mark_delivered(pending.label, pending.marks)
+            self._firewall.mark_delivered(
+                pending.label, pending.marks, decision=decision, channel=channel, server_marks=True
+            )
         except SessionStateError as exc:
             decision = self._firewall.withhold(pending.label, exc, call_id=pending.call_id)
             self._report_block(f"withheld a reply to {pending.method}", decision)
@@ -2138,6 +2220,9 @@ class Proxy:
             if kind == "tools":
                 # Annotations are pinned with the rest of the tool, and they can only add flow labels.
                 self._firewall.learn_annotations(item["name"], item.get("annotations"))
+                names = list(tool_parameters(item))
+                with self._state:
+                    self._parameter_names.update(names[: max(0, MAX_KNOWN_NAMES - len(self._parameter_names))])
             return None, forwarded
         if pinned:
             # Remember the name: the agent may already know it from an

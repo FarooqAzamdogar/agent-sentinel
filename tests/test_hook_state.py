@@ -1,12 +1,13 @@
-"""Rate-limit counts kept in a file for hook mode (agent_sentinel/hook_state.py)."""
+"""State kept in files for hook mode (agent_sentinel/hook_state.py): rate-limit counts and settings snapshots."""
 
 import json
+import os
 import threading
 from unittest import mock
 
 from cli_support import TempFolderTest
 from agent_sentinel import Firewall, Policy, hook_state
-from agent_sentinel.hook_state import FileRateLimiter, RateLimitStateError
+from agent_sentinel.hook_state import FileRateLimiter, RateLimitStateError, SettingsSnapshot
 
 START = 1_800_000_000  # a wall-clock second
 
@@ -186,3 +187,88 @@ class WithTheFirewall(RateTest):
         policy = Policy.from_dict({"default": "allow", "limits": {"max_calls_per_minute": 1}})
         self.assertTrue(Firewall(policy).check_call("x", {}).allowed)
         self.assertTrue(Firewall(policy).check_call("x", {}).allowed)
+
+
+# ---- settings snapshots (ConfigChange) ----------------------------------------------------------------
+
+class SettingsSnapshots(TempFolderTest):
+    def setUp(self):
+        super().setUp()
+        self.state = self.folder / "state"
+        self.settings = self.write("project/.claude/settings.json", {"model": "opus", "env": {"KEY": "secret-value"}})
+
+    def snapshot(self, session="s1"):
+        """A new snapshot object, as a new hook process would make."""
+        return SettingsSnapshot(self.state, session)
+
+    def test_a_change_is_named_by_key_and_the_snapshot_follows_kept_changes(self):
+        self.snapshot().take([self.settings])
+        self.write("project/.claude/settings.json", {"model": "sonnet", "hooks": {}})
+        changes = self.snapshot().compare(self.settings, keep=False)
+        self.assertEqual((changes.known, changes.changed, changes.added, changes.removed),
+                         (True, ("model",), ("hooks",), ("env",)))
+        self.assertEqual(self.snapshot().compare(self.settings, keep=True).changed, ("model",))
+        self.assertEqual(self.snapshot().compare(self.settings, keep=True).changed, ())
+
+    def test_values_are_never_stored_and_each_snapshot_has_its_own_salt(self):
+        self.snapshot().take([self.settings])
+        first = json.loads(self.snapshot().path.read_text(encoding="utf-8"))
+        self.assertNotIn("secret-value", json.dumps(first))
+        self.assertNotIn("opus", json.dumps(first))
+        self.snapshot().take([self.settings])
+        second = json.loads(self.snapshot().path.read_text(encoding="utf-8"))
+        self.assertNotEqual(first["salt"], second["salt"])
+        (entry,) = second["files"].values()
+        self.assertNotEqual(entry, next(iter(first["files"].values())))
+
+    def test_a_missing_file_and_a_file_that_appears(self):
+        later = self.folder / "project" / ".claude" / "settings.local.json"
+        self.snapshot().take([self.settings, later])
+        self.write("project/.claude/settings.local.json", {"permissions": {}})
+        changes = self.snapshot().compare(later, keep=True)
+        self.assertEqual((changes.known, changes.added), (True, ("permissions",)))
+        later.unlink()
+        changes = self.snapshot().compare(later, keep=True)
+        self.assertTrue(changes.now.missing)
+        self.assertEqual(changes.removed, ("permissions",))
+
+    def test_a_snapshot_of_another_session_or_a_damaged_one_counts_as_none(self):
+        self.snapshot("other").take([self.settings])
+        self.assertIsNone(self.snapshot("s1").compare(self.settings, keep=False).before)
+        self.snapshot().take([self.settings])
+        for damage in ("{not json", json.dumps({"format": "x"}), "[]"):
+            with self.subTest(damage=damage):
+                self.snapshot().path.write_text(damage, encoding="utf-8")
+                changes = self.snapshot().compare(self.settings, keep=False)
+                self.assertIsNone(changes.before)
+                self.assertFalse(changes.known)
+
+    def test_files_that_cannot_be_read_say_why(self):
+        for content, problem in ((b"{oops", "is not valid JSON"), (b"[1]", "is not a JSON object"),
+                                 (b'{"a": 1, "a": 2}', "is not valid JSON"),
+                                 (b"x" * (hook_state.MAX_SETTINGS_BYTES + 1), "is not a regular file of at most")):
+            with self.subTest(problem=problem):
+                self.settings.write_bytes(content)
+                keys = hook_state.read_settings_keys(self.settings, "0" * 32)
+                self.assertIsNone(keys.hashes)
+                self.assertIn(problem, keys.problem)
+        # A folder: Windows refuses to open it at all, POSIX opens it and fstat says what it is.
+        self.assertRegex(hook_state.read_settings_keys(self.folder, "0" * 32).problem,
+                         "not a regular file|cannot be read")
+        self.assertEqual(hook_state.read_settings_keys("relative/settings.json", "0" * 32).problem, "not a full path")
+
+    def test_the_number_of_files_remembered_is_bounded(self):
+        count = hook_state.MAX_SNAPSHOT_FILES + 4
+        paths = [self.write(f"p{index}/settings.json", {"a": index}) for index in range(count)]
+        self.snapshot().take(paths)
+        self.assertEqual(len(json.loads(self.snapshot().path.read_text(encoding="utf-8"))["files"]),
+                         hook_state.MAX_SNAPSHOT_FILES)
+        for path in paths:
+            self.snapshot().compare(path, keep=True)
+        self.assertEqual(len(json.loads(self.snapshot().path.read_text(encoding="utf-8"))["files"]),
+                         hook_state.MAX_SNAPSHOT_FILES)
+
+    def test_paths_are_compared_as_the_system_compares_them(self):
+        self.snapshot().take([self.settings])
+        spelled = str(self.settings).upper() if os.name == "nt" else str(self.settings)
+        self.assertTrue(self.snapshot().compare(spelled, keep=False).known)
