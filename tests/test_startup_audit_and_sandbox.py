@@ -91,7 +91,10 @@ def wait_for(harness, seconds=5.0):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if harness.to_client.getvalue():
-            time.sleep(0.05)  # the notice to the server is written just before the answer to the client
+            # The client is answered first, and the notice to the server is written just after.
+            while b"notifications/cancelled" not in harness.to_server.getvalue() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.05)
             return harness.sent_to_client(), harness.sent_to_server()
         time.sleep(0.01)
     return [], harness.sent_to_server()

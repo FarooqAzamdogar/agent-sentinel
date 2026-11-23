@@ -17,9 +17,12 @@ How the start time is found, each with a limit on what it reads and how long it 
 
 When the client cannot be found (a process that cannot be read, a parent
 that started after its child, which means its number was reused, or more
-than MAX_ANCESTORS launchers), the run is UNKNOWN. Every proxy of the group
-then shares one run, whatever client run it belongs to: marks carry over
-from one run of the client to the next, which is too strict, never too lax.
+than MAX_ANCESTORS launchers), the run is UNKNOWN. Every such proxy of the
+group then shares one run, whatever client run it belongs to: marks carry
+over from one run of the client to the next. And since such a proxy may
+belong to any client run, the marks of every run of the group count for it,
+and the marks of the unknown run count for every other run
+(session.GroupSessionStore): too strict, never too lax.
 """
 
 from __future__ import annotations
@@ -45,6 +48,10 @@ LAUNCHERS = frozenset({
 })
 _PYTHON = re.compile(r"(python|pypy)[0-9.]*[tw]?(d|_d)?")
 _MAX_STAT_BYTES = 4096
+# /proc/stat has a line for each processor and one long line of interrupt counts before "btime": on a
+# large machine that is far more than _MAX_STAT_BYTES. It is read a line at a time, up to this much.
+_MAX_SYSTEM_STAT_BYTES = 1024 * 1024
+_MAX_STAT_LINE_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -52,7 +59,9 @@ class ClientRun:
     """One run of the MCP client: its id, and what is known about the client process."""
 
     id: str  # "<pid>@<start time>", or UNKNOWN
-    started: float | None = None  # when the client process started, in seconds since the epoch
+    # When the client process started, in seconds since the epoch; None when that is not known (the run
+    # is unknown, or Linux did not say when the system started).
+    started: float | None = None
     program: str = ""  # the client's program name, for the operator
 
 
@@ -111,12 +120,17 @@ def _walk_up(reader: "_Reader", deadline: float) -> ClientRun:
         if found is None or found.started > child.started + 1e-6:
             return ClientRun(UNKNOWN)  # gone, unreadable, or a number given out again to a younger process
         if not is_launcher(found.name, found.image):
-            return ClientRun(f"{pid}@{found.start_key}", found.started, found.name)
+            return ClientRun(f"{pid}@{found.start_key}", found.started if reader.since_epoch else None, found.name)
         child, pid = found, found.parent
     return ClientRun(UNKNOWN)
 
 
 class _Reader:
+    # Whether the start times this reader gives count from the epoch. When they do not (they then
+    # count from some other moment, the same for every process), they still say which of two
+    # processes is older, but not whether a file was written before the client started.
+    since_epoch = True
+
     def process(self, pid: int) -> _Process | None:
         raise NotImplementedError
 
@@ -124,16 +138,24 @@ class _Reader:
 # ---- Linux -------------------------------------------------------------------------------------
 
 class _ProcProcesses(_Reader):
-    """/proc/<pid>/stat: the parent, the program name and the start time in clock ticks since boot."""
+    """/proc/<pid>/stat: the parent, the program name and the start time in clock ticks since boot.
 
-    def __init__(self) -> None:
-        self._boot = _boot_time()
+    When /proc/stat does not say when the system started (_boot_time), the
+    start times count from the start of the system, not from the epoch
+    (since_epoch is False): the run's id does not need more.
+    """
+
+    def __init__(self, root: str = "/proc") -> None:
+        self._root = root
+        boot = _boot_time(f"{root}/stat")
+        self.since_epoch = boot is not None
+        self._boot = boot if boot is not None else 0.0
         self._ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-        self._boot_id = _read_small("/proc/sys/kernel/random/boot_id").strip()[:36]
+        self._boot_id = _read_small(f"{root}/sys/kernel/random/boot_id").strip()[:36]
 
     def process(self, pid: int) -> _Process | None:
         try:
-            data = _read_small(f"/proc/{pid}/stat")
+            data = _read_small(f"{self._root}/{pid}/stat")
         except OSError:
             return None
         start, end = data.find("("), data.rfind(")")
@@ -152,11 +174,27 @@ def _read_small(path: str) -> str:
         return handle.read(_MAX_STAT_BYTES).decode("utf-8", "replace")
 
 
-def _boot_time() -> float:
-    for line in _read_small("/proc/stat").splitlines():
-        if line.startswith("btime "):
-            return float(line.split()[1])
-    return 0.0
+def _boot_time(path: str = "/proc/stat") -> float | None:
+    """When the system started, in seconds since the epoch: the "btime" line of /proc/stat. None if it has none.
+
+    The line comes after one line for each processor and the line of
+    interrupt counts, so the file is read a line at a time, as far as
+    _MAX_SYSTEM_STAT_BYTES, and a longer line in pieces.
+    """
+    try:
+        with open(path, "rb") as handle:
+            read, at_line_start = 0, True
+            while read < _MAX_SYSTEM_STAT_BYTES:
+                line = handle.readline(_MAX_STAT_LINE_BYTES)
+                if not line:
+                    break
+                read += len(line)
+                if at_line_start and line.startswith(b"btime "):
+                    return float(line.split()[1])
+                at_line_start = line.endswith(b"\n")
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 # ---- macOS and other systems: ps -------------------------------------------------------------------

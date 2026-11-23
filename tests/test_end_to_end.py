@@ -1765,6 +1765,52 @@ class TheProxiesOfOneClient(EndToEndTest):
         self.assertIn(timeout["ref"], answer["error"]["message"])
         self.assertTrue(any(r["event"] == "dropped" and "late server reply" in r["reason"] for r in records))
 
+    def test_a_server_that_hangs_and_reads_nothing_more_does_not_stop_the_answers(self):
+        # A server that hangs usually stops reading its input as well. Once its pipe was full, the proxy's
+        # write of the next request blocked for good, the cancellation of a timed-out call blocked behind it,
+        # and no call was answered again, though the log said each had timed out.
+        server = self.write("hanging_server.py", (
+            "import json, sys, time\n"
+            "for line in sys.stdin:\n"
+            "    message = json.loads(line)\n"
+            "    if message.get('method') == 'tools/call':\n"
+            "        time.sleep(float(sys.argv[1]))  # it hangs here: nothing more is read\n"
+            "        sys.exit(0)\n"
+            "    if 'id' in message:\n"
+            "        result = {'protocolVersion': '2025-06-18', 'capabilities': {'tools': {}},\n"
+            "                  'serverInfo': {'name': 'hanging', 'version': '1'}}\n"
+            "        print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}), flush=True)\n"
+        ))
+        policy = self.write("policy.json", {"default": "allow", "limits": {"call_timeout_seconds": 1}})
+        audit = self.folder / "audit.jsonl"
+        proxy = self.proxy("--policy", policy, "--audit", audit, "--name", "hanging", server=server,
+                           server_args=("8",))
+        proxy.initialize()
+        # The call that hangs the server; then one request larger than any pipe's buffer, and many small ones.
+        messages = [call(1, "hang"), call(2, "write_file", {"content": "A" * 300_000})]
+        messages += [call(number, "small", {"note": "x" * 200}) for number in range(3, 63)]
+        started = time.monotonic()
+        sender = threading.Thread(target=lambda: [proxy.send(message) for message in messages], daemon=True)
+        sender.start()
+        answers = {}
+        while len(answers) < len(messages):
+            message = proxy.next_message()  # fails the test when nothing comes within WAIT seconds
+            answers[message["id"]] = message
+        self.assertLess(time.monotonic() - started, WAIT)
+        sender.join(timeout=WAIT)
+        self.assertEqual(sorted(answers), list(range(1, 63)))
+        for answer in answers.values():
+            self.assertEqual(answer["error"]["code"], -32001)
+            self.assertRegex(answer["error"]["message"],
+                             r"\ABlocked by agent-sentinel: the server did not answer in time, so the request was "
+                             r"cancelled " + REF + r"\Z")
+        proxy.stop()  # the proxy ends once the server has (it cannot close the input of a server that reads nothing)
+        self.assertIsNotNone(proxy.exit_code)
+        timeouts = [r for r in self.records(audit) if r["event"] == "timeout"]
+        self.assertEqual(len({r["ref"] for r in timeouts}), 62)
+        told = " ".join(answer["error"]["message"] for answer in answers.values())
+        self.assertTrue(all(r["ref"] in told for r in timeouts))  # each answer has the ref of its record
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -121,6 +121,27 @@ class TheValidator(unittest.TestCase):
         schema = {"type": "object", "patternProperties": {"^(a+)+$": {}}, "additionalProperties": False}
         self.assertEqual(validate({"anything": 1}, schema), [])
 
+    def test_beside_prefix_items_items_is_about_the_rest(self):
+        # Review of 0.6: a 2020-12 tuple was refused, since `items` was applied to the positions that
+        # prefixItems covers as well.
+        rest = {"type": "array", "prefixItems": [{"type": "string"}], "items": {"type": "integer"}}
+        self.assertEqual(validate(["label", 1, 2, 3], rest), [])
+        self.assertEqual(validate(["label"], rest), [])
+        self.assertEqual(validate([], rest), [])
+        self.assertEqual(validate(["label", 1, "two"], rest), ["the value[2] is text, not integer"])
+        closed = {"type": "array", "prefixItems": [{"type": "string"}, {"type": "number"}], "items": False}
+        self.assertEqual(validate(["x", 1.5], closed), [])
+        self.assertEqual(validate(["x"], closed), [])
+        self.assertEqual(validate(["x", 1.5, "more"], closed), ["the value[2] is not allowed by the schema"])
+        self.assertEqual(validate([1, "x"], closed), [])  # prefixItems itself is not checked
+        nested = {"type": "object", "properties": {"point": closed}}
+        self.assertEqual(validate({"point": ["x", 1.5]}, nested), [])
+        # Without prefixItems, or with one that is no list, `items` is about every element, as before.
+        for prefix in ({}, {"prefixItems": {"type": "string"}}, {"prefixItems": None}):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(validate(["a", 1], {**prefix, "items": {"type": "integer"}}),
+                                 ["the value[0] is text, not integer"])
+
     def test_a_part_nested_too_deeply_to_check_is_a_problem(self):
         schema = value = None
         for _ in range(20):
@@ -260,6 +281,13 @@ class RemoteReferences(unittest.TestCase):
     def test_at_most_a_few_are_reported(self):
         tool = {"inputSchema": {"properties": {str(i): {"$ref": f"https://x.example/{i}"} for i in range(100)}}}
         self.assertEqual(len(remote_refs(tool)), schema_check.MAX_REFERENCES_REPORTED)
+
+    def test_the_schema_may_be_in_another_member(self):
+        params = {"mode": "form", "message": "Which one?",
+                  "requestedSchema": {"type": "object", "properties": {"q": {"$ref": "https://evil.example/s.json"}}}}
+        self.assertEqual(remote_refs(params), [])  # an elicitation has no inputSchema
+        self.assertEqual(remote_refs(params, ("requestedSchema",)), ['$ref "https://evil.example/s.json"'])
+        self.assertEqual(remote_refs({"requestedSchema": "https://evil.example/"}, ("requestedSchema",)), [])
 
 
 class TheStore(unittest.TestCase):

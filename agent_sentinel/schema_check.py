@@ -22,6 +22,9 @@ The validator knows these keywords only: type, properties, required,
 additionalProperties (true, false or a schema), enum, const, minimum,
 maximum, exclusiveMinimum, exclusiveMaximum (a number, or draft-04's true or
 false), minLength, maxLength, items (one schema), minItems and maxItems.
+Beside a prefixItems list (a 2020-12 tuple), items applies to the elements
+after those the list covers, as that draft says; prefixItems itself is not
+checked.
 Every other keyword is ignored, $ref included: a part of a schema that only
 refers elsewhere accepts anything. Nothing the server wrote is ever run as a
 regular expression (pattern, patternProperties, format are ignored), so a
@@ -90,10 +93,11 @@ KEYWORDS = frozenset((
 
 # ---- references that point outside the schema -----------------------------------------------------
 
-def remote_refs(tool: Any) -> list[str]:
+def remote_refs(tool: Any, members: tuple[str, ...] = ("inputSchema", "outputSchema")) -> list[str]:
     """The references in a tool's inputSchema and outputSchema that point outside the schema, described.
 
-    Each is described as the keyword and its value, shortened and printable:
+    members: where the schemas are in `tool`; an elicitation's params have
+    one in "requestedSchema". Each reference is described as the keyword and its value, shortened and printable:
     '$ref "https://example.com/s.json"'. At most MAX_REFERENCES_REPORTED are
     returned. Every object in the schemas is looked at, wherever it is (a
     client that resolves references may resolve them anywhere, even inside
@@ -112,7 +116,7 @@ def remote_refs(tool: Any) -> list[str]:
         return []
     found: list[str] = []
     stack: list[tuple[Any, bool]] = []
-    for key in ("inputSchema", "outputSchema"):
+    for key in members:
         schema = tool.get(key)
         if isinstance(schema, (dict, list)):
             meta = schema.get("$schema") if isinstance(schema, dict) else None
@@ -309,7 +313,10 @@ def _check_one(value: Any, schema: Any, path: tuple[Any, ...], named: _Names, pr
         if isinstance(items, (dict, bool)) and value:
             if len(value) > budget[0]:
                 raise _TooLarge
-            return [(child, items, (*path, index)) for index, child in enumerate(value)]
+            # A 2020-12 tuple: `items` is about the elements after those prefixItems covers.
+            prefix = schema.get("prefixItems")
+            covered = len(prefix) if isinstance(prefix, list) else 0
+            return [(child, items, (*path, index)) for index, child in enumerate(value) if index >= covered]
     return []
 
 

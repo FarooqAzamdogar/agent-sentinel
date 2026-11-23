@@ -578,7 +578,8 @@ COVERAGE = (
              "(schema_checks.results); scanned, also together with the end of the reply before it; "
              "secrets.in_results; a notice put before its content at injection.warn_severity; flow marks (the "
              "tool's, the server's server_labels, the content's at injection.mark_at). No reply within "
-             "limits.call_timeout_seconds: an error, and notifications/cancelled to the server."),
+             "limits.call_timeout_seconds: an error, and notifications/cancelled to the server; also when the "
+             "server has stopped reading its input."),
     Coverage("resources/list", "client", ALL_REVISIONS, (FORWARDED, SCANNED),
              "Each resource scanned and its icons cleaned; one whose URI has characters the proxy cannot forward is "
              "removed. Not pinned. Empty from a server quarantined by --pin-server."),
@@ -603,8 +604,9 @@ COVERAGE = (
              "named 'prompts/get'), checked like a call of 'prompts/get' with {name, arguments}. Reply scanned, "
              "also together with the end of the reply before it."),
     Coverage("completion/complete", "client", "2025-03-26 and later", (CHECKED,),
-             "Its params (what the user is typing) pass the secret guard, then client_requests. Refused to a "
-             "server quarantined by --pin-server."),
+             "Its params (what the user is typing) pass the secret guard, then client_requests. Refused when its "
+             "ref names a quarantined prompt or a URI a quarantined template may produce, and to a server "
+             "quarantined by --pin-server."),
     Coverage("tasks/*", "client", "2025-11-25 and 2026-07-28 (extension)", (REFUSED,),
              "Answered 'method not found' (-32601): tasks are not supported."),
     Coverage("notifications/cancelled", "client", ALL_REVISIONS, (FORWARDED,),
@@ -632,11 +634,15 @@ COVERAGE = (
     # ---- from the server ----
     Coverage("sampling/createMessage", "server", LEGACY_ONLY, (CHECKED, SCANNED),
              "server_requests decides (refused: the server is told 'request refused', the client nothing); refused "
-             "too when includeContext is not 'none', or when a block flow to a sink would refuse a call; then "
-             "scanned. The client's answer passes the secret guard."),
+             "too when includeContext is not 'none', or when a block flow to a sink would refuse a call. The "
+             "icons of the tools it offers are cleaned, and a schema of theirs that refers outside itself is "
+             "reported, or the request refused (schema_checks.remote_refs); then scanned. The client's answer "
+             "passes the secret guard."),
     Coverage("elicitation/create", "server", "2025-06-18 to 2025-11-25", (CHECKED, SCANNED),
              "server_requests, then what it asks: a URL must be a public https address (and on the "
-             "--elicitation-host list, if given); a form may not ask for a password, key or card number. Scanned."),
+             "--elicitation-host list, if given); a form may not ask for a password, key or card number, and one "
+             "whose requestedSchema refers outside itself is reported or refused (schema_checks.remote_refs). "
+             "Scanned."),
     Coverage("roots/list", "server", LEGACY_ONLY, (CHECKED, SCANNED),
              "server_requests decides; scanned. The client's answer passes the secret guard."),
     Coverage("any other server request", "server", LEGACY_ONLY, (CHECKED, SCANNED),
