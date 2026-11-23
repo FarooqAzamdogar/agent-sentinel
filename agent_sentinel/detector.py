@@ -357,7 +357,7 @@ def _decode(text: str) -> str:
     decoded. HTML tags are removed by the caller, as a separate view, and so
     are tag characters, base64 and hex.
     """
-    if "\x1b" in text:
+    if "\x1b" in text or "\x9b" in text or "\x9d" in text:  # ESC, or the one-character CSI and OSC
         text = _ANSI_RE.sub("", text)
     if "\\/" in text:
         text = text.replace("\\/", "/")  # "http:\/\/host", as JSON kept inside a string writes it

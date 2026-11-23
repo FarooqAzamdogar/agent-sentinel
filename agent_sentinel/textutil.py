@@ -727,12 +727,19 @@ def percent_decoded(text: str) -> str:
 # Terminal escapes and Unicode tag characters
 # --------------------------------------------------------------------------
 
-# Terminal escape sequences: CSI (colours, cursor moves: ESC [ ... letter) and
-# OSC (window titles, OSC 8 hyperlinks: ESC ] ... BEL or ESC \). Every part is
-# bounded, so a hostile text cannot make one attempt read far ahead. A longer
-# sequence is not matched; removing the ESC character then leaves it as
-# harmless visible text.
-TERMINAL_ESCAPE = re.compile(r"\x1b\[[0-?]{0,64}[ -/]{0,8}[@-~]|\x1b\][^\x07\x1b]{0,512}(?:\x07|\x1b\\)")
+# Terminal escape sequences: CSI (colours, cursor moves: ESC [ ... letter, or
+# the one-character CSI U+009B) and OSC (window titles, OSC 8 hyperlinks: ESC ]
+# or U+009D ... BEL, ESC \ or U+009C). The parameters of a CSI have no length
+# bound, as a terminal reads any number of them ("ESC[000...0m" with a hundred
+# zeros is a colour): they cannot hold the characters that start or end a
+# sequence, so no character is read by more than a few attempts. An OSC is
+# bounded, so that one attempt cannot read far ahead; a longer one is not
+# matched, and removing the ESC character then leaves it as visible text.
+TERMINAL_ESCAPE = re.compile(
+    r"(?:\x1b\[|\x9b)[0-?]*[ -/]{0,8}[@-~]|(?:\x1b\]|\x9d)[^\x07\x1b\x9c]{0,512}(?:\x07|\x1b\\|\x9c)"
+)
+# The characters a terminal escape sequence starts with.
+TERMINAL_ESCAPE_STARTS = ("\x1b", "\x9b", "\x9d")
 
 # Unicode tag characters (U+E0000 to U+E007F) draw nothing, and U+E0020 to
 # U+E007E copy printable ASCII one to one. A sentence written in them is
@@ -1187,7 +1194,7 @@ def clean_for_forwarding(text: str) -> str:
     the original before passing the cleaned one on: what is forwarded must be
     what was checked.
     """
-    if "\x1b" in text:
+    if any(start in text for start in TERMINAL_ESCAPE_STARTS):
         text = TERMINAL_ESCAPE.sub("", text)
     text = text.translate(_CONTROLS_AND_BIDI)
     if "\r" in text:
