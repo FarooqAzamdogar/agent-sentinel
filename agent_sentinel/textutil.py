@@ -318,7 +318,9 @@ def normalised_arguments(value: Any) -> Any:
         int or float becomes the plain type); bytes stay bytes (read as UTF-8);
       * an Enum: its value, made JSON in turn;
       * a path (os.PathLike): os.fspath() of it;
-      * an object with model_dump (a pydantic model): model_dump(mode="json");
+      * an object with model_dump (a pydantic model): model_dump(mode="json"),
+        with the fields it leaves out or a serializer rewrites read as the
+        model holds them (`_model_copy`);
       * a dataclass instance: an object of its fields, as dataclasses.asdict gives;
       * a UUID, a datetime, date or time, a Decimal: its str();
       * a mapping: an object (keys become text as JSON writes them; two keys
@@ -490,7 +492,7 @@ def _converted(item: Any) -> Any:
     if isinstance(item, os.PathLike):
         return _called(os.fspath, item)
     if callable(getattr(item, "model_dump", None)):
-        return _called(lambda model: model.model_dump(mode="json"), item)
+        return _called(_model_copy, item)
     if isinstance(item, (Mapping, *_ARRAYS)) or dataclasses.is_dataclass(item):
         if dataclasses.is_dataclass(item) and isinstance(item, (Mapping, *_ARRAYS)):
             raise UnscannableError(f"an argument of type {type(item).__name__} is two kinds of value at once")
@@ -503,6 +505,60 @@ def _converted(item: Any) -> Any:
     if pydantic_core is not None and type(item).__module__.split(".")[0] in ("pydantic", "pydantic_core"):
         return _called(pydantic_core.to_jsonable_python, item)
     raise UnscannableError(f"an argument of type {type(item).__name__} cannot be checked")
+
+
+def _model_copy(model: Any) -> Any:
+    """A pydantic model as the checks read it: model_dump(mode="json"), and what the tool reads that it hides.
+
+    The tool reads the model's attributes, and model_dump leaves out a field
+    with exclude=True and writes a field with a serializer as the serializer
+    says. Each such field is read as the model holds it, and so is each
+    private attribute that holds text, bytes or a number (PrivateAttr). A
+    pydantic secret among them is read as model_dump writes one, masked. A
+    value of a kind that cannot be checked is left out, as model_dump left
+    it out. A model whose own serializer writes it as no object is read as
+    it writes itself.
+    """
+    dumped = model.model_dump(mode="json")
+    fields = getattr(type(model), "model_fields", None)
+    if type(dumped) is not dict or not isinstance(fields, Mapping):
+        return dumped
+    hidden = {name for name in fields if name not in dumped} | _serialised_fields(type(model), fields)
+    for name in sorted(hidden):
+        held = getattr(model, name, None)
+        if held is None or held == "":
+            continue  # nothing in it to check
+        if callable(getattr(held, "get_secret_value", None)):
+            dumped[name] = _MASKED
+            continue
+        try:
+            dumped[name] = normalised_arguments(held)
+        except UnscannableError:
+            continue
+    private = getattr(model, "__pydantic_private__", None)
+    if isinstance(private, dict):
+        for name, held in private.items():
+            if isinstance(name, str) and name not in dumped and type(held) in (str, bytes, int, float) and held:
+                dumped[name] = normalised_arguments(held)
+    return dumped
+
+
+_MASKED = "**********"  # how pydantic writes a secret (SecretStr, SecretBytes) as JSON
+
+
+def _serialised_fields(model_type: Any, fields: Mapping[str, Any]) -> set[str]:
+    """The names of the fields of a pydantic model that a serializer writes (all of them for a model_serializer)."""
+    decorators = getattr(model_type, "__pydantic_decorators__", None)
+    if getattr(decorators, "model_serializers", None):
+        return set(fields)
+    names: set[str] = set()
+    for decorator in dict(getattr(decorators, "field_serializers", None) or {}).values():
+        covered = getattr(getattr(decorator, "info", None), "fields", ())
+        names.update(fields if "*" in covered else (name for name in covered if name in fields))
+    for name, field in fields.items():
+        if any(type(part).__name__ in ("PlainSerializer", "WrapSerializer") for part in getattr(field, "metadata", ())):
+            names.add(name)
+    return names
 
 
 def _called(function: Any, item: Any) -> Any:
