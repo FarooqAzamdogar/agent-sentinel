@@ -380,13 +380,22 @@ class FailingClosed(HookTest):
                                  + REF + "$")
         self.assertEqual(err.strip(), reason, "on exit 2 Claude reads stderr: only the generic text")
 
-    def assert_stopped_generically(self, code, answer, err):
-        self.assertEqual(code, 2)
-        self.assertEqual(set(answer), {"continue", "stopReason"})
+    def assert_stopped_generically(self, code, answer, err, event_name=None):
+        """event_name: the event was read far enough to know that it carries a tool's output. The stop then goes
+        out with exit code 0, because Claude Code reads the JSON answer only then (on exit code 2 it would show
+        Claude the text and go on). An event of no known kind gets the stop and exit code 2, which is what
+        blocks a call that has not been made."""
+        self.assertEqual(code, 0 if event_name else 2)
+        blocked = {"decision", "reason"} if event_name == "PostToolUse" else set()
+        self.assertEqual(set(answer), {"continue", "stopReason"} | blocked)
         self.assertIs(answer["continue"], False)
         self.assertRegex(answer["stopReason"], "^agent-sentinel stopped the agent: what the tool returned could not "
                                                "be checked " + REF)
         self.assertEqual(err.strip(), answer["stopReason"])
+        if blocked:
+            self.assertEqual(answer["decision"], "block")
+            self.assertRegex(answer["reason"], "^Blocked by agent-sentinel: what the tool returned could not be "
+                                               "checked " + REF + "$")
 
     def test_a_policy_that_does_not_load_blocks_every_call_and_says_why_only_in_the_audit_log(self):
         for text, why in (('{"default": "deny"}', "Invalid policy"), ("{oops", "not valid JSON")):
@@ -409,26 +418,44 @@ class FailingClosed(HookTest):
 
     def test_a_result_that_cannot_be_checked_stops_the_agent(self):
         self.policy.write_text('{"tools": 5}', encoding="utf-8")
-        self.assert_stopped_generically(*self.hook(recorded("post_tool_use_mcp.json")))
-        self.assert_stopped_generically(*self.hook(recorded("post_tool_use_failure_mcp.json")))
+        self.assert_stopped_generically(*self.hook(recorded("post_tool_use_mcp.json")), event_name="PostToolUse")
+        self.assert_stopped_generically(*self.hook(recorded("post_tool_use_failure_mcp.json")),
+                                        event_name="PostToolUseFailure")
 
     def test_input_that_is_not_a_hook_event_is_refused(self):
-        for name, data in (
-            ("empty", b""),
-            ("not JSON", b"not json"),
-            ("a list", b"[]"),
-            ("no event name", b'{"session_id": "s"}'),
-            ("a number as event name", b'{"hook_event_name": 5}'),
-            ("a repeated key", b'{"hook_event_name": "PreToolUse", "hook_event_name": "Stop"}'),
-            ("NaN", b'{"hook_event_name": "PostToolUse", "x": NaN}'),
-            ("a number too large to be one", b'{"hook_event_name": "PreToolUse", "tool_name": "Bash", "x": 1e999}'),
-            ("not UTF-8", b'{"hook_event_name": "\xff"}'),
-            ("deep nesting", b"[" * 100_000 + b"]" * 100_000),
-            ("a huge number", b'{"x": ' + b"9" * 5000 + b"}"),
-            ("too large", b'{"hook_event_name": "PostToolUse", "pad": "' + b"a" * claude_hooks.MAX_EVENT_BYTES + b'"}'),
+        deep = b"[" * 100_000 + b"]" * 100_000
+        large = b'"' + b"a" * claude_hooks.MAX_EVENT_BYTES + b'"'
+        for name, data, event_name in (
+            ("empty", b"", None),
+            ("not JSON", b"not json", None),
+            ("a list", b"[]", None),
+            ("no event name", b'{"session_id": "s"}', None),
+            ("a number as event name", b'{"hook_event_name": 5}', None),
+            ("not UTF-8", b'{"hook_event_name": "\xff"}', None),
+            ("deep nesting", deep, None),
+            ("a huge number", b'{"x": ' + b"9" * 5000 + b"}", None),
+            ("an event name this hook does not handle", b'{"hook_event_name": "Stop", "x": NaN}', None),
+            ("a name inside a value", b'{"x": {"hook_event_name": "PostToolUse"}, "y": NaN}', None),
+            ("a name inside a text", b'{"x": "\\", \\"hook_event_name\\": \\"PostToolUse\\"", "y": NaN}', None),
+            # What cannot be read may still give its name, when that comes first, as Claude Code writes it:
+            # the answer is then the one for that event.
+            ("NaN", b'{"hook_event_name": "PostToolUse", "x": NaN}', "PostToolUse"),
+            ("a deep output", b'{"hook_event_name": "PostToolUse", "tool_response": ' + deep + b"}", "PostToolUse"),
+            ("too large", b'{"hook_event_name": "PostToolUse", "pad": ' + large + b"}", "PostToolUse"),
+            ("a large error", b'{"session_id": "s", "hook_event_name": "PostToolUseFailure", "error": ' + large + b"}",
+             "PostToolUseFailure"),
         ):
             with self.subTest(name):
-                self.assert_stopped_generically(*self.hook(data))
+                self.assert_stopped_generically(*self.hook(data), event_name=event_name)
+                self.assertEqual(self.records()[-1]["rule"], "malformed")
+        for name, data in (
+            ("a repeated key", b'{"hook_event_name": "PreToolUse", "hook_event_name": "Stop"}'),
+            ("a number too large to be one", b'{"hook_event_name": "PreToolUse", "tool_name": "Bash", "x": 1e999}'),
+            ("a large input", b'{"hook_event_name": "PreToolUse", "tool_input": {"command": ' + large + b"}}"),
+            ("a deep input", b'{"hook_event_name": "PreToolUse", "tool_input": ' + deep + b"}"),
+        ):
+            with self.subTest(name):
+                self.assert_denied_generically(*self.hook(data))
                 self.assertEqual(self.records()[-1]["rule"], "malformed")
 
     def test_a_pre_tool_use_event_with_fields_of_the_wrong_kind_is_denied(self):
@@ -455,7 +482,8 @@ class FailingClosed(HookTest):
             ("an error that is not text", recorded("post_tool_use_failure_mcp.json", error={"message": "x"})),
         ):
             with self.subTest(name):
-                self.assert_stopped_generically(*self.hook(json.dumps(event).encode("utf-8")))
+                self.assert_stopped_generically(*self.hook(json.dumps(event).encode("utf-8")),
+                                                event_name=event["hook_event_name"])
 
     def test_an_event_the_hook_does_not_check_is_left_alone(self):
         code, answer, _ = self.hook({"hook_event_name": "Stop", "stop_hook_active": False})
@@ -646,3 +674,67 @@ class WithheldCopies(TempFolderTest):
                          [{"type": "text", "text": "N"}])
         self.assertEqual(claude_hooks.mcp_replacement({"content": [], "isError": True}, "N"),
                          {"content": [{"type": "text", "text": "N"}]})
+
+
+class AnswersThatCannotBeWritten(HookTest):
+    """The answer is turned into its line, and written, inside the guard: whatever fails there still blocks."""
+
+    def unwritable_once(self):
+        """Patch the hook so that the first answer cannot be turned into its line, as one nested too deeply."""
+        from agent_sentinel import cli_hook
+
+        real, calls = cli_hook._line, []
+
+        def line(answer):
+            calls.append(answer)
+            if len(calls) == 1:
+                raise RecursionError("maximum recursion depth exceeded while encoding a JSON object")
+            return real(answer)
+
+        return mock.patch.object(cli_hook, "_line", line)
+
+    def test_a_replaced_output_that_cannot_be_written_stops_the_agent(self):
+        self.policy = self.write("policy.json", {**HOOK_POLICY, "secrets": {"in_results": "redact"}})
+        secret = [{"type": "text", "text": "the key is ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"}]
+        with self.unwritable_once():
+            code, answer, err = self.hook(recorded("post_tool_use_mcp.json", tool_response=secret))
+        self.assertEqual(code, 0)
+        self.assertIs(answer["continue"], False)
+        self.assertRegex(answer["stopReason"], "what the tool returned could not be checked " + REF)
+        self.assertNotIn("ghp_", json.dumps(answer) + err)
+        record = self.records()[-1]
+        self.assertEqual((record["rule"], record["tool"], record["call_id"]),
+                         ("hook_failed", "mcp__github__get_issue", "toolu_01ISSUE"))
+        self.assertIn("the answer could not be written: RecursionError", record["reason"])
+
+    def test_an_answer_to_a_call_that_cannot_be_written_denies_it(self):
+        with self.unwritable_once():
+            code, answer, err = self.pre("pre_tool_use_read.json")
+        self.assertEqual(code, 2)
+        self.assertEqual(self.decision(answer)[0], "deny")
+        self.assertRegex(err, "the call could not be checked, so it was not made " + REF)
+
+    def test_a_real_output_at_the_depth_the_writer_cannot_follow_never_ends_with_another_exit_code(self):
+        # The reader and the writer give up at different depths, which differ from one Python to the next:
+        # every depth around both must end with 0 or 2 and one line of JSON at most (HookTest.hook checks it).
+        self.policy = self.write("policy.json", {**HOOK_POLICY, "secrets": {"in_results": "redact"}})
+        limit = sys.getrecursionlimit()
+        seen = set()
+        for depth in (5, 50, *range(limit - 150, limit + 20, 3), *range(3 * limit - 150, 3 * limit + 20, 3)):
+            body = "[" * depth + '"ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"' + "]" * depth
+            event = ('{"hook_event_name": "PostToolUse", "session_id": "deep", "tool_name": "mcp__github__get_issue", '
+                     '"tool_use_id": "t", "tool_input": {}, "tool_response": %s}' % body).encode("utf-8")
+            code, answer, err = self.hook(event)
+            self.assertNotIn("Traceback", err)
+            self.assertEqual(code, 0, "the event's name was read, so even a stop goes out where it is read")
+            self.assertNotIn("ghp_", json.dumps(answer))
+            seen.add("stopped" if "continue" in answer else "replaced")
+        self.assertEqual(seen, {"stopped", "replaced"})
+
+    def test_an_answer_that_cannot_be_sent_ends_with_exit_code_2(self):
+        from agent_sentinel import cli_hook
+
+        for error in (OSError("the pipe is closed"), ValueError("I/O operation on closed file"), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__), mock.patch.object(cli_hook, "_send", side_effect=error):
+                self.assertEqual(self.pre("pre_tool_use_read.json")[0], 2)
+                self.assertEqual(self.pre()[0], 2, "even for an allowed call: nothing was said, so nothing is let through")

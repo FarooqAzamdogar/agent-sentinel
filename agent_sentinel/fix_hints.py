@@ -30,6 +30,7 @@ from .policy import (
     RULE_CALLER,
     RULE_DEFAULT,
     RULE_HOOK_CONFIG_CHANGES,
+    RULE_HOOK_POLICY_CHANGES,
     RULE_HOOK_FAILED,
     RULE_INCLUDE_CONTEXT,
     RULE_INDEX,
@@ -81,6 +82,7 @@ _FIXED_KINDS = {
     RULE_CALLER: "caller",
     RULE_HOOK_FAILED: "hook_failed",
     RULE_HOOK_CONFIG_CHANGES: "config_change",
+    RULE_HOOK_POLICY_CHANGES: "policy_change",
     RULE_ELICITATION_URL: "elicitation",
     RULE_ELICITATION_FORM: "elicitation",
     RULE_AUDIT: "audit_required",
@@ -105,7 +107,7 @@ _PART_KINDS = {"other_args": "other_args", "max_calls_per_minute": "limit_tool",
 PROTECTIVE_KINDS = frozenset({
     "deny_global", "deny_tool", "secrets", "secrets_results", "canary", "known_value", "secret_pattern",
     "injection", "unscannable", "malformed", "quarantine", "session", "flow", "flow_exception", "hook_failed",
-    "command", "config_change", "elicitation", "audit_required",
+    "command", "config_change", "policy_change", "elicitation", "audit_required",
     "schema_arguments", "schema_result", "schema_remote_refs", "include_context",
 })
 
@@ -452,6 +454,13 @@ _FIXED_HINTS = {
         "the running session did not apply it; the file itself stays changed, and the next session reads it. If "
         "you made the change, start a new session; if not, find out what wrote the file and undo it. "
         '"audit" records such changes without refusing them.'
+    ),
+    "policy_change": (
+        "The policy file changed while the Claude Code session was running, and the policy the session began with "
+        "has hook.policy_changes \"block\" (the default), so the hook refuses every event of that session. If you "
+        "changed the policy, start a new Claude Code session: it takes the new file. If you did not, find out what "
+        "wrote the file (the record gives both SHA-256 values) and put the old one back, which also lets the "
+        'session go on. "audit" in the policy a session begins with records such a change without refusing.'
     ),
     "elicitation": (
         "An MCP server asked the user for something an elicitation may not ask: an address that is not a public "

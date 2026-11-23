@@ -18,7 +18,8 @@ says which of these classes the command line falls into:
                   Out-File, [IO.File]::WriteAllText ... with an agent's configuration, a
                   credential file or the PowerShell profile ($PROFILE) as a target; or
                   a command line that changes into such a folder (cd .claude) and runs
-                  anything that may write
+                  anything that may write; or a target that may be one of them once the
+                  shell has expanded it (see "Names the shell expands" below)
     obfuscation   hides what runs: base64 -d piped to a shell, powershell -EncodedCommand,
                   eval, iex, bash -c with a $( ) in its command, text piped into a shell
                   or an interpreter that runs it (echo 'curl x' | bash), a command's
@@ -30,6 +31,42 @@ says which of these classes the command line falls into:
 PowerShell reads the typographic quotes (‘ ’ ‚ ‛ “ ” „) as quotes and the en
 dash, em dash and horizontal bar as "-"; so does this reader.
 
+Names the shell expands
+-----------------------
+A word can name a protected file without spelling it: ~/.agent-s*/policy.json,
+.cl?ude/settings.json, ~/.agent-$d/policy.json, {.cl,x}aude. The reader
+cannot tell where such a word lands, so a word that MAY be expanded to a
+hidden protected file or folder counts as one: a write to it is config_write,
+and any command that names it is secret_read and obfuscation (it hides what
+it reads or writes). That is:
+
+  * a part of a path that starts with "." and holds a wildcard (* ? [ ]), a
+    Bash brace list, a variable or a command's output (.agent-s*, .e*, .cl$x);
+  * a part that could spell the name of a hidden protected folder (.claude,
+    .agent-sentinel, .git, .ssh, .aws ...) with its first characters coming
+    from a variable, a brace list or a command's output ($x-sentinel,
+    {.cl,x}aude), or in PowerShell from a wildcard, which matches a leading
+    "." there (?claude, *sentinel). A read counts only when the part is a
+    folder on the way to a file (?ssh/id_x);
+  * in PowerShell, a ( ) group with a word that is the start of such a
+    folder's name: ('.agent-' + 'sentinel');
+  * the variables that name agent-sentinel's folder or Claude Code's
+    ($AGENT_SENTINEL_HOME, ${CLAUDE_CONFIG_DIR}, $env:..., %...%).
+
+A write counts as config_write too when a wildcard or a variable may turn a
+part after a protected folder into one of its protected entries
+(.git/hoo*/pre-commit, .vscode/*.json), or a wildcard may turn the file name
+into an agent's instruction or MCP file (CLAUDE.m?, AGENT?.md, .mcp.j*); a
+search by extension (*.md) does not count.
+
+In Bash, a wildcard or brace inside quotes or after a backslash is not
+expanded, so it does not count ('s/.*//' is a sed script); PowerShell's
+cmdlets expand wildcards in quoted paths too, so there it counts. A find
+that deletes what it finds, or runs a program that may write on it (-delete,
+-exec cp x {} ...), is config_write unless its -name tests rule the protected
+names out; so is a writing program fed by xargs or parallel from a pipeline
+that names such files or runs such a find.
+
 Command texts kept for later are read as commands too: the text trap runs
 (trap 'curl x' EXIT runs at the end of the call), compgen -C and complete -C,
 and what an alias set in the same line stands for (Set-Alias x iwr; x ...,
@@ -39,16 +76,21 @@ command writes to it or changes into it.
 
 A command that cannot be read with certainty is "unreadable": an unclosed
 quote or $( ), a heredoc or here-string, ANSI-C quoting ($'...'), a program
-chosen at run time ($c args, PowerShell's & $c, & (...) and . (...)), a program
-name with a wildcard or a brace expansion (/???/cur?, {curl,x}), a shell's -c
-that cannot be placed (bash -o -c x), more than MAX_SEGMENTS commands, more than
-MAX_COMMAND_CHARS characters, deeper nesting than MAX_DEPTH, or a control
-character. The policy decides what happens to it (see CommandRule).
+chosen at run time ($c args, PowerShell's & $c, & (...) and . (...), zsh's
+=curl, cmd's %a%rl and !a!rl), a program name with a wildcard or a brace
+expansion (/???/cur?, {curl,x}), a shell's -c that cannot be placed (bash -o -c
+x), more wrappers before the program than _MAX_WRAPPERS (nice nice ... curl),
+more than MAX_SEGMENTS commands, more than MAX_COMMAND_CHARS characters, deeper
+nesting than MAX_DEPTH, or a control character. The policy decides what happens
+to it (see CommandRule). A "#" after an escaped blank (a\ #b, PowerShell's
+a` #b) is part of the word, as the shells read it, not a comment; in cmd's text
+("cmd /c ...") a "#" never starts a comment and a "'" is no quote.
 
 This raises the bar; it is not a boundary. A shell can reach the same ends in
 ways no text reading follows: variables, aliases and functions set in an
 earlier call (c=curl), scripts, python -c, node -e, Invoke-Expression of a
-string built at run time, globs in arguments (cat .e*), and programs this list
+string built at run time, a path made only of variables (cp x "$d/$f"), a
+file name from a variable or a brace list ("$name.md"), and programs this list
 does not name. Nothing here runs anything or touches the file system or the network.
 """
 
@@ -76,7 +118,7 @@ CLASS_TEXT = {
     INSTALL: "installs or runs code from a package registry or the web",
     SECRET_READ: "reads a credential file or an agent's configuration, or prints the environment",
     CONFIG_WRITE: "writes to an agent's configuration or a credential file",
-    OBFUSCATION: "hides what it runs (decoded, evaluated or piped-in text)",
+    OBFUSCATION: "hides what it runs (decoded, evaluated or piped-in text) or which protected file it names",
     ENCODED_HOST: "names a host that looks like it carries data",
 }
 # allow_programs can lift these classes for one program; the others are about words, not programs.
@@ -95,12 +137,20 @@ _READINGS_KEPT = 64  # read_command's cache
 _SUBST = "\x00"
 # Stands for a PowerShell ( ) group in an argument ("Set-Content ('x') y"), as a word of its own.
 _GROUP = "\x01"
+# Stand for * ? [ and { written inside quotes or after a backslash, while shlex removes the quotes: Bash
+# does not expand those. Control characters, like _SUBST.
+_QUOTED_GLOBS = {"*": "\x02", "?": "\x03", "[": "\x04", "{": "\x05"}
+_UNQUOTED_GLOBS = str.maketrans({mark: ch for ch, mark in _QUOTED_GLOBS.items()})
 # PowerShell's tokenizer reads ‘ ’ ‚ ‛ as ', “ ” „ as ", and the en dash, em dash and horizontal bar as -
 # (in parameters and operators, and powershell.exe in its own options): & ‘curl.exe’ x runs curl.
 _POWERSHELL_PLAIN = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'", "\u201c": '"',
                                    "\u201d": '"', "\u201e": '"', "\u2013": "-", "\u2014": "-", "\u2015": "-"})
 # The dashes powershell.exe and pwsh accept before their own options (–Command, —EncodedCommand).
 _DASHES = "-\u2013\u2014\u2015"
+
+
+class _Literal(str):
+    """A Bash word whose wildcard and brace characters were all quoted: the shell hands it on as written."""
 
 
 class Unreadable(Exception):
@@ -262,7 +312,12 @@ class _Splitter:
             self.pipeline = []
 
     def at_word_start(self) -> bool:
-        return not self.current or self.current[-1][-1:].isspace()
+        """True after nothing or after a blank. An escaped blank (Bash's backslash, PowerShell's backtick, each
+        pushed as one piece of two characters) is part of the word: "a\\ #b" is the one word "a #b"."""
+        if not self.current:
+            return True
+        piece = self.current[-1]
+        return piece[-1:].isspace() and not (len(piece) == 2 and piece[0] in "\\`")
 
     def ends_with_redirection(self) -> bool:
         """True if the current command's text ends with a ">" operator (so a "&" next is part of >& or 2>&1,
@@ -700,14 +755,51 @@ def _bash_words(segment: str) -> tuple[list[str], list[str]]:
     """The words of one Bash simple command (quotes removed, by shlex), and its output targets."""
     import shlex  # here, not at the top: importing the library must not load it (the hook starts often)
 
-    lexer = shlex.shlex(segment, posix=True, punctuation_chars=True)
+    lexer = shlex.shlex(_quoted_globs_marked(segment), posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
     try:
         tokens = list(lexer)
     except ValueError as exc:  # "No closing quotation", "No escaped character"
         raise Unreadable(f"it cannot be split into words ({exc})") from None
-    return _redirections(tokens, attached=False)
+    return _redirections([_unmarked(token) for token in tokens], attached=False)
+
+
+def _quoted_globs_marked(segment: str) -> str:
+    """The segment with each * ? [ { that is quoted or escaped replaced by its mark (_QUOTED_GLOBS).
+
+    Quotes are read as shlex reads them: '...' holds no escapes; in "..." and
+    outside quotes a backslash takes the next character as it is.
+    """
+    if not any(ch in segment for ch in _QUOTED_GLOBS):
+        return segment
+    parts: list[str] = []
+    quote = ""
+    i, n = 0, len(segment)
+    while i < n:
+        c = segment[i]
+        if quote == "'":
+            quote = "" if c == "'" else quote
+            parts.append(_QUOTED_GLOBS.get(c, c))
+        elif c == "\\" and i + 1 < n:
+            parts.append(c + _QUOTED_GLOBS.get(segment[i + 1], segment[i + 1]))
+            i += 1
+        elif quote:
+            quote = "" if c == '"' else quote
+            parts.append(_QUOTED_GLOBS.get(c, c))
+        else:
+            quote = c if c in "'\"" else ""
+            parts.append(c)
+        i += 1
+    return "".join(parts)
+
+
+def _unmarked(token: str) -> str:
+    """A word as written; a _Literal when it has wildcard or brace characters and every one was quoted."""
+    if not any(mark in token for mark in _QUOTED_GLOBS.values()):
+        return token
+    plain = token.translate(_UNQUOTED_GLOBS)
+    return plain if any(ch in token for ch in _QUOTED_GLOBS) else _Literal(plain)
 
 
 def _redirections(tokens: list[str], attached: bool) -> tuple[list[str], list[str]]:
@@ -862,6 +954,8 @@ _STRIPPED_EXTENSIONS = (".exe", ".cmd", ".bat", ".ps1")
 # What makes Bash expand a program's name into another one: *, ?, {a,b} or {a..b}; and [...], which
 # _check_program_word looks for without a pattern (a pattern would scan the rest of the word from every "[").
 _BASH_PATTERN = re.compile(r"[*?]|\{[^{}]*(,|\.\.)[^{}]*\}")
+# A variable of cmd in a program's name: %name% (with its :~0,2 and :a=b forms) and the delayed !name!.
+_CMD_VARIABLE = re.compile(r"%[^%\s]+%|![^!\s]+!")
 
 
 def _program_name(word: str) -> str:
@@ -890,6 +984,10 @@ def _check_program_word(word: str, shell: str) -> None:
     run, which _inner_commands reads as a command line too. Its folders may hold
     a variable ("$DIR/tool"), but not its last part; quoted, it holds no wildcards.
     """
+    if shell != "powershell" and (word.startswith("=") or _CMD_VARIABLE.search(_last_part(word))):
+        # zsh (which Claude Code's Bash tool may run) expands =curl to curl's path, and cmd, whose text is
+        # read as Bash's, expands %name% and !name!: "set a=cu&& call %a%rl x" runs curl.
+        raise Unreadable("the program is chosen when the command runs (zsh's =name, or cmd's %name% or !name!)")
     if any(ch.isspace() for ch in word):
         if _runtime_chosen(_last_part(word)):
             raise Unreadable("the program is chosen when the command runs (a variable or a command's output)")
@@ -936,8 +1034,12 @@ def _simple_commands(words: list[str], targets: list[str], shell: str, pipeline:
         name = _program_name(word)
         if shell == "powershell" and name == "start":
             name = "start-process"  # in PowerShell, start is Start-Process
-        if name not in _WRAPPERS or peeled >= _MAX_WRAPPERS or (name == "." and shell != "powershell"):
+        if name not in _WRAPPERS or (name == "." and shell != "powershell"):
             break
+        if peeled >= _MAX_WRAPPERS:
+            # Past the bound the real program is never looked at: taking the wrapper for it would read
+            # "nice nice ... curl x" as a harmless command.
+            raise Unreadable(f"it stacks more than {_MAX_WRAPPERS} wrappers before the program")
         found = _start_process(rest[1:]) if name in _LAUNCHERS else _after_wrapper(name, rest[1:])
         if found is None:  # "env" alone, "command -v curl": the wrapper is the program
             break
@@ -1371,7 +1473,11 @@ def _shell_call(program: str, words: list[str]) -> _ShellCall | None:
         found = _CMD_RUN_SWITCH.search(line)
         if found is None:
             return _ShellCall(stdin=True)
-        rest = line[found.end():].replace("^", "").strip()  # /ccurl x, /c"curl x", //ccurl x (Git Bash)
+        # /ccurl x, /c"curl x", //ccurl x (Git Bash). cmd has no backslash escape: in its text a backslash
+        # only separates the parts of a path, so it is read as "/" (Bash's reader would drop it). Nor has it
+        # comments or single quotes: "echo a #b & curl x" and "echo ' & curl x & echo '" run curl, so a "#"
+        # is kept as a character and a "'" read as a blank (for /f runs what it puts in quotes: ('curl x')).
+        rest = line[found.end():].replace("^", "").replace("\\", "/").replace("#", "\\#").replace("'", " ").strip()
         return _ShellCall(((rest, "bash"),)) if rest else _ShellCall(missing=True)
     return None
 
@@ -1674,6 +1780,222 @@ _PROTECTED_TARGET = re.compile(
 # to one, or a change into one, counts as protected (the path matcher refuses such names for the same
 # reason). Only the words a command writes to or changes into are looked at: git log HEAD~1 is not.
 _SHORT_NAME = re.compile(r"(^|[\\/:])[^\\/:.~\s]{1,8}~[0-9]{1,6}(\.[^\\/:.~\s]{1,3})?([\\/]|$)")
+# Hidden folders that hold an agent's settings, agent-sentinel's own files, git's hooks or keys. A part of
+# a path that the shell may expand to one of these names counts as protected (_may_be_hidden).
+_HIDDEN_FOLDERS = (
+    ".agent-sentinel", ".claude", ".cursor", ".codeium", ".gemini", ".windsurf", ".codex", ".git", ".github",
+    ".vscode", ".ssh", ".aws", ".azure", ".docker", ".gnupg", ".kube",
+)
+# Names of files that are protected wherever they are, for find's -name tests (find's * matches a leading dot).
+_PROTECTED_NAMES = (
+    *_HIDDEN_FOLDERS, ".env", ".netrc", ".npmrc", ".pypirc", ".pgpass", ".git-credentials", ".mcp.json",
+    ".claude.json", ".cursorrules", ".bashrc", ".bash_profile", ".bash_login", ".zshrc", ".zshenv", ".zprofile",
+    ".profile", "policy.json", "pins.json", "audit.jsonl", "audit.key", "settings.json", "settings.local.json",
+    "claude.md", "claude.local.md", "agents.md", "memory.md", "gemini.md", "copilot-instructions.md",
+    "mcp.json", "mcp_config.json", "claude_desktop_config.json", "config.toml", "hooks.json", "cli.json",
+    "tasks.json", "config", "hooks", "credentials", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+)
+# What a part of a path may become when the shell expands it: any one character (? and [...]), any text from
+# a wildcard (*), and any text from a variable, a brace list or a command's output. Other characters stand
+# for themselves, lowercased.
+_ANY_ONE, _ANY_GLOB, _ANY_TEXT = 1, 2, 3
+_EXPANSION_CHARACTERS = "*?[{}$%!" + _SUBST + _GROUP
+_PATH_PARTS = re.compile(r"[\\/:=@]")
+_MAX_PATH_PARTS = 256  # of one word; a word with more is not a path
+_FIND_NAME_TESTS = frozenset({"-name", "-iname"})
+_FIND_RUNNERS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+# Variables that name agent-sentinel's own folder or Claude Code's: a path through one is protected whatever
+# follows ($AGENT_SENTINEL_HOME/policy.json, ${CLAUDE_CONFIG_DIR}/settings.json, %AGENT_SENTINEL_HOME%).
+_PROTECTED_VARIABLE = re.compile(r"(\$\{?|\$env:|%)(agent_sentinel_home|claude_config_dir)\b", re.IGNORECASE)
+# The entries of a folder that hold an agent's configuration (AGENT_CONFIG_PATTERN), for a part after the
+# folder that the shell may expand to one: .git/hoo*/pre-commit. In .claude, .gemini and .windsurf every
+# entry is protected, which the patterns see already.
+_PROTECTED_ENTRIES = {
+    ".git": ("hooks", "config"), ".vscode": ("settings.json", "tasks.json", "mcp.json"),
+    ".cursor": ("rules", "cli.json", "hooks.json", "mcp.json"), ".github": ("copilot-instructions.md",),
+    ".codex": ("config.toml",),
+}
+# Files that tell an agent what to do, or which MCP servers it starts, wherever they are.
+_AGENT_FILE_NAMES = (
+    "claude.md", "claude.local.md", "agents.md", "memory.md", "gemini.md", ".mcp.json", "mcp_config.json",
+    ".cursorrules", "claude_desktop_config.json", ".claude.json",
+)
+
+
+@functools.lru_cache(maxsize=512)
+def _expansions(part: str, shell: str, globs: bool) -> tuple[Any, ...]:
+    """One part of a path as what the shell may expand it to (see _ANY_ONE, _ANY_GLOB, _ANY_TEXT).
+
+    globs: wildcards and Bash brace lists count (false for a Bash word that quoted them all). Variables
+    count either way: $x, ${x}, $env:X, cmd's %X% and !X!, PowerShell's {0} of -f, and _SUBST and _GROUP.
+    Any text right after any text is left out, so there are never more of those than plain characters.
+    """
+    tokens: list[Any] = []
+    i, n = 0, len(part)
+    while i < n:
+        c = part[i]
+        nxt = part[i + 1:i + 2]
+        end = -1
+        if c in (_SUBST, _GROUP):
+            end = i + 1
+        elif c == "$" and nxt == "{":
+            end = part.find("}", i + 2) + 1 or n
+        elif c == "$" and nxt and (nxt.isalnum() or nxt in "_?@*#!$-"):
+            end = i + 2
+            while end < n and (part[end].isalnum() or part[end] in "_:"):
+                end += 1
+        elif c in "%!" and part.find(c, i + 2) > 0:
+            end = part.find(c, i + 2) + 1
+        elif c == "{" and shell == "powershell":
+            closing = part.find("}", i + 1)
+            end = closing + 1 if closing > i + 1 and part[i + 1:closing].isdigit() else -1
+        elif c == "{" and globs:
+            closing = part.find("}", i + 1)
+            end = closing + 1 if closing > 0 and ("," in part[i:closing] or ".." in part[i:closing]) else -1
+        if end > 0 or globs and c == "*":
+            if not tokens or tokens[-1] not in (_ANY_GLOB, _ANY_TEXT):
+                tokens.append(_ANY_TEXT if end > 0 else _ANY_GLOB)
+            i = end if end > 0 else i + 1
+        elif globs and (c == "?" or c == "[" and part.find("]", i + 2) > 0):
+            tokens.append(_ANY_ONE)
+            i = i + 1 if c == "?" else part.find("]", i + 2) + 1
+        else:
+            tokens.append(c.lower())
+            i += 1
+    return tuple(tokens)
+
+
+def _could_spell(tokens: tuple[Any, ...], name: str) -> bool:
+    """Whether the expansions of a path part could give exactly `name`."""
+    if sum(1 for token in tokens if isinstance(token, str)) > len(name):
+        return False
+    reached = {0}  # how much of the name the tokens so far may have spelled
+    for token in tokens:
+        if token in (_ANY_GLOB, _ANY_TEXT):
+            reached = set(range(min(reached), len(name) + 1))
+        elif token == _ANY_ONE:
+            reached = {at + 1 for at in reached if at < len(name)}
+        else:
+            reached = {at + 1 for at in reached if at < len(name) and name[at] == token}
+        if not reached:
+            return False
+    return len(name) in reached
+
+
+def _may_be_hidden(word: str, shell: str, reading: bool = False) -> bool:
+    """True if the shell may expand a word to a hidden protected file or folder (the module docstring's
+    "Names the shell expands").
+
+    reading: the word is only read, so a part whose first characters are expanded counts only as a folder
+    on the way to a file.
+    """
+    if not any(ch in word for ch in _EXPANSION_CHARACTERS):
+        return False
+    if _PROTECTED_VARIABLE.search(word):
+        return True  # $AGENT_SENTINEL_HOME/policy.json: the variable names the folder itself
+    globs = shell != "bash" or not isinstance(word, _Literal)
+    parts = _PATH_PARTS.split(word, maxsplit=_MAX_PATH_PARTS)
+    if len(parts) > _MAX_PATH_PARTS:
+        return False
+    if shell == "powershell":
+        parts = [piece for part in parts for piece in part.split(",")]
+    for index, part in enumerate(parts):
+        if not any(ch in part for ch in _EXPANSION_CHARACTERS):
+            continue
+        tokens = _expansions(part, shell, globs)
+        if all(isinstance(token, str) for token in tokens):
+            if globs and shell == "bash" and part.startswith(".") and "}" in part:
+                return True  # the end of a brace list that began in an earlier part: {~/.cl,x}aude
+            continue
+        first = tokens[0]
+        if first == ".":
+            return True  # .agent-s*, .e*, .cl$x: a hidden name the reader cannot tell
+        if isinstance(first, str) or shell == "bash" and first in (_ANY_ONE, _ANY_GLOB):
+            continue  # a plain first character, or a Bash wildcard, which does not match a leading "."
+        if reading and index == len(parts) - 1 or not any(isinstance(token, str) for token in tokens):
+            continue  # only listed, not read through; or nothing but expansions, which says nothing
+        if first == _ANY_GLOB and tokens[1] == "." and "." not in tokens[2:] and all(
+                isinstance(token, str) for token in tokens[1:]):
+            continue  # *.json, *.md: a search by extension
+        if any(_could_spell(tokens, name) for name in _HIDDEN_FOLDERS):
+            return True
+    return False
+
+
+def _may_be_protected_entry(word: str, shell: str) -> bool:
+    """True if the shell may expand a word a command writes to into an agent's file that the patterns see only
+    spelled out: an entry of a protected folder (.git/hoo*/pre-commit, .vscode/*.json) or an instruction file
+    (CLAUDE.m?, AGENT?.md). A search by extension (*.md) or a bare wildcard as the file name does not count.
+    """
+    if not any(ch in word for ch in _EXPANSION_CHARACTERS):
+        return False
+    globs = shell != "bash" or not isinstance(word, _Literal)
+    parts = _PATH_PARTS.split(word, maxsplit=_MAX_PATH_PARTS)
+    if len(parts) > _MAX_PATH_PARTS:
+        return False
+    for index, part in enumerate(parts):
+        if not any(ch in part for ch in _EXPANSION_CHARACTERS):
+            continue
+        tokens = _expansions(part, shell, globs)
+        if all(isinstance(token, str) for token in tokens):
+            continue
+        entries = _PROTECTED_ENTRIES.get(parts[index - 1].lower(), ()) if index else ()
+        if any(_could_spell(tokens, name) for name in entries):
+            return True
+        if index < len(parts) - 1 or _ANY_TEXT in tokens:
+            continue  # a file name from a variable ("$name.json") is the limit of a path made of variables
+        plain = [token for token in tokens if isinstance(token, str)]
+        by_extension = tokens[0] == _ANY_GLOB and plain[:1] == ["."] and "." not in plain[1:] and len(plain) == len(
+            tokens) - 1
+        if plain and not by_extension and any(_could_spell(tokens, name) for name in _AGENT_FILE_NAMES):
+            return True
+    return False
+
+
+def _starts_a_hidden_name(word: str) -> bool:
+    """A PowerShell group word that is the start of a hidden protected folder's name: ('.agent-' + 'sentinel')."""
+    start = _last_part(word).lower()
+    return len(start) >= 3 and start.startswith(".") and any(
+        name.startswith(start) and name != start for name in _HIDDEN_FOLDERS)
+
+
+def _expanded_word(command: _Command) -> str | None:
+    """A word of the command that the shell may expand to a hidden protected name, if any (as it is read)."""
+    for word in (*command.words, *command.targets, *command.groups):
+        if _may_be_hidden(word, command.shell, reading=True):
+            return word
+    if command.shell == "powershell":
+        return next((word for word in command.groups if _starts_a_hidden_name(word)), None)
+    return None
+
+
+def _find_may_reach_protected(words: Iterable[str]) -> bool:
+    """Whether a find's tests leave it free to find a protected file: no -name test, a negation, or a -name
+    that a protected name matches (find's own wildcards, which match a leading dot, quoted or not)."""
+    words = list(words)
+    names = [words[index + 1] for index, word in enumerate(words[:-1]) if word in _FIND_NAME_TESTS]
+    if not names or any(word in ("!", "-not") for word in words):
+        return True
+    for pattern in names:
+        tokens = _expansions(pattern, "powershell", True)
+        if any(_could_spell(tokens, name) for name in _PROTECTED_NAMES):
+            return True
+    return False
+
+
+def _find_changes_what_it_finds(command: _Command) -> bool:
+    """find ... -delete, or -exec with a program that may write and is handed what was found ({})."""
+    words = list(command.words)
+    if "-delete" in words:
+        return True
+    for index, word in enumerate(words):
+        if word in _FIND_RUNNERS:
+            inner = words[index + 1:]
+            inner = inner[:next((at for at, part in enumerate(inner) if part in (";", "+")), len(inner))]
+            if inner and any("{}" in part for part in inner[1:]) and (
+                    _program_name(inner[0]) not in _READ_ONLY_PROGRAMS):
+                return True
+    return False
 
 # The host part of a URL, and a word that is a host name (with a user, a port or an scp path).
 _URL_HOST = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://(?:[^/?#@\s]*@)?([^/?#:\s]*)")
@@ -1743,7 +2065,8 @@ def _changed_into(command: _Command) -> str | None:
     if command.program in _CD_PROGRAMS:
         folders.extend(_write_targets(command.words))
     for folder in folders:
-        if _protected(folder) or any(_PROTECTED_FOLDER.search(spelling) for spelling in _spellings(folder)):
+        if _protected(folder, command.shell) or any(
+                _PROTECTED_FOLDER.search(spelling) for spelling in _spellings(folder)):
             return folder
     return None
 
@@ -1905,6 +2228,9 @@ def _secret_read(command: _Command, earlier: list[_Command]) -> str | None:
     for word in _named_files(command):
         if _SECRET_WORD.search(word):
             return f"word '{word}'"
+    expanded = _expanded_word(command)
+    if expanded is not None:
+        return f"word '{expanded}', which the shell may expand to a protected name"
     positional = _positional(words)
     if program == "printenv":
         return "program 'printenv'"
@@ -1924,11 +2250,12 @@ def _secret_read(command: _Command, earlier: list[_Command]) -> str | None:
     return None
 
 
-def _protected(word: str) -> bool:
+def _protected(word: str, shell: str = "bash") -> bool:
     """True if a word a command writes to (or changes into) names an agent's configuration, a credential file
-    or $PROFILE, or has a Windows short name in it, which may stand for any of them."""
+    or $PROFILE, has a Windows short name in it, which may stand for any of them, or may be expanded by the
+    shell to a protected name (_may_be_hidden, _may_be_protected_entry)."""
     return any(_PROTECTED_TARGET.search(spelling) or _PROFILE_VARIABLE.match(spelling) or _SHORT_NAME.search(spelling)
-               for spelling in _spellings(word))
+               for spelling in _spellings(word)) or _may_be_hidden(word, shell) or _may_be_protected_entry(word, shell)
 
 
 def _short_note(word: str) -> str:
@@ -1942,24 +2269,38 @@ def _write_targets(words: Iterable[str]) -> Iterator[str]:
         if word.startswith("-") and word != "-":
             value = re.split(r"[=:]", word, maxsplit=1)[1:]
             if value and value[0]:
-                yield value[0]
+                yield type(word)(value[0])  # a word whose wildcards were quoted stays one
         else:
             yield word
 
 
 def _config_write(command: _Command, earlier: list[_Command]) -> str | None:
+    shell = command.shell
     for target in command.targets:
-        if _protected(target):
+        if _protected(target, shell):
             return f"a redirection to '{target}'{_short_note(target)}"
     program, words = command.program, command.words
+    if program == "find" and _find_changes_what_it_finds(command) and _find_may_reach_protected(words):
+        return "program 'find' changes the files it finds, and its tests do not rule out protected ones"
     writes = program in _PROGRAM_WRITERS or (
         program in _IN_PLACE_EDITORS and any(word.startswith(("-i", "--in-place", "-pi")) for word in words)) or (
         program == "tar" and _tar_extracts(words)) or (
-        command.shell == "powershell" and any(_DOTNET_WRITE.search(word) for word in (command.written, *words)))
+        shell == "powershell" and any(_DOTNET_WRITE.search(word) for word in (command.written, *words)))
     if writes:
         for word in (*_write_targets(words), *command.groups):
-            if _protected(word):
+            if _protected(word, shell):
                 return f"program '{program or command.written}' with '{word}'{_short_note(word)}"
+    if shell == "powershell" and (writes or command.targets):
+        # Set-Content ($HOME + '\.agent-' + 'sentinel\policy.json'): the target's name is put together.
+        for word in command.groups:
+            if _starts_a_hidden_name(word):
+                return f"a write to a name built from '{word}', which starts a protected folder's name"
+    if writes and command.fed is not None:
+        # find ~ -name policy.json | xargs -I{} cp x {}: the names come from the pipeline.
+        for other in earlier:
+            if other.program == "find" and _find_may_reach_protected(other.words) or any(
+                    _protected(word, other.shell) for word in other.words):
+                return f"program '{program}' with names from '{other.program}', which may be protected files"
     return None
 
 
@@ -1996,6 +2337,10 @@ def _obfuscation(command: _Command, earlier: list[_Command]) -> str | None:
         return f"decoded text piped to '{program}'"
     if command.shell == "powershell" and any(_DOTNET_DECODE.search(word) for word in (program, *words)):
         return "[Convert]::FromBase64String"
+    expanded = _expanded_word(command)
+    if expanded is not None:
+        # cat ~/.agent-s*/audit.key: which file is read or written is only known when the shell has run.
+        return f"word '{expanded}' may name a protected file through a wildcard, a variable or a built name"
     return None
 
 

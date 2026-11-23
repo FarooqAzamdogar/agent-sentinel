@@ -285,12 +285,18 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
     "Grep": {
       "action": "allow",
       "labels": ["private"],
-      "deny_args": [{ "arg": "path", "type": "path", "roots": ["~/.ssh", "~/.aws", "~/.agent-sentinel"] }]
+      "deny_args": [
+        { "arg": "path", "type": "path", "roots": ["~/.ssh", "~/.aws", "~/.agent-sentinel"], "or_above": true },
+        { "arg": "glob", "pattern": "(^|[\\\\/{,])(\\.[^\\\\/]*[*?\\[{]|\\[[^\\]\\\\/]*\\.)" }
+      ]
     },
     "Glob": {
       "action": "allow",
       "labels": ["private"],
-      "deny_args": [{ "arg": "path", "type": "path", "roots": ["~/.ssh", "~/.aws", "~/.agent-sentinel"] }]
+      "deny_args": [
+        { "arg": "path", "type": "path", "roots": ["~/.ssh", "~/.aws", "~/.agent-sentinel"], "or_above": true },
+        { "arg": "pattern", "pattern": "(^|[\\\\/{,])(\\.[^\\\\/]*[*?\\[{]|\\[[^\\]\\\\/]*\\.)" }
+      ]
     },
     "Edit": {
       "action": "allow",
@@ -406,7 +412,7 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
     },
     "Bash": {
       "action": "allow",
-      "labels": [],
+      "labels": ["private"],
       "deny_args": [
         {
           "arg": "command",
@@ -417,12 +423,16 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
       "command": {
         "shell": "bash",
         "ask_classes": ["network", "install", "config_write", "obfuscation"],
-        "labels_by_class": { "network": ["sink"], "install": ["sink"], "secret_read": ["private"] }
+        "labels_by_class": {
+          "network": ["untrusted", "sink"],
+          "install": ["untrusted", "sink"],
+          "secret_read": ["private"]
+        }
       }
     },
     "PowerShell": {
       "action": "allow",
-      "labels": [],
+      "labels": ["private"],
       "deny_args": [
         {
           "arg": "command",
@@ -433,7 +443,11 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
       "command": {
         "shell": "powershell",
         "ask_classes": ["network", "install", "config_write", "obfuscation"],
-        "labels_by_class": { "network": ["sink"], "install": ["sink"], "secret_read": ["private"] }
+        "labels_by_class": {
+          "network": ["untrusted", "sink"],
+          "install": ["untrusted", "sink"],
+          "secret_read": ["private"]
+        }
       }
     },
     "WebFetch": {
@@ -458,6 +472,17 @@ In hook mode, tool names are Claude Code's names, so the policy needs rules for 
     "AskUserQuestion": { "action": "allow", "labels": [] },
     "ExitPlanMode": { "action": "allow", "labels": [] },
     "SubagentHandback": { "action": "allow", "labels": [] },
+    "EnterPlanMode": { "action": "allow", "labels": [] },
+    "TaskCreate": { "action": "allow", "labels": [] },
+    "TaskUpdate": { "action": "allow", "labels": [] },
+    "TaskList": { "action": "allow", "labels": [] },
+    "TaskGet": { "action": "allow", "labels": [] },
+    "TaskStop": { "action": "allow", "labels": [] },
+    "KillShell": { "action": "allow", "labels": [] },
+    "Skill": { "action": "allow", "labels": ["private"] },
+    "TaskOutput": { "action": "allow", "labels": ["private"] },
+    "BashOutput": { "action": "allow", "labels": ["private"] },
+    "ToolSearch": { "action": "allow", "labels": ["private"] },
     "mcp__*": { "action": "ask", "labels": ["untrusted", "sink"] }
   },
   "server_requests": { "sampling/createMessage": "block", "*": "allow" },

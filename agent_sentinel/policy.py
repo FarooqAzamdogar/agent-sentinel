@@ -45,6 +45,8 @@ in the policy file:
     flows[0].other_args                  an argument that no unless_args entry of the flow names
     secrets.patterns[0]                  the first custom secret format
     hook.config_changes                  the Claude Code hook refused a change to Claude Code's settings
+    hook.policy_changes                  the Claude Code hook refused an event because the policy file
+                                         changed during the session
 
 Checks that are not written in the policy have the fixed names below (RULE_*).
 """
@@ -126,6 +128,8 @@ RULE_SECRETS_IN_RESULTS = "secrets.in_results"
 RULE_SECRETS_CANARIES = "secrets.canaries"
 RULE_SECRETS_KNOWN_VALUES = "secrets.known_values_from_env"
 RULE_HOOK_CONFIG_CHANGES = "hook.config_changes"  # the Claude Code hook refused a settings change (hook section)
+# The Claude Code hook refused an event because the policy file is not the one the session began with.
+RULE_HOOK_POLICY_CHANGES = "hook.policy_changes"
 # The proxy's checks against the schemas a server declared (schema_checks; schema_check.py).
 RULE_SCHEMA_ARGUMENTS = "schema.arguments"  # a call's arguments do not match the tool's inputSchema
 RULE_SCHEMA_RESULT = "schema.result"  # a result's structuredContent does not match the tool's outputSchema
@@ -178,6 +182,9 @@ MAX_KNOWN_VALUE_NAMES = 100
 # hook.config_changes: what the Claude Code hook does with a change to Claude Code's settings
 # or skills made during a session. "audit" records it; "block" also refuses it.
 CONFIG_CHANGES = ("audit", "block")
+# hook.policy_changes: what the Claude Code hook does when the policy file is no longer the one a session
+# began with. "block" refuses every event of that session; "audit" only records the change.
+POLICY_CHANGES = ("block", "audit")
 
 # ---- session limits and approval memory (0.6) ---------------------------------------------
 
@@ -244,7 +251,7 @@ _LIMITS_KEYS = (
     "max_identical_calls", "call_timeout_seconds",
 )
 _APPROVALS_KEYS = ("refusal_window_seconds", "max_refusals_per_tool")
-_HOOK_KEYS = ("config_changes", "treat_auto_as_non_prompting")
+_HOOK_KEYS = ("config_changes", "treat_auto_as_non_prompting", "policy_changes")
 
 
 def limit_rule(bucket: str) -> str:
@@ -532,7 +539,7 @@ class SecretPattern:
 class HookOptions:
     """The "hook" section: settings that only the Claude Code hook reads (claude_hooks.py).
 
-    {"config_changes": "block", "treat_auto_as_non_prompting": true}
+    {"config_changes": "block", "treat_auto_as_non_prompting": true, "policy_changes": "block"}
 
     config_changes:               "audit" (the default): a change to Claude Code's settings files or
                                   skills during a session is recorded in the audit log, with the
@@ -542,14 +549,22 @@ class HookOptions:
     treat_auto_as_non_prompting:  true: in Claude Code's "auto" permission mode an "ask" is refused,
                                   as in a mode that shows no prompt. Default false: "auto" shows the
                                   prompt, except for the calls it never prompts for (claude_hooks.NEVER_PROMPTS).
+    policy_changes:               "block" (the default): when the policy file is no longer the one a
+                                  session began with, every later event of that session is refused,
+                                  until a new session starts (which takes the new policy) or the old
+                                  file is put back. "audit": the change is only recorded. What counts
+                                  is the value in the policy the session began with, never the one in
+                                  the changed file.
     """
 
     config_changes: str = "audit"
     treat_auto_as_non_prompting: bool = False
+    policy_changes: str = "block"
 
     def __post_init__(self) -> None:
         _expect_choice(self.config_changes, "hook.config_changes", CONFIG_CHANGES)
         _expect_bool(self.treat_auto_as_non_prompting, "hook.treat_auto_as_non_prompting")
+        _expect_choice(self.policy_changes, "hook.policy_changes", POLICY_CHANGES)
 
 
 @dataclass(frozen=True)
@@ -1212,6 +1227,7 @@ class Policy:
         found.extend(_overridden_glob_warnings(self.tools))
         found.extend(_shadowed_glob_warnings(self.tools))
         found.extend(_missing_root_warnings(self))
+        found.extend(_variable_root_warnings(self))
         found.extend(_flow_warnings(self))
         found.extend(_label_warnings(self))
         found.extend(_rule_of_two_warnings(self))
@@ -1248,6 +1264,9 @@ class Policy:
                               "session state that cannot be used), so it refused",
             RULE_HOOK_CONFIG_CHANGES: f'hook.config_changes is "{self.hook.config_changes}": the Claude Code hook '
                                       "refuses a change to Claude Code's settings or skills made during a session",
+            RULE_HOOK_POLICY_CHANGES: "the policy file changed during the Claude Code session, and the policy the "
+                                      'session began with has hook.policy_changes "block": the hook refuses every '
+                                      "event of that session until a new session starts or the old file is back",
             RULE_AUDIT: "the audit record could not be written, and --audit-required refuses what is not recorded",
             RULE_SCHEMA_ARGUMENTS: "the proxy's check of a call's arguments against the input schema the server "
                                    "declared for the tool (schema_checks.arguments, schema_checks.undeclared_args)",
@@ -1829,6 +1848,23 @@ def _missing_root_warnings(policy: Policy) -> list[str]:
                     if not os.path.isdir(os.path.dirname(root) if deny else root)
                 )
     return found
+
+
+def _variable_root_warnings(policy: Policy) -> list[str]:
+    """Warn about a path root with text that looks like a variable: it is not expanded, so it may not be the
+    folder the author meant."""
+    lists = [("deny_args", policy.deny_args)]
+    for rule in policy.tools:
+        lists += [(f"tools.{rule.name}.deny_args", rule.deny_args), (f"tools.{rule.name}.allow_args", rule.allow_args)]
+    lists += [(f"flows[{index}].unless_args", flow.unless_args) for index, flow in enumerate(policy.flows)]
+    return [
+        f"{where}[{index}]: the root '{root}' holds text that looks like a variable ($NAME, %NAME% or !NAME!). It "
+        "is not expanded: the root is the folder with exactly that name, and a call's value with such text is "
+        "refused. Write the folder's real path"
+        for where, entries in lists
+        for index, entry in enumerate(entries) if isinstance(entry.matcher, PathMatcher)
+        for root in entry.matcher.variable_roots()
+    ]
 
 
 def _labels_said(rules: _RuleIndex, rule: ToolRule) -> bool:
@@ -2527,6 +2563,7 @@ def _hook_options(spec: Any) -> HookOptions:
     return HookOptions(
         config_changes=spec.get("config_changes", "audit"),
         treat_auto_as_non_prompting=spec.get("treat_auto_as_non_prompting", False),
+        policy_changes=spec.get("policy_changes", "block"),
     )
 
 
