@@ -87,7 +87,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Iterable, Sequence
 
-from .detector import VIEW_KINDS, Finding, reads_as, scan_views, view_of, view_sources, views_of
+from .detector import SEVERITY_ORDER, VIEW_KINDS, Finding, reads_as, scan_views, view_of, view_sources, views_of
 from .session import TAIL_CHARS
 from .textutil import MAX_CONTAINERS, texts_in
 
@@ -126,8 +126,9 @@ class _Shapes(dict[int, str]):
     """A str.translate table that writes each character as its shape (see above).
 
     A text's shape has its length, so a position in one is the same in the
-    other. Filled in as characters are met, as the detector's tables are
-    (detector._Table): at most one entry per code point, ever.
+    other. Filled in as characters are met. The table all texts share holds
+    at most _MAX_SHAPES characters: a text that could take it past that gets
+    a table of its own, which goes with it (`compacted`).
     """
 
     def __missing__(self, code: int) -> str:
@@ -146,6 +147,9 @@ def _shape_of(char: str) -> str:
 
 
 _SHAPES = _Shapes()
+# How many characters the shared table may hold: far more than texts use, and a few megabytes at most.
+# Without a bound, texts holding every character of Unicode would leave a table of tens of megabytes behind.
+_MAX_SHAPES = 65_536
 
 
 # ---- what the model reads -------------------------------------------------------------------
@@ -225,7 +229,7 @@ def compacted(text: str) -> str:
     reads whole where those are deleted and in two where they are spaced;
     else (combining marks only) the first.
     """
-    shape = text.translate(_SHAPES)
+    shape = text.translate(_SHAPES if len(_SHAPES) + len(text) <= _MAX_SHAPES else _Shapes())
     pieces: list[str] = []
     at = 0
     for run in _BLANK_RUN.finditer(shape):
@@ -337,13 +341,24 @@ def _grown(source: str, kinds: Sequence[str], wanted: int, from_end: bool, whole
 
 
 def _redacted(views: _Views, redact: Callable[[str], str]) -> _Views:
-    """The views of each piece once `redact` has replaced its secrets (made again only where it replaced any)."""
+    """The views of each piece once `redact` has replaced its secrets (made again only where it replaced any).
+
+    A secret is looked for in the piece as it is (before the views close up
+    its words) and then in its plain view: a view writes a value spelled in
+    full-width letters, or with zero-width spaces or marks inside it, as
+    plain text, which `redact` does not read in the piece. Where the plain
+    view holds one, the redacted plain view is the piece from then on.
+    """
     pieces: dict[int, tuple[str, list[str]]] = {}
     for kind, (piece, _) in views.items():
         pieces.setdefault(id(piece), (piece, []))[1].append(kind)
     redacted = dict(views)
     for piece, kinds in pieces.values():
         kept = redact(piece)
+        plain = view_of(VIEW_KINDS[0], kept)
+        folded = redact(plain)
+        if folded != plain:
+            kept = folded
         if kept != piece:
             redacted.update({kind: (kept, view) for kind, view in views_of(kept, kinds).items()})
     return redacted
@@ -384,15 +399,22 @@ def read_with_tail(
     before += [""] * (len(VIEW_KINDS) - len(before))
     found: list[Finding] = []
     read: set[tuple[str, str]] = set()
-    after: list[str] = []
+    after: list[tuple[str, bool]] = []
+    alone: list[str] = []
     for kind, kept in zip(VIEW_KINDS, before):
         if kept.strip():
             for pair in _readings(kept, ends.start(kind)):
                 if pair not in read:  # most texts read the same in several kinds of view
                     read.add(pair)
                     found += _joined_findings(*pair, known, names)
-        after.append(_next_tail(kept, *ends.end(kind), redact))
-    return found, tuple(after)
+        end, whole = ends.end(kind)
+        after.append(_next_tail(kept, end, whole, redact))
+        alone.append(end[-TAIL_CHARS:] if end.strip() else kept)
+    if any(replaced for _, replaced in after):
+        # A secret the tail and the text make together was replaced in one kind of view. Another kind may
+        # spell it otherwise ("_" read as a space), where `redact` does not see it: no kind rolls this time.
+        return found, tuple(kept if replaced else end for (kept, replaced), end in zip(after, alone))
+    return found, tuple(kept for kept, _ in after)
 
 
 def _readings(tail: str, head: str) -> list[tuple[str, str]]:
@@ -410,8 +432,11 @@ def _readings(tail: str, head: str) -> list[tuple[str, str]]:
     return [(left, gap + head) for left in lefts for gap in gaps]
 
 
-def _next_tail(tail: str, end: str, whole: bool, redact: Callable[[str], str] | None = None) -> str:
-    """The tail of one kind to keep once a text is delivered after `tail`; `end`, `whole`: _Ends.end of the text.
+def _next_tail(
+    tail: str, end: str, whole: bool, redact: Callable[[str], str] | None = None
+) -> tuple[str, bool]:
+    """(The tail of one kind to keep once a text is delivered after `tail`, whether a secret was replaced in it
+    that the two make together); `end`, `whole`: _Ends.end of the text.
 
     A text with nothing to read keeps the tail as it was. A short text (all
     of it is in `end`) rolls into the tail: with SEAM between them when the
@@ -420,16 +445,16 @@ def _next_tail(tail: str, end: str, whole: bool, redact: Callable[[str], str] | 
     joined only.
     """
     if not end.strip():
-        return tail
+        return tail, False
     if not tail or not whole:
-        return end[-TAIL_CHARS:]
+        return end[-TAIL_CHARS:], False
     rolled = tail + ("" if tail.endswith(" ") or end.startswith(" ") else SEAM) + end
     if redact is not None and SEAM in rolled:
         joined = rolled.replace(SEAM, "")
         kept = redact(joined)
         if kept != joined:
-            rolled = kept
-    return rolled[-TAIL_CHARS:]
+            return kept[-TAIL_CHARS:], True
+    return rolled[-TAIL_CHARS:], False
 
 
 def _names(parameter_names: Iterable[str]) -> tuple[str, ...]:
@@ -449,24 +474,44 @@ def _joined_findings(tail: str, head: str, known: list[Finding], names: tuple[st
 
     (A pair from _readings: `head` starts with the space between them, if any.)
     `known` are the findings of the new text itself: a rule it matches is
-    reported for it already. For a rule the tail matches on its own
-    (reported with the content it came from), the joined text is read again
-    from just after the tail's own match (_after_own_match), so that only
-    another match, one that ends in the new text, counts. Excerpts start
-    with JOINED.
+    reported for it already, at the severity it has there. A rule is
+    reported again when the joined text makes it more severe: a link with
+    a slot for data is medium alone and high once the sentence before it,
+    at the end of the last result, names a secret. For a rule the tail
+    matches on its own at the same severity (reported with the content it
+    came from), the joined text is read again from just after the tail's
+    own match (_after_own_match), so that only another match, one that ends
+    in the new text, counts; one the joined text makes more severe than the
+    tail has it alone needs the new text, and counts as it is. Excerpts
+    start with JOINED.
     """
     if not head.strip():
         return []
-    have = {finding.rule for finding in known}
-    joined = [finding for finding in _scan(tail + head, names) if finding.rule not in have]
+    have = _severities(known)
+    joined = [finding for finding in _scan(tail + head, names) if _more_severe(finding, have)]
     if not joined:
         return []
-    alone = {finding.rule for finding in _scan(tail, names)}
-    found = [finding for finding in joined if finding.rule not in alone]
-    for rule in sorted({finding.rule for finding in joined} & alone):
+    alone = _severities(_scan(tail, names))
+    found = [finding for finding in joined if _more_severe(finding, alone)]
+    for rule in sorted({finding.rule for finding in joined} - {finding.rule for finding in found}):
         rest = _after_own_match(tail, rule, names)
-        found += [finding for finding in _scan(rest + head, names) if finding.rule == rule]
+        found += [
+            finding for finding in _scan(rest + head, names) if finding.rule == rule and _more_severe(finding, have)
+        ]
     return [Finding(finding.rule, finding.severity, JOINED + finding.excerpt) for finding in found]
+
+
+def _severities(findings: Iterable[Finding]) -> dict[str, int]:
+    """Each rule among `findings` with the rank of its severity (the highest, should a rule be there twice)."""
+    ranks: dict[str, int] = {}
+    for finding in findings:
+        ranks[finding.rule] = max(SEVERITY_ORDER[finding.severity], ranks.get(finding.rule, -1))
+    return ranks
+
+
+def _more_severe(finding: Finding, than: dict[str, int]) -> bool:
+    """Whether `finding` is of a rule not among `than`, or more severe than that rule is there."""
+    return SEVERITY_ORDER[finding.severity] > than.get(finding.rule, -1)
 
 
 def _after_own_match(tail: str, rule: str, names: tuple[str, ...] = ()) -> str:

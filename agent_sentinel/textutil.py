@@ -318,7 +318,9 @@ def normalised_arguments(value: Any) -> Any:
         int or float becomes the plain type); bytes stay bytes (read as UTF-8);
       * an Enum: its value, made JSON in turn;
       * a path (os.PathLike): os.fspath() of it;
-      * an object with model_dump (a pydantic model): model_dump(mode="json");
+      * an object with model_dump (a pydantic model): model_dump(mode="json"),
+        with the fields it leaves out or a serializer rewrites read as the
+        model holds them (`_model_copy`);
       * a dataclass instance: an object of its fields, as dataclasses.asdict gives;
       * a UUID, a datetime, date or time, a Decimal: its str();
       * a mapping: an object (keys become text as JSON writes them; two keys
@@ -490,7 +492,7 @@ def _converted(item: Any) -> Any:
     if isinstance(item, os.PathLike):
         return _called(os.fspath, item)
     if callable(getattr(item, "model_dump", None)):
-        return _called(lambda model: model.model_dump(mode="json"), item)
+        return _called(_model_copy, item)
     if isinstance(item, (Mapping, *_ARRAYS)) or dataclasses.is_dataclass(item):
         if dataclasses.is_dataclass(item) and isinstance(item, (Mapping, *_ARRAYS)):
             raise UnscannableError(f"an argument of type {type(item).__name__} is two kinds of value at once")
@@ -503,6 +505,60 @@ def _converted(item: Any) -> Any:
     if pydantic_core is not None and type(item).__module__.split(".")[0] in ("pydantic", "pydantic_core"):
         return _called(pydantic_core.to_jsonable_python, item)
     raise UnscannableError(f"an argument of type {type(item).__name__} cannot be checked")
+
+
+def _model_copy(model: Any) -> Any:
+    """A pydantic model as the checks read it: model_dump(mode="json"), and what the tool reads that it hides.
+
+    The tool reads the model's attributes, and model_dump leaves out a field
+    with exclude=True and writes a field with a serializer as the serializer
+    says. Each such field is read as the model holds it, and so is each
+    private attribute that holds text, bytes or a number (PrivateAttr). A
+    pydantic secret among them is read as model_dump writes one, masked. A
+    value of a kind that cannot be checked is left out, as model_dump left
+    it out. A model whose own serializer writes it as no object is read as
+    it writes itself.
+    """
+    dumped = model.model_dump(mode="json")
+    fields = getattr(type(model), "model_fields", None)
+    if type(dumped) is not dict or not isinstance(fields, Mapping):
+        return dumped
+    hidden = {name for name in fields if name not in dumped} | _serialised_fields(type(model), fields)
+    for name in sorted(hidden):
+        held = getattr(model, name, None)
+        if held is None or held == "":
+            continue  # nothing in it to check
+        if callable(getattr(held, "get_secret_value", None)):
+            dumped[name] = _MASKED
+            continue
+        try:
+            dumped[name] = normalised_arguments(held)
+        except UnscannableError:
+            continue
+    private = getattr(model, "__pydantic_private__", None)
+    if isinstance(private, dict):
+        for name, held in private.items():
+            if isinstance(name, str) and name not in dumped and type(held) in (str, bytes, int, float) and held:
+                dumped[name] = normalised_arguments(held)
+    return dumped
+
+
+_MASKED = "**********"  # how pydantic writes a secret (SecretStr, SecretBytes) as JSON
+
+
+def _serialised_fields(model_type: Any, fields: Mapping[str, Any]) -> set[str]:
+    """The names of the fields of a pydantic model that a serializer writes (all of them for a model_serializer)."""
+    decorators = getattr(model_type, "__pydantic_decorators__", None)
+    if getattr(decorators, "model_serializers", None):
+        return set(fields)
+    names: set[str] = set()
+    for decorator in dict(getattr(decorators, "field_serializers", None) or {}).values():
+        covered = getattr(getattr(decorator, "info", None), "fields", ())
+        names.update(fields if "*" in covered else (name for name in covered if name in fields))
+    for name, field in fields.items():
+        if any(type(part).__name__ in ("PlainSerializer", "WrapSerializer") for part in getattr(field, "metadata", ())):
+            names.add(name)
+    return names
 
 
 def _called(function: Any, item: Any) -> Any:
@@ -671,12 +727,19 @@ def percent_decoded(text: str) -> str:
 # Terminal escapes and Unicode tag characters
 # --------------------------------------------------------------------------
 
-# Terminal escape sequences: CSI (colours, cursor moves: ESC [ ... letter) and
-# OSC (window titles, OSC 8 hyperlinks: ESC ] ... BEL or ESC \). Every part is
-# bounded, so a hostile text cannot make one attempt read far ahead. A longer
-# sequence is not matched; removing the ESC character then leaves it as
-# harmless visible text.
-TERMINAL_ESCAPE = re.compile(r"\x1b\[[0-?]{0,64}[ -/]{0,8}[@-~]|\x1b\][^\x07\x1b]{0,512}(?:\x07|\x1b\\)")
+# Terminal escape sequences: CSI (colours, cursor moves: ESC [ ... letter, or
+# the one-character CSI U+009B) and OSC (window titles, OSC 8 hyperlinks: ESC ]
+# or U+009D ... BEL, ESC \ or U+009C). The parameters of a CSI have no length
+# bound, as a terminal reads any number of them ("ESC[000...0m" with a hundred
+# zeros is a colour): they cannot hold the characters that start or end a
+# sequence, so no character is read by more than a few attempts. An OSC is
+# bounded, so that one attempt cannot read far ahead; a longer one is not
+# matched, and removing the ESC character then leaves it as visible text.
+TERMINAL_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]{0,8}[@-~]|\x1b\][^\x07\x1b\x9c]{0,512}(?:\x07|\x1b\\|\x9c)")
+# The same sequences started by the one-character CSI and OSC. A pattern of its
+# own, used only on text that has one: a pattern that starts with ESC alone is
+# searched for far more quickly than one that starts with any of three.
+C1_TERMINAL_ESCAPE = re.compile(r"\x9b[0-?]*[ -/]{0,8}[@-~]|\x9d[^\x07\x1b\x9c]{0,512}(?:\x07|\x1b\\|\x9c)")
 
 # Unicode tag characters (U+E0000 to U+E007F) draw nothing, and U+E0020 to
 # U+E007E copy printable ASCII one to one. A sentence written in them is
@@ -809,10 +872,15 @@ _MAX_CARRIER_RUNS = 256
 _MAX_BIT_GROUPS = 8 * 1024
 # Bits scattered in groups of one to seven are read joined across the visible
 # text only when there are this many of one pair (a payload of
-# HIDDEN_TEXT_CHARS characters), and both of its characters occur: ordinary
+# _MIN_SCATTERED_CHARS characters), and both of its characters occur: ordinary
 # text uses one of them alone (Persian ZWNJ), which reads as no text at all.
 # Of them, the first _MAX_SCATTERED_BITS are read (4 KiB of hidden text).
-_MIN_SCATTERED_BITS = 8 * HIDDEN_TEXT_CHARS
+# A payload gathered from across a text needs more characters than one that
+# stands in a run: text that uses both characters of a pair (Persian words
+# next to emoji joined by ZWJ) spells random bytes, and eight random bytes
+# are printable once in a few hundred texts, sixteen about never.
+_MIN_SCATTERED_CHARS = 16
+_MIN_SCATTERED_BITS = 8 * _MIN_SCATTERED_CHARS
 _MAX_SCATTERED_BITS = 8 * 4096
 
 
@@ -962,15 +1030,33 @@ def _scattered_text(carriers: str, pair: str) -> str | None:
     """What the carriers of one pair, gathered from across a text, spell; None unless it is a payload.
 
     That needs _MIN_SCATTERED_BITS carriers or more, both characters of the
-    pair, and text of HIDDEN_TEXT_CHARS characters or more, with
-    _MIN_DISTINCT_CHARS different ones, in the first _MAX_SCATTERED_BITS.
+    pair, and, in the first _MAX_SCATTERED_BITS, text with
+    _MIN_DISTINCT_CHARS different characters that reads as written text
+    somewhere (`_reads_as_written_text`): the joiners of ordinary text, read
+    as bits, pass for "mostly printable" now and then, but not for that.
     """
     if len(carriers) < _MIN_SCATTERED_BITS or pair[0] not in carriers or pair[1] not in carriers:
         return None
     spelled = _bits_spelled(carriers[:_MAX_SCATTERED_BITS], pair)
-    if spelled is None or len(spelled) < HIDDEN_TEXT_CHARS or len(set(spelled)) < _MIN_DISTINCT_CHARS:
+    if spelled is None or len(set(spelled)) < _MIN_DISTINCT_CHARS or not _reads_as_written_text(spelled):
         return None
     return spelled
+
+
+def _reads_as_written_text(text: str) -> bool:
+    """Whether `text` has _MIN_SCATTERED_CHARS characters in a row that are all printable, at least half of them
+    letters or spaces: a sentence or a command, not bytes that happen to be printable."""
+    position = 0
+    unprintable = [
+        match.start() for match in _NOT_PLAIN_ASCII.finditer(text)
+        if match.group() == _REPLACEMENT or not match.group().isprintable()
+    ]
+    for at in (*unprintable, len(text)):
+        if at - position >= _MIN_SCATTERED_CHARS:
+            if 2 * len(_LETTERS_AND_SPACES.findall(text, position, at)) >= at - position:
+                return True
+        position = at + 1
+    return False
 
 
 def _unprintable(text: str) -> float:
@@ -1110,6 +1196,8 @@ def clean_for_forwarding(text: str) -> str:
     """
     if "\x1b" in text:
         text = TERMINAL_ESCAPE.sub("", text)
+    if "\x9b" in text or "\x9d" in text:
+        text = C1_TERMINAL_ESCAPE.sub("", text)
     text = text.translate(_CONTROLS_AND_BIDI)
     if "\r" in text:
         text = _LONE_CARRIAGE_RETURN.sub("\n", text)
@@ -1207,7 +1295,9 @@ def folded_text(text: str) -> str:
     returned as it is. Normalized in slices, never cut between a character
     and the marks that combine with it, and a slice that would grow more than
     _MAX_FOLD_EXPANSION times has its expanding characters made spaces, so
-    hostile text stays quick and short.
+    hostile text stays quick and short. (A slice with one of the characters
+    of _MAY_EXPAND is measured by its characters each folded alone, which
+    can be a little longer than the slice folded whole.)
     """
     if text.isascii():
         return text
@@ -1220,15 +1310,38 @@ def folded_text(text: str) -> str:
         while end < reach and unicodedata.combining(text[end]):
             end += 1
         piece = text[start:end]
+        # Normalising a slice full of characters that expand is itself slow (on Windows above all), so a
+        # slice that holds any of those that expand most is first measured without normalising it.
+        if _MAY_EXPAND.search(piece) is not None and _folded_length(piece) > _MAX_FOLD_EXPANSION * len(piece):
+            piece = _without_expanding(piece)
         folded = unicodedata.normalize("NFKC", piece)
-        if len(folded) > _MAX_FOLD_EXPANSION * len(piece):
-            piece = "".join(
-                " " if len(unicodedata.normalize("NFKC", ch)) > _MAX_FOLD_EXPANSION else ch for ch in piece
-            )
-            folded = unicodedata.normalize("NFKC", piece)
+        if len(folded) > _MAX_FOLD_EXPANSION * len(piece):  # a character that expands, not among those
+            folded = unicodedata.normalize("NFKC", _without_expanding(piece))
         pieces.append(folded)
         start = end
     return "".join(pieces)
+
+
+# Where the characters are that NFKC writes as more than _MAX_FOLD_EXPANSION characters: squared Katakana
+# words and units (U+3307 ... U+33AF) and two Arabic ligatures (U+FDFA, U+FDFB, which become 18 and 8).
+_MAY_EXPAND = re.compile("[㌀-㏿ﷺﷻ]")
+
+
+def _folded_length(piece: str) -> int:
+    """How long `piece` is with each character in its own NFKC form (composing marks only shortens it)."""
+    return sum(piece.count(ch) * len(unicodedata.normalize("NFKC", ch)) for ch in set(piece))
+
+
+def _without_expanding(piece: str) -> str:
+    """`piece` with a space for each character NFKC writes as more than _MAX_FOLD_EXPANSION characters.
+
+    One translate, with a table of the characters of the piece: not a
+    normalisation per character.
+    """
+    expanding = {
+        ord(ch): " " for ch in set(piece) if len(unicodedata.normalize("NFKC", ch)) > _MAX_FOLD_EXPANSION
+    }
+    return piece.translate(expanding)
 
 
 def clean_value_for_forwarding(value: Any) -> Any:
@@ -1421,6 +1534,73 @@ _MAX_SKIPPED_BYTES = 16
 # How many bytes of a binary run are returned as Latin-1 when they are asked
 # for (the secret guard: a token inside binary data).
 MAX_BINARY_BYTES = 4 * 1024
+# Base64 cut into pieces, read joined up (besides each piece that is long
+# enough, on its own: two values next to each other are not one).
+# Pieces: runs of _MIN_PIECE_CHARS characters or more (as the run pattern
+# finds them) with a line break and its indent, a space or two, or a
+# written-out "\n" between them (_PIECE_BREAK); after a line break the last
+# piece may be shorter (_LAST_PIECE). Shorter pieces are the words of
+# ordinary text. They are grouped as the runs are found, so the text is
+# read once.
+# _SHORT_LINES: three or more whole lines of 8 to 15 characters, as base64
+# wrapped at a short width, and a shorter last line. It starts with the line
+# break before the block (or the start of the text), which lets the regex
+# engine jump from one line break to the next.
+_BASE64_CHARS = "A-Za-z0-9+/_-"
+# How long a piece is: wrapped base64 has lines of 64 or 76 characters, and a
+# longer run is a value of its own, not a piece of one.
+_MIN_PIECE_CHARS = 16
+_MAX_PIECE_CHARS = 256
+# What stands between two pieces. A written-out "\n" puts an "n" in front of the next piece ("\r" the
+# character between the two backslashes), which the run that follows starts with.
+_PIECE_BREAK = re.compile(r"\r?\n[ \t]{0,8}|[ \t]{1,2}")
+_WRITTEN_OUT_BREAK = ("\\", "\\r\\")
+_LAST_PIECE = re.compile(rf"\r?\n[ \t]{{0,8}}[{_BASE64_CHARS}]{{1,15}}(?![{_BASE64_CHARS}])={{0,2}}")
+_LINES = (
+    rf"(?P<block>[{_BASE64_CHARS}]{{8,15}}(?:\r?\n[{_BASE64_CHARS}]{{8,15}}){{2,}}"
+    rf"(?:\r?\n[{_BASE64_CHARS}]{{1,7}}(?![{_BASE64_CHARS}]))?={{0,2}})"
+)
+_SHORT_LINES = re.compile(r"\n" + _LINES)
+_SHORT_LINES_FIRST = re.compile(_LINES)
+
+
+_MAX_BLOCKS = 256  # blocks of pieces gathered from one text: more than the attempts of any decoder
+# How long a block of pieces gets: far more than the bytes of one run that are decoded (max_run_bytes). A
+# longer one is read as blocks of this length.
+_MAX_BLOCK_CHARS = 32 * 1024
+
+
+_COMMON_BREAKS = frozenset({" ", "\n", "\r\n", "\t", "  "})
+
+
+def _breaks_pieces(text: str, end: int, start: int) -> bool:
+    """Whether what stands between a piece that ends at `end` and a run that starts at `start` is a break."""
+    if start - end > 10:
+        return False
+    gap = text[end:start]
+    if gap in _COMMON_BREAKS:
+        return True
+    if gap in _WRITTEN_OUT_BREAK:
+        return text.startswith("n", start)
+    return _PIECE_BREAK.fullmatch(gap) is not None
+
+
+def _block_of(text: str, start: int, end: int) -> tuple[int, int]:
+    """Where a block of pieces from `start` to `end` stands in `text`, with a shorter last piece on the next line."""
+    last = _LAST_PIECE.match(text, end)
+    return start, last.end() if last else end
+
+
+def _joined_up(run: str) -> str:
+    """A run without what stands between its pieces: line breaks, spaces, written-out line breaks.
+
+    The run itself when it is in one piece.
+    """
+    if "\\" in run:
+        run = run.replace("\\r\\n", "").replace("\\n", "")
+    if "\n" in run or " " in run or "\t" in run or "\r" in run:
+        return "".join(run.split())
+    return run
 
 
 class DecodedRun(NamedTuple):
@@ -1449,9 +1629,16 @@ class EncodedRuns:
     sample and the text found of the bytes, so a long binary run costs
     little. Every run that looks encoded costs an attempt, binary or not.
 
+    Base64 cut into pieces (lines, spaces, written-out line breaks between
+    them: `_runs`, `_SHORT_LINES`) is also read joined up. A run full of "/"
+    is tried out of a count of its own and kept only if it is text (a path is
+    no text). A run that is not text as it stands is also read from its second
+    character on (base64: also its third and fourth; hex: one digit in front),
+    at no further attempt; an odd number of hex digits is read without its last.
+
     The limits make the work bounded on hostile input, and they can be used to
     hide a payload: runs placed before it use up the attempts or the bytes, and
-    a payload encoded twice, split over runs, or written with separators
+    a payload encoded twice, split over runs, or hex written with separators
     ("48 65 6c", "\\x48") is not decoded. Runs shorter than the minimum
     lengths are not decoded either. Which runs are pictures is the caller's
     business: give the decoder only the text it should read (text_views' media).
@@ -1478,7 +1665,7 @@ class EncodedRuns:
         min_hex_chars: int = MIN_HEX_CHARS,
         binary: bool = False,
     ) -> None:
-        self.attempts_left = max_attempts
+        self.attempts_left = self._max_attempts = max_attempts
         self.kept_left = max_kept
         self.bytes_left = max_bytes
         self._max_run_bytes = max_run_bytes
@@ -1490,39 +1677,110 @@ class EncodedRuns:
         # several lines, as `base64` wraps its output. Hex is also looked for on
         # its own, because a letter or "/" before it ("example/6768...") makes
         # the longer run base64-shaped.
-        shortest = min(min_base64_chars, min_hex_chars)
-        self._run_pattern = re.compile(rf"[A-Za-z0-9+/_-]{{{shortest},}}(?:\r?\n[A-Za-z0-9+/_-]+)*={{0,2}}")
+        # Runs as short as a piece are found (`_runs`), and only those of the
+        # shortest length decoded are tried on their own. Each match is a whole
+        # run: one that is long enough matches from its first character on.
+        self._shortest = shortest = min(min_base64_chars, min_hex_chars)
+        self._run_pattern = re.compile(
+            rf"[{_BASE64_CHARS}]{{{min(shortest, _MIN_PIECE_CHARS)},}}(?:\r?\n[{_BASE64_CHARS}]+)*={{0,2}}"
+        )
         self._hex_pattern = re.compile(rf"[0-9A-Fa-f]{{{min_hex_chars},}}")
         self._seen: set[str] = set()
+        # Runs full of "/" are paths far more often than base64. They are tried all the same (see
+        # `_attempt`), but out of a count of their own: a listing of files must not use up the attempts.
+        self._path_attempts_left = max_attempts
 
-    def decoded(self, text: str) -> list[DecodedRun]:
-        """Each new run in `text` that decodes to text: base64-shaped runs first, then hex ones."""
+    def decoded(self, text: str, *, read_before: str | None = None) -> list[DecodedRun]:
+        """Each new run in `text` that decodes to text: base64-shaped runs first, then hex ones, then base64
+        cut into pieces (see `_runs`) and in short lines (`_SHORT_LINES`).
+
+        read_before: a text this decoder was given before, of which `text`
+        is another spelling (the same without invisible characters, say). A
+        run that stands in it as it does here was read there and is passed
+        over, and at most `max_attempts` runs that this decoder has not met
+        are looked at: only what the other spelling brings together is new.
+        """
         found: list[DecodedRun] = []
-        for match in itertools.chain(self._run_pattern.finditer(text), self._hex_pattern.finditer(text)):
+        unmet_left = self._max_attempts
+        for run in self._runs(text):
             if self.attempts_left <= 0 or self.kept_left <= 0 or self.bytes_left <= 0:
                 break
-            run = match.group()
             if run in self._seen:
                 continue
+            if read_before is not None:
+                if unmet_left <= 0:
+                    break
+                unmet_left -= 1
+                # Only its start can be decoded (max_run_bytes): a long run is not copied and read whole.
+                run = run[: 2 * self._max_run_bytes + 4]
+                if run in read_before or run in self._seen:
+                    continue
             self._seen.add(run)
-            compact = "".join(run.split()) if "\n" in run else run
+            compact = _joined_up(run)
+            if compact is not run:
+                if compact in self._seen:
+                    continue  # the same run with other breaks between its pieces
+                self._seen.add(compact)
+            attempts = self.attempts_left + self._path_attempts_left
             first = self._attempt(compact, run)
+            tried = self.attempts_left + self._path_attempts_left < attempts
             results = [first]
             if "/" in compact and (_not_clean_text(first) or _partly_text(first)):
                 # In a URL the path before a run is part of it ("example/Z2hw..."): try what follows the last "/".
                 tail = compact.rpartition("/")[2]
                 if tail not in self._seen:
                     self._seen.add(tail)
-                    from_tail = self._attempt(tail, tail)
-                    if _is_text(first) and _is_text(from_tail) and first.text.endswith(from_tail.text):
-                        results = [from_tail]  # the same text, without the path read as bytes in front of it
-                    else:
-                        results.append(from_tail)
+                    results.append(self._attempt(tail, tail))
+            if len(results) == 2:
+                results = _with_the_part_after_a_slash(*results)
+            if tried and not _is_text(first):
+                # Not text as it stands. A character or two written in front of a run shifts every
+                # byte of it: read from one of its next characters, it may be text from there on.
+                # Read as well, not instead: binary data as it stands may hold a token (the guard).
+                # Only a run that was tried: one past the limits is not read at all.
+                results.append(self._shifted(compact, run))
             for result in results:
                 if result is not None and self.kept_left > 0:
                     self.kept_left -= 1
                     found.append(result)
         return found
+
+    def _runs(self, text: str) -> Iterator[str]:
+        """The candidates in `text`, as they stand in it: runs, hex runs, then blocks of pieces and short lines.
+
+        The blocks of pieces are gathered from the runs as they are found
+        (at most _MAX_BLOCKS of them), and come after the hex runs.
+        """
+        blocks: list[tuple[int, int]] = []
+        shortest = self._shortest
+        first = last = -1  # where the block of pieces being gathered starts and ends
+        pieces = 0
+        for match in self._run_pattern.finditer(text):
+            start, end = match.span()
+            if end - start >= shortest:
+                yield match.group()
+            if not _MIN_PIECE_CHARS <= end - start <= _MAX_PIECE_CHARS or len(blocks) >= _MAX_BLOCKS:
+                continue
+            if pieces and end - first <= _MAX_BLOCK_CHARS and (
+                text[last:start] in _COMMON_BREAKS or _breaks_pieces(text, last, start)
+            ):
+                last, pieces = end, pieces + 1
+                continue
+            if pieces > 1:
+                blocks.append(_block_of(text, first, last))
+            first, last, pieces = start, end, 1
+        if pieces > 1 and len(blocks) < _MAX_BLOCKS:
+            blocks.append(_block_of(text, first, last))
+        for match in self._hex_pattern.finditer(text):
+            yield match.group()
+        for start, end in blocks:
+            yield text[start:end]
+        if "\n" in text:
+            first = _SHORT_LINES_FIRST.match(text)
+            if first is not None:
+                yield first.group("block")
+            for match in _SHORT_LINES.finditer(text):
+                yield match.group("block")
 
     def _attempt(self, compact: str, run: str) -> DecodedRun | None:
         """Decode one candidate, if it looks encoded and the limits allow; None if it is not text."""
@@ -1531,30 +1789,57 @@ class EncodedRuns:
         kind = self._kind(compact)
         if kind is None:
             return None
-        self.attempts_left -= 1
-        return self._decode(compact, kind, run)
+        # A run full of path separators is a path, unless it decodes to text: "?" at the right places
+        # of a text is written "/", and a payload must not escape decoding by holding many of them. A
+        # run of slashes counts once: it is how bytes 0xFF are written ("////").
+        path = kind == "base64" and len(_SLASHES.findall(compact)) * 16 > len(compact)
+        if path:
+            if self._path_attempts_left <= 0:
+                return None
+            self._path_attempts_left -= 1
+        else:
+            self.attempts_left -= 1
+        return self._decode(compact, kind, run, path)
 
     def _kind(self, run: str) -> str | None:
         """How to decode `run`, or None if it does not look like encoded text at all (which costs no attempt)."""
         bare = run.rstrip("=")
-        if len(bare) >= self._min_hex_chars and len(bare) % 2 == 0 and _HEX_DIGITS.fullmatch(bare):
-            return "hex"
+        if len(bare) >= self._min_hex_chars and _HEX_DIGITS.fullmatch(bare):
+            return "hex"  # with an odd number of digits too: one more digit must not switch decoding off
         if len(run) < self._min_base64_chars:
             return None
-        # Base64 of text has capitals and small letters, and rarely a "/": a
-        # run without both, or full of path separators, is a word, a path or an
-        # id. A run of slashes counts once: it is how bytes 0xFF are written
-        # ("////"), and a payload must not escape decoding by ending in them.
-        if not (_UPPER.search(run) and _LOWER.search(run)) or len(_SLASHES.findall(run)) * 16 > len(run):
+        # Base64 of text has capitals and small letters: a run without both is a word or an id.
+        if not (_UPPER.search(run) and _LOWER.search(run)):
             return None
         if ("+" in run or "/" in run) and ("-" in run or "_" in run):
             return None  # both alphabets at once: not base64
         return "base64"
 
-    def _decode(self, compact: str, kind: str, run: str) -> DecodedRun | None:
-        """Decode a run: first a sample, to tell text from binary data, then as much as the limits allow."""
+    def _shifted(self, compact: str, run: str) -> DecodedRun | None:
+        """A run that is not text as it stands, read from its second character on (base64: also its third
+        or fourth), if it is text from there; else None. See `_realigned`. It costs no further attempt."""
+        kind = self._kind(compact)
+        if kind is None or self.bytes_left <= 0:
+            return None
         limit = min(self._max_run_bytes, self.bytes_left)
-        bare = _without_padding(compact.rstrip("="), kind)
+        realigned = _realigned(compact.rstrip("="), kind, limit)
+        if realigned is None:
+            return None
+        bare, sample, sample_cut, whole, found = realigned
+        raw, cut = (sample, sample_cut) if whole else _raw_bytes(bare, kind, limit)
+        found_text = None if raw is None else _text_of(raw[found[0]:], truncated=cut < len(bare))
+        if raw is None or found_text is None or not found_text[1]:
+            return None  # text at its start only: the run as it stands is read for pieces of text already
+        self.bytes_left -= len(raw)
+        return DecodedRun(kind, found_text[0], run)
+
+    def _decode(self, compact: str, kind: str, run: str, path: bool = False) -> DecodedRun | None:
+        """Decode a run: first a sample, to tell text from binary data, then as much as the limits allow.
+
+        path: the run is full of "/" (see `_attempt`): it is returned only if text is found in it.
+        """
+        limit = min(self._max_run_bytes, self.bytes_left)
+        bare = _whole_groups(_without_padding(compact.rstrip("="), kind), kind)
         sample, sample_cut = _raw_bytes(bare, kind, min(limit, _SAMPLE_BYTES + _MAX_SKIPPED_BYTES))
         if sample is None:
             return None  # not valid base64 or hex
@@ -1576,6 +1861,9 @@ class EncodedRuns:
             found_text = _text_of(raw, truncated=cut < len(bare))
             # Charged for the sample and the text found: a binary run must not use up the bytes of the runs after it.
             charged = len(sample) + (len(found_text[0]) if found_text else 0)
+        if found_text is None and path:
+            self.bytes_left -= charged
+            return None  # a path after all
         if found_text is None or (not found_text[1] and self._binary):
             # Binary data, or text and binary data: the guard reads it all as Latin-1, so nothing in it is missed.
             return self._binary_run(bare, kind, run, raw, cut >= len(bare), limit, charged)
@@ -1628,6 +1916,73 @@ def _without_padding(bare: str, kind: str) -> str:
     rest = bare[repeated.end():] if repeated else bare
     shortest = 2 * _MIN_TEXT_CHARS if kind == "hex" else (_MIN_TEXT_CHARS * 4 + 2) // 3
     return rest if len(rest) >= shortest else bare
+
+
+_A_WORD = re.compile(r"[^\W\d_]{3}")  # three letters in a row
+_BOUNDARY_CHARS = 8  # how much of the text before a tail is looked at for bytes that are no text
+
+
+def _with_the_part_after_a_slash(first: DecodedRun | None, from_tail: DecodedRun | None) -> list[DecodedRun | None]:
+    """What is kept of a run and of the part after its last "/", each as decoded (None: not text).
+
+    Both, unless one says nothing the other does not: a tail whose text
+    stands inside the run's adds nothing. When the run's text ends with the
+    tail's, what stands before it in the run decides.
+
+      * No words (a URL's path read as base64): the tail alone, the same
+        text without those bytes in front of it. Unless they end in a letter
+        or digit and hold no control character: then they may be the start
+        of a word that a stray byte cut ("Ig", a byte, "nore all ..."), and
+        both are kept.
+      * Words: the run, which has all of the text; the tail is its end, cut
+        where a "/" happened to stand. With the tail when bytes that are no
+        text stand right before it in the run, so that its first word is
+        read clean as well.
+    """
+    if first is None or first.binary or from_tail is None or from_tail.binary:
+        return [first, from_tail]
+    if not first.text.endswith(from_tail.text):
+        return [first] if from_tail.text in first.text else [first, from_tail]
+    before = first.text[: len(first.text) - len(from_tail.text)]
+    if _A_WORD.search(before) is None:
+        cuts_a_word = before.rstrip(_REPLACEMENT)[-1:].isalnum() and all(ch.isprintable() for ch in before)
+        return [first, from_tail] if cuts_a_word else [from_tail]
+    near = before[-_BOUNDARY_CHARS:]
+    return [first, from_tail] if any(ch == _REPLACEMENT or not ch.isprintable() for ch in near) else [first]
+
+
+def _whole_groups(bare: str, kind: str) -> str:
+    """A run without the last digit of an odd number of hex digits: one digit cannot be a byte."""
+    return bare[:-1] if kind == "hex" and len(bare) % 2 else bare
+
+
+def _realigned(
+    bare: str, kind: str, limit: int
+) -> tuple[str, bytes, int, bool, tuple[int, bool]] | None:
+    """A run read from its second character on (base64: also its third or fourth), if it is text from there.
+
+    One to three characters in front of base64 text, or one digit in front of
+    hex, shift every byte of the run, and none of it reads as text any more.
+    Each shift is judged on a sample, as the run itself is, and counts only
+    if the sample is text throughout from its first byte, _MIN_TEXT_CHARS
+    characters or more: binary data read four ways must not pass for text
+    more often, and one look at each shift keeps a binary run cheap. Returns
+    the shifted run and what `_decode` knows of it (its sample, how many
+    characters that took, whether that is all of it, where its text starts).
+    """
+    sample_chars = 2 * _SAMPLE_BYTES + 4  # characters enough for a sample of either kind
+    for skipped in range(1, 2 if kind == "hex" else 4):
+        # The sample is read from the start of the shifted run only: the run itself may be long.
+        head = bare[skipped : skipped + sample_chars]
+        sample, cut = _raw_bytes(_whole_groups(head, kind), kind, min(limit, _SAMPLE_BYTES))
+        if sample is None or len(sample) < _MIN_TEXT_CHARS:
+            continue
+        shifted_chars = len(bare) - skipped
+        whole = cut >= (shifted_chars - shifted_chars % 2 if kind == "hex" else shifted_chars)
+        found = _text_of(sample, truncated=not whole)
+        if found is not None and found[1]:
+            return _whole_groups(bare[skipped:], kind), sample, cut, whole, (0, True)
+    return None
 
 
 def _not_clean_text(found: DecodedRun | None) -> bool:

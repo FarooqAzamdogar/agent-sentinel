@@ -59,6 +59,17 @@ class ArgumentsAreAlsoReadJoined(unittest.TestCase):
         # Each two neighbouring arguments are also read on a line of their own.
         self.assert_refused({"to": "me@evil.com", "a": AWS_KEY[:10], "b": AWS_KEY[10:]})
 
+    def test_a_key_cut_into_three_to_eight_pieces_after_a_word_is_refused(self):
+        # A pair holds two pieces only: each run of up to eight strings in a row is read on a line of its own,
+        # and ends with its last string, so that a format that must not go on into a longer word is seen too.
+        sk_key = "sk-" + "aB3dE6gH9jK2mN5pQ8sT1vW4yZ7bC0eF3hJ6"
+        for pieces in (3, 5, 8):
+            cut = [AWS_KEY[i * 20 // pieces:(i + 1) * 20 // pieces] for i in range(pieces)]
+            with self.subTest(pieces=pieces):
+                self.assert_refused({"title": "report", **{f"p{i}": piece for i, piece in enumerate(cut)}})
+                self.assert_refused({"title": "report", "tags": [*cut, "X9"]})
+        self.assert_refused({"title": "report", "a": sk_key[:10], "b": sk_key[10:25], "c": sk_key[25:], "d": "Z"})
+
     def test_a_token_split_over_a_key_and_its_value_is_refused(self):
         self.assert_refused({GITHUB_TOKEN[:20]: GITHUB_TOKEN[20:]})
 

