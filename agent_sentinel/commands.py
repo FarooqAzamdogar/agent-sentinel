@@ -82,7 +82,7 @@ expansion (/???/cur?, {curl,x}), a shell's -c that cannot be placed (bash -o -c
 x), more wrappers before the program than _MAX_WRAPPERS (nice nice ... curl),
 more than MAX_SEGMENTS commands, more than MAX_COMMAND_CHARS characters, deeper
 nesting than MAX_DEPTH, or a control character. The policy decides what happens
-to it (see CommandRule). A "#" after an escaped blank (a\ #b, PowerShell's
+to it (see CommandRule). A "#" after an escaped blank (a\\ #b, PowerShell's
 a` #b) is part of the word, as the shells read it, not a comment; in cmd's text
 ("cmd /c ...") a "#" never starts a comment and a "'" is no quote.
 
