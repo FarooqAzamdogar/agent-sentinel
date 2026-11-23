@@ -34,6 +34,7 @@ its long name once (_long_home_name).
 
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
 import ntpath
 import os
@@ -55,8 +56,8 @@ TYPES = ("path", "url", "email", "command")
 URL_LIMITS = ("max_label_length", "max_path_segment_chars", "max_query_chars")
 # What each type needs, and what it may have besides.
 _TYPE_REQUIRED = {"path": "roots", "url": "hosts", "email": "domains", "command": "classes"}
-_TYPE_OPTIONAL = {"path": (), "url": ("schemes", *URL_LIMITS), "email": (), "command": ("shell",)}
-TYPE_SETTINGS = ("roots", "hosts", "schemes", "domains", *URL_LIMITS, "classes", "shell")
+_TYPE_OPTIONAL = {"path": ("or_above",), "url": ("schemes", *URL_LIMITS), "email": (), "command": ("shell",)}
+TYPE_SETTINGS = ("roots", "or_above", "hosts", "schemes", "domains", *URL_LIMITS, "classes", "shell")
 # Every key an entry of deny_args or allow_args may have. Keys that suit only
 # one side are accepted here and refused with a specific message by `build`
 # (or, for "optional" and "action", by the policy loader).
@@ -417,7 +418,8 @@ class PathMatcher(Matcher):
     A value is refused (allow_args) or denied (deny_args) when it cannot be
     read with certainty: a Windows short name ("SSH~1"), an alternate data
     stream ("a.txt:secret"), a "\\\\?\\" or "\\\\.\\" path, a network (UNC) path, a
-    device name (CON, NUL, COM1...), a name ending in a dot or a space,
+    device name (CON, NUL, COM1...), a name ending in a dot or a space, a value
+    that starts or ends with a blank of any kind (a tool may trim it, on every system),
     wildcards, control characters, "~user", a path through /proc/<process>/root,
     cwd or fd or through /dev/fd, or more than MAX_PATH_CHARS characters. So is
     one that names an environment variable ($HOME, ${HOME}, $(cmd), %USERPROFILE%;
@@ -436,9 +438,19 @@ class PathMatcher(Matcher):
     Case. On Windows, ASCII letters compare without case (as the file system
     does); other letters must match exactly. Elsewhere, case matters in
     allow_args. deny_args ignores case everywhere, which can only add blocks.
+
+    "or_above": true (deny_args only) also denies a value that is a folder
+    above a root, such as the home folder for the root "~/.ssh": for a tool
+    that searches everything below the folder it is given.
+
+    Roots. A root is the folder spelled exactly as written (after "~/"): text
+    in it that looks like a variable ($data, %name%, !name!) is not expanded,
+    and `variable_roots` lists such roots for a warning. A call's value with
+    such text is still refused, as above.
     """
 
     roots: tuple[str, ...]  # canonical, as made by `for_roots`
+    or_above: bool = False
     # For tests: the path rules of another system, and fixed folders. Defaults are this machine's.
     flavour: ModuleType = field(default=os.path, repr=False)
     current_folder: Callable[[], str] = field(default=os.getcwd, repr=False, compare=False)
@@ -462,7 +474,9 @@ class PathMatcher(Matcher):
 
         A root is an absolute path, or a path starting with "~/" (the home
         folder of whoever loads the policy). It must pass the same checks as a
-        value, and is made canonical once, here.
+        value, except that text that looks like a variable is taken as it is
+        written (the operator wrote it, and nothing expands it). It is made
+        canonical once, here.
         """
         checker = cls((), flavour=flavour, current_folder=current_folder, home_folder=home_folder)
         roots = []
@@ -475,10 +489,14 @@ class PathMatcher(Matcher):
             if not is_absolute:
                 raise PolicyError(f"{where}: the root {quoted(entry)} must be an absolute path, or start with ~/")
             try:
-                roots.append(checker._absolute(expanded, expand_home=False))
+                roots.append(checker._absolute(expanded, expand_home=False, literal=True))
             except _Unreadable as exc:
                 raise PolicyError(f"{where}: the root {quoted(entry)} cannot be used: {exc}") from None
         return cls(tuple(roots), flavour=flavour, current_folder=current_folder, home_folder=home_folder)
+
+    def variable_roots(self) -> tuple[str, ...]:
+        """The roots with text that looks like a variable ($NAME, %NAME%, !NAME!), which is not expanded."""
+        return tuple(root for root in self.roots if _names_a_variable(root))
 
     @property
     def _windows(self) -> bool:
@@ -506,10 +524,12 @@ class PathMatcher(Matcher):
         except _Unreadable:
             return True
         roots = [root.casefold() for root in self.roots]
-        return any(self._inside(name, root) for name in names for root in roots)
+        return any(self._inside(name, root) or self.or_above and self._inside(root, name)
+                   for name in names for root in roots)
 
     def describe(self) -> str:
-        return f"a path inside {', '.join(quoted(root, limit=200) for root in self.roots)}"
+        above = " (or a folder above one)" if self.or_above else ""
+        return f"a path inside {', '.join(quoted(root, limit=200) for root in self.roots)}{above}"
 
     # ---- reading a value --------------------------------------------------------
 
@@ -536,9 +556,16 @@ class PathMatcher(Matcher):
         separators = "/\\" if self._windows else "/"
         return path == "~" or (path.startswith("~") and path[1] in separators)
 
-    def _absolute(self, path: str, expand_home: bool) -> str:
-        """The absolute, normalised form of a path, or _Unreadable."""
-        if len(path) <= MAX_PATH_CHARS and _names_a_variable(path):
+    def _absolute(self, path: str, expand_home: bool, literal: bool = False) -> str:
+        """The absolute, normalised form of a path, or _Unreadable.
+
+        literal: a root from the policy, where text that looks like a variable is part of the folder's name.
+        """
+        if not literal and (path[:1].isspace() or path[-1:].isspace()):
+            # " /home/me/.ssh/id_rsa" would be read as a name in the current folder, but a tool that trims its
+            # arguments opens the absolute path. The same on every system. (Roots never have such blanks.)
+            raise _Unreadable("it starts or ends with a blank, which a tool may trim")
+        if not literal and len(path) <= MAX_PATH_CHARS and _names_a_variable(path):
             # A tool that expands it opens another file than the text names ("%USERPROFILE%\\.ssh").
             raise _Unreadable("it names an environment variable ($NAME, ${...}, $(...) or %NAME%), which a tool "
                               "may expand")
@@ -1046,7 +1073,15 @@ def _typed(spec: dict[str, Any], where: str, deny: bool, any_arg: bool) -> Match
     if required not in spec:
         raise PolicyError(f"{where}: \"type\": {quoted(kind)} needs {quoted(required)}")
     if kind == "path":
-        return PathMatcher.for_roots(spec["roots"], where)
+        or_above = spec.get("or_above", False)
+        if not isinstance(or_above, bool):
+            raise PolicyError(f"{where}: 'or_above' must be true or false, got {quoted(or_above)}")
+        if or_above and not deny:
+            raise PolicyError(
+                f"{where}: 'or_above' is only used in deny_args; in allow_args a value must be inside a root"
+            )
+        matcher = PathMatcher.for_roots(spec["roots"], where)
+        return dataclasses.replace(matcher, or_above=True) if or_above else matcher
     if kind == "email":
         domains = _host_entries(spec["domains"], where, "domains", allow_addresses=False, allow_side=not deny)
         return EmailMatcher(domains)

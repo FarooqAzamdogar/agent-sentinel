@@ -42,7 +42,12 @@ PostToolUse         firewall.check_result(tool_name, tool_response), which knows
                     read through ReadMcpResourceTool and ListMcpResourcesTool) is also cleaned
                     of terminal escapes, control characters, tag characters and bidi controls
                     (textutil.clean_value_for_forwarding); a cleaned copy is checked again,
-                    replaces the output, and is recorded with the audit event "cleaned".
+                    replaces the output, and is recorded with the audit event "cleaned". An
+                    output that needs cleaning and holds more than MAX_CLEANED_TEXT_CHARS
+                    characters of text is withheld without being checked, and one whose
+                    first check took longer than MAX_FIRST_CHECK_SECONDS is not checked a
+                    second time but withheld, so that the hook answers before Claude Code's
+                    timeout (rule "unscannable").
                     A blocked result is replaced by an output that says it was withheld.
                     Claude Code passes an MCP tool's replacement on as it is. A built-in
                     tool's replacement is checked against the tool's output schema and
@@ -59,7 +64,8 @@ SessionStart        a new session (source "startup" or "clear") gets an empty se
                     ConfigChange.
                     Every source writes a "session_start" audit record (the version, the
                     policy's SHA-256, the OS user and the host). SessionEnd is not handled,
-                    so hook mode writes no "session_end" record.
+                    so hook mode writes no "session_end" record. A new session also removes
+                    the state files of sessions not used for 30 days (hook_state.prune_state_files).
 Elicitation         an MCP server asks the user for input. The policy's server_requests rule
                     for elicitation/create, then what is asked (elicitation.review_request: a
                     URL must be a public https address; a form may not ask for a password, a
@@ -86,13 +92,42 @@ Tool names are the names Claude Code uses: "Bash", "WebFetch",
 "mcp__github__create_issue". A policy for hook mode has rules for those
 names, for example "mcp__github__*".
 
+A policy that changes during a session
+--------------------------------------
+The hook reads the policy file anew for every event, so an agent that managed
+to rewrite the file would be judged by its own policy from the next event on.
+The first event of a session therefore records the SHA-256 of the policy file
+and its hook.policy_changes setting in the state folder
+(hook_state.PolicyRecord); a SessionStart of a new session (source "startup"
+or "clear") replaces the record, any other source keeps it. When a later
+event of the session loads a file with another SHA-256:
+
+  "block" (the default)  the event is refused (rule "hook.policy_changes"): a call is
+                         denied, an output stops the agent, an elicitation is declined, a
+                         settings change is refused, and SessionStart tells the user. It
+                         stays so until a new session starts, or the old file is back.
+  "audit"                an audit record (event "policy_change") says so, once for each
+                         change, and the new policy applies.
+
+The setting that counts is the recorded one, never the one in the changed
+file. A record that cannot be read or written refuses the event (rule
+"hook_failed"). This does not make the policy file safe from an agent that
+can run programs: the record lives in the state folder, which is protected
+only by the same rules as the policy file.
+
 Failing closed
 --------------
 An event that cannot be read, a policy that does not load, session state
 that cannot be used, or any other error blocks. PreToolUse exits with code 2,
-so the call is not made. The other tool events exit with code 2 and stop the
-agent (continue: false): the tool has run, and its output cannot be taken
-back. The elicitation events decline, and ConfigChange refuses the change
+so the call is not made. The other tool events stop the agent (continue:
+false): the tool has run, and its output cannot be taken back. That answer
+goes out with exit code 0, because Claude Code reads the JSON answer only
+then; on exit code 2 it would show Claude the text and go on. Only when not
+even the event's name could be read does the hook exit with code 2 and print
+the stop as well: 2 is what blocks a call that has not been made. An event
+too large or too deeply nested to read still gives its name when that comes
+before its large fields (event_name_of). The elicitation events decline, and
+ConfigChange refuses the change
 (an event that cannot be read under hook.config_changes "audit" is recorded
 and let through, since that setting refuses nothing). Whatever Claude can read
 (the deny reason, stderr on exit 2, the stop reason) is a generic text with a
@@ -106,6 +141,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable
@@ -122,12 +158,22 @@ from .firewall import (
     secret_rule,
     with_ref,
 )
-from .hook_state import MAX_SETTINGS_PATH_CHARS, FileRateLimiter, KeyChanges, RateLimitStateError, SettingsSnapshot
+from .hook_state import (
+    MAX_SETTINGS_PATH_CHARS,
+    FileRateLimiter,
+    KeyChanges,
+    PolicyRecord,
+    PolicyRecordError,
+    RateLimitStateError,
+    SettingsSnapshot,
+    prune_state_files,
+)
 from .jsonutil import strict_loads
 from .mcp_protocol import ShapeError
 from .policy import (
     RULE_HOOK_CONFIG_CHANGES,
     RULE_HOOK_FAILED,
+    RULE_HOOK_POLICY_CHANGES,
     RULE_MALFORMED,
     RULE_SESSION,
     RULE_UNSCANNABLE,
@@ -136,7 +182,7 @@ from .policy import (
 )
 from .policy_errors import file_error_message
 from .session import MAX_SESSION_ID_CHARS, FileSessionStore, SessionStateError
-from .textutil import UnscannableError, clean_value_for_forwarding, printable
+from .textutil import UnscannableError, clean_value_for_forwarding, printable, texts_in
 
 PRE_TOOL_USE = "PreToolUse"
 POST_TOOL_USE = "PostToolUse"
@@ -160,6 +206,15 @@ EXIT_BLOCK = 2
 
 # The largest event read. The proxy drops MCP messages larger than this by default.
 MAX_EVENT_BYTES = 16 * 1024 * 1024
+# How far into an event that cannot be read its name is looked for (event_name_of): Claude Code writes the
+# name before the tool's input and output, which are what make an event large or deeply nested.
+MAX_NAME_SEARCH_BYTES = 64 * 1024
+# An MCP output that needs cleaning is checked twice, and its first check reads more views of the text than a
+# plain one does. A hook that runs past the 60 seconds `hook install` gives it answers nothing, so such an
+# output is withheld instead when it holds more than MAX_CLEANED_TEXT_CHARS characters of text, or when its
+# first check took longer than MAX_FIRST_CHECK_SECONDS (a slow machine): the second takes about half as long.
+MAX_CLEANED_TEXT_CHARS = 4 * 1024 * 1024
+MAX_FIRST_CHECK_SECONDS = 20.0
 
 # The tools whose output the PostToolUse hooks see when `hook install` runs
 # without --scan-all-results: what comes from the web and from MCP servers,
@@ -223,6 +278,9 @@ _UNCHECKED_CALL = "the call could not be checked, so it was not made"
 _UNCHECKED_OUTPUT = "what the tool returned could not be checked"
 _UNCHECKED_ELICITATION = "the request for input could not be checked, so it was declined"
 _UNCHECKED_CONFIG = "the settings change could not be checked, so it was not applied"
+# The audit event of a record about the policy file changing during a session, and what such a record names.
+POLICY_CHANGE_EVENT = "policy_change"
+_POLICY_LABEL = "policy"
 # What a refusal says (to nobody, in practice: Claude Code shows neither the user nor the
 # server why an elicitation was declined, or why a settings change was refused).
 _INPUT_REFUSAL = "the server asked for input that is not permitted"
@@ -282,7 +340,7 @@ class HookSettings:
 def read_event(data: bytes) -> dict[str, Any]:
     """Parse the bytes of one hook event (strict JSON, jsonutil: no repeated keys, no NaN) and check its fields."""
     if len(data) > MAX_EVENT_BYTES:
-        raise MalformedEvent(f"the event is larger than {MAX_EVENT_BYTES} bytes")
+        raise MalformedEvent(f"the event is larger than {MAX_EVENT_BYTES} bytes", event_name_of(data))
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -290,8 +348,76 @@ def read_event(data: bytes) -> dict[str, Any]:
     try:
         event = strict_loads(text, "the hook event")
     except ValueError as exc:  # also NaN, Infinity and 1e999, which the audit log could not hold
-        raise MalformedEvent(str(exc).splitlines()[0]) from exc
+        # An output nested more deeply than the reader follows ends here too: its event still gives its name.
+        raise MalformedEvent(str(exc).splitlines()[0], event_name_of(data)) from exc
     return checked_event(event)
+
+
+def event_name_of(data: bytes) -> str | None:
+    """The hook_event_name of an event that cannot be read (too large, or nested too deeply), when it is one
+    this module handles; else None.
+
+    Only the top-level keys within the first MAX_NAME_SEARCH_BYTES are looked
+    at, each exactly once: a key inside the tool's input or output, or inside
+    a text, is never taken for the event's own. Anything unexpected gives None,
+    and the caller then answers as for an event of no known kind.
+    """
+    head = data[:MAX_NAME_SEARCH_BYTES]
+    n = len(head)
+
+    def skip_space(i: int) -> int:
+        while i < n and head[i] in b" \t\r\n":
+            i += 1
+        return i
+
+    def text_end(i: int) -> int:
+        """The index after the JSON string that starts at `i` (a quote); -1 when it does not end in `head`."""
+        i += 1
+        while i < n:
+            if head[i] == 0x5C:  # a backslash takes the next byte with it
+                i += 2
+            elif head[i] == 0x22:
+                return i + 1
+            else:
+                i += 1
+        return -1
+
+    i = skip_space(0)
+    if i >= n or head[i] != 0x7B:  # {
+        return None
+    i = skip_space(i + 1)
+    while i < n and head[i] == 0x22:
+        end = text_end(i)
+        if end < 0:
+            return None
+        key = head[i:end]
+        i = skip_space(end)
+        if i >= n or head[i] != 0x3A:  # :
+            return None
+        i = skip_space(i + 1)
+        if key == b'"hook_event_name"':
+            end = text_end(i) if i < n and head[i] == 0x22 else -1
+            name = head[i + 1:end - 1].decode("ascii", "replace") if end > 0 else ""
+            return name if name in HANDLED_EVENTS else None
+        depth = 0
+        while i < n:  # skip this key's value: a text, or anything else up to the "," or "}" that ends it
+            byte = head[i]
+            if byte == 0x22:
+                i = text_end(i)
+                if i < 0:
+                    return None
+                continue
+            if byte in b"{[":
+                depth += 1
+            elif byte in b"}]":
+                if depth == 0:
+                    return None  # the end of the event: it has no name
+                depth -= 1
+            elif byte == 0x2C and depth == 0:  # ,
+                break
+            i += 1
+        i = skip_space(i + 1)
+    return None
 
 
 def checked_event(event: Any, *, needs_session: bool = True) -> dict[str, Any]:
@@ -422,7 +548,73 @@ def answer_event(data: bytes, settings: HookSettings) -> HookAnswer:
         ref = _log_failure(settings.audit, event, f"the hook could not start: {type(exc).__name__}: {exc}",
                            RULE_HOOK_FAILED, settings)
         return failed_answer(name, ref)
+    refusal = _policy_change_refusal(settings, firewall, event)
+    if refusal is not None:
+        return refusal
     return answer_with(firewall, event)
+
+
+def _policy_change_refusal(settings: HookSettings, firewall: Firewall, event: dict[str, Any]) -> HookAnswer | None:
+    """Refuse an event of a session whose policy file is no longer the one it began with; None to go on.
+
+    See "A policy that changes during a session" in the module docstring. The
+    refusal's audit record is written without the policy (_log_failure): the
+    file that was just loaded is the one that is not trusted.
+    """
+    name, sha256 = event["hook_event_name"], firewall.policy_sha256
+    setting = firewall.policy.hook.policy_changes
+    try:
+        if sha256 is None:
+            raise PolicyRecordError("the policy was not loaded from a file")
+        record = PolicyRecord(settings.state_dir, event["session_id"])
+        if name == SESSION_START and event.get("source") in NEW_SESSION_SOURCES:
+            record.remember(sha256, setting)
+            return None
+        seen = record.seen(sha256, setting)
+        if seen.sha256 == sha256:
+            return None
+        change = (f"the policy file changed during the session: the session began with the file whose SHA-256 is "
+                  f"{seen.sha256}, and the file is now {sha256}")
+        if seen.policy_changes == "audit":
+            firewall.note(_POLICY_LABEL, f'{change}; recorded only (hook.policy_changes was "audit" when the '
+                                         "session began), so the new policy applies", event=POLICY_CHANGE_EVENT)
+            record.remember(sha256, seen.policy_changes)  # one record for each change, not for each event
+            return None
+    except (PolicyRecordError, ValueError) as exc:
+        problem = f"the policy this session began with is not known: {exc}"
+        if name == SESSION_START:
+            return HookAnswer(exit_code=EXIT_BLOCK, message=(
+                f"agent-sentinel: the session could not be started ({printable(problem, limit=500)}). Every tool "
+                "call will be blocked until the state folder can be used."
+            ))
+        return failed_answer(name, _log_failure(settings.audit, event, problem, RULE_HOOK_FAILED, settings))
+    reason = f'{change}; refused (hook.policy_changes was "block" when the session began)'
+    told = (f"agent-sentinel: the policy file {printable(settings.policy, limit=300)} changed during this Claude Code "
+            "session, so the session's tool calls are refused (hook.policy_changes). A new Claude Code session "
+            "takes the new policy; putting the old file back lets this session go on.")
+    if name == SESSION_START:
+        _log_note(settings.audit, reason, _POLICY_LABEL, POLICY_CHANGE_EVENT, settings, event["session_id"])
+        return HookAnswer(exit_code=EXIT_BLOCK, message=told)
+    ref = _log_failure(settings.audit, event, reason, RULE_HOOK_POLICY_CHANGES, settings)
+    return _policy_changed_answer(name, ref, told)
+
+
+def _policy_changed_answer(event_name: str, ref: str, told: str) -> HookAnswer:
+    """The refusal of an event because the policy file changed: generic for Claude, plain for the user.
+
+    Claude reads the same words as for any event that could not be checked.
+    The user is told what happened where only the user reads it: the
+    systemMessage of a denied call, the stop reason of a stopped agent, and
+    stderr on exit code 0 (which Claude Code keeps for the user).
+    """
+    if event_name == PRE_TOOL_USE:
+        output = _pre_tool_use_output("deny", blocked_text(with_ref(_UNCHECKED_CALL, ref)))
+        return HookAnswer({**output, "systemMessage": told}, EXIT_OK, told)
+    if event_name in (POST_TOOL_USE, POST_TOOL_USE_FAILURE):
+        answer = failed_answer(event_name, ref)
+        stop = f"{told} (ref {ref})"
+        return HookAnswer({**(answer.output or {}), "stopReason": stop}, answer.exit_code, told)
+    return failed_answer(event_name, ref)
 
 
 def open_firewall(settings: HookSettings, session_id: str) -> Firewall:
@@ -474,9 +666,12 @@ def failed_answer(event_name: str | None, ref: str) -> HookAnswer:
 
     PreToolUse: the call is denied, and the exit code 2 denies it even if the
     JSON were not read. Elicitation and ElicitationResult: the request, or the
-    answer, is declined. ConfigChange: the change is not applied. Any other
-    event, or one whose name is not known: the agent is stopped, because the
-    tool has already run.
+    answer, is declined. ConfigChange: the change is not applied.
+    PostToolUse and PostToolUseFailure: the agent is stopped, because the tool
+    has already run; with exit code 0, since Claude Code reads the JSON answer
+    (continue: false) only then, and on exit code 2 would only show Claude the
+    text. An event whose name is not known may be a call that has not been
+    made, which only exit code 2 blocks: it gets the stop and exit code 2.
     """
     if event_name == PRE_TOOL_USE:
         text = blocked_text(with_ref(_UNCHECKED_CALL, ref))
@@ -486,6 +681,12 @@ def failed_answer(event_name: str | None, ref: str) -> HookAnswer:
     if event_name == CONFIG_CHANGE:
         return _config_refused(blocked_text(with_ref(_UNCHECKED_CONFIG, ref)))
     stop = _stop_text(with_ref(_UNCHECKED_OUTPUT, ref))
+    if event_name == POST_TOOL_USE:
+        notice = blocked_text(with_ref(_UNCHECKED_OUTPUT, ref))
+        return HookAnswer({"continue": False, "stopReason": stop, "decision": "block", "reason": notice}, EXIT_OK,
+                          stop)
+    if event_name == POST_TOOL_USE_FAILURE:
+        return HookAnswer({"continue": False, "stopReason": stop}, EXIT_OK, stop)
     return HookAnswer({"continue": False, "stopReason": stop}, EXIT_BLOCK, stop)
 
 
@@ -547,7 +748,8 @@ def _log_failure(
 
 
 def _log_note(
-    audit: Path | None, reason: str, label: str, event: str, settings: HookSettings | None = None
+    audit: Path | None, reason: str, label: str, event: str, settings: HookSettings | None = None,
+    session_id: str | None = None,
 ) -> None:
     """Write an audit record that blocks nothing (action "note"), without the policy. Never raises.
 
@@ -558,10 +760,12 @@ def _log_note(
     try:
         try:
             firewall = Firewall(
-                Policy(), audit, log_args=False, server_name=AUDIT_SERVER_NAME, **_audit_options(settings)
+                Policy(), audit, log_args=False, server_name=AUDIT_SERVER_NAME, session_id=session_id,
+                **_audit_options(settings)
             )
         except ValueError:  # the key file (AuditKeyError) or the size cannot be used
-            firewall = Firewall(Policy(), audit, log_args=False, server_name=AUDIT_SERVER_NAME)
+            firewall = Firewall(Policy(), audit, log_args=False, server_name=AUDIT_SERVER_NAME,
+                                session_id=session_id)
         firewall.note(label, reason, event=event)
     except Exception:
         pass
@@ -677,10 +881,21 @@ def marks_wait_for_the_output(tool: str) -> bool:
 def _post_tool_use(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
     tool, call_id, output = event["tool_name"], event.get("tool_use_id"), event["tool_response"]
     names = _argument_names(event)
-    checked = firewall.check_result(tool, output, call_id=call_id, parameter_names=names)
+    began = _clock()
+    if _cleaned_like_mcp_content(tool) and _large_and_needs_cleaning(output):
+        # Its first check would read more views of the text than a plain one does (escapes can hide text), and
+        # the cleaned copy would be checked again: withheld at once, before any of that.
+        refusal = firewall.refuse(
+            tool, f"the output needs cleaning and holds more than {MAX_CLEANED_TEXT_CHARS} characters of text: "
+                  "checking it and its cleaned copy would take the hook past Claude Code's timeout, so it was withheld",
+            event="result", public_reason=_UNCHECKED_OUTPUT, rule=RULE_UNSCANNABLE, call_id=call_id,
+        )
+        checked = CheckedResult(refusal)
+    else:
+        checked = firewall.check_result(tool, output, call_id=call_id, parameter_names=names)
     cleaned = False
     if checked.decision.allowed and _cleaned_like_mcp_content(tool):
-        checked, cleaned = _cleaned(firewall, tool, checked, call_id, names)
+        checked, cleaned = _cleaned(firewall, tool, checked, call_id, names, _clock() - began)
     arguments = _call_arguments(event)
     decision = _delivered(firewall, tool, checked.decision, call_id, arguments)
     if decision.allowed:
@@ -704,6 +919,8 @@ def _post_tool_use(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
 
 
 _UNCHANGED = object()
+# The clock the first check of an output is timed with (a test puts its own here).
+_clock = time.monotonic
 
 
 def post_tool_use_answer(tool: str, replacement: Any = _UNCHANGED, *, notice: str | None = None,
@@ -740,8 +957,22 @@ def _cleaned_like_mcp_content(tool: str) -> bool:
     return is_mcp_tool(tool) or tool in MCP_RESOURCE_TOOLS
 
 
+def _large_and_needs_cleaning(output: Any) -> bool:
+    """Whether an output holds more than MAX_CLEANED_TEXT_CHARS characters of text and cleaning would change it.
+
+    False for an output that cannot be walked or cleaned: the checks that follow refuse it.
+    """
+    try:
+        if sum(len(text) for text in texts_in(output)) <= MAX_CLEANED_TEXT_CHARS:
+            return False
+        return clean_value_for_forwarding(output) != output
+    except (UnscannableError, RecursionError):
+        return False
+
+
 def _cleaned(
     firewall: Firewall, tool: str, checked: CheckedResult, call_id: str | None, parameter_names: Iterable[str] = (),
+    first_check_seconds: float = 0.0,
 ) -> tuple[CheckedResult, bool]:
     """The checked output without what can hide or disguise text from a reader; whether that changed it.
 
@@ -756,6 +987,11 @@ def _cleaned(
     the cleaned copy's, which is what Claude reads. Both checks know the
     names of the call's arguments (parameter_names), so an order to put a
     credential file into one of them is read the same in the cleaned copy.
+
+    first_check_seconds: how long the first check took. The second costs
+    about as much, so past MAX_FIRST_CHECK_SECONDS an output that needs
+    cleaning is withheld instead: the hook must answer before Claude Code's
+    timeout, or its answer counts for nothing.
     """
     try:
         cleaned = clean_value_for_forwarding(checked.content)
@@ -767,6 +1003,13 @@ def _cleaned(
         return CheckedResult(refusal), False
     if cleaned == checked.content:
         return checked, False
+    if first_check_seconds > MAX_FIRST_CHECK_SECONDS:
+        refusal = firewall.refuse(
+            tool, f"the output needs cleaning, and its first check took {first_check_seconds:.0f} seconds: checking "
+                  "the cleaned copy too would take the hook past Claude Code's timeout, so it was withheld",
+            event="result", public_reason=_UNCHECKED_OUTPUT, rule=RULE_UNSCANNABLE, call_id=call_id,
+        )
+        return CheckedResult(refusal), False
     first = checked.decision
     again = firewall.check_result(
         tool, cleaned, log_clean=False, call_id=call_id, parameter_names=parameter_names,
@@ -840,6 +1083,7 @@ def _session_start(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
     store = firewall.session_store
     if event.get("source") in NEW_SESSION_SOURCES and isinstance(store, FileSessionStore):
         store.begin()  # SessionStateError if the file cannot be written: answer_with reports it to the user
+        _prune_old_state(firewall, store)
     written = firewall.provenance(SESSION_START_RECORD, "a Claude Code session started", {
         "version": __version__,
         "policy_sha256": firewall.policy_sha256,
@@ -860,20 +1104,38 @@ def _session_start(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
     return HookAnswer()
 
 
+def _prune_old_state(firewall: Firewall, store: FileSessionStore) -> None:
+    """Remove the state files of sessions long over (hook_state.prune_state_files). Best effort, and recorded."""
+    try:
+        removed = prune_state_files(store.directory)
+    except Exception as exc:  # the files only take room: the session goes on
+        firewall.note("state", f"old session state could not be removed: {type(exc).__name__}: {exc}",
+                      event="session_state")
+        return
+    if removed:
+        firewall.note("state", f"removed {removed} state file(s) of sessions not used for 30 days",
+                      event="session_state")
+
+
 def settings_files(cwd: Any) -> list[Path]:
     """The Claude Code settings files whose top-level keys a session's snapshot notes.
 
-    The user's (~/.claude/settings.json), and the project's two in the
-    session's working folder (.claude/settings.json and settings.local.json),
-    when the event gives that folder as a full path. The managed policy
-    settings are left out: their changes cannot be refused anyway.
+    The user's (settings.json in ~/.claude, or in the folder CLAUDE_CONFIG_DIR
+    names when that is set to a full path, as Claude Code reads it), and the
+    project's two in the session's working folder (.claude/settings.json and
+    settings.local.json), when the event gives that folder as a full path.
+    The managed policy settings are left out: their changes cannot be refused
+    anyway.
     """
     # Imported here: home loads the command-line helpers, which importing the library must not load.
     from . import home
 
     files = []
     user = home.user_folder()
-    if user is not None:
+    moved = os.environ.get("CLAUDE_CONFIG_DIR")
+    if _text(moved, MAX_SETTINGS_PATH_CHARS) and "\0" not in moved and os.path.isabs(moved):
+        files.append(Path(moved) / "settings.json")
+    elif user is not None:
         files.append(user / ".claude" / "settings.json")
     if _text(cwd, MAX_SETTINGS_PATH_CHARS) and "\0" not in cwd and os.path.isabs(cwd):
         project = Path(cwd) / ".claude"
@@ -902,14 +1164,15 @@ def _snapshot_settings(firewall: Firewall, store: FileSessionStore, source: Any,
 def _elicitation(firewall: Firewall, event: dict[str, Any]) -> HookAnswer:
     """An MCP server asks the user for input: decline it (exit 2) if the policy, the checks or the detector refuse."""
     label = event_label(event)
-    params = {"mode": event.get("mode") or "form"}  # no mode: a form, as before MCP 2025-11-25
+    # No mode: a form, as before MCP 2025-11-25. The message is reviewed with the form: it can ask for a secret.
+    params = {"mode": event.get("mode") or "form", "message": event["message"]}
     if event.get("url") is not None:
         params["url"] = event["url"]
     if event.get("requested_schema") is not None:
         params["requestedSchema"] = event["requested_schema"]
     decision = _elicitation_refusal(firewall, label, params)
     if decision is None:
-        scanned = {"message": event["message"], **params}
+        scanned = dict(params)
         decision = _elicitation_delivered(firewall, label, firewall.scan_result(label, scanned, event="server_request"))
     if decision is not None:
         return _declined(ELICITATION, blocked_text(decision.public_reason))
@@ -1041,10 +1304,11 @@ def describe_key_changes(changes: KeyChanges) -> str:
     if now.hashes is None:
         return f"the file {now.problem}, so which top-level keys changed is not known"
     if now.missing:
-        state = "the file no longer exists"
-        if changes.before is None or not changes.before.hashes:
-            return state
-        return f"{state}; top-level keys removed: {_names(sorted(changes.before.hashes))}"
+        if changes.before is None or changes.before.missing:
+            return "the file does not exist"
+        if not changes.before.hashes:
+            return "the file no longer exists"
+        return f"the file no longer exists; top-level keys removed: {_names(sorted(changes.before.hashes))}"
     if not changes.known:
         if changes.before is None:
             why = "no earlier snapshot of this file"

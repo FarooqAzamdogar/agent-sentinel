@@ -742,5 +742,71 @@ class ThePolicyFileStillLoads(unittest.TestCase):
         self.assertEqual(policy.evaluate("read", {"path": "server.pem"}).action, "block")
 
 
+class ValuesWithBlanksAtTheEdges(unittest.TestCase):
+    """A tool that trims its argument opens " /home/me/.ssh/id_rsa" as the absolute path: such a value is read as
+    one that cannot be read with certainty, the same with Windows and POSIX rules."""
+
+    def test_a_value_that_starts_or_ends_with_a_blank_is_refused_and_denied(self):
+        for rules, secret in ((WINDOWS, r"C:\Users\me\.ssh\id_rsa"), (POSIX, "/home/me/.ssh/id_rsa")):
+            allow = PathMatcher.for_roots(["~/work"], **rules)
+            deny = PathMatcher.for_roots(["~/.ssh"], **rules)
+            inside = rules["home_folder"]() + ("\\work\\notes.txt" if rules is WINDOWS else "/work/notes.txt")
+            for value in (" " + secret, " ~/.ssh/id_rsa", "\u00a0" + secret, "\u2003" + secret, "\u3000~/.ssh/x",
+                          " " + inside, inside + " ", inside + "\u00a0", "%20" + secret.replace("\\", "/")):
+                with self.subTest(flavour=rules["flavour"].__name__, value=value):
+                    self.assertFalse(allow.accepts(value))
+                    self.assertTrue(deny.found_in(value))
+            self.assertTrue(allow.accepts(inside))
+            self.assertFalse(deny.found_in(inside))
+
+    def test_roots_keep_refusing_blanks_at_their_edges(self):
+        entry_rejected(self, {"arg": "p", "type": "path", "roots": [" /home/me/work"]}, "spaces around it")
+        entry_rejected(self, {"arg": "p", "type": "path", "roots": ["/home/me/work\u00a0"]}, "spaces around it")
+
+
+class PathsAboveARoot(unittest.TestCase):
+    """"or_above": a deny entry for a tool that searches below the folder it is given."""
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.home, True))
+        self.root = str(self.home / "me" / ".ssh")
+
+    def policy(self, **settings):
+        return rule({"arg": "path", "type": "path", "roots": [self.root], **settings}, deny=True)
+
+    def test_a_folder_above_a_root_is_denied_only_with_or_above(self):
+        above = [str(self.home / "me"), str(self.home), str(self.home / "me" / ".ssh" / ".."),
+                 os.path.splitdrive(str(self.home))[0] + os.sep]
+        beside = [str(self.home / "me" / "projects"), str(self.home / "you"), str(self.home / "me" / ".sshx")]
+        plain, searching = self.policy(), self.policy(or_above=True)
+        for value in above:
+            with self.subTest(value=value):
+                self.assertEqual(verdict(plain, path=value), "allow")
+                self.assertEqual(verdict(searching, path=value), "block")
+        for value in beside:
+            with self.subTest(value=value):
+                self.assertEqual(verdict(plain, path=value), "allow")
+                self.assertEqual(verdict(searching, path=value), "allow")
+        for value in (self.root, os.path.join(self.root, "id_ed25519")):
+            self.assertEqual(verdict(plain, path=value), "block")
+            self.assertEqual(verdict(searching, path=value), "block")
+        self.assertEqual(verdict(self.policy(or_above=False), path=above[0]), "allow")
+        self.assertIn("(or a folder above one)", searching.tools[0].deny_args[0].matcher.describe())
+        self.assertNotIn("above", plain.tools[0].deny_args[0].matcher.describe())
+
+    def test_mistakes_are_errors(self):
+        entry = {"arg": "path", "type": "path", "roots": [self.root]}
+        rejected(self, {"tools": {"t": {"action": "allow", "allow_args": [{**entry, "or_above": True}]}}},
+                 "'or_above' is only used in deny_args")
+        rejected(self, {"tools": {"t": {"action": "allow", "deny_args": [{**entry, "or_above": "yes"}]}}},
+                 "'or_above' must be true or false")
+        rejected(self, {"tools": {"t": {"action": "allow", "deny_args": [
+            {"arg": "url", "type": "url", "hosts": ["example.com"], "or_above": True}]}}},
+            "goes with \"type\": 'path'")
+        rejected(self, {"tools": {"t": {"action": "allow", "deny_args": [{"arg": "p", "contains": "x", "or_above": True}]}}},
+                 "goes with \"type\"")
+
+
 if __name__ == "__main__":
     unittest.main()

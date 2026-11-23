@@ -32,52 +32,37 @@ from an audit log), so the command modules pass it through `printable` first.
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
+from typing import Any
 
-from . import (
-    __version__,
-    cli_audit,
-    cli_check,
-    cli_clients,
-    cli_demo,
-    cli_doctor,
-    cli_explain,
-    cli_hook,
-    cli_init,
-    cli_inspect,
-    cli_pins,
-    cli_report,
-    cli_scan,
-    cli_suggest,
-    cli_test,
-    cli_unwrap,
-    cli_validate,
-    cli_wrap,
-    mcp_proxy,
-)
+from . import __version__
 from .cli_common import EXIT_ERROR, CommandError, print_error
 from .textutil import printable
 
-# The commands, in the order --help lists them: name and the module that runs it.
-_COMMANDS = (
-    ("init", cli_init),
-    ("inspect", cli_inspect),
-    ("clients", cli_clients),
-    ("wrap", cli_wrap),
-    ("unwrap", cli_unwrap),
-    ("doctor", cli_doctor),
-    ("hook", cli_hook),
-    ("pins", cli_pins),
-    ("check", cli_check),
-    ("test", cli_test),
-    ("validate", cli_validate),
-    ("scan", cli_scan),
-    ("report", cli_report),
-    ("explain", cli_explain),
-    ("suggest", cli_suggest),
-    ("audit", cli_audit),
-    ("demo", cli_demo),
+# The commands, in the order --help lists them: each is run by the module agent_sentinel/cli_<name>.py.
+_COMMAND_NAMES = (
+    "init", "inspect", "clients", "wrap", "unwrap", "doctor", "hook", "pins", "check", "test", "validate", "scan",
+    "report", "explain", "suggest", "audit", "demo",
 )
+
+
+def _commands() -> tuple[tuple[str, Any], ...]:
+    """Each command's name and the module that runs it.
+
+    The modules are loaded here, not when this one is: Claude Code starts
+    `hook claude-code` anew for every event, and that command needs none of
+    the others (see main).
+    """
+    return tuple((name, importlib.import_module(f".cli_{name}", __package__)) for name in _COMMAND_NAMES)
+
+
+def __getattr__(name: str) -> Any:
+    """_COMMANDS, the commands with their modules as 0.5 had them, for code that lists them (tests do)."""
+    if name == "_COMMANDS":
+        return _commands()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 # Exit code for a command stopped with Ctrl+C, as shells report it.
 _EXIT_INTERRUPTED = 130
@@ -97,7 +82,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.Argumen
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
     commands.add_parser("proxy", help="run an MCP server behind the firewall (see: proxy --help)")
     command_parsers = {}
-    for name, module in _COMMANDS:
+    for name, module in _commands():
         command = commands.add_parser(
             name,
             help=module.HELP,
@@ -119,7 +104,7 @@ def _split_server_command(argv: list[str]) -> tuple[list[str], list[str] | None]
     the server's own words (its options, a second "--") must reach it exactly
     as written. None when there is no "--" or the command takes no server command.
     """
-    takes = {name for name, module in _COMMANDS if getattr(module, "TAKES_SERVER_COMMAND", False)}
+    takes = {name for name, module in _commands() if getattr(module, "TAKES_SERVER_COMMAND", False)}
     if argv[:1] and argv[0] in takes and "--" in argv:
         at = argv.index("--")
         return argv[:at], argv[at + 1:]
@@ -129,7 +114,14 @@ def _split_server_command(argv: list[str]) -> tuple[list[str], list[str] | None]
 def main(argv: list[str] | None = None) -> int:
     _make_output_safe()
     argv = sys.argv[1:] if argv is None else argv
+    if argv[:2] == ["hook", "claude-code"]:
+        # What Claude Code runs for every event: answered without loading the other commands.
+        from . import cli_hook
+
+        return cli_hook.run_event(argv[2:])
     if argv[:1] == ["proxy"]:  # the proxy parses its own arguments, including the '--' part
+        from . import mcp_proxy
+
         mcp_proxy.exit_process(mcp_proxy.main(argv[1:]))  # does not return: see exit_process for why
 
     parser, command_parsers = _build_parser()

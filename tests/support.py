@@ -4,12 +4,16 @@ Run all tests from the project folder:   python -m unittest discover tests -v
 """
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+# The hook's settings snapshot reads the user's settings in the folder this names, when it is set: no test
+# may read the real one. A test that needs it sets it to a temporary folder.
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
 
 from agent_sentinel import Policy  # noqa: E402
 from agent_sentinel.auditlog import META_EVENTS  # noqa: E402

@@ -115,7 +115,9 @@ class PrintingTheSnippet(InstallTest):
                                                  "hook": {"config_changes": "block",
                                                           "treat_auto_as_non_prompting": True}})
         _, out, _ = self.install()
-        self.assertIn("SubagentHandback, ReadMcpResourceTool, ListMcpResourcesTool, Monitor (it has no rule", out)
+        self.assertIn("SubagentHandback, ReadMcpResourceTool, ListMcpResourcesTool, Monitor, MultiEdit,", out)
+        self.assertIn("ToolSearch, Skill, TaskCreate, TaskUpdate, TaskList, TaskGet, TaskOutput, TaskStop, "
+                      "BashOutput, KillShell (it has no rule", out)
         self.assertNotIn("whose streamed events", out)
         self.assertIn("is refused (hook.config_changes)", out)
 
@@ -337,3 +339,112 @@ class RecognisingOurEntries(InstallTest):
                                        cli_hook.hook_groups(ours))
         self.assertEqual(merged["PreToolUse"][0], {"matcher": "*", "hooks": [mine]})
         self.assertEqual(merged["PreToolUse"][1]["hooks"], [ours])
+
+
+class WhatInstallSaysAboutClaudeCodesOwnTools(InstallTest):
+    def header(self, policy):
+        self.policy = self.write("policy.json", policy)
+        code, out, err = self.install()
+        self.assertEqual(code, 0, err)
+        return out.split("Add this to", 1)[0]
+
+    def test_a_policy_written_for_mcp_servers_is_warned_about_every_tool_it_blocks(self):
+        header = self.header({"default": "block", "tools": {"mcp__github__*": "allow", "Read": "allow"}})
+        (warning,) = [line for line in header.splitlines() if "the policy blocks Claude Code's own tools" in line]
+        for tool in ("Bash", "ToolSearch", "Skill", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskOutput",
+                     "TaskStop", "EnterPlanMode", "ExitPlanMode", "AskUserQuestion", "Monitor"):
+            self.assertIn(f" {tool}", warning)
+        self.assertNotIn(" Read,", warning)
+        (note,) = [line for line in header.splitlines() if "the policy also refuses" in line]
+        self.assertIn("EnterWorktree, ExitWorktree, LSP, CronCreate, CronDelete, CronList, SendMessage, ListAgents",
+                      note)
+        self.assertEqual(set(cli_hook.BUILT_IN_TOOLS) & set(cli_hook.OTHER_BUILT_IN_TOOLS), set())
+
+    def test_the_hook_templates_decide_each_tool_install_knows_and_get_no_warning(self):
+        from agent_sentinel import Policy, templates
+
+        for name in ("claude-code", "claude-code-strict"):
+            with self.subTest(template=name):
+                document = templates.template(name)
+                header = self.header(document)
+                self.assertNotIn("the policy blocks Claude Code's own tools", header)
+                self.assertNotIn("warning(s)", header)
+                self.assertIn("Note: the policy also refuses EnterWorktree, ExitWorktree, LSP,", header)
+                policy = Policy.from_dict(document)
+                for tool in cli_hook.BUILT_IN_TOOLS:
+                    self.assertNotEqual(policy.tool_level_action(tool), "block", tool)
+                for tool in ("ToolSearch", "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskStop", "KillShell",
+                             "EnterPlanMode", "Skill", "TaskOutput", "BashOutput"):
+                    self.assertEqual(policy.tool_level_action(tool), "allow", tool)
+                # What brings text in is labelled on purpose; what does neither says so with no labels.
+                for tool in ("Skill", "TaskOutput", "BashOutput", "ToolSearch", "Bash", "PowerShell"):
+                    self.assertEqual(set(policy.tool_labels(tool)), {"private"}, tool)
+                for tool in ("TaskCreate", "TaskStop", "EnterPlanMode"):
+                    self.assertEqual(set(policy.tool_labels(tool)), set(), tool)
+                for tool in cli_hook.OTHER_BUILT_IN_TOOLS:
+                    self.assertEqual(policy.tool_level_action(tool), "block", tool)
+
+    def test_the_monitor_note_does_not_ask_for_labels_that_are_there(self):
+        labelled = {"default": "block", "tools": {"Monitor": {"action": "ask", "labels": ["untrusted", "sink"]}}}
+        header = self.header(labelled)
+        self.assertIn("Note: the policy lets the agent use Monitor, whose streamed events no hook can scan.", header)
+        self.assertNotIn("Label it", header)
+        for labels in ([], ["untrusted"], ["sink"]):
+            header = self.header({"default": "block", "tools": {"Monitor": {"action": "ask", "labels": labels}}})
+            self.assertIn('no hook can scan. Label it "untrusted" and "sink" for the flow rules, or block it.', header)
+        self.assertNotIn("Monitor, whose", self.header({"default": "block", "tools": {"Read": "allow"}}))
+
+    def test_it_says_what_happens_when_the_policy_file_changes_during_a_session(self):
+        header = self.header(POLICY)
+        self.assertIn("If the policy file changes during a session, that session's calls are refused until a new "
+                      "session starts (hook.policy_changes).", header)
+        header = self.header({**POLICY, "hook": {"policy_changes": "audit"}})
+        self.assertIn('is only recorded, and applies at once (hook.policy_changes is "audit")', header)
+
+
+class TheCommandClaudeCodeRuns(InstallTest):
+    """`hook claude-code` starts anew for every event, so it loads only what answering one needs."""
+
+    EVENT = {"session_id": "s", "hook_event_name": "PreToolUse", "tool_name": "Read", "tool_use_id": "t",
+             "tool_input": {"file_path": "notes.txt"}, "permission_mode": "default"}
+
+    def run_event(self, *words, event=None, code=None):
+        """Answer one event in a new Python; return (exit code, stdout, stderr)."""
+        import subprocess
+
+        from support import ROOT
+
+        command = [sys.executable, *(("-c", code) if code else ("-m", "agent_sentinel")), "hook", "claude-code",
+                   "--policy", str(self.policy), "--state-dir", str(self.folder / "state"), *words]
+        environment = {**os.environ, "PYTHONPATH": str(ROOT)}
+        done = subprocess.run(command, input=json.dumps(event or self.EVENT).encode("utf-8"), capture_output=True,
+                              timeout=120, env=environment)
+        return done.returncode, done.stdout.decode("utf-8"), done.stderr.decode("utf-8")
+
+    def test_an_event_does_not_load_the_other_commands(self):
+        code = ("import sys\n"
+                "from agent_sentinel.__main__ import main\n"
+                "status = main(sys.argv[1:])\n"
+                "loaded = sorted(name.split('.')[1] for name in sys.modules if name.startswith('agent_sentinel.'))\n"
+                "print(' '.join(loaded), file=sys.stderr)\n"
+                "sys.exit(status)\n")
+        status, out, err = self.run_event(code=code)
+        self.assertEqual((status, out), (0, ""), err)
+        loaded = set(err.split())
+        self.assertLessEqual({"cli_hook", "claude_hooks", "firewall", "policy", "hook_state"}, loaded)
+        for module in ("mcp_proxy", "cli_doctor", "cli_wrap", "cli_init", "launch", "containment", "control_plane",
+                       "clients", "config_file", "wrapping", "pins", "server_probe"):
+            self.assertNotIn(module, loaded)
+
+    def test_it_answers_as_through_the_whole_command_line(self):
+        denied = {**self.EVENT, "tool_name": "Write"}
+        status, out, err = self.run_event(event=denied)
+        self.assertEqual(status, 0, err)
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+        # Words it does not know end with exit code 2, which blocks; so does a missing --policy.
+        self.assertEqual(self.run_event("--no-such-option")[0], 2)
+        self.assertEqual(run_cli("hook", "claude-code", "--state-dir", self.folder / "state", stdin=b"{}")[0], 2)
+        code, out, _ = run_cli("hook", "claude-code", "--help")
+        self.assertEqual(code, 0)
+        self.assertIn("usage: agent-sentinel hook claude-code", out)
+        self.assertIn("--audit-required", out)

@@ -43,6 +43,8 @@ MAX_FORM_FIELDS = 64
 # refused rather than read in part, so a phrase cannot hide past what is read.
 MAX_FIELD_NAME_CHARS = 256
 MAX_FIELD_TEXT_CHARS = 4096
+# The message shown above a form. It is read whole for the phrases below, so a longer one is refused.
+MAX_MESSAGE_CHARS = 65_536
 # How much longer a label may become once normalised (NFKC). Ordinary text barely
 # grows; one character such as U+FDFA becomes 18, which would let a form of short
 # labels cost seconds to read. A label that grows more is refused as malformed.
@@ -59,10 +61,11 @@ RULE_FORM = "elicitation.form"
 
 # Phrases that always mean a secret, matched as whole words once a field's
 # text is reduced to lowercase words ("apiKey" and "API_KEY" read "api key").
-# A phrase of two words also matches written as one ("apikey", "passphrase").
+# A phrase of two words also matches written as one ("apikey", "passphrase"), so "pass word" covers
+# "password", "passWord" and "pass_word".
 SECRET_PHRASES = (
-    "password", "pass phrase", "api key", "secret key", "private key", "card number", "cvv", "cvc", "ssn",
-    "one time code",
+    "pass word", "pass phrase", "api key", "secret key", "private key", "card number", "credit card", "cvv", "cvc",
+    "ssn", "social security", "seed phrase", "recovery phrase", "one time code",
 )
 # Words that mean a secret only sometimes. Reported, never refused.
 UNCLEAR_WORDS = ("pin", "token", "secret", "otp", "2fa", "passcode", "credential", "credentials", "iban", "key")
@@ -106,7 +109,10 @@ def allowed_hosts(entries: Sequence[str]) -> Matcher | None:
 def review_request(params: Any, hosts: Matcher | None) -> Review:
     """Check the params of an elicitation request (elicitation/create, or an input_required entry).
 
-    A request without a mode is a form, as before 2025-11-25.
+    A request without a mode is a form, as before 2025-11-25. A form's
+    message is read like its fields: "Enter your password" above a field
+    named "value" asks for a secret too. A form request that also carries a
+    url has it checked as a URL-mode request's is: a client may show it.
     """
     if not isinstance(params, dict):
         raise ShapeError("an elicitation's params must be an object")
@@ -119,7 +125,16 @@ def review_request(params: Any, hosts: Matcher | None) -> Review:
             raise ShapeError("a URL-mode elicitation must have a text url")
         refusal = url_refusal(url, hosts)
         return Review(refusal, RULE_URL) if refusal else Review()
-    return _review_form(params.get("requestedSchema"))
+    if params.get("url") is not None:
+        if not isinstance(params["url"], str):
+            raise ShapeError("an elicitation's url must be text")
+        refusal = url_refusal(params["url"], hosts)
+        if refusal:
+            return Review(refusal, RULE_URL)
+    review = _review_form(params.get("requestedSchema"))
+    if review.refusal is None and isinstance(params.get("message"), str):
+        return _review_message(params["message"], review)
+    return review
 
 
 def review_url_required_error(error: Any, hosts: Matcher | None) -> Review:
@@ -185,6 +200,18 @@ def _review_form(schema: Any) -> Review:
         if any(_UNCLEAR_WORD.search(text) for text in words):
             unclear.append(f"the field '{printable(name, limit=80)}'")
     return Review(unclear=tuple(unclear))
+
+
+def _review_message(message: str, review: Review) -> Review:
+    """Check the message shown above a form whose fields passed: it may be what asks for the secret."""
+    if len(message) > MAX_MESSAGE_CHARS:
+        raise ShapeError(f"the elicitation's message is longer than {MAX_MESSAGE_CHARS} characters")
+    words = _as_words(message)
+    if _SECRET_PHRASE.search(words):
+        return Review("the form's message asks for a secret", RULE_FORM)
+    if _UNCLEAR_WORD.search(words):
+        return Review(unclear=(*review.unclear, "what its message names"))
+    return review
 
 
 def _field_texts(name: str, field: Any) -> list[str]:

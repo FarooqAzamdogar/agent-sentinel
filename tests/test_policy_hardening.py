@@ -157,10 +157,23 @@ class PathsAToolWouldExpand(unittest.TestCase):
         policy.evaluate("t", {f"Key{n}": "v" for n in range(10_000)})
         self.assertLess(time.perf_counter() - start, 2.0)
 
-    def test_a_root_that_names_a_variable_is_refused(self):
-        with self.assertRaisesRegex(PolicyError, "environment variable"):
-            rules({"t": {"action": "allow", "allow_args": [{"arg": "p", "type": "path",
-                                                            "roots": [str(ROOT / "$HOME")]}]}})
+    def test_a_root_with_text_like_a_variable_is_the_folder_of_that_name_and_is_warned_about(self):
+        # The operator wrote it and nothing expands it, so the policy loads, as it did in 0.5.0. The values of
+        # a call are still refused when they hold such text: a tool may expand them.
+        for name in ("$HOME", "$data", "a$b", "${x}", "%b%", "!x!", "100%_done%"):
+            for side in ("allow_args", "deny_args"):
+                with self.subTest(name=name, side=side):
+                    root = str(ROOT / name)
+                    policy = rules({"t": {"action": "allow", side: [{"arg": "p", "type": "path", "roots": [root]}]}})
+                    (warning,) = [text for text in policy.warnings() if "looks like a variable" in text]
+                    self.assertIn(f"tools.t.{side}[0]: the root '{root}'", warning)
+                    self.assertIn("It is not expanded", warning)
+                    inside = policy.evaluate("t", {"p": str(ROOT / name / "notes.txt")})
+                    self.assertEqual(inside.action, "block", "a value with such text is refused on both sides")
+        plain = rules({"t": {"action": "allow", "allow_args": [{"arg": "p", "type": "path", "roots": [str(ROOT)]}]}})
+        self.assertEqual([text for text in plain.warnings() if "looks like a variable" in text], [])
+        self.assertEqual(plain.evaluate("t", {"p": str(ROOT / "$HOME" / "x")}).action, "block")
+        self.assertEqual(plain.evaluate("t", {"p": str(ROOT / "notes.txt")}).action, "allow")
 
 
 # ---- POL-8: wildcard rules under an exact rule ------------------------------------------------------
@@ -653,6 +666,61 @@ class ClaudeCodeTemplateFromInit(IsolatedHomeTest):
                 self.assertEqual(code, 0, err)
                 self.assertNotIn("Warning", out)
                 self.assertIn("bash command checks", out)
+
+
+class SearchToolsInTheHookTemplates(IsolatedHomeTest):
+    """Grep and Glob search everything below the folder they are given: the hook templates do not let a search
+    start in a credential folder, in a folder above one, or with a file pattern that spells a hidden name
+    through wildcards."""
+
+    def policies(self):
+        return {name: Policy.from_dict(templates.template(name)) for name in ("claude-code", "claude-code-strict")}
+
+    def test_a_search_may_not_start_in_or_above_a_credential_folder(self):
+        home = str(self.user)
+        above = [home, os.path.dirname(home), os.path.join(home, "projects", ".."), "~", "~/",
+                 os.path.splitdrive(home)[0] + os.sep]
+        inside = [os.path.join(home, ".ssh"), os.path.join(home, ".aws", "sso"), "~/.agent-sentinel"]
+        for name, policy in self.policies().items():
+            for tool in ("Grep", "Glob"):
+                for path in above:
+                    with self.subTest(template=name, tool=tool, path=path):
+                        verdict = policy.evaluate(tool, {"pattern": "PRIVATE KEY", "path": path})
+                        self.assertEqual((verdict.action, verdict.rule), ("block", f"tools.{tool}.deny_args[0]"))
+                for path in inside:  # named outright: the policy-wide entries refuse these first
+                    with self.subTest(template=name, tool=tool, path=path):
+                        self.assertEqual(policy.evaluate(tool, {"pattern": "PRIVATE KEY", "path": path}).action,
+                                         "block")
+                for path in (str(self.project), os.path.join(home, "projects", "app"), os.path.join(home, "Documents")):
+                    with self.subTest(template=name, tool=tool, path=path):
+                        self.assertEqual(policy.evaluate(tool, {"pattern": "TODO", "path": path}).action, "allow")
+            # Read names one file: the home folder itself is no credential folder, and nothing is searched.
+            self.assertEqual(policy.evaluate("Read", {"file_path": os.path.join(home, "notes.txt")}).action, "allow")
+            self.assertEqual(policy.evaluate("Read", {"file_path": os.path.join(home, ".ssh", "config")}).action,
+                             "block")
+
+    def test_a_file_pattern_may_not_spell_a_hidden_name_through_wildcards(self):
+        project = str(self.project)
+        hidden = (".ss*/*", ".a*/cred*", "**/.e*", ".agent-s*/*", "src/.[e]nv", "{.ss*,x}/id", ".s{sh,x}/*", "[.]ssh/*",
+                  "**/[.e]nv", ".??*", "a/b/.c*")
+        ordinary = ("*.py", "**/*.ts", "src/**/*.{js,jsx}", "docs/*.md", "test_[a-c]*.py", ".github/workflows/*.yml",
+                    "**/.gitignore", "a.b/c*.txt")
+        for name, policy in self.policies().items():
+            for pattern in hidden:
+                with self.subTest(template=name, pattern=pattern):
+                    grep = policy.evaluate("Grep", {"pattern": ".", "path": project, "glob": pattern})
+                    self.assertEqual((grep.action, grep.rule), ("block", "tools.Grep.deny_args[1]"))
+                    glob = policy.evaluate("Glob", {"pattern": pattern, "path": project})
+                    self.assertEqual((glob.action, glob.rule), ("block", "tools.Glob.deny_args[1]"))
+            for pattern in ordinary:
+                with self.subTest(template=name, pattern=pattern):
+                    self.assertEqual(policy.evaluate("Grep", {"pattern": ".", "path": project, "glob": pattern}).action,
+                                     "allow")
+                    self.assertEqual(policy.evaluate("Glob", {"pattern": pattern, "path": project}).action, "allow")
+            # Grep's own pattern is the text it looks for, a regular expression: ".*" there is not a file name.
+            for regex in (r".*foo", r"\.[ch]$", r"^\s*import .*", r"/.[a-z]*"):
+                with self.subTest(template=name, regex=regex):
+                    self.assertEqual(policy.evaluate("Grep", {"pattern": regex, "path": project}).action, "allow")
 
 
 if __name__ == "__main__":

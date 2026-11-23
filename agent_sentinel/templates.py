@@ -180,17 +180,33 @@ STRICT_ROOT = "~/projects"
 
 # Claude Code's own tools (hook mode), and the arguments that name the file they read or write.
 CLAUDE_CODE_READ_TOOLS: dict[str, str] = {"Read": "file_path", "Grep": "path", "Glob": "path"}
+# The tools that search a folder, and the argument that holds the file pattern of the search (Grep's
+# "pattern" is the text looked for, a regular expression; its file pattern is "glob").
+CLAUDE_CODE_SEARCH_TOOLS: dict[str, str] = {"Grep": "glob", "Glob": "pattern"}
 CLAUDE_CODE_WRITE_TOOLS: dict[str, str] = {
     "Edit": "file_path", "Write": "file_path", "MultiEdit": "file_path", "NotebookEdit": "notebook_path",
 }
-# Tools that neither read nor send anything the flow rules care about ("labels": [] says so).
-CLAUDE_CODE_PLAIN_TOOLS = ("Agent", "Task", "TodoWrite", "AskUserQuestion", "ExitPlanMode", "SubagentHandback")
+# Tools that neither read nor send anything the flow rules care about ("labels": [] says so): subagents,
+# the to-do and task lists, plan mode, questions to the user, and stopping a background task.
+CLAUDE_CODE_PLAIN_TOOLS = (
+    "Agent", "Task", "TodoWrite", "AskUserQuestion", "ExitPlanMode", "SubagentHandback", "EnterPlanMode",
+    "TaskCreate", "TaskUpdate", "TaskList", "TaskGet", "TaskStop", "KillShell",
+)
+# Tools that bring text this machine holds into the conversation, as Read does: a skill's instructions,
+# what a background command has printed (TaskOutput; BashOutput in older versions of Claude Code), and
+# the definition of a tool that Claude Code has not loaded yet (ToolSearch, which sends nothing out).
+CLAUDE_CODE_LOCAL_TEXT_TOOLS = ("Skill", "TaskOutput", "BashOutput", "ToolSearch")
 # The command classes each template refuses or asks about (commands.py).
 COMMAND_CLASSES_ASKED = ["network", "install", "config_write", "obfuscation"]
 COMMAND_CLASSES_STRICT = ["network", "install", "secret_read", "config_write", "obfuscation", "encoded_host"]
-# What a command adds to the flow labels of a Bash or PowerShell call: one that talks to another
-# machine can carry data out, one that reads a credential file brings private data in.
-COMMAND_LABELS = {"network": ["sink"], "install": ["sink"], "secret_read": ["private"]}
+# What a command adds to the flow labels of a Bash or PowerShell call (which is "private" whatever it
+# runs: a shell reads local files as Read and Grep do). One that talks to another machine can carry data
+# out, and what it prints is content from there, as a fetched page is.
+COMMAND_LABELS = {"network": ["untrusted", "sink"], "install": ["untrusted", "sink"], "secret_read": ["private"]}
+# A file pattern with a hidden file or folder spelled through a wildcard, a class or a brace list
+# (".ss*/*", "**/.e*", "[.]ssh/*", "{.aws,x}/cred*"): it can name a credential folder that the text
+# patterns do not see. Used on the file pattern of the search tools only.
+HIDDEN_GLOB_PATTERN = r"(^|[\\/{,])(\.[^\\/]*[*?\[{]|\[[^\]\\/]*\.)"
 # The strict hook template keeps the parts of a fetched URL that can carry data short.
 STRICT_URL_LIMITS = {"max_label_length": 30, "max_path_segment_chars": 80, "max_query_chars": 128}
 
@@ -364,6 +380,11 @@ def _claude_code(strict: bool) -> dict[str, Any]:
     for name, argument in CLAUDE_CODE_READ_TOOLS.items():
         tools[name] = {"action": "allow", "labels": ["private"],
                        "deny_args": [{"arg": argument, "type": "path", "roots": list(SECRET_ROOTS)}]}
+    for name, argument in CLAUDE_CODE_SEARCH_TOOLS.items():
+        # A search reaches everything below its folder: it may not start in a credential folder, nor in a
+        # folder above one (the home folder), and its file pattern may not spell a hidden name with wildcards.
+        tools[name]["deny_args"][0]["or_above"] = True
+        tools[name]["deny_args"].append({"arg": argument, "pattern": HIDDEN_GLOB_PATTERN})
     for name, argument in CLAUDE_CODE_WRITE_TOOLS.items():
         tools[name] = {
             "action": "allow",
@@ -381,7 +402,7 @@ def _claude_code(strict: bool) -> dict[str, Any]:
         else:
             command["ask_classes"] = list(COMMAND_CLASSES_ASKED)
         command["labels_by_class"] = copy.deepcopy(COMMAND_LABELS)
-        tools[name] = {"action": "allow", "labels": [], "deny_args": [setting], "command": command}
+        tools[name] = {"action": "allow", "labels": ["private"], "deny_args": [setting], "command": command}
     tools["WebFetch"] = {"action": "allow", "labels": ["untrusted", "sink"],
                          "deny_args": _fetch_denies(STRICT_URL_LIMITS if strict else None)}
     # A search query, a resource URI and a server name all leave the machine.
@@ -389,6 +410,7 @@ def _claude_code(strict: bool) -> dict[str, Any]:
         tools[name] = {"action": "allow", "labels": ["untrusted", "sink"]}
     tools["Monitor"] = {"action": "ask", "labels": ["untrusted", "sink"]}
     tools.update(_rules(CLAUDE_CODE_PLAIN_TOOLS, {"action": "allow", "labels": []}))
+    tools.update(_rules(CLAUDE_CODE_LOCAL_TEXT_TOOLS, {"action": "allow", "labels": ["private"]}))
     tools["mcp__*"] = {"action": "ask", "labels": ["untrusted", "sink"]}
     # As in the proxy templates: output that reads like instructions to the agent (a medium finding)
     # reaches Claude with a notice to treat it as data (PostToolUse additionalContext). In the strict

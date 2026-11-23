@@ -380,5 +380,31 @@ class ValidateShowsTheNewSettings(unittest.TestCase):
                       "in auto mode is refused.", output)
 
 
+class HookPolicyChanges(unittest.TestCase):
+    def test_a_changed_policy_is_refused_unless_the_policy_says_audit(self):
+        self.assertEqual(Policy.from_dict({}).hook.policy_changes, "block")
+        self.assertEqual(Policy.from_dict({"hook": {"config_changes": "block"}}).hook.policy_changes, "block")
+        self.assertEqual(POLICY.hook.policy_changes, "block")
+        for value in ("block", "audit"):
+            policy = Policy.from_dict({"hook": {"policy_changes": value}})
+            self.assertEqual(policy.hook.policy_changes, value)
+            self.assertEqual(policy.warnings(), Policy.from_dict({}).warnings())
+        self.assertIn("the policy file changed during the Claude Code session",
+                      Policy.from_dict({}).describe_rule("hook.policy_changes"))
+
+    def test_mistakes_are_errors(self):
+        from agent_sentinel.policy import HookOptions
+
+        for data, expected in (
+            ({"hook": {"policy_changes": "allow"}}, "hook.policy_changes must be 'block' or 'audit'"),
+            ({"hook": {"policy_changes": True}}, "hook.policy_changes must be"),
+            ({"hook": {"policy_change": "audit"}}, "did you mean 'policy_changes'?"),
+        ):
+            with self.subTest(data=data):
+                self.assertIn(expected, load_error(data))
+        with self.assertRaisesRegex(PolicyError, "hook.policy_changes"):
+            HookOptions(policy_changes="ask")
+
+
 if __name__ == "__main__":
     unittest.main()

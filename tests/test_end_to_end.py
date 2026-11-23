@@ -1134,7 +1134,9 @@ class TheHook(EndToEndTest):
                      str(self.policy), "--audit", str(self.audit), "--state-dir", str(self.state)],
                     input=(EVENTS / event).read_bytes(), capture_output=True, env=self.environment, timeout=120,
                 )
-                self.assertEqual(proc.returncode, 2, proc.stderr)
+                # A stopped agent is a JSON answer, which Claude Code reads only on exit code 0 (on exit code 2 it
+                # would show Claude the text and go on); a call that is not made, or a session that cannot start, 2.
+                self.assertEqual(proc.returncode, 0 if event.startswith("post_") else 2, proc.stderr)
                 out = proc.stdout.decode("utf-8")
                 if event == "session_start.json":
                     self.assertIn(b"could not be started", proc.stderr)

@@ -1,11 +1,13 @@
 """State kept in files for hook mode, where every event is answered by a new process.
 
-Two kinds of state live here, next to the session file
+Three kinds of state live here, next to the session file
 (session.FileSessionStore: the flow marks and, since its format version 2,
 the tails of the tail scan, the session-limit counts and approval memory):
-the rate-limit counts (FileRateLimiter) and a snapshot of Claude Code's
-settings files (SettingsSnapshot, at the end). Each kind has its own file,
-format name and version, and all of them share the folder's lock file.
+the rate-limit counts (FileRateLimiter), a snapshot of Claude Code's
+settings files (SettingsSnapshot) and which policy file the session began
+with (PolicyRecord). Each kind has its own file, format name and version,
+and all of them share the folder's lock file. prune_state_files, at the end,
+removes the files of sessions that are long over.
 
 Rate limits
 -----------
@@ -57,6 +59,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import secrets
 import stat
 import threading
@@ -68,6 +71,7 @@ from typing import Any, Callable, Iterable, Mapping
 from . import jsonutil
 from .filelock import locked, make_private_folder, replace_file
 from .firewall import RATE_WINDOW_SECONDS
+from .policy import POLICY_CHANGES
 from .session import LOCK_FILE_NAME, MAX_SESSION_ID_CHARS
 
 RATE_FILE_FORMAT = "agent-sentinel-rate"
@@ -316,14 +320,14 @@ class SettingsSnapshot:
             name = settings_path_key(path)
             if name is not None and name not in files and len(files) < MAX_SNAPSHOT_FILES:
                 files[name] = _entry(read_settings_keys(path, salt))
-        self.directory.mkdir(parents=True, exist_ok=True)
+        make_private_folder(self.directory)  # owner-only, the missing folders above it too
         with self._thread_lock, locked(self._lock_path):
             self._write(salt, files)
 
     def compare(self, path: str | Path, keep: bool) -> KeyChanges:
         """The file at `path` now against the snapshot; with `keep`, remember it as it is now."""
         name = settings_path_key(path)
-        self.directory.mkdir(parents=True, exist_ok=True)
+        make_private_folder(self.directory)  # owner-only, the missing folders above it too
         with self._thread_lock, locked(self._lock_path):
             salt, files = self._read()
             if salt is None:
@@ -400,7 +404,7 @@ def read_settings_keys(path: str | Path, salt: str) -> SettingsKeys:
     no hashes and a problem.
     """
     if settings_path_key(path) is None:
-        return SettingsKeys(None, "not a full path")
+        return SettingsKeys(None, "is not named by a full path")
     try:
         data = _read_regular_file(Path(path), MAX_SETTINGS_BYTES)
     except FileNotFoundError:
@@ -477,4 +481,204 @@ def _keys_of(entry: Any) -> SettingsKeys | None:
 
 def _shortened(text: str) -> str:
     return text if len(text) <= MAX_PROBLEM_CHARS else text[:MAX_PROBLEM_CHARS - 3] + "..."
+
+
+# ---- the policy a session began with ---------------------------------------------------------
+
+POLICY_FILE_FORMAT = "agent-sentinel-session-policy"
+POLICY_FILE_VERSION = 1
+MAX_POLICY_RECORD_BYTES = 4096
+_SHA256_CHARS = 64
+# The record's own time is brought up to date this often, so that a long session's record is not taken
+# for an old session's (prune_state_files).
+_RECORD_REFRESH_SECONDS = 24 * 60 * 60
+
+
+class PolicyRecordError(Exception):
+    """The record of the policy a session began with cannot be read or written, so the event cannot be judged."""
+
+
+@dataclass(frozen=True)
+class SeenPolicy:
+    """The policy a session began with: the SHA-256 of its file, and its hook.policy_changes then."""
+
+    sha256: str
+    policy_changes: str
+
+
+class PolicyRecord:
+    """Which policy file a session began with, in a file in the state folder.
+
+        <state folder>/policy-<hash of the session id>.json
+
+    The hook reads the policy file anew for every event. Without this record,
+    an agent that managed to rewrite the policy would be judged by its own
+    policy from the next event on. remember() writes the record when a new
+    session starts; seen() returns it, writing it first for a session that
+    has none (state written by an older version, or lost). The caller
+    compares the SHA-256 with the file it has just loaded.
+
+    Failing closed: a record that cannot be read, locked or written, or that
+    is not exactly what this class writes, raises PolicyRecordError, and the
+    hook refuses the event. A missing record is a session not seen before,
+    so deleting it makes the session take the policy as it is now: the state
+    folder needs the same care as the policy file itself.
+    """
+
+    def __init__(self, directory: str | Path, session_id: str, clock: Callable[[], float] = time.time) -> None:
+        if not isinstance(session_id, str) or not 0 < len(session_id) <= MAX_SESSION_ID_CHARS:
+            raise ValueError(f"the session id must be text of 1 to {MAX_SESSION_ID_CHARS} characters")
+        self.directory = Path(directory)
+        self.session_id = session_id
+        digest = hashlib.sha256(session_id.encode("utf-8", errors="surrogatepass")).hexdigest()[:32]
+        self.path = self.directory / f"policy-{digest}.json"
+        self._lock_path = self.directory / LOCK_FILE_NAME
+        self._clock = clock
+        self._thread_lock = threading.Lock()
+
+    def remember(self, sha256: str, policy_changes: str) -> SeenPolicy:
+        """A new session: record this policy, replacing what an earlier session of the same id left."""
+        seen = _seen_policy(sha256, policy_changes)
+        try:
+            make_private_folder(self.directory)
+            with self._thread_lock, locked(self._lock_path):
+                self._write(seen)
+        except OSError as exc:
+            raise PolicyRecordError(f"cannot use the policy record {self.path}: {exc}") from exc
+        return seen
+
+    def seen(self, sha256: str, policy_changes: str) -> SeenPolicy:
+        """The policy the session began with; for a session with no record, this one, which is recorded."""
+        current = _seen_policy(sha256, policy_changes)
+        try:
+            make_private_folder(self.directory)
+            with self._thread_lock, locked(self._lock_path):
+                recorded = self._read()
+                if recorded is None:
+                    self._write(current)
+                    return current
+                self._refresh()
+                return recorded
+        except OSError as exc:
+            raise PolicyRecordError(f"cannot use the policy record {self.path}: {exc}") from exc
+
+    # ---- the file ------------------------------------------------------------------------
+
+    def _read(self) -> SeenPolicy | None:
+        """The record in the file; None when there is no file. PolicyRecordError when it is not valid."""
+        try:
+            with open(self.path, "rb") as handle:
+                data = handle.read(MAX_POLICY_RECORD_BYTES + 1)
+        except FileNotFoundError:
+            return None
+        problem = "too large" if len(data) > MAX_POLICY_RECORD_BYTES else None
+        document: Any = None
+        if problem is None:
+            try:
+                document = jsonutil.loads(data.decode("utf-8"))
+            except (ValueError, RecursionError):  # includes UnicodeDecodeError and a repeated key
+                problem = "not JSON"
+        if problem is None and (not isinstance(document, dict) or set(document) != {
+                "format", "version", "session", "sha256", "policy_changes"}):
+            problem = "unexpected contents"
+        if problem is None and (document["format"], document["version"]) != (POLICY_FILE_FORMAT, POLICY_FILE_VERSION):
+            problem = "unknown format or version"
+        if problem is None and document["session"] != self.session_id:
+            problem = "it belongs to another session"
+        if problem is None:
+            try:
+                return _seen_policy(document["sha256"], document["policy_changes"])
+            except ValueError:
+                problem = "unexpected contents"
+        raise PolicyRecordError(
+            f"the policy record {self.path} is not valid ({problem}); delete it and start a new Claude Code session"
+        )
+
+    def _write(self, seen: SeenPolicy) -> None:
+        document = {
+            "format": POLICY_FILE_FORMAT, "version": POLICY_FILE_VERSION, "session": self.session_id,
+            "sha256": seen.sha256, "policy_changes": seen.policy_changes,
+        }
+        replace_file(self.path, json.dumps(document, ensure_ascii=True).encode("ascii"))
+
+    def _refresh(self) -> None:
+        """Bring the record's time up to date once a day (best effort): the session is still in use."""
+        try:
+            now = self._clock()
+            if now - os.stat(self.path).st_mtime > _RECORD_REFRESH_SECONDS:
+                os.utime(self.path, (now, now))
+        except OSError:
+            pass
+
+
+def _seen_policy(sha256: Any, policy_changes: Any) -> SeenPolicy:
+    """A SeenPolicy from values that may come from a file; ValueError for anything but a SHA-256 and a setting."""
+    if not (isinstance(sha256, str) and len(sha256) == _SHA256_CHARS and all(ch in "0123456789abcdef" for ch in sha256)):
+        raise ValueError("the policy's SHA-256 must be 64 lowercase hexadecimal characters")
+    if policy_changes not in POLICY_CHANGES:
+        raise ValueError(f"policy_changes must be one of {', '.join(POLICY_CHANGES)}")
+    return SeenPolicy(sha256, policy_changes)
+
+
+# ---- old state files --------------------------------------------------------------------------
+
+# The files this module and session.FileSessionStore write for one session: a kind, and the hash of its id.
+_STATE_FILE = re.compile(r"(session|rate|settings|policy)-([0-9a-f]{32})\.json")
+# A session whose files were all left alone for this long is over: its files are removed.
+MAX_STATE_AGE_SECONDS = 30 * 24 * 60 * 60
+# Bounds on one run of prune_state_files: names looked at, and files removed.
+MAX_PRUNE_ENTRIES = 20_000
+MAX_PRUNED_FILES = 400
+
+
+def prune_state_files(directory: str | Path, now: float | None = None,
+                      max_age: float = MAX_STATE_AGE_SECONDS) -> int:
+    """Remove the state files of sessions that have not been used for `max_age` seconds; return how many.
+
+    Only regular files in `directory` itself whose names are exactly what the
+    hook writes for a session (session-, rate-, settings- and policy-<hash>.json)
+    are looked at; nothing else is touched, and no folder is entered. A
+    session's files go together, and only when every one of them is old: a
+    session still in use keeps its policy record fresh (PolicyRecord). At most
+    MAX_PRUNE_ENTRIES names are looked at and MAX_PRUNED_FILES files removed in
+    one run; the rest waits for the next. Best effort: a file that cannot be
+    looked at or removed is left, and OSError is raised only when the folder
+    cannot be locked.
+    """
+    folder = Path(directory)
+    if not folder.is_dir():
+        return 0
+    limit = (time.time() if now is None else now) - max_age
+    removed = 0
+    with locked(folder / LOCK_FILE_NAME):
+        sessions: dict[str, list[tuple[str, float]]] = {}
+        try:
+            with os.scandir(folder) as entries:
+                for count, entry in enumerate(entries):
+                    if count >= MAX_PRUNE_ENTRIES:
+                        break
+                    found = _STATE_FILE.fullmatch(entry.name)
+                    if found is None:
+                        continue
+                    try:
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        modified = entry.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        continue
+                    sessions.setdefault(found.group(2), []).append((entry.name, modified))
+        except OSError:
+            return 0
+        for files in sessions.values():
+            if any(modified >= limit for _, modified in files):
+                continue
+            for name, _ in files:
+                if removed >= MAX_PRUNED_FILES:
+                    return removed
+                try:
+                    os.remove(folder / name)
+                    removed += 1
+                except OSError:
+                    pass
+    return removed
 

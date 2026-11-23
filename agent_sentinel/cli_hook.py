@@ -33,26 +33,28 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import difflib
 import io
 import json
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, TextIO
+from typing import TYPE_CHECKING, Any, TextIO
 
-from . import __version__, audit_chain, claude_hooks, control_plane, home
+from . import __version__, audit_chain, claude_hooks, home
 from .claude_hooks import HookAnswer, HookSettings
 from .cli_common import EXIT_ERROR, EXIT_OK, INSTALL_COMMAND, CommandError, full_path, load_policy, shown_path
-from .cli_wrap import this_python
-from .clients import inside_folder, is_app_state
-from .config_file import ConfigFile, create_config, read_config, with_top_level_value, write_config
 from .firewall import new_ref
 from .leaks import redact_value
 from .policy import Policy
 from .textutil import printable
-from .wrapping import ISOLATED_MODULE, PACKAGE, PLAIN_MODULE, SCRIPT, PythonCheck
+
+# Claude Code starts `hook claude-code` anew for every event, so this module loads at its top only what
+# answering an event needs. What only `hook install` uses (the client configurations, the settings file
+# editor, the checks of this Python) is imported inside the functions that use it.
+if TYPE_CHECKING:
+    from .config_file import ConfigFile
+    from .wrapping import PythonCheck
 
 HELP = "enforce the policy inside Claude Code through its hooks (hook claude-code, hook install claude-code)"
 DESCRIPTION = (
@@ -80,12 +82,20 @@ SUBAGENT_RESULTS_MATCHER = "|".join((RESULTS_MATCHER, *claude_hooks.SUBAGENT_REP
 # ConfigChange: every source Claude Code reports. Letters, "_" and "|" only, so an exact list, not a pattern.
 CONFIG_MATCHER = "|".join(claude_hooks.CONFIG_SOURCES)
 ALL = "*"
-# Some of Claude Code's own tools. A policy written for MCP servers blocks them all when its default is
-# "block", including the ones Claude uses to ask the user something or to leave plan mode, to read MCP
-# resources, or to hand back a subagent's report in auto mode.
+# Claude Code's own tools that the hook templates have a rule for. A policy written for MCP servers blocks
+# them all when its default is "block", including the ones Claude uses to ask the user something or to
+# leave plan mode, to read MCP resources, to look up a tool it has not loaded yet (ToolSearch), to run a
+# skill, or to hand back a subagent's report in auto mode. `hook install` warns about those it blocks.
 BUILT_IN_TOOLS = (
     "Read", "Glob", "Grep", "Edit", "Write", "NotebookEdit", "Bash", "WebFetch", "WebSearch", "Agent",
     "AskUserQuestion", "ExitPlanMode", "SubagentHandback", "ReadMcpResourceTool", "ListMcpResourcesTool", "Monitor",
+    "MultiEdit", "PowerShell", "Task", "TodoWrite", "EnterPlanMode", "ToolSearch", "Skill", "TaskCreate",
+    "TaskUpdate", "TaskList", "TaskGet", "TaskOutput", "TaskStop", "BashOutput", "KillShell",
+)
+# More of Claude Code's own tools, which the hook templates leave without a rule (so they are refused there):
+# what they do depends on how they are used. `hook install` names the ones a policy has no rule for.
+OTHER_BUILT_IN_TOOLS = (
+    "EnterWorktree", "ExitWorktree", "LSP", "CronCreate", "CronDelete", "CronList", "SendMessage", "ListAgents",
 )
 
 
@@ -153,6 +163,21 @@ def run(args: argparse.Namespace) -> int:
     return install_claude_code(args)
 
 
+def run_event(argv: list[str]) -> int:
+    """`hook claude-code` with these words after it, without the other commands being loaded.
+
+    __main__ comes here first for the command Claude Code runs for every
+    event. The options are those of add_arguments; a word that is not one of
+    them ends the process with exit code 2 (argparse), which blocks.
+    """
+    parser = argparse.ArgumentParser(
+        prog="agent-sentinel hook claude-code",
+        description="Answer one Claude Code hook event, read as JSON on stdin. Exits 0, or 2 to block.",
+    )
+    _add_paths(parser)
+    return run_claude_code(parser.parse_args(argv))
+
+
 # ---- hook claude-code ------------------------------------------------------------------------------
 
 def run_claude_code(args: argparse.Namespace) -> int:
@@ -167,21 +192,41 @@ def run_claude_code(args: argparse.Namespace) -> int:
     held = io.StringIO()
     try:
         with contextlib.redirect_stdout(held), contextlib.redirect_stderr(held):
-            answer = _answer(args)
+            answer, line = _answer(args)
     except BaseException:  # even Ctrl+C must not end with an exit code that lets the call through
         answer = claude_hooks.failed_answer(None, new_ref())
-    _send(answer, held.getvalue(), stdout, stderr)
+        line = _line(answer)
+    try:
+        _send(answer, line, held.getvalue(), stdout, stderr)
+    except BaseException:  # the answer could not be written (a closed pipe): nothing was said, so block
+        return claude_hooks.EXIT_BLOCK
     return answer.exit_code
 
 
-def _answer(args: argparse.Namespace) -> HookAnswer:
+def _answer(args: argparse.Namespace) -> tuple[HookAnswer, str | None]:
+    """The answer to the event on stdin, and the line that goes to stdout for it (None: nothing)."""
     data = sys.stdin.buffer.read(claude_hooks.MAX_EVENT_BYTES + 1)
     try:
         settings = _hook_settings(args)
     except Exception as exc:  # e.g. the home folder for the default state folder cannot be worked out
         audit = Path(os.path.abspath(args.audit)) if args.audit else None
-        return claude_hooks.refusal_without_settings(data, audit, f"the hook could not start: {exc}")
-    return claude_hooks.answer_event(data, settings)
+        answer = claude_hooks.refusal_without_settings(data, audit, f"the hook could not start: {exc}")
+        return answer, _line(answer)
+    answer = claude_hooks.answer_event(data, settings)
+    try:
+        return answer, _line(answer)
+    except (RecursionError, ValueError, TypeError) as exc:
+        # A replaced output sits a few levels deeper in the answer than it did in the event: one nested as
+        # deeply as the reader accepts may be more than the writer can write. The original cannot then be
+        # replaced, so the event is refused like any other that could not be checked.
+        answer = claude_hooks.refusal_without_settings(
+            data, settings.audit, f"the answer could not be written: {type(exc).__name__}", settings)
+        return answer, _line(answer)
+
+
+def _line(answer: HookAnswer) -> str | None:
+    """One line of ASCII JSON and nothing else: Claude Code reads stdout as the answer only then."""
+    return None if answer.output is None else json.dumps(answer.output, ensure_ascii=True)
 
 
 def _hook_settings(args: argparse.Namespace) -> HookSettings:
@@ -199,10 +244,9 @@ def _hook_settings(args: argparse.Namespace) -> HookSettings:
     )
 
 
-def _send(answer: HookAnswer, held: str, stdout: TextIO, stderr: TextIO) -> None:
-    if answer.output is not None:
-        # One line of ASCII JSON and nothing else: Claude Code reads stdout as the answer only then.
-        stdout.write(json.dumps(answer.output, ensure_ascii=True) + "\n")
+def _send(answer: HookAnswer, line: str | None, held: str, stdout: TextIO, stderr: TextIO) -> None:
+    if line is not None:
+        stdout.write(line + "\n")
         stdout.flush()
     text = answer.message if answer.exit_code != claude_hooks.EXIT_OK else held + answer.message
     for line in text.splitlines():
@@ -253,6 +297,13 @@ def install_claude_code(args: argparse.Namespace) -> int:
     return _change_settings(Path(full_path(args.settings)), handler, args, python, files, policy)
 
 
+def this_python() -> PythonCheck:
+    """Whether this Python can start agent-sentinel from another folder, and how (cli_wrap.this_python)."""
+    from .cli_wrap import this_python as check
+
+    return check()
+
+
 def audit_options(key_file: str | None, required: bool, max_bytes: int | None) -> list[str]:
     """The audit options of `hook claude-code`, as words for the hook entry (none when not used)."""
     words = ["--audit-key-file", key_file] if key_file else []
@@ -266,6 +317,8 @@ def audit_options(key_file: str | None, required: bool, max_bytes: int | None) -
 def hook_handler(python: str, isolated: bool, policy: str, audit: str, state: str, log_args: bool = True,
                  audit_options: list[str] | None = None) -> dict[str, Any]:
     """The hook entry that runs `agent-sentinel hook claude-code`: exec form, absolute paths, blocking on failure."""
+    from .wrapping import ISOLATED_MODULE, PLAIN_MODULE
+
     words = [*(ISOLATED_MODULE if isolated else PLAIN_MODULE), "hook", "claude-code",
              "--policy", policy, "--audit", audit, "--state-dir", state]
     if not log_args:
@@ -340,6 +393,8 @@ def is_our_handler(handler: Any) -> bool:
     """Whether a hook entry runs `agent-sentinel hook claude-code` (as install writes it, or by hand)."""
     if not isinstance(handler, dict) or not isinstance(handler.get("command"), str):
         return False
+    from .wrapping import PACKAGE, SCRIPT
+
     args = handler.get("args")
     words = [handler["command"], *args] if isinstance(args, list) else handler["command"].split()
     # The last part of each word, whichever slash it uses: "C:\py\Scripts\agent-sentinel.exe" -> "agent-sentinel.exe".
@@ -371,6 +426,10 @@ def _print_header(policy_path: str, policy: Policy, audit: str, state: str, args
     if blocked:
         print(f"  Warning: the policy blocks Claude Code's own tools {', '.join(blocked)} (it has no rule that "
               'allows them). Add rules for the ones the agent should use, such as "Read": "allow" or "Bash": "ask".')
+    others = [tool for tool in OTHER_BUILT_IN_TOOLS if policy.tool_level_action(tool) == "block"]
+    if others:
+        print(f"  Note: the policy also refuses {', '.join(others)}, tools of Claude Code that the hook templates "
+              "leave without a rule. Add a rule for one the agent should use.")
     if policy.may_ask():
         auto = ("every 'ask' in auto mode (hook.treat_auto_as_non_prompting)" if policy.hook.treat_auto_as_non_prompting
                 else "an 'ask' for SubagentHandback in auto mode, which runs without a prompt")
@@ -385,11 +444,19 @@ def _print_header(policy_path: str, policy: Policy, audit: str, state: str, args
               'mcp__<server>__* tool rules instead, such as "mcp__web__*": {"action": "allow", "labels": '
               '["untrusted"]}.')
     if policy.tool_level_action("Monitor") != "block":
-        print("  Note: the policy lets the agent use Monitor, whose streamed events no hook can scan. Label it "
-              '"untrusted" and "sink" for the flow rules, or block it.')
+        note = "  Note: the policy lets the agent use Monitor, whose streamed events no hook can scan."
+        if not {"untrusted", "sink"} <= set(policy.tool_labels("Monitor")):
+            note += ' Label it "untrusted" and "sink" for the flow rules, or block it.'
+        print(note)
     if policy.hook.config_changes == "block":
         print("Settings:      a change to Claude Code's settings or skills during a session is refused "
               "(hook.config_changes); the file stays changed, and the next session reads it.")
+    if policy.hook.policy_changes == "block":
+        print("               If the policy file changes during a session, that session's calls are refused until "
+              "a new session starts (hook.policy_changes).")
+    else:
+        print("               A change to the policy file during a session is only recorded, and applies at once "
+              '(hook.policy_changes is "audit").')
     print(f"Audit log:     {shown_path(audit)}")
     print(f"Session state: {shown_path(state)} (flow marks, rate-limit counts, session limits, the end of the last "
           "output for the tail scan, and the settings snapshot; keep it out of the agent's reach)")
@@ -414,6 +481,12 @@ def _print_snippet(hooks: dict[str, Any], policy_path: str) -> None:
 
 def _change_settings(path: Path, handler: dict[str, Any], args: argparse.Namespace, python: PythonCheck,
                      files: dict[str, str], policy: Policy | None = None) -> int:
+    import difflib
+
+    from . import control_plane
+    from .clients import is_app_state
+    from .config_file import create_config, read_config, with_top_level_value, write_config
+
     if is_app_state(path):
         raise CommandError(f"{path} is Claude Code's own state file, which agent-sentinel never edits; hooks belong "
                            "in a settings file such as ~/.claude/settings.json")
@@ -465,6 +538,8 @@ def _warn_about_project(settings: Path, files: dict[str, str]) -> None:
     """For a project's settings file (<project>/.claude/...): say so if the policy or the state is in that project."""
     if settings.parent.name.lower() != ".claude":
         return
+    from .clients import inside_folder
+
     project = settings.parent.parent
     user = home.user_folder()
     if user is not None and inside_folder(project, user) and inside_folder(user, project):

