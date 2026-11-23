@@ -741,10 +741,11 @@ class Policy:
                             ("hide_blocked_tools", self.hide_blocked_tools),
                             ("require_labels", self.require_labels)):
             _expect_bool(value, name)
+        rules = _RuleIndex(self.tools) if self.require_labels else None
         for rule in self.tools:
             if rule.command is not None and not isinstance(rule.command, CommandRule):
                 raise PolicyError(f"tools.{rule.name}.command must be a CommandRule")
-            if self.require_labels and rule.action != "block" and not _labels_said(self.tools, rule):
+            if rules is not None and rule.action != "block" and not _labels_said(rules, rule):
                 raise PolicyError(
                     f'tools.{rule.name}: "require_labels" is true, so a rule that allows or asks must say its flow '
                     'labels: add "labels" (["untrusted"], ["private"], ["sink"] ..., or [] for none)'
@@ -779,7 +780,9 @@ class Policy:
         try:
             data = jsonutil.loads(text)  # json.loads keeps the last of two equal keys without a word
         except jsonutil.RepeatedKeyError as exc:  # say so, instead of "not valid JSON"
-            raise PolicyError(f"{label}: duplicate key {exc.key!r}: a key may appear only once in an object") from exc
+            raise PolicyError(
+                f"{label}: duplicate key {quoted(exc.key)}: a key may appear only once in an object"
+            ) from exc
         except json.JSONDecodeError as exc:
             raise PolicyError(json_error_message(label, exc)) from exc
         except (ValueError, RecursionError) as exc:  # absurd nesting, a huge number, NaN or Infinity
@@ -1238,7 +1241,9 @@ class Policy:
             RULE_QUARANTINE: "the tool was removed from the tool list (its description was flagged, it changed "
                              "after it was first seen, or its list could not be checked)",
             RULE_CALLER: "the program that uses the firewall blocked it (Firewall.block)",
-            RULE_SESSION: "the session state of the flow rules could not be recorded, so the result was withheld",
+            RULE_SESSION: "the session state (flow marks, session limits) could not be read or kept, so the call was "
+                          "refused or the result withheld; the reason says why (a missing or damaged session file, a "
+                          "state folder that cannot be written, or more values or counters than a session keeps)",
             RULE_HOOK_FAILED: "the Claude Code hook could not finish its checks (a policy that does not load, or "
                               "session state that cannot be used), so it refused",
             RULE_HOOK_CONFIG_CHANGES: f'hook.config_changes is "{self.hook.config_changes}": the Claude Code hook '
@@ -1751,18 +1756,50 @@ def _overridden_glob_warnings(tools: list[ToolRule]) -> list[str]:
     return found
 
 
+class _RuleIndex:
+    """The tool rules of a policy, filed so that the rules matching a name are found without trying them all.
+
+    For the warnings and the require_labels check, which ask this for every
+    rule: trying every rule each time made them quadratic, and a generated
+    policy can have tens of thousands of rules. Exact rules are filed by
+    name, wildcards by the text before their first "*"; `matching` tries only
+    the wildcards whose start the name has.
+    """
+
+    def __init__(self, tools: Sequence[ToolRule]) -> None:
+        self._exact: dict[str, list[tuple[int, ToolRule]]] = {}
+        self._globs: dict[str, list[tuple[int, ToolRule]]] = {}
+        for position, rule in enumerate(tools):
+            if rule.is_glob:
+                self._globs.setdefault(rule._pieces[0], []).append((position, rule))
+            else:
+                self._exact.setdefault(rule.name, []).append((position, rule))
+        self._starts = sorted({len(start) for start in self._globs})
+
+    def matching(self, name: str) -> list[ToolRule]:
+        """Every rule that matches `name` (what `rule.matches(name)` would pick), in the policy's order."""
+        found = list(self._exact.get(name, ()))
+        for length in self._starts:
+            if length > len(name):
+                break
+            found += [pair for pair in self._globs.get(name[:length], ()) if pair[1].matches(name)]
+        found.sort(key=lambda pair: pair[0])
+        return [rule for _, rule in found]
+
+
 def _shadowed_glob_warnings(tools: list[ToolRule]) -> list[str]:
     """Warn when an exact rule replaces the allow_args (or the closed list) of a wildcard rule that matches it.
 
     The exact rule decides the action and the allowed arguments; the
     wildcard's deny_args, command section, labels and rate limit still apply.
     """
+    rules = _RuleIndex(tools)
     found = []
     for rule in tools:
         if rule.is_glob:
             continue
-        for glob in tools:
-            if glob.is_glob and glob.matches(rule.name) and (glob.allow_args or glob.other_args == "block"):
+        for glob in rules.matching(rule.name):
+            if glob.is_glob and (glob.allow_args or glob.other_args == "block"):
                 found.append(
                     f"tools.{rule.name}: this exact rule replaces the allow_args of the wildcard rule '{glob.name}', "
                     f"so they do not apply to '{rule.name}' (its deny_args, labels and rate limit still do); "
@@ -1794,17 +1831,20 @@ def _missing_root_warnings(policy: Policy) -> list[str]:
     return found
 
 
-def _labels_said(tools: Sequence[ToolRule], rule: ToolRule) -> bool:
+def _labels_said(rules: _RuleIndex, rule: ToolRule) -> bool:
     """True if the rule says its flow labels (maybe none), or, for an exact rule, a matching wildcard does."""
     if rule.labelled:
         return True
-    return not rule.is_glob and any(other.is_glob and other.labelled and other.matches(rule.name) for other in tools)
+    return not rule.is_glob and any(other.is_glob and other.labelled for other in rules.matching(rule.name))
 
 
-def _possible_labels(policy: Policy, rule: ToolRule) -> frozenset[str]:
-    """The labels a call to the tools of this rule can have: its own (with a matching wildcard's), and its
-    command section's labels_by_class."""
-    labels = set(rule.labels if rule.is_glob else policy.tool_labels(rule.name))
+def _possible_labels(rules: _RuleIndex, rule: ToolRule) -> frozenset[str]:
+    """The labels a call to the tools of this rule can have: its own (with a matching wildcard's, as
+    Policy.tool_labels gives them), and its command section's labels_by_class."""
+    if rule.is_glob:
+        labels = set(rule.labels)
+    else:
+        labels = {label for other in rules.matching(rule.name) for label in other.labels}
     if rule.command is not None:
         labels.update(label for _, given in rule.command.labels_by_class for label in given)
     return frozenset(labels)
@@ -1823,17 +1863,18 @@ def _label_warnings(policy: Policy) -> list[str]:
     """
     if not policy.flows:
         return []
+    rules = _RuleIndex(policy.tools)
     found = []
     for rule in policy.tools:
         if rule.action == "block":
             continue
-        if not _labels_said(policy.tools, rule):
+        if not _labels_said(rules, rule):
             found.append(
                 f"tools.{rule.name}: it is allowed but has no flow labels, so the flow rules cannot see what it "
                 'reads or sends; add "labels" (["untrusted"], ["private"], ["sink"] ..., or [] if it has none)'
             )
             continue
-        labels = _possible_labels(policy, rule)
+        labels = _possible_labels(rules, rule)
         if SINK in labels or PRIVATE in labels:
             continue
         if UNTRUSTED in labels:
@@ -1863,10 +1904,11 @@ def _rule_of_two_warnings(policy: Policy) -> list[str]:
     its exception are the ones its author chose to let through.
     """
     reachable: dict[str, list[str]] = {UNTRUSTED: [], PRIVATE: [], SINK: []}
+    rules = _RuleIndex(policy.tools)
     for rule in policy.tools:
         if rule.action == "block":
             continue
-        labels = _possible_labels(policy, rule)
+        labels = _possible_labels(rules, rule)
         for label, names in reachable.items():
             if label in labels:
                 names.append(rule.name)
@@ -1897,7 +1939,8 @@ def _flow_warnings(policy: Policy) -> list[str]:
     """Warn about flow rules that can never apply, labels nothing uses, and tools a flow will lock after one use."""
     if not policy.flows:
         return []
-    given = {label for rule in policy.tools for label in _possible_labels(policy, rule)}
+    rules = _RuleIndex(policy.tools)
+    given = {label for rule in policy.tools for label in _possible_labels(rules, rule)}
     given.update(label for rule in policy.server_labels for label in rule.labels)
     if policy.mark_at is not None:
         given.add(policy.injection_mark)
@@ -2219,8 +2262,7 @@ def _distinct_limits(specs: Any, where: str) -> tuple[DistinctLimit, ...]:
             raise PolicyError(f"{entry} needs 'arg' (an argument name) and 'max' (how many different values)")
         limit = DistinctLimit(spec["arg"], spec["max"])
         _check_distinct(limit, entry)
-        if any(known.arg == limit.arg for known in limits):
-            raise PolicyError(f"{entry}: the argument {quoted(limit.arg)} is listed twice")
+        _expect_new_distinct_arg(limit, limits, entry)
         limits.append(limit)
     return tuple(limits)
 
@@ -2230,8 +2272,20 @@ def _check_distinct(limit: Any, where: str) -> None:
         raise PolicyError(f"{where} must be a DistinctLimit")
     _expect_name(limit.arg, f"{where}: argument name")
     if "*" in limit.arg:
-        raise PolicyError(f"{where}: argument name {limit.arg!r} holds a '*'; max_distinct counts one named argument")
+        raise PolicyError(f"{where}: argument name {quoted(limit.arg)} holds a '*'; max_distinct counts one named "
+                          "argument")
     _expect_whole(limit.max, f"{where}.max", 1, MAX_DISTINCT_VALUES)
+
+
+def _expect_new_distinct_arg(limit: DistinctLimit, earlier: Sequence[DistinctLimit], where: str) -> None:
+    """Refuse a max_distinct entry for an argument an earlier entry of the list already counts.
+
+    max_distinct finds its argument by name ignoring case (as deny_args do),
+    so "to" and "To" count the same values: two entries would keep them twice.
+    """
+    if any(known.arg.casefold() == limit.arg.casefold() for known in earlier):
+        raise PolicyError(f"{where}: the argument {quoted(limit.arg)} is listed twice (names are matched ignoring "
+                          "case)")
 
 
 def _check_session_limits(calls: Any, distinct: Any, where: str) -> None:
@@ -2242,6 +2296,7 @@ def _check_session_limits(calls: Any, distinct: Any, where: str) -> None:
         raise PolicyError(f"{where}.max_distinct must be a tuple of at most {MAX_DISTINCT_ENTRIES} DistinctLimit")
     for index, limit in enumerate(distinct):
         _check_distinct(limit, f"{where}.max_distinct[{index}]")
+        _expect_new_distinct_arg(limit, distinct[:index], f"{where}.max_distinct[{index}]")
 
 
 def _whole_setting(spec: dict[str, Any], key: str, where: str, lowest: int, highest: int,
@@ -2436,7 +2491,7 @@ def _arg_rules(specs: Any, where: str, deny: bool) -> tuple[ArgRule, ...]:
             # Tool names take wildcards; argument names do not. "file_*" would
             # load and then match only an argument literally called "file_*".
             raise PolicyError(
-                f"{entry}: argument name {arg!r} holds a '*'. Argument names are exact; "
+                f"{entry}: argument name {quoted(arg)} holds a '*'. Argument names are exact; "
                 f"use '{ANY_ARG}' alone to mean every argument"
             )
         # "optional" makes sense on the allow side only. Accepting it on the
@@ -2545,4 +2600,5 @@ def _expect_severity(
 def _expect_name(name: Any, what: str) -> None:
     """Refuse a tool, method or argument name that is empty or has spaces around it: almost certainly a typo."""
     if not isinstance(name, str) or not name or name != name.strip():
-        raise PolicyError(f"{what} {name!r} must be text that is not empty and has no spaces around it")
+        # quoted() shortens the echo: a list of thousands of entries written where a name belongs is not repeated.
+        raise PolicyError(f"{what} {quoted(name)} must be text that is not empty and has no spaces around it")

@@ -342,6 +342,34 @@ class AgentConfigurationIsWriteProtected(unittest.TestCase):
             pattern.search(text)
             self.assertLess(time.perf_counter() - start, 0.5)
 
+    def test_a_name_is_read_whole_and_a_megabyte_of_escapes_stays_quick(self):
+        # The escaped-name alternative was tried at every escape of a run of them, each time reading up to 80
+        # more: a megabyte of A took about 3.4 seconds (ordinary text 0.15), on every argument of the
+        # write tools. The name is now read once, as one run, which also takes in other escapes (YAML's \x5f)
+        # and a name of any length.
+        pattern = re.compile(templates.CONTROL_SETTING_PATTERN, re.IGNORECASE)
+        escape = "\\"
+        for text in ('"' + escape + 'u004eODE' + escape + 'x5fOPTIONS": "--require ./x.js"',  # YAML decodes both
+                     '"{' + escape + '"' + escape + 'u0041NTHROPIC_BASE_URL' + escape + '": 1}"',  # JSON in JSON
+                     '{"' + escape + 'u0041' + "b" * 200 + '": 1}', escape + "U0000004e" + "x" * 100 + " = 1"):
+            with self.subTest(text=text[:40]):
+                self.assertTrue(pattern.search(text))
+        for text in ('print("' + escape + 'u0041bc")', "path = 'C:" + escape + "users" + escape + "ann'",
+                     escape * 50 + "u0041", escape + "u0041 " + escape + "u0041 x"):
+            with self.subTest(text=text[:40]):
+                self.assertFalse(pattern.search(text))
+        for text in ((escape + "u0041") * 166_667, ((escape + "u0041") * 81 + " ") * 2_053, escape * 1_000_000,
+                     (escape + "u00e9") * 166_667, escape + "u0041" + "." * 1_000_000):
+            with self.subTest(text=text[:14]):
+                start = time.perf_counter()
+                self.assertFalse(pattern.search(text))
+                self.assertLess(time.perf_counter() - start, 2.0)
+        claude_code = Policy.from_dict(templates.template("claude-code"))
+        start = time.perf_counter()
+        verdict = claude_code.evaluate("Write", {"file_path": "notes.txt", "content": (escape + "u0041") * 166_667})
+        self.assertLess(time.perf_counter() - start, 3.0)
+        self.assertEqual(verdict.action, "allow")
+
     def test_may_ask_counts_every_source_of_an_ask(self):
         # Review round 3: hook install and wrap say that asks are refused without a prompt or an approver;
         # asks from argument entries, command sections and flows count, not only a rule's action.
@@ -653,6 +681,21 @@ class ClaudeCodeTemplateFromInit(IsolatedHomeTest):
                 self.assertEqual(code, 0, err)
                 self.assertNotIn("Warning", out)
                 self.assertIn("bash command checks", out)
+
+    def test_the_strict_summary_says_what_it_still_asks_about(self):
+        # The summary said the strict template "refuses what it asks about there", but a command it cannot read
+        # (every heredoc commit), Monitor and MCP tools are still asked about.
+        summary = templates.TEMPLATES["claude-code-strict"].summary
+        self.assertNotIn("refuses what it asks about", summary)
+        self.assertIn("a command it cannot read, Monitor and MCP tools are still asked about", summary)
+        strict = Policy.from_dict(templates.template("claude-code-strict"))
+        self.assertEqual(strict.evaluate("Bash", {"command": "git commit -F - <<'EOF'\nmsg\nEOF"}).action, "ask")
+        self.assertEqual(strict.tool_level_action("Monitor"), "ask")
+        self.assertEqual(strict.tool_level_action("mcp__github__create_issue"), "ask")
+        for tool, args in (("Bash", {"command": "curl https://example.com"}), ("Write", {
+                "file_path": ".claude/settings.json", "content": "{}"})):
+            with self.subTest(tool=tool):
+                self.assertEqual(strict.evaluate(tool, args).action, "block")
 
 
 if __name__ == "__main__":

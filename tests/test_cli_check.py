@@ -150,6 +150,57 @@ class Marks(TempFolderTest):
         self.assertIn("no flow rules, so --marks changes nothing", out)
 
 
+class AsTheProxyDecides(TempFolderTest):
+    """check gives the answer the proxy would give for the same policy and the same history."""
+
+    def test_asks_in_the_history_are_refused_and_not_counted_by_a_proxy_with_no_way_to_ask(self):
+        # The history's asks were approved as by a person also with --proxy, and counted in the session limits:
+        # check said BLOCK where the proxy, which refuses such an ask before counting it, allows the call.
+        policy = self.write("p.json", {"default": "block", "tools": {"send": "ask", "read": "allow"},
+                                       "limits": {"max_calls_per_session": 2}})
+        history = self.write("h.json", [{"call": "send", "args": {"n": 1}}, {"call": "send", "args": {"n": 2}}])
+        code, out, _ = check(policy, "read", "--proxy", "--history", history)
+        self.assertEqual(code, 0, out)
+        self.assertIn("call send(n=1) -> block, unavailable (tools.send)", out)
+        self.assertIn("rule:        tools.read", out)
+        code, out, _ = check(policy, "read", "--history", history)  # with someone to ask, the asks count
+        self.assertEqual(code, 1, out)
+        self.assertIn("rule:        limits.max_calls_per_session", out)
+        # The call itself: refused for the ask, before a full session limit is looked at, as the proxy does.
+        full = self.write("full.json", [{"call": "read"}, {"call": "read"}])
+        code, out, _ = check(policy, "send", "--proxy", "--history", full)
+        self.assertEqual(code, 1, out)
+        self.assertIn("BLOCK (the rule says ask", out)
+        self.assertIn("rule:        tools.send", out)
+
+    def test_server_labels_mark_the_session_of_the_server_named(self):
+        # server_labels need the name the proxy runs under: check had no way to give one, and said ALLOW where
+        # the proxy started with --name web blocks.
+        policy = self.write("p.json", {
+            "default": "block", "server_labels": {"web": ["untrusted"]},
+            "tools": {"fetch": {"action": "allow", "labels": []}, "send": {"action": "allow", "labels": ["sink"]}},
+            "flows": [{"after": ["untrusted"], "then": "sink", "action": "block"}]})
+        code, out, _ = check(policy, "send")
+        self.assertEqual(code, 0, out)
+        self.assertIn("checked without one, they set no mark: try --server NAME", out)
+        code, out, _ = check(policy, "send", "--server", "web")
+        self.assertEqual(code, 1, out)
+        self.assertIn("rule:        flows[0]", out)
+        self.assertIn("server_labels gives this proxy's server from its first reply on: untrusted", out)
+        self.assertEqual(check(policy, "send", "--server", "mail")[0], 0)
+        history = self.write("h.json", [{"result": "fetch", "content": "a page"}])
+        self.assertEqual(check(policy, "send", "--server", "web", "--history", history)[0], 1)
+        code, _, err = check(policy, "send", "--server", "not a name")
+        self.assertEqual(code, 2)
+        self.assertIn("--server must be a server name", err)
+        # A rule of only "*" marks an unnamed proxy too, as the proxy does.
+        everyone = self.write("all.json", {"server_labels": {"*": ["untrusted"]},
+                                           "tools": {"send": {"action": "allow", "labels": ["sink"]}},
+                                           "flows": [{"after": ["untrusted"], "then": "sink", "action": "block"}]})
+        self.assertEqual(check(everyone, "send", "--proxy")[0], 1)
+        self.assertEqual(check(everyone, "send")[0], 0)
+
+
 class ShowRules(TempFolderTest):
     def test_the_exact_rule_decides_and_the_wildcard_keeps_only_its_restrictions(self):
         policy = self.write("p.json", {"tools": {"send_*": "allow", "send_email": {

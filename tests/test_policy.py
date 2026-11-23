@@ -673,6 +673,23 @@ class Warnings(unittest.TestCase):
         self.assertEqual(policy.warnings(), [])
         self.assertEqual(policy.evaluate("search", {"q": "hello"}).action, "allow")
 
+    def test_a_policy_with_thousands_of_rules_is_checked_quickly(self):
+        # The warnings and require_labels look up the rules that match each rule's name; trying every rule
+        # each time took a validate of 20,000 rules 95 seconds, and every proxy start prints the warnings.
+        tools = {f"srv{i}_*": {"action": "allow", "labels": ["untrusted", "sink"],
+                               "allow_args": [{"arg": "q", "pattern": "x"}]} for i in range(300)}
+        tools.update({f"srv{i % 300}_tool{i}": {"action": "allow", "labels": ["sink"]} for i in range(6000)})
+        tools["private_notes"] = {"action": "allow", "labels": ["private"]}
+        data = {"tools": tools, "require_labels": True,
+                "flows": [{"after": ["untrusted", "private"], "then": "sink", "action": "block"}]}
+        started = time.perf_counter()
+        warnings = Policy.from_dict(data).warnings()
+        self.assertLess(time.perf_counter() - started, 5)
+        # What the warnings say is unchanged: each exact rule is told that it replaces its wildcard's allow_args.
+        self.assertEqual(len(warnings), 6000)
+        self.assertIn("tools.srv7_tool307: this exact rule replaces the allow_args of the wildcard rule 'srv7_*'",
+                      warnings[307])
+
 
 class FindingsOfTheSecondReview(unittest.TestCase):
     """Each test here closes a gap found when version 0.4.0 was reviewed."""

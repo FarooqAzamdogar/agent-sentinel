@@ -107,6 +107,25 @@ class RunningCases(TempFolderTest):
         self.assertNotIn("\x1b", out)
         self.assertNotIn("\x07", out)
 
+    def test_a_case_is_decided_as_the_proxy_decides_it(self):
+        # A "proxy" case played its history's asks as approved by a person, and counted them; a case could not
+        # name the server whose server_labels mark the session. Both now give the proxy's answer.
+        policy = self.write("p.json", {
+            "default": "block", "server_labels": {"web": ["untrusted"]}, "limits": {"max_calls_per_session": 2},
+            "tools": {"ask_me": "ask", "read": "allow", "send": {"action": "allow", "labels": ["sink"]}},
+            "flows": [{"after": ["untrusted"], "then": "sink", "action": "block"}]})
+        asks = [{"call": "ask_me", "args": {"n": 1}}, {"call": "ask_me", "args": {"n": 2}}]
+        cases = [
+            {"tool": "read", "proxy": True, "history": asks, "expect": "allow"},
+            {"tool": "read", "history": asks, "expect": "block", "expect_rule": "limits.max_calls_per_session"},
+            {"tool": "send", "server": "web", "expect": "block", "expect_rule": "flows[0]"},
+            {"tool": "send", "server": "mail", "expect": "allow"},
+            {"tool": "send", "expect": "allow"},
+        ]
+        code, out, _ = self.run_cases(cases, policy=policy)
+        self.assertEqual(code, 0, out)
+        self.assertIn("send() [server web] -> block (flows[0])", out)
+
 
 class StrictLoading(TempFolderTest):
     def load_error(self, content):
@@ -137,6 +156,9 @@ class StrictLoading(TempFolderTest):
             ({"tool": "x", "marks": "untrusted", "expect": "block"}, "cases[0].marks must be a list"),
             ({"tool": "x", "marks": ["sink"], "expect": "block"}, "never a mark"),
             ({"tool": "x", "proxy": "yes", "expect": "block"}, "cases[0].proxy must be true or false"),
+            ({"tool": "x", "server": "a b", "expect": "block"}, "cases[0].server must be a server name"),
+            ({"tool": "x", "server": 5, "expect": "block"}, "cases[0].server must be a server name"),
+            ({"scan": "x", "server": "web", "expect": "pass"}, "unknown key 'server'"),
             ({"tool": "x", "expect": "deny"}, "did you mean 'block'?"),
             ({"tool": "x", "expect": "pass"}, "must be 'allow', 'ask' or 'block'"),
             ({"scan": "x", "expect": "allow"}, "must be 'block' or 'pass'"),

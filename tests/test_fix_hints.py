@@ -87,6 +87,36 @@ class Hints(unittest.TestCase):
             with self.subTest(rule=rule):
                 self.assertNotIn("\x1b", fix_hint(rule, tool=["odd"], matched_arg={"odd": 1}, args="odd"))
 
+    def test_a_tool_name_with_dots_is_not_read_as_a_part_of_another_rule(self):
+        # "tools.vscode.command.run" was read as the command section of a rule "vscode", class "run", which no
+        # command section writes: check, explain and report gave a command hint for a tool rule that blocks.
+        found = classify("tools.vscode.command.run")
+        self.assertEqual((found.kind, found.tool_rule), ("tool", "vscode.command.run"))
+        for kind in ("network", "install", "secret_read", "config_write", "obfuscation", "encoded_host", "unreadable"):
+            with self.subTest(kind=kind):
+                found = classify(f"tools.Bash.command.{kind}")
+                self.assertEqual((found.kind, found.tool_rule, found.name), ("command", "Bash", kind))
+        hint = fix_hint("tools.vscode.command.run", tool="vscode.command.run",
+                        policy=Policy.from_dict({"tools": {"vscode.command.run": "block"}}))
+        self.assertIn("The tool rule 'vscode.command.run' blocks this tool", hint)
+        # With a policy, a whole tool rule of that name wins over a part of a rule the policy does not have.
+        dotted = Policy.from_dict({"tools": {"notes.command.network": "block", "mail.max_calls_per_minute": "block",
+                                             "Bash": {"action": "allow", "command": {"deny_classes": ["network"]}}}})
+        for rule in ("tools.notes.command.network", "tools.mail.max_calls_per_minute"):
+            with self.subTest(rule=rule):
+                self.assertIn(f"The tool rule '{rule[6:]}' blocks this tool", fix_hint(rule, policy=dotted))
+        self.assertIn("command section of the tool rule 'Bash'", fix_hint("tools.Bash.command.network", policy=dotted))
+
+    def test_the_session_hint_covers_calls_and_the_bounds_of_a_session(self):
+        # Rule "session" also refuses a call whose session limits cannot be counted; the hint and the
+        # description spoke only of a withheld result and a state folder.
+        policy = Policy.from_dict({})
+        for text in (fix_hint("session"), policy.describe_rule("session")):
+            with self.subTest(text=text[:40]):
+                self.assertIn("the call was refused or the result withheld", text)
+                self.assertIn("more values or counters than a session keeps", text.lower())
+        self.assertIn("max_distinct", fix_hint("session"))
+
 
 
 class HookHints(unittest.TestCase):

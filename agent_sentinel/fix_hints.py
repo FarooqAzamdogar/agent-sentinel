@@ -19,6 +19,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from .commands import CLASSES as COMMAND_CLASSES, UNREADABLE
 from .elicitation import RULE_FORM as RULE_ELICITATION_FORM, RULE_URL as RULE_ELICITATION_URL
 from .policy import (
     IDENTICAL_CALLS_LIMIT,
@@ -57,8 +58,9 @@ _TOOL_PART = re.compile(
     rf"tools\.(.+)\.(deny_args{_INDEX}|allow_args{_INDEX}|other_args|max_calls_per_minute|max_calls_per_session"
     rf"|max_distinct{_INDEX})"
 )
-# A tool rule's command section: tools.Bash.command.network, tools.Bash.command.unreadable.
-_TOOL_COMMAND = re.compile(r"tools\.(.+)\.command\.([a-z_]{1,20})")
+# A tool rule's command section: tools.Bash.command.network, tools.Bash.command.unreadable. Only the
+# classes the firewall writes: a tool rule named "vscode.command.run" has the id "tools.vscode.command.run".
+_TOOL_COMMAND = re.compile(r"tools\.(.+)\.command\.(" + "|".join((*COMMAND_CLASSES, UNREADABLE)) + ")")
 
 # The fixed rule ids (policy.RULE_*) and the kind of hint each gets.
 _FIXED_KINDS = {
@@ -177,7 +179,7 @@ def fix_hint(
     approval:    the record's "approval": the rule said ask, and the call was "refused" by the
                  person asked, or nobody could be asked ("unavailable")
     """
-    rule_id = classify(rule)
+    rule_id = _as_the_policy_names_it(classify(rule), rule, policy)
     if approval == "refused (repeat)":
         return (
             "The policy sends this call to a person, and it was refused without asking: a person refused this "
@@ -254,6 +256,22 @@ def fix_hint(
             "rate limit. Raise it if such a session is normal; a new session starts the count again."
         )
     return _FIXED_HINTS.get(kind, _FIXED_HINTS["unknown"])
+
+
+def _as_the_policy_names_it(rule_id: RuleId, rule: Any, policy: Policy | None) -> RuleId:
+    """The id read as a whole tool rule's when the policy has a tool rule of that whole name and none of the part's.
+
+    A tool name may hold dots, so "tools.a.max_calls_per_minute" is the rate
+    limit of rule "a" or the rule "a.max_calls_per_minute". Without a policy,
+    or when the policy has both rules, the id is read as a part.
+    """
+    if policy is None or rule_id.tool_rule is None or rule_id.kind == "tool" or not isinstance(rule, str):
+        return rule_id
+    names = {tool_rule.name for tool_rule in policy.tools}
+    whole = rule[len("tools."):]
+    if whole in names and rule_id.tool_rule not in names:
+        return RuleId("tool", rule_id.text, tool_rule=whole)
+    return rule_id
 
 
 def _command_hint(rule_id: RuleId) -> str:
@@ -407,8 +425,12 @@ _FIXED_HINTS = {
         "tool is legitimate, review it, then remove its entry from the pins file so that it is pinned again."
     ),
     "session": (
-        "The session state of the flow rules could not be recorded, so the result was withheld. Check that the "
-        "state folder is writable."
+        "The session state (the flow marks, the counts of the session limits) could not be read or kept, so the "
+        "call was refused or the result withheld; the reason says why. A session file that is missing or damaged, "
+        "or a state folder that cannot be written: check that folder (a new session starts a new file). More "
+        "values or counters than a session keeps (\"too many values are kept\", or a count or set of values that "
+        "is \"malformed\" on a policy with many limits): lower the max of the max_distinct limits or use fewer "
+        "session limits; validate warns about such a policy."
     ),
     "caller": "The program that uses the firewall blocked this itself (Firewall.block). Look at that program.",
     "include_context": (

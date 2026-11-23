@@ -119,8 +119,14 @@ SECRET_ROOTS = ("~/.ssh", "~/.aws", "~/.agent-sentinel")
 #     the program reading the file decodes (JSON's, and YAML's and TOML's,
 #     _ or \U0000005f), right before ":" or "=": "chat.tools.autoApprove":
 #     and NODE_OPTIONS=. Ordinary files have no reason to escape those.
+#     The name is read once, from its start, as one run of letters, digits,
+#     "_", "." and backslashes (so other escapes in it, such as \x5f, count
+#     too): a match tried at every escape of a long run of escapes cost
+#     seconds per megabyte. A lookahead finds the escape in the run, then the
+#     run is passed over in one step.
 _ANY_CASE_SETTING = r"\w*_base_url|node_options"
-_ESCAPED_PLAIN = r"\\(u00|U000000)"  # then two hex digits
+_ESCAPED_PLAIN = r"\\(u00|U000000)(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])"
+_ESCAPED_NAME = r"(?<![\w.\\])(?=[\w.\\]*?" + _ESCAPED_PLAIN + r")[\w.\\]*"
 CONTROL_SETTING_PATTERN = (
     r"(?<![\w.-])((?-i:[A-Z][A-Z0-9_]*_BASE_URL)|anthropic\w*_base_url|node_options"
     r"|chat\.tools\.(global\.)?autoApprove|enableAllProjectMcpServers|disableAllHooks)"
@@ -129,8 +135,7 @@ CONTROL_SETTING_PATTERN = (
     r"|\$\{?env:(" + _ANY_CASE_SETTING + r")\}?\s*\+?="
     r"|(?<![\w$:{])env:[\\/]?(" + _ANY_CASE_SETTING + r")\b"
     r"|SetEnvironmentVariable\s*\(\s*" + _QUOTE + r"?(" + _ANY_CASE_SETTING + r")\b"
-    r"|" + _ESCAPED_PLAIN + r"(2e|3[0-9]|4[1-9a-f]|5[0-9af]|6[1-9a-f]|7[0-9a])"
-    r"([\w.]|" + _ESCAPED_PLAIN + r"[0-9a-f]{2}){0,80}" + _QUOTE + r"?\s*[:=]"
+    r"|" + _ESCAPED_NAME + _QUOTE + r"?\s*[:=]"
 )
 
 # A value that starts with "-" can be read as an option by a program the tool
@@ -468,9 +473,11 @@ TEMPLATES: dict[str, Template] = {
         ),
         Template(
             "claude-code-strict",
-            "Like claude-code, but refuses what it asks about there and any command that names a credential file "
-            "or a host that looks like it carries data, keeps WebFetch URLs short, asks before anything is sent "
-            "out after untrusted content, and blocks medium injection findings.",
+            "Like claude-code, but refuses the writes to agent settings and instruction files and the commands "
+            "it asks about there, and any command that names a credential file or a host that looks like it "
+            "carries data (a command it cannot read, Monitor and MCP tools are still asked about); keeps WebFetch "
+            "URLs short, asks before anything is sent out after untrusted content, and blocks medium injection "
+            "findings.",
             _claude_code(strict=True),
             (
                 "Validate it: agent-sentinel validate {policy}",

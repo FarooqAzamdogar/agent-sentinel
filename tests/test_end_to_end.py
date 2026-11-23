@@ -414,7 +414,8 @@ class TheLibrary(EndToEndTest):
         self.assertEqual((again.allowed, again.ref), (False, pending.ref))
         other = firewall.check_call("send_email", {"to": "bob@example.com"}, defer_ask=True)
         not_true = firewall.finish_approval(other, "yes", "a person")  # only exactly True approves
-        self.assertEqual((not_true.allowed, not_true.approval, not_true.ref), (False, "refused", other.ref))
+        # Neither True nor False is no answer, as from the library approver: "unavailable", not a person's "no".
+        self.assertEqual((not_true.allowed, not_true.approval, not_true.ref), (False, "unavailable", other.ref))
         events = [(r["event"], r["action"]) for r in self.records(self.audit) if r.get("call_id") == pending.call_id]
         self.assertEqual(events, [("call", "ask"), ("approval", "allow"), ("approval", "block")])
 

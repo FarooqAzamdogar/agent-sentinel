@@ -47,7 +47,7 @@ import argparse
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 from . import fix_hints, session_limits
 from .cli_common import (
@@ -65,7 +65,7 @@ from .cli_common import (
     strict_json,
     without_ref,
 )
-from .firewall import WAITING_FOR_APPROVAL, Decision, Firewall, agent_text
+from .firewall import APPROVAL_UNAVAILABLE, SERVER_NAME, WAITING_FOR_APPROVAL, Decision, Firewall, agent_text
 from .policy import Policy, limit_rule
 from .session import SINK, MemorySessionStore, is_label
 from .policy_errors import quoted, type_name, unknown_keys_message
@@ -129,6 +129,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
                         help="also scan this file as the tool's result (JSON or text; '-' for stdin)")
     parser.add_argument("--history", metavar="FILE",
                         help="play these earlier calls and results of the session first (a JSON list; see below)")
+    parser.add_argument("--server", metavar="NAME",
+                        help="answer as a proxy started with --name NAME: the policy's server_labels for that "
+                             "server mark the session from the start")
 
 
 def take_extra_arguments(args: argparse.Namespace, extras: list[str]) -> bool:
@@ -149,20 +152,26 @@ def run(args: argparse.Namespace) -> int:
     marks = parse_marks(args.marks)
     result = _read_result(args.result) if args.result is not None else None
     history = _read_history(args.history) if args.history is not None else []
+    check_server_name(args.server, "--server")
 
     store = MemorySessionStore()
     if marks:
         store.add(marks, _MARKS_CAUSE)
-    firewall = Firewall(policy, session_store=store)  # no audit log, no approver
-    played = replay_history(firewall, history)
-    decision = firewall.check_call(args.tool, arguments, defer_ask=True)
+    firewall = Firewall(policy, session_store=store, server_name=args.server)  # no audit log, no approver
+    # The marks of server_labels come from a proxy only: one with --proxy, or named with --server.
+    proxied = args.proxy or args.server is not None
+    if proxied:
+        deliver_server_marks(firewall)
+    played = replay_history(firewall, history, as_proxy=args.proxy, server_marks=proxied)
+    # A proxy with no way to ask refuses an ask at once, before the rate and session limits count it.
+    decision = firewall.check_call(args.tool, arguments, defer_ask=not args.proxy)
     outcome = outcome_of(decision, as_proxy=args.proxy)
 
     if played:
         _print_history(played)
     print(shown_call(args.tool, arguments))
     _print_decision(policy, args.tool, arguments, decision, outcome, as_proxy=args.proxy)
-    _print_session_note(policy, marks, bool(history))
+    _print_session_note(policy, marks, bool(history), proxied, policy.server_marks(args.server) if proxied else ())
     if args.show_rules:
         _print_rules(policy, firewall, args.tool, arguments, decision)
 
@@ -339,12 +348,30 @@ def _history_step(entry: Any, where: str) -> HistoryStep:
     return HistoryStep(kind, tool, args=args, answer=answer, seconds_ago=float(seconds_ago))
 
 
-def replay_history(firewall: Firewall, steps: list[HistoryStep]) -> list[str]:
+def check_server_name(server: Any, where: str) -> None:
+    """Raise CommandError unless `server` is None or a name `proxy --name` takes (firewall.SERVER_NAME)."""
+    if server is not None and (not isinstance(server, str) or not SERVER_NAME.fullmatch(server)):
+        raise CommandError(f"{where} must be a server name as proxy --name takes it: 1 to 64 letters, digits, '_', "
+                           f"'-' or '.', got {quoted(server, limit=60)}")
+
+
+def deliver_server_marks(firewall: Firewall) -> None:
+    """Set the marks the policy's server_labels give the firewall's server, as a proxy does before any call:
+    every reply of the server sets them, and its reply to initialize comes first."""
+    firewall.mark_delivered("initialize", frozenset(), channel="reply to initialize", server_marks=True)
+
+
+def replay_history(
+    firewall: Firewall, steps: list[HistoryStep], as_proxy: bool = False, server_marks: bool = False
+) -> list[str]:
     """Play the steps against the firewall, in order, as they happened; one line per step, for printing.
 
     A call is checked (and counted) like a real one; one that needs approval
-    is answered by a person as the step says. A result is checked like a real
-    one and, if it passes, delivered (its marks, its tail). Each step happens
+    is answered by a person as the step says, or, `as_proxy` (a proxy with no
+    way to ask), refused at once and not counted, as that proxy refuses it.
+    A result is checked like a real one and, if it passes, delivered (its
+    marks, its tail; with `server_marks`, those of server_labels too, as a
+    proxy delivers everything its server sends). Each step happens
     `seconds_ago` before now on the firewall's clocks: the one approval memory
     reads, and the one the rate limits count calls in (so calls an hour apart
     do not count as made in the same minute). Afterwards it is now again.
@@ -355,16 +382,16 @@ def replay_history(firewall: Firewall, steps: list[HistoryStep]) -> list[str]:
         for step in steps:
             firewall._clock = lambda at=now - step.seconds_ago: at
             firewall._rate_clock = lambda at=ticks - step.seconds_ago: at
-            lines.append(_played(firewall, step))
+            lines.append(_played(firewall, step, as_proxy, server_marks))
     finally:
         firewall._clock, firewall._rate_clock = time.time, None
     return lines
 
 
-def _played(firewall: Firewall, step: HistoryStep) -> str:
+def _played(firewall: Firewall, step: HistoryStep, as_proxy: bool = False, server_marks: bool = False) -> str:
     when = f" ({step.seconds_ago:g} s ago)" if step.seconds_ago else ""
     if step.kind == "call":
-        decision = firewall.check_call(step.tool, step.args, defer_ask=True)
+        decision = firewall.check_call(step.tool, step.args, defer_ask=not as_proxy)
         if decision.pending:
             approved = step.answer == "approve"
             decision = firewall.finish_approval(decision, approved, "the history", asked=True)
@@ -381,7 +408,7 @@ def _played(firewall: Firewall, step: HistoryStep) -> str:
     decision = checked.decision
     if not decision.allowed:
         return f"result of {printable(step.tool, limit=80)}{when} -> withheld ({printable(decision.rule, limit=120)})"
-    firewall.mark_delivered(step.tool, args=step.call_args, decision=decision)
+    firewall.mark_delivered(step.tool, args=step.call_args, decision=decision, server_marks=server_marks)
     marks = sorted(firewall.session_marks().labels)
     shown = f"; the session's marks: {', '.join(marks)}" if marks else ""
     return f"result of {printable(step.tool, limit=80)}{when} -> delivered{shown}"
@@ -418,7 +445,7 @@ def _print_decision(
     policy: Policy, tool: str, arguments: dict[str, Any], decision: Decision, outcome: str, as_proxy: bool
 ) -> None:
     verdict = outcome.upper()
-    if decision.pending and as_proxy:
+    if as_proxy and decision.approval == APPROVAL_UNAVAILABLE:
         verdict += " (the rule says ask, and a proxy with no way to ask a person refuses it)"
     print_field("verdict", verdict)
     print_field("rule", _rule_text(decision))
@@ -441,12 +468,24 @@ def _print_decision(
         print_field("to allow", hint)
 
 
-def _print_session_note(policy: Policy, marks: list[str], has_history: bool = False) -> None:
+def _print_session_note(
+    policy: Policy, marks: list[str], has_history: bool = False, proxied: bool = False,
+    server_marks: Iterable[str] = (),
+) -> None:
+    """Notes on the session the call was checked in. `proxied`: checked as a proxy (--proxy or --server), whose
+    server gave the session `server_marks` (server_labels)."""
+    server_marks = sorted(server_marks)
     if marks and not policy.flows:
         print("Note: the policy has no flow rules, so --marks changes nothing.")
-    elif policy.flows and not marks and not has_history:
+    elif policy.flows and not marks and not has_history and not server_marks:
         print("Note: checked as the first call of a session. Flow rules apply once the agent has read content; "
               "try --marks untrusted (or the labels your flow rules name), or --history.")
+    if policy.flows and server_marks:
+        print(f"Note: the session has the marks server_labels gives this proxy's server from its first reply on: "
+              f"{', '.join(server_marks)}.")
+    elif policy.flows and policy.server_labels and not proxied:
+        print("Note: the policy's server_labels mark the session in a proxy, by the name it runs under (--name); "
+              "checked without one, they set no mark: try --server NAME.")
 
 
 def _print_result(firewall: Firewall, tool: str, scanned: Decision, source: str, call_outcome: str) -> None:
