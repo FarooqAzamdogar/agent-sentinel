@@ -379,6 +379,11 @@ class Permissions(unittest.TestCase):
         self.assertEqual(windows_home_lines(dict(profile, AGENT_SENTINEL_HOME="/srv/x"), "linux"), [])
         self.assertTrue(windows_home_lines(dict(profile, AGENT_SENTINEL_HOME="C:\\Users\\me\\..\\Public\\x"), "win32"))
         self.assertTrue(windows_home_lines(dict(profile, AGENT_SENTINEL_HOME="\\\\server\\share\\me"), "win32"))
+        # Told "win32", it reads the paths by Windows' own rules wherever it runs: either slash, no case, and
+        # a folder whose name only begins with the profile's is not inside it.
+        self.assertEqual(windows_home_lines(dict(profile, AGENT_SENTINEL_HOME="c:/USERS/ME/.agent-sentinel"),
+                                            "win32"), [])
+        self.assertTrue(windows_home_lines(dict(profile, AGENT_SENTINEL_HOME="C:\\Users\\mex"), "win32"))
 
     @unittest.skipUnless(sys.platform == "win32", "short names and junctions are Windows matters")
     def test_windows_resolves_the_home_and_the_profile(self):

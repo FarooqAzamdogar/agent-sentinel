@@ -342,7 +342,7 @@ def windows_home_lines(environ: Mapping[str, str] | None = None, platform: str |
     if platform != "win32" or not chosen or not home.is_absolute(chosen, platform):
         return []
     profile = home.user_folder(environ, platform)
-    if profile is not None and inside_profile(chosen, str(profile)):
+    if profile is not None and inside_profile(chosen, str(profile), platform):
         return []
     return [f"{home.ENV_VAR} is {printable(chosen, limit=300)}, outside your user profile: a folder there takes the "
             "permissions of the folder above it (often any signed-in user may change it), not the profile's private "
@@ -380,16 +380,24 @@ def home_name_lines(environ: Mapping[str, str] | None = None) -> list[str]:
 _LOCAL_DRIVE_PATH = re.compile(r"[A-Za-z]:[\\/]")
 
 
-def inside_profile(chosen: str, profile: str) -> bool:
-    """Whether a folder is in the user profile. On Windows itself, as the system resolves both paths: a short
-    (8.3) spelling of the profile (C:\\Users\\JOHNSM~1\\...) is inside it, and a junction or link from the
-    profile to a folder elsewhere is not. Only paths on a local drive are resolved (a network path never is)."""
-    if sys.platform == "win32" and _LOCAL_DRIVE_PATH.match(chosen) and _LOCAL_DRIVE_PATH.match(profile):
+def inside_profile(chosen: str, profile: str, platform: str | None = None) -> bool:
+    """Whether a folder is in the user profile, by the path rules of `platform` (this machine's by default).
+
+    On Windows itself, as the system resolves both paths: a short (8.3)
+    spelling of the profile (C:\\Users\\JOHNSM~1\\...) is inside it, and a
+    junction or link from the profile to a folder elsewhere is not. Only
+    paths on a local drive are resolved (a network path never is), and only
+    when the platform judged is the one this is running on: a Windows path
+    cannot be resolved from another system, where it is read as text alone.
+    """
+    platform = platform or sys.platform
+    if (platform == sys.platform == "win32" and _LOCAL_DRIVE_PATH.match(chosen)
+            and _LOCAL_DRIVE_PATH.match(profile)):
         try:
             return clients.inside_folder(os.path.realpath(chosen), os.path.realpath(profile))
         except (OSError, ValueError):
             pass
-    return clients.inside_folder(chosen, profile)
+    return clients.inside_folder(chosen, profile, clients.path_rules(platform))
 
 
 # ---- the files themselves --------------------------------------------------------------------------------

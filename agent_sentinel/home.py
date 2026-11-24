@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import ntpath
 import os
+import posixpath
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -113,7 +114,10 @@ def home_folder(environ: Mapping[str, str] | None = None, platform: str | None =
             raise HomeError(
                 f"{ENV_VAR} must be a full path, such as {_example_path(platform)}; got {chosen!r}"
             )
-        return Path(os.path.normpath(chosen))
+        # By the path rules of the platform asked about, not of the one this runs on: ntpath reads
+        # "C:\\Users\\me\\..\\x" as a path with folders in it wherever the question is asked.
+        rules = ntpath if platform == "win32" else posixpath
+        return Path(rules.normpath(chosen))
     folder = user_folder(environ, platform)
     if folder is None:
         variable = "USERPROFILE" if platform == "win32" else "HOME"

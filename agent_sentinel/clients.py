@@ -25,17 +25,32 @@ folder by setting HOME / USERPROFILE / APPDATA / LOCALAPPDATA / XDG_CONFIG_HOME.
 from __future__ import annotations
 
 import json
+import ntpath
 import os
+import posixpath
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 from . import home
 from .cli_common import CommandError, shell_line
 
 MAX_EXTENSIONS_LISTED = 100
+
+
+def path_rules(platform: str | None = None) -> ModuleType:
+    """The path module whose rules a path of that platform follows: ntpath for Windows, posixpath otherwise.
+
+    A check that is told which platform to judge as must decide from the text
+    and that platform alone, so that the answer is the same wherever it runs.
+    os.path is only one of the two, chosen when this process started: on Linux
+    it compares "C:\\Users\\me\\x" as one long name with no folders in it, so a
+    Windows check that asked os.path would reach a different answer there.
+    """
+    return ntpath if (platform or sys.platform) == "win32" else posixpath
 
 
 @dataclass(frozen=True)
@@ -257,8 +272,9 @@ def scope_of(path: Path, environ: Mapping[str, str] | None = None, platform: str
     if name == ".mcp.json" or parent == ".vscode":
         return "project"
     if parent == ".cursor":
+        rules = path_rules(platform)
         user = home.user_folder(os.environ if environ is None else environ, platform or sys.platform)
-        same = user is not None and os.path.normcase(str(path.parent.parent)) == os.path.normcase(str(user))
+        same = user is not None and rules.normcase(str(path.parent.parent)) == rules.normcase(str(user))
         return "user" if same else "project"
     return "user"
 
@@ -268,11 +284,17 @@ def project_folder(path: Path) -> Path:
     return path.parent.parent if path.parent.name.lower() in (".vscode", ".cursor") else path.parent
 
 
-def inside_folder(path: str | Path, folder: str | Path) -> bool:
-    """Whether `path` is `folder` or inside it, compared by components (no file is looked at)."""
-    inside = os.path.normcase(os.path.normpath(str(folder)))
+def inside_folder(path: str | Path, folder: str | Path, rules: ModuleType | None = None) -> bool:
+    """Whether `path` is `folder` or inside it, compared by components (no file is looked at).
+
+    `rules` is the path module to compare by: this machine's (os.path) by
+    default, or the one a caller that was told a platform chose with
+    path_rules, so that its answer does not depend on where it runs.
+    """
+    rules = os.path if rules is None else rules
+    inside = rules.normcase(rules.normpath(str(folder)))
     try:
-        return os.path.commonpath([os.path.normcase(os.path.normpath(str(path))), inside]) == inside
+        return rules.commonpath([rules.normcase(rules.normpath(str(path))), inside]) == inside
     except ValueError:  # different drives, or one path relative
         return False
 
