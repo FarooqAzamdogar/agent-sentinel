@@ -1297,12 +1297,28 @@ class RealHookProcess(IsolatedHomeTest):
         for command in ("Copy-Item p.json $env:NAME*/policy.json", "Copy-Item p.json */policy.json"):
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(policy, "PowerShell", {"command": command}), "ask")
+        # A keyword in front of the assignment must not hide it, one name may be set from another, and a
+        # line that sets more than the reader keeps is asked about rather than read as if it set nothing.
+        for command in ("{ p=~/.agent-s; cp p.json $p*/policy.json; }",
+                        "if true; then p=~/.agent-s; cp p.json $p*/policy.json; fi",
+                        "for f in x; do p=~/.agent-s; cp p.json $p*/policy.json; done",
+                        "p=~/.agent-s; q=$p; cp p.json $q*/policy.json",
+                        "; ".join(f"V{index}=x" for index in range(40)) + "; cp p.json $V39*/policy.json",
+                        "p=" + "y" * 200 + "; cp p.json $p*/policy.json"):
+            with self.subTest(command=command):
+                self.assertIn(self.run_hook(policy, "Bash", {"command": command}), ("ask", "deny"))
+                self.assertEqual(self.run_hook(policy, "Bash", {"command": command}, "bypassPermissions"), "deny")
         # And the everyday commands of the same shape, which the line shows nothing of a name for, are
         # allowed: a firewall that asks about "rm $build*" is one people switch off.
         for command in ("rm $build*", "rm -rf $tmp*", "mv $f* archive/", "mv out/$stamp* archive/",
-                        "cp $src* /tmp/", 'cp "${files[0]}" out/', "rm $*", "chmod +x $*"):
+                        "cp $src* /tmp/", 'cp "${files[0]}" out/', "rm $*", "chmod +x $*",
+                        'export PATH="$HOME/bin:$PATH"; make build', "out=dist; mkdir -p $out; cp build/app $out/",
+                        "if [ -f build.sh ]; then ./build.sh; fi", "for f in *.txt; do cp \"$f\" out/; done"):
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(policy, "Bash", {"command": command}), "allow")
+        for command in (r"Copy-Item build\*\app.exe dist", r"Get-Content logs\*\latest.log"):
+            with self.subTest(command=command):
+                self.assertEqual(self.run_hook(policy, "PowerShell", {"command": command}), "allow")
         records = [json.loads(line) for line in (self.folder / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertIn("tools.Bash.command.install", [record.get("rule") for record in records])
 
@@ -1406,6 +1422,33 @@ class NamesTheShellExpands(unittest.TestCase):
         ("Copy-Item new.json *$p/policy.json", "powershell"),
         (r"$p = '.agent-s'; Copy-Item new.json $HOME\$p*\policy.json", "powershell"),
         (r"$env:P = '.agent-s'; Copy-Item new.json $HOME\$env:P*\policy.json", "powershell"),
+        # A shell keyword in front of the assignment does not hide it: the whole of a brace group, a
+        # subshell, an if, a while, a for, a function's body and a continued line is one command line.
+        ("{ p=~/.agent-s; cp new.json $p*/policy.json; }", "bash"),
+        ("( p=~/.agent-s; cp new.json $p*/policy.json )", "bash"),
+        ("if true; then p=~/.agent-s; cp new.json $p*/policy.json; fi", "bash"),
+        ("if false; then :; else p=~/.agent-s; cp new.json $p*/policy.json; fi", "bash"),
+        ("while :; do p=~/.agent-s; cp new.json $p*/policy.json; done", "bash"),
+        ("until false; do p=~/.agent-s; cp new.json $p*/policy.json; done", "bash"),
+        ("for f in x; do p=~/.agent-s; cp new.json $p*/policy.json; done", "bash"),
+        ("f() { p=~/.agent-s; cp new.json $p*/policy.json; }; f", "bash"),
+        ("! p=~/.agent-s; cp new.json $p*/policy.json", "bash"),
+        ("time p=~/.agent-s; cp new.json $p*/policy.json", "bash"),
+        ("p=~/.agent-s && cp new.json $p*/policy.json", "bash"),
+        ("p=~/.agent-s || cp new.json $p*/policy.json", "bash"),
+        ("p=~/.agent-s | cp new.json $p*/policy.json", "bash"),
+        ("p=~/.agent-s \\\n cp new.json $p*/policy.json", "bash"),
+        ("[[ -d x ]] && p=~/.agent-s; cp new.json $p*/policy.json", "bash"),
+        (r'cmd /c "if x==x set p=%USERPROFILE%\.agent-s& copy new.json %p%*\policy.json"', "bash"),
+        ("if ($true) { $p = '~/.agent-s'; Copy-Item new.json $p*/policy.json }", "powershell"),
+        ("foreach ($i in 1..2) { $p = '~/.agent-s'; Copy-Item new.json $p*/policy.json }", "powershell"),
+        # One name set from another is followed from one to the next, four steps of the chain.
+        ("p=~/.agent-s; q=$p; cp new.json $q*/policy.json", "bash"),
+        ("p=~/.agent-s; q=$p; r=$q; cp new.json $r*/policy.json", "bash"),
+        ("p=~/.agent-s; q=${p}; r=$q; s=$r; cp new.json $s*/policy.json", "bash"),
+        ("{ p=~/.agent-s; q=$p; }; cp new.json $q*/policy.json", "bash"),
+        (r'cmd /c "set p=%USERPROFILE%\.agent-s& set q=%p%& copy new.json %q%*\policy.json"', "bash"),
+        ("$p = '~/.agent-s'; $q = $p; Copy-Item new.json $q*/policy.json", "powershell"),
     )
     READS = (
         ("cat ~/.agent-s*/policy.json", "bash"),
@@ -1420,6 +1463,11 @@ class NamesTheShellExpands(unittest.TestCase):
         (r"Get-Content $HOME\.agent-s*\audit.key", "powershell"),
         (r"Get-Content $HOME\?ssh\key", "powershell"),
         (r"Get-Content ($HOME + '\.agent-' + 'sentinel\audit.key')", "powershell"),
+        ("{ p=~/.agent-s; cat $p*/audit.key; }", "bash"),
+        ("while :; do p=~/.agent-s; cat $p*/audit.key; done", "bash"),
+        ("p=~/.agent-s; q=$p; cat $q*/audit.key", "bash"),
+        (r"Get-Content ~\*\audit.key", "powershell"),
+        (r"Get-Content C:\*\audit.key", "powershell"),
     )
     ORDINARY = (
         ("ls *.py", "bash"), ("rm build/*.o", "bash"), ("cp src/*.txt out/", "bash"), ("rm -rf node_modules/.cache/*", "bash"),
@@ -1460,6 +1508,20 @@ class NamesTheShellExpands(unittest.TestCase):
         ("stamp=$(date +%s); mv out/$stamp* archive/", "bash"), ("d=/tmp; rm $d/*", "bash"),
         ("build=out; rm -rf $build*", "bash"),
         (r"Remove-Item $env:TEMP\*", "powershell"), ("Remove-Item $build*", "powershell"),
+        # A name whose own text names it again says only what it held before the line, which the line
+        # does not show: the everyday way a line adds to PATH must not turn every later word protected.
+        ('export PATH="$HOME/bin:$PATH"; ls $PATH', "bash"),
+        ("PATH=/usr/local/bin:$PATH make build", "bash"),
+        ("$env:PATH = \"$env:PATH;C:\\bin\"; Get-ChildItem $env:PATH", "powershell"),
+        # A chain of ordinary names stays ordinary all the way along it.
+        ("d=build; e=$d; rm -rf $e/*", "bash"), ("src=src; dst=dist; cp -r $src/* $dst/", "bash"),
+        ("out=dist; mkdir -p $out; cp build/app $out/", "bash"),
+        # A keyword before an ordinary assignment does not make it protected either.
+        ("if [ -f build.sh ]; then out=dist; cp build/app $out/; fi", "bash"),
+        ('for f in *.txt; do out=dist; cp "$f" $out/; done', "bash"),
+        # In PowerShell a searched part under a folder the line names itself cannot leave that folder.
+        (r"Copy-Item build\*\app.exe dist", "powershell"), (r"Get-Content logs\*\latest.log", "powershell"),
+        (r"Get-ChildItem src\*\*.ps1", "powershell"), (r"Copy-Item dist\*\app.exe out", "powershell"),
     )
 
     def test_a_write_to_a_name_the_shell_may_expand_to_a_protected_one_is_config_write(self):
@@ -1596,6 +1658,57 @@ class NamesTheShellExpands(unittest.TestCase):
         self.assertEqual(kinds(r'cmd /c "del .claude\settings.local.json"'), {"config_write", "secret_read"})
         self.assertEqual(kinds(r'cmd /c "dir src\app"'), set())
 
+    def test_every_bound_on_what_a_line_shows_fails_closed(self):
+        """A line that sets more than the reader keeps must not read as one that set nothing.
+
+        Each of these pushes the real assignment, or the text of it, past one of the reader's bounds.
+        Past a bound the part the reader could not work out counts as a protected name, so the write is
+        asked about: a command too large or too tangled to read is one the reader could not read.
+        """
+        past_a_bound = (
+            # More names than _MAX_VALUES, so the one that matters is not kept as itself (a name is kept
+            # as written and lower-cased, since cmd and PowerShell do not mind the case).
+            "; ".join(f"V{index}=x" for index in range(40)) + "; cp new.json $V39*/policy.json",
+            # A text longer than _MAX_VALUE_CHARS.
+            "p=" + "y" * 200 + "; cp new.json $p*/policy.json",
+            "p=~/.agent-s; p=" + "y" * 200 + "; cp new.json $p*/policy.json",
+            # More texts for one name than _MAX_VALUES_PER_NAME.
+            "p=a; p=b; p=c; p=d; p=e; cp new.json $p*/policy.json",
+            # A chain of assignments longer than _MAX_CHAIN.
+            "a=~/.agent-s; b=$a; c=$b; d=$c; e=$d; f=$e; g=$f; cp new.json $g*/policy.json",
+            # More readings of one word than _MAX_RESOLVED keeps, and more text put in than fits.
+            "p=a; p=b; cp new.json " + "$p" * 8 + "*/policy.json",
+            "p=" + "z" * 120 + "; cp new.json " + "$p" * 60 + "*/policy.json",
+            # A path of more parts than the reader reads.
+            "p=x; cp new.json " + "a/" * 300 + "$p*/policy.json",
+            # A brace list longer than the reader reads: what it may expand to is not plain text.
+            "cp new.json ~/{.agent-sen," + "y" * 300 + "}tinel/policy.json",
+            "cp new.json {.cl," + "y" * 300 + "}aude/settings.json",
+        )
+        for text in past_a_bound:
+            with self.subTest(text=text[:60]):
+                self.assertIn("config_write", kinds(text))
+                self.assertIn(STARTER.evaluate("Bash", {"command": text}).action, ("ask", "block"))
+                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "block")
+        # A line that stays inside every bound is still read exactly, and is still ordinary where the
+        # line shows nothing of a protected name: the bounds are generous enough for everyday work.
+        for text in ("; ".join(f"v{index}=x" for index in range(30)) + "; cp new.json $v29*/policy.json",
+                     "a=build; b=$a; c=$b; d=$c; rm -rf $d/*",
+                     "p=" + "y" * 100 + "; cp new.json $p/out.json"):
+            with self.subTest(text=text[:60]):
+                self.assertEqual(kinds(text), set())
+                self.assertEqual(STARTER.evaluate("Bash", {"command": text}).action, "allow")
+
+    def test_an_assignment_in_an_earlier_call_is_not_followed(self):
+        """The assignment has to be in the same command line. Claude Code runs each Bash call in a shell
+        of its own and the hook is given one command line (tool_input "command"), with nothing of the
+        shell that ran the call before, so a variable set in one call is not there in the next. The
+        second call is then read as any line that uses a variable it does not set: ordinary."""
+        self.assertIn("config_write", kinds("p=~/.agent-s; cp new.json $p*/policy.json"))
+        self.assertEqual(kinds("p=~/.agent-s"), set())
+        self.assertEqual(kinds("cp new.json $p*/policy.json"), set())
+        self.assertEqual(STARTER.evaluate("Bash", {"command": "cp new.json $p*/policy.json"}).action, "allow")
+
     def test_hostile_expansions_stay_fast(self):
         hostile = ["cp x " + "$a" * 4000, "cp x ~/" + "*a" * 4000, "rm ." + "?" * 8000, "cp x " + "{" * 8000,
                    "cat " + "%a" * 4000, "cp x ~/$a" + "*" * 8000 + "b", "cp x ~/$a" + "?" * 8000 + "b",
@@ -1605,7 +1718,14 @@ class NamesTheShellExpands(unittest.TestCase):
                    "p=~/.agent-s; cp x " + "$p" * 3000, "p=~/.agent-s; cp x " + "${p}" * 1500,
                    "p=~/.agent-s; cp x " + "${p:-~/.agent-s}" * 500,
                    "; ".join(f"v{i}=~/.agent-s" for i in range(40)) + "; cp x " + "$v1" * 2000,
-                   "cp x " + "$(echo ~/.agent-s)" * 400]
+                   "cp x " + "$(echo ~/.agent-s)" * 400,
+                   # A name with several texts, which makes the readings of one word branch; and chains
+                   # of assignments, which are followed from one name to the next.
+                   "p=a; p=b; p=c; p=d; cp x " + "$p" * 4000,
+                   "p=a; p=b; p=c; p=d; cp x " + "${p}" * 2000,
+                   "a=~/.agent-s; b=$a; c=$b; d=$c; cp x " + "$d" * 2000,
+                   "; ".join(f"v{i}=$v{i - 1}" for i in range(1, 80)) + "; cp x " + "$v79" * 1000,
+                   "; ".join(f"v{i}=$v{i + 1}" for i in range(80)) + "; cp x " + "$v0" * 1000]
         for shell in ("bash", "powershell"):
             for text in hostile:
                 with self.subTest(shell=shell, text=ascii(text[:30])):

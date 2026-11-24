@@ -84,8 +84,9 @@ ConfigChange        a settings file or a skill changed during the session. Recor
                     top-level keys that changed, from the SessionStart snapshot (names only,
                     never values). With the policy's hook.config_changes "block", the change
                     is also refused (exit 2). An event that cannot be read is refused whatever
-                    that setting says: it names no session, so nothing can be looked up for it,
-                    and the policy file on disk may itself be what changed. A refusal
+                    that setting says: an event the reader could not read is not trusted to say
+                    which session it belongs to, so the policy that session began with cannot be
+                    looked up for it, and the policy file on disk may itself be what changed. A refusal
                     only keeps the running session on its old settings: the file stays changed,
                     and the next session reads it. Managed policy settings cannot be refused
                     (Claude Code ignores the answer), so their changes are only recorded.
@@ -130,8 +131,9 @@ the stop as well: 2 is what blocks a call that has not been made. An event
 too large or too deeply nested to read still gives its name when that comes
 before its large fields (event_name_of). The elicitation events decline, and
 ConfigChange refuses the change. No unreadable event is decided by the policy
-file: it names no session, so the policy the session began with cannot be
-looked up, and the file on disk may be what changed. Whatever Claude can read
+file: an event the reader could not read is not trusted to say which session it
+belongs to, so the policy that session began with cannot be looked up for it,
+and the file on disk may be what changed. Whatever Claude can read
 (the deny reason, stderr on exit 2, the stop reason) is a generic text with a
 ref; the detail goes to the audit log. Claude Code v2.1.295 or later is
 needed, with "onFailure": "block" on each hook: without it, a hook that cannot
@@ -522,9 +524,10 @@ def answer_event(data: bytes, settings: HookSettings) -> HookAnswer:
     try:
         event = read_event(data)
     except MalformedEvent as exc:
-        # An event that cannot be read is not decided by the policy file: it names no session, so the
-        # record of the policy the session began with cannot be looked up, and the file on disk may be
-        # exactly what changed. Every unreadable event blocks, whatever hook.config_changes now says.
+        # An event that cannot be read is not decided by the policy file: an event the reader could not
+        # read is not trusted to say which session it belongs to, so the record of the policy that
+        # session began with cannot be looked up for it, and the file on disk may be exactly what
+        # changed. Every unreadable event blocks, whatever hook.config_changes now says.
         reason = f"the hook event could not be read: {exc}"
         ref = _log_failure(settings.audit, None, reason, RULE_MALFORMED, settings)
         return failed_answer(exc.event_name, ref)

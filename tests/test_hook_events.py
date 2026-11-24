@@ -492,9 +492,11 @@ class ConfigChanges(HookTest):
         self.assertIn("no file named", self.last()["reason"])
 
     def test_an_event_that_cannot_be_read_is_refused_whatever_the_policy_file_now_says(self):
-        """An unreadable event names no session, so the policy the session began with cannot be looked up
-        for it, and the file on disk may be exactly what changed. It is refused either way: a policy whose
-        hook.config_changes is "audit" must not be what decides an event that could not be read."""
+        """An event the reader could not read is not trusted to say which session it belongs to - whether
+        it leaves the session out, names it as something that is not a name, or does not parse at all - so
+        the policy that session began with cannot be looked up for it, and the file on disk may be exactly
+        what changed. It is refused either way: a policy whose hook.config_changes is "audit" must not be
+        what decides an event that could not be read."""
         self.start()
         unreadable = [json.dumps(recorded("config_change.json", **changes)).encode("utf-8")
                       for changes in ({"source": None}, {"source": 5}, {"file_path": ["x"]},

@@ -782,6 +782,20 @@ class TheHookTemplatesAndTheShell(HookTest):
             ("PowerShell", "Remove-Item -Recurse $HOME\\.agent-sen*\\hook-state"),
             ("PowerShell", "Set-Content .cl*\\settings.json '{}'"),
             ("PowerShell", "Copy-Item p.json (Resolve-Path ~\\.agent-s*\\policy.json)"),
+            # The assignment counts wherever the line puts it, with any keyword in front of it, and a
+            # name set from another name is followed from one to the next.
+            ("Bash", "{ p=~/.agent-s; cp p.json $p*/policy.json; }"),
+            ("Bash", "( p=~/.agent-s; cp p.json $p*/policy.json )"),
+            ("Bash", "if true; then p=~/.agent-s; cp p.json $p*/policy.json; fi"),
+            ("Bash", "while :; do p=~/.agent-s; cp p.json $p*/policy.json; done"),
+            ("Bash", "f() { p=~/.agent-s; cp p.json $p*/policy.json; }; f"),
+            ("Bash", "p=~/.agent-s; q=$p; cp p.json $q*/policy.json"),
+            ("Bash", "p=~/.agent-s; q=$p; r=$q; cp p.json $r*/policy.json"),
+            ("PowerShell", "if ($true) { $p = '~/.agent-s'; Copy-Item p.json $p*/policy.json }"),
+            # And past any bound on what the reader keeps, the write is refused, not let through.
+            ("Bash", "; ".join(f"V{index}=x" for index in range(40)) + "; cp p.json $V39*/policy.json"),
+            ("Bash", "p=" + "y" * 200 + "; cp p.json $p*/policy.json"),
+            ("Bash", "a=~/.agent-s; b=$a; c=$b; d=$c; e=$d; f=$e; g=$f; cp p.json $g*/policy.json"),
         ]
         for name, refused in (("claude-code", "ask"), ("claude-code-strict", "deny")):
             self.use(name)
@@ -795,6 +809,24 @@ class TheHookTemplatesAndTheShell(HookTest):
                 with self.subTest(template=name, command=command):
                     self.assertEqual(self.asked("Bash", {"command": command}), refused)
                     self.assertEqual(self.asked("Bash", {"command": command}, "bypassPermissions"), "deny")
+
+    def test_an_assignment_split_over_two_calls_is_the_documented_limit(self):
+        """The assignment has to be in the same command line as the write.
+
+        A PreToolUse event carries one command line ("command") and nothing of the shell that ran the
+        call before it, and Claude Code runs each Bash call in a shell of its own, so a variable set in
+        one call is not there in the next: the second line below really does expand "$p" to nothing. It
+        is read as any line that uses a variable it does not set - ordinary - and that is the limit
+        SECURITY.md states. The one-call form of the same write is refused by both templates.
+        """
+        for name, refused in (("claude-code", "ask"), ("claude-code-strict", "deny")):
+            self.use(name)
+            with self.subTest(template=name):
+                self.assertEqual(self.asked("Bash", {"command": "p=~/.agent-s"}), "allow")
+                self.assertEqual(self.asked("Bash", {"command": "cp p.json $p*/policy.json"}), "allow")
+                one_line = {"command": "p=~/.agent-s; cp p.json $p*/policy.json"}
+                self.assertIn(self.asked("Bash", one_line), (refused, "deny"))
+                self.assertEqual(self.asked("Bash", one_line, "bypassPermissions"), "deny")
 
 
 if __name__ == "__main__":
