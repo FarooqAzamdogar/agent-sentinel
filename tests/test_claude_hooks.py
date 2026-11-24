@@ -39,6 +39,38 @@ HOOK_POLICY = {
 }
 
 
+def _json_gives_up_at(most=100_000):
+    """The depth at which this Python's JSON writer gives up on a nested value, found by asking it.
+
+    Up to CPython 3.11 that depth is sys.getrecursionlimit(); from 3.12 the C
+    reader and writer are bounded by a count of their own, which is 3,000 on
+    Windows and 10,000 on Linux, so no test can name it. Found by halving,
+    which asks at most about seventeen times, and from where the caller
+    stands: the frames already in use count towards the same bound.
+    """
+    def gives_up(depth):
+        value = current = []
+        for _ in range(depth - 1):
+            current.append([])
+            current = current[0]
+        try:
+            json.dumps(value)
+            return False
+        except RecursionError:
+            return True
+
+    if not gives_up(most):
+        return most
+    low, high = 1, most
+    while low + 1 < high:
+        middle = (low + high) // 2
+        if gives_up(middle):
+            high = middle
+        else:
+            low = middle
+    return high
+
+
 def recorded(name, **changes):
     """A recorded event with some fields changed (a value of None removes the field)."""
     event = json.loads((EVENTS / name).read_text(encoding="utf-8"))
@@ -715,12 +747,20 @@ class AnswersThatCannotBeWritten(HookTest):
         self.assertRegex(err, "the call could not be checked, so it was not made " + REF)
 
     def test_a_real_output_at_the_depth_the_writer_cannot_follow_never_ends_with_another_exit_code(self):
-        # The reader and the writer give up at different depths, which differ from one Python to the next:
-        # every depth around both must end with 0 or 2 and one line of JSON at most (HookTest.hook checks it).
+        # The reader and the writer give up at different depths, and at a depth that is neither
+        # sys.getrecursionlimit() nor the same from one Python or system to the next: CPython 3.12 and later
+        # bound the recursion of the C reader and writer by a number of their own, which is 3,000 on Windows
+        # and 10,000 on Linux. So the depth they give up at is measured here, around whatever the frames of
+        # this test have used already. Every depth around both bounds must end with 0 or 2 and one line of
+        # JSON at most (HookTest.hook checks it).
         self.policy = self.write("policy.json", {**HOOK_POLICY, "secrets": {"in_results": "redact"}})
         limit = sys.getrecursionlimit()
+        gives_up = _json_gives_up_at()
+        self.assertGreater(gives_up, 200, "the writer's own bound was not found")
+        depths = {5, 50, *range(limit - 150, limit + 20, 3), *range(gives_up - 150, gives_up + 20, 3),
+                  gives_up - 1, gives_up, gives_up + 1}  # both sides of the bound, whatever the stride misses
         seen = set()
-        for depth in (5, 50, *range(limit - 150, limit + 20, 3), *range(3 * limit - 150, 3 * limit + 20, 3)):
+        for depth in sorted(depth for depth in depths if depth > 0):
             body = "[" * depth + '"ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"' + "]" * depth
             event = ('{"hook_event_name": "PostToolUse", "session_id": "deep", "tool_name": "mcp__github__get_issue", '
                      '"tool_use_id": "t", "tool_input": {}, "tool_response": %s}' % body).encode("utf-8")
