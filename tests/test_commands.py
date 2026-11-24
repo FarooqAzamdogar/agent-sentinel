@@ -8,6 +8,7 @@ reads credentials (cat .aws/credentials), installs an attacker's package
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -15,7 +16,7 @@ import unittest
 
 from cli_support import IsolatedHomeTest, run_cli
 from support import ROOT
-from agent_sentinel import Firewall, Policy, PolicyError, fix_hints, templates
+from agent_sentinel import Firewall, Policy, PolicyError, commands, fix_hints, templates
 from agent_sentinel.commands import CLASSES, MAX_COMMAND_CHARS, MAX_SEGMENTS, CommandRule, read_command
 from agent_sentinel.matchers import CommandMatcher
 
@@ -1933,6 +1934,157 @@ class NamesTheShellExpands(unittest.TestCase):
                     start = time.perf_counter()
                     read_command(text[:MAX_COMMAND_CHARS - 1] + " ", shell)
                     self.assertLess(time.perf_counter() - start, 1.0)
+
+
+# ---- every spelling of every protected name, generated from the one declaration --------------------
+
+def wildcard_spellings(name):
+    """The same name with a wildcard put in place of part of it, keeping its first character.
+
+    A leading "." is left alone on purpose: a Bash wildcard never matches one, so "?env" names no
+    credential there, and the reader says as much. These five are the spellings the rounds were shown
+    one at a time - one character replaced, a run replaced, and a wildcard added at the end.
+    """
+    middle = len(name) // 2
+    return (
+        name[:-1] + "?",
+        name[:-1] + "*",
+        name + "*",
+        name[:middle] + "*" + name[middle + 1:],
+        name[:middle] + "?" + name[middle + 1:],
+    )
+
+
+def protected_paths():
+    """Every protected path the declaration knows, as (parts, sides), generated from it.
+
+    sides: "both" where reading the path is a read of a credential or of an agent's configuration as
+    well as writing it is a write of one, "write" where only the write counts.
+    """
+    paths = []
+    for folder in commands._PROTECTED_FOLDERS:
+        for entry in folder.entries:
+            paths.append(([folder.name, entry], "both"))
+        if folder.whole:  # every entry of the folder counts, named here or not
+            paths.append(([folder.name, "x.json"], folder.whole))
+    for file in commands._PROTECTED_FILES:
+        paths.append(([file.name], "both"))
+    return paths
+
+
+def spellings_of(parts):
+    """The path spelled out, and the same path with each part in turn given a wildcard."""
+    yield list(parts)
+    for index, part in enumerate(parts):
+        for spelling in wildcard_spellings(part):
+            yield [*parts[:index], spelling, *parts[index + 1:]]
+
+
+class EverySpellingOfEveryProtectedName(unittest.TestCase):
+    """The reader has one declaration of what the product protects, and this generates every spelling
+    of every name in it: the path written out, and the same path with a wildcard put into each of its
+    parts in turn, on the write side and the read side, in both shells, under each depth of folder.
+
+    Five rounds each closed the spellings they were shown and were then found to have missed a
+    neighbouring one - a read where only the write counted, one wildcard character in a file name, a
+    folder the list of names had left out. Generating the cases from the declaration is what keeps them
+    in step: a name added to the declaration is tested in every spelling without anyone writing it out.
+    """
+
+    DEPTHS = ("", "repo/", "w/repo/")
+
+    @staticmethod
+    def line(program, parts, shell, prefix):
+        path = (prefix + "/".join(parts)).replace("/", "\\" if shell == "powershell" else "/")
+        return f"{program} {path}"
+
+    def test_each_part_of_each_protected_path_counts_with_a_wildcard_in_it(self):
+        checked = 0
+        for parts, sides in protected_paths():
+            for spelling in spellings_of(parts):
+                for prefix in self.DEPTHS:
+                    for shell, write, read in (("bash", "cp evil", "cat"),
+                                               ("powershell", "Copy-Item evil", "Get-Content")):
+                        written = self.line(write, spelling, shell, prefix)
+                        found = kinds(written, shell)
+                        with self.subTest(text=written):
+                            self.assertIsNotNone(found, "unreadable")
+                            self.assertIn("config_write", found)
+                        if sides == "both":
+                            text = self.line(read, spelling, shell, prefix)
+                            with self.subTest(text=text):
+                                self.assertIn("secret_read", kinds(text, shell))
+                        checked += 1
+        self.assertGreater(checked, 1500)
+
+    def test_a_searched_part_reaches_every_name_that_is_protected_wherever_it_stands(self):
+        """In PowerShell a wildcard matches a leading ".", so a part the shell searches may land in any
+        folder at all, and the name the path gives after it is what says whether it reaches something
+        protected - spelled out, or spelled with a wildcard of its own. In Bash such a search never
+        matches a leading "." and adds nothing: where the same path under a folder the line names is
+        ordinary, the searched form is ordinary too, which is the reader's own documented limit."""
+        for name in commands._PROTECTED_WHEREVER_IT_IS:
+            for spelling in (name, *wildcard_spellings(name)):
+                for depth in (r"repo\*", r"a\b\*", r"repo\*\sub"):
+                    for program, kind in (("Copy-Item evil", "config_write"), ("Get-Content", "secret_read")):
+                        text = f"{program} {depth}\\{spelling}"
+                        with self.subTest(text=text):
+                            self.assertIn(kind, kinds(text, "powershell"))
+                named = f"cp evil repo/x/{spelling}"
+                searched = f"cp evil repo/*/{spelling}"
+                with self.subTest(text=searched):
+                    self.assertEqual(kinds(searched), kinds(named))
+
+    def test_the_ordinary_lines_of_the_same_shape_stay_ordinary(self):
+        """The counterparts that must not be refused: a search by extension, a bare wildcard as the file
+        name, a file name that comes from a variable, and a path to a file that is protected nowhere.
+        A needless refusal is a real cost - this reader runs on every shell command an agent issues -
+        and under the strict template it is a refusal the operator cannot approve."""
+        ordinary = []
+        for depth in (r"repo\*", r"build\*", r"a\b\*", r"docs\*", r"logs\*", r"src\*"):
+            ordinary += [rf"{depth}\*.md", rf"{depth}\*.json", rf"{depth}\*", rf"{depth}\$name",
+                         rf"{depth}\$env:NAME", rf"{depth}\app.exe", rf"{depth}\latest.log",
+                         rf"{depth}\x.md", rf"{depth}\main.c", rf"{depth}\sub\app.exe"]
+        for path in ordinary:
+            for program, tool in (("Copy-Item evil", "PowerShell"), ("Get-Content", "PowerShell"),
+                                  ("Remove-Item", "PowerShell")):
+                text = f"{program} {path}"
+                with self.subTest(text=text):
+                    self.assertEqual(kinds(text, "powershell"), set())
+                    self.assertEqual(STARTER.evaluate(tool, {"command": text}).action, "allow")
+                    self.assertEqual(STRICT.evaluate(tool, {"command": text}).action, "allow")
+            bash = f"cp evil {path}".replace("\\", "/").replace("$env:NAME", "$NAME")
+            with self.subTest(text=bash):
+                self.assertEqual(kinds(bash), set())
+                self.assertEqual(STRICT.evaluate("Bash", {"command": bash}).action, "allow")
+
+    def test_the_declaration_and_the_shipped_policy_patterns_name_the_same_files(self):
+        """The templates ship the same names as text patterns (a policy value operators copy), and the
+        reader's own tests are worked out from the declaration. A name in one and not the other is the
+        asymmetry this round was for, so each spelled-out path the declaration knows must be one the
+        shipped patterns name, and a name neither of them holds must stay ordinary in both.
+        """
+        # The three ways a shipped template names these files: the credential preset, the agent's
+        # configuration pattern, and the baseline deny that keeps an agent out of agent-sentinel's
+        # own folder by the folder's name.
+        contains = [entry["contains"] for entry in templates.BASELINE_DENY_ARGS if "contains" in entry]
+        self.assertEqual(contains, [".agent-sentinel"])
+        shipped = re.compile(f"{templates.CREDENTIAL_PATTERN}|{templates.AGENT_CONFIG_PATTERN}"
+                             f"|{re.escape(contains[0])}", re.IGNORECASE)
+        for parts, _sides in protected_paths():
+            if parts[-1] == "x.json":
+                continue  # an entry the folder's own name covers, which no list of names spells out
+            for path in ("/".join(parts), "\\".join(parts), "/w/repo/" + "/".join(parts)):
+                with self.subTest(path=path):
+                    self.assertTrue(shipped.search(path), f"{path} is in no shipped pattern")
+        # And the other way about: what neither holds is in neither, so that the shipped pattern cannot
+        # quietly grow an entry the reader does not know, or the reader one the pattern does not.
+        declared = set(commands._PROTECTED_WHEREVER_IT_IS)
+        for name in ("plans", "notes.md", "extensions.json", "workflows", "todo.txt"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, declared)
+                self.assertIsNone(shipped.search(f"/w/repo/.claude/{name}"))
+                self.assertIsNone(shipped.search(f"/w/repo/.vscode/{name}"))
 
 
 if __name__ == "__main__":
