@@ -257,7 +257,7 @@ This release closes the gaps that a security review of 0.5.0 found, and adds def
 - Removed: `textutil.media_payloads` (use `media_blocks`), the `skip=` parameter of `EncodedRuns` and the `skip_decoding=` parameter of `detector.scan_views`.
 - A session store written for 0.5.0 (with only `read` and `add`) keeps recording marks: the `Firewall` wraps it, warns once, and skips or refuses what such a store cannot hold. It keeps no tail, and session budgets refuse every counted call with it. An object without those two methods is a `TypeError` when the `Firewall` is made.
 
-About 3,200 tests. Before the release they were run on Windows with Python 3.10 and 3.13; CI runs them on Linux and Windows with Python 3.10 to 3.13.
+About 3,250 tests. Before the release they were run on Windows with Python 3.10 and 3.13; CI runs them on Linux and Windows with Python 3.10 to 3.13.
 
 ## 0.5.0 (2026-11-20)
 

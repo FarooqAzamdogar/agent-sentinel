@@ -1184,9 +1184,9 @@ Run `agent-sentinel COMMAND --help` for every option.
 |---|---|---|
 | `proxy` | Run an MCP server behind the firewall (what a client starts). | `agent-sentinel proxy --policy /full/path/policy.json -- npx -y some-server` |
 | `init` | Write a first policy from a template (`starter`, `strict`, `readonly`, `monitor`, `claude-code`, `claude-code-strict`), or draft one from a server's tools. Never overwrites a file. | `agent-sentinel init --template starter` |
-| `inspect` | Start a server, list its tools, and show what the proxy (and a policy) would do with each. Calls no tool. Warns about a risky launch, and refuses to start a package known to be malware. | `agent-sentinel inspect --policy policy.json -- python my_server.py` |
+| `inspect` | Start a server, list its tools, and show what the proxy (and a policy) would do with each. Calls no tool. Warns about a risky launch, and refuses to start a package known to be malware. `--format json` prints the same as JSON. | `agent-sentinel inspect --policy policy.json -- python my_server.py` |
 | `clients` | List the MCP client configurations on this machine and how many servers are protected, with a line for each server whose launch looks risky. | `agent-sentinel clients` |
-| `wrap` | Put the proxy in front of each server in a client's configuration. Shows a diff; `--apply` writes it after a backup. `--contain`, `--session-group NAME` and `--no-session-group` choose what the entries get. | `agent-sentinel wrap --client cursor --policy ~/.agent-sentinel/policy.json --apply` |
+| `wrap` | Put the proxy in front of each server in a client's configuration. Shows a diff; `--apply` writes it after a backup. `--contain`, `--session-group NAME` and `--no-session-group` choose what the entries get, and `--audit FILE` and `--pins-dir DIR` where the log and the pins files go. | `agent-sentinel wrap --client cursor --policy ~/.agent-sentinel/policy.json --apply` |
 | `unwrap` | Give each wrapped server its own command back. | `agent-sentinel unwrap --client cursor --apply` |
 | `doctor` | Check, without changing anything, that every server is protected and would start, how each is launched, and who can reach agent-sentinel's own files. `--save-baseline FILE` records the configurations; `--baseline FILE` fails on any change since. | `agent-sentinel doctor --format json` |
 | `hook install claude-code` | Print (or, with `--settings FILE --apply`, add) the Claude Code hooks. | `agent-sentinel hook install claude-code --policy ~/.agent-sentinel/hook-policy.json` |
@@ -1195,17 +1195,20 @@ Run `agent-sentinel COMMAND --help` for every option.
 | `pins diff` | Show what changed in a tool, prompt or template the proxy removed, or with `--server` in the server itself. Exit code 1 when a change waits. | `agent-sentinel pins diff --pins PINS create_issue` |
 | `pins accept` / `forget` | On a terminal only: accept the new definition, or forget a pin. `--server` does the same for the server pin. Then restart the client. | `agent-sentinel pins accept --pins PINS create_issue` |
 | `check` | Try one call against a policy: which rule decides, and what the agent would be told. `--history FILE` plays earlier calls and results first; `--server NAME` answers as a proxy of that name. | `agent-sentinel check policy.json send_email to=bob@example.com --show-rules` |
-| `test` | Run a policy's test cases. Exit code 1 if any fails, for CI. | `agent-sentinel test policy.json cases.json` |
+| `test` | Run a policy's test cases. Exit code 1 if any fails, for CI. `--quiet` (or `-q`) prints only the cases that fail, and the summary. | `agent-sentinel test policy.json cases.json` |
 | `validate` | Check a policy file, print a summary, and warn about likely mistakes. | `agent-sentinel validate policy.json` |
 | `scan` | Scan text files (or stdin) for prompt injection. | `agent-sentinel scan --policy policy.json page.html` |
 | `report` | Summarize an audit log: whether its hash chain is intact, calls, top reasons for blocks with how to fix each, the last blocks. | `agent-sentinel report audit.jsonl --since 2h --show-args` |
 | `explain` | Explain blocks from the audit log, by reference or the last few. | `agent-sentinel explain audit.jsonl --ref 7f3a9c21 --policy policy.json` |
 | `suggest` | Draft exact-name rules from a monitor-mode log, as a diff. Writes only with `--out`. | `agent-sentinel suggest audit.jsonl --policy policy.json` |
 | `audit verify` | Check that an audit log is as it was written: its hash chain and, with `--key-file`, its signatures. Exit code 1 when it is broken. | `agent-sentinel audit verify audit.jsonl --key-file ~/.agent-sentinel/audit.key` |
-| `demo` | See the library and the proxy at work, in a temporary folder. | `agent-sentinel demo` |
+| `demo` | See the library and the proxy at work, in a temporary folder. `--keep DIR` writes the demo's policy and audit log to a new or empty folder of yours and leaves them there. | `agent-sentinel demo` |
 
 A few more details:
 
+- **`init -- <server command>`** drafts a policy from a real server's tools, asking about each one on a terminal. `--trust-annotations` allows, without asking, the tools the server says are read-only; the server writes those annotations itself, so use it only for a server you trust. `--timeout SECONDS` (1 to 600, default 15) gives up on a server that has not answered by then; `inspect --timeout` does the same.
+- **`pins --kind KIND`** says what the NAME on the command line is: `tool` (the default), `prompt`, `template`, or `instructions` for the server's own instructions, which take no NAME. `show`, `diff`, `accept` and `forget` all take it.
+- **`pins accept --force`** accepts a definition in which the scanner still finds what the policy would block. `accept` scans the new definition again and refuses such a one, because the proxy keeps it in a plain file beside the pins file, which anything able to write there could have edited. Use `--force` only after reading the definition yourself and deciding the finding is wrong, never to make a quarantined tool work again. It changes nothing in the proxy: the proxy scans the definition itself and removes the tool again, unless the policy's `injection.block_severity` allows that finding.
 - **`test`** reads a case file like this. A case can be a call or a text to scan:
 
   ```json
@@ -1239,11 +1242,14 @@ A few more details:
 - **`check --show-rules`** lists everything that applies to the tool: deny rules, the command section, the flow rules with their exceptions, the session limits and the flow labels.
 - **`check --server NAME`** answers as a proxy started with `--name NAME`: the policy's `server_labels` for that server mark the session from the start, as a proxy sets them with the server's first reply, and with every result of the history. `--proxy` alone is an unnamed proxy. With neither, `check` says that `server_labels` set no mark.
 - **`check --proxy`** answers the asks of a `--history` the way a proxy with no approver does: refused at once, and not counted. Without it, each step's own `"answer"` decides, as a person would.
+- **`check`'s arguments.** After the tool's name, `name=value` passes the value as text, exactly as typed, and `name:=JSON` passes a JSON value (`count:=5`, `flag:=true`, `tags:='["a","b"]'`). **`--args JSON`** gives them all as one JSON object instead; the two can be mixed, and a name given twice is an error.
 - **`scan --as description`** (or `instructions`) reads the text with the stricter rules for what a server says about its tools. `--fail-on medium` sets the threshold; exit code 1 means a finding at or above it.
 - **`check --result FILE`** also scans a file as the tool's result. With `--history`, it is read together with the end of the last result of the history.
+- **`report --last N`** lists that many of the most recent blocks (default 10); `--last 0` prints the counts only, without blocks or reasons. `--tool GLOB` (`read_*`), `--server NAME`, `--action`, `--event`, `--since` and `--until` choose which records count; `--server`, `--action` and `--event` can be repeated. `--by server` groups the calls table by server instead of by tool, and `--show-args` adds the arguments of the blocked calls.
 - **`report --follow`** watches the log and prints a line for each new block. `--format json` gives JSON. `--since` and `--until` take `30m`, `2h`, `7d`, `1w`, `2026-11-18` or `2026-11-18T14:30`.
+- **`explain --last N`** explains the last N blocks (the default, with N=3). `--ref` explains one instead.
 - **`report` and `explain`** start with a line about the log's hash chain, such as `Integrity: hash chain intact, seq 0 to 13; MACs not checked here (audit verify --key-file checks them).` They read the current log file only. The one exception: when `explain --ref` finds the reference nowhere in the log, it looks in the newest files the log was rotated to and says where it found it, since just after a rotation the record is there. In `report --format json` the integrity line is under `integrity`.
-- **`suggest`** never loosens a block that has a reason (a deny rule, a secret, an injection, a refused approval, a command class, a schema check, a flow exception). It only proposes exact rules for tools that the default blocked.
+- **`suggest`** never loosens a block that has a reason (a deny rule, a secret, an injection, a refused approval, a command class, a schema check, a flow exception). It only proposes exact rules for tools that the default blocked. `--as ask` proposes `"action": "ask"` for each one instead of `allow`, `--no-limits` leaves `max_calls_per_minute` out of the proposal, and `--server NAME` reads only that server's calls from a log several servers share.
 - **`doctor --format json`** has the same content as the text: per server its status, lines and `containment`, and at the top `advisories`, `control_plane`, `baseline`, `saved_baseline` and `baseline_warnings`. `doctor --baseline FILE` exits with 2 when FILE is missing or is not a baseline.
 - **`audit verify`** is described under [The audit log](#the-audit-log).
 
@@ -1617,7 +1623,7 @@ One JSON object per line. For example, a blocked call (the two hashes are shorte
 | `event` | What the record is about. See the table of events below. |
 | `call_id` | Shared by the records of one call (the call, the approval, the result, a timeout). |
 | `action` | `allow`, `ask` (waiting for a person), `block`, `would_block` (monitor mode) or `note` (information only; also a result that was let through with a notice). |
-| `rule` | Which rule decided, for example `default`, `tools.send_email`, `tools.send_email.allow_args[0]`, `deny_args[0]`, `tools.Bash.command.network`, `flows[0]`, `flows[0].unless_args[0]`, `limits.max_calls_per_session`, `secrets`, `secrets.canaries`, `injection`, `quarantine`, `malformed`, `unscannable`, `schema.arguments`, `include_context`, `hook.config_changes`, `hook.policy_changes`, `audit_required`, `caller` (the program that uses the firewall refused the call itself) and `hook_failed` (the Claude Code hook could not finish its checks, so the call or its output was refused). |
+| `rule` | Which rule decided, for example `default`, `tools.send_email`, `tools.send_email.allow_args[0]`, `deny_args[0]`, `tools.Bash.command.network`, `flows[0]`, `flows[0].unless_args[0]`, `limits.max_calls_per_session`, `secrets`, `secrets.canaries`, `injection`, `quarantine`, `malformed`, `unscannable`, `schema.arguments`, `include_context`, `elicitation.url` and `elicitation.form` (an elicitation was declined for where it sends you, or for what its form asks), `hook.config_changes`, `hook.policy_changes`, `audit_required`, `caller` (the program that uses the firewall refused the call itself) and `hook_failed` (the Claude Code hook could not finish its checks, so the call or its output was refused). |
 | `matched_arg` | The argument a rule matched. |
 | `ref` | The reference the agent was shown. 8 random hex characters, so two records can share one in a long log. |
 | `policy` | On a `block` or `would_block`: the first 12 hex characters of the SHA-256 of the policy file that decided, so you can tell which version of the policy refused a call. Absent for a policy built in code. |
@@ -1822,7 +1828,7 @@ What the proxy passes on is cleaned too: besides escape codes and control charac
 
 With the default policy only high findings block; medium and low findings are logged. With `injection.warn_severity: "medium"`, a medium finding in a result also puts a [notice](#the-notice-for-a-warning) in front of it. `agent-sentinel scan` exits with 1 for the new medium findings too.
 
-The rules are tested against 650 real tool descriptions from public MCP servers (none may be high) and 43 published attacks (`tests/attack_corpus/`). The attacks the rules miss are listed there with the reason. The new rules are heuristics like the old ones: a reworded order, a link without a telltale slot or a host label under the length limits passes, and a hashed CDN host name or a long tracking link can be flagged.
+The rules are tested against 650 real tool descriptions from public MCP servers (none may be high) and 87 published attacks (`tests/attack_corpus/`). The attacks the rules miss are listed there with the reason. The new rules are heuristics like the old ones: a reworded order, a link without a telltale slot or a host label under the length limits passes, and a hashed CDN host name or a long tracking link can be flagged.
 
 ## Troubleshooting
 
@@ -1960,7 +1966,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how the code is organized, how a mess
 python -m unittest discover tests -v
 ```
 
-There are about 3,200 tests. They need nothing but Python and take about eight minutes on a current machine, longer on a hosted runner. The tests for the Linux and macOS sandboxes and for file permissions skip themselves on other systems.
+There are about 3,250 tests. They need nothing but Python and take about eight minutes on a current machine, longer on a hosted runner. The tests for the Linux and macOS sandboxes and for file permissions skip themselves on other systems.
 
 ## Ideas for what to build next
 

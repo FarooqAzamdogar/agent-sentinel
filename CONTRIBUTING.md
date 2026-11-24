@@ -112,7 +112,7 @@ Shared helpers: `tests/support.py` (the example policy, a typical injection, and
 - **Read an audit log with `support.audit_records`.** Every new log starts with a `chain_start` record, and the proxy adds `session_start`, `protocol` and `session_end`. A test that takes the first line for the first call, or counts lines, breaks on them.
 - **List the tools before you call one** in a proxy test with flow rules. A tool that no checked `tools/list` has shown counts as untrusted and a sink, and the flow rule refuses the call instead of what you meant to test.
 - **Timing tests and a busy machine.** About thirty test modules check that hostile input stays fast, with `assertLess(seconds, limit)`. On an idle machine no check uses more than about 40% of its limit. A second test run on the same machine at the same time makes the scans three to four times slower, and then the 5-second checks with an idle time above about 1.2 seconds can fail: the hostile-input classes of `test_hidden_text.py`, `test_result_rules.py`, `test_detector.py` and `test_proxy_gaps.py`. Run the suite alone before you read such a failure as a regression, and do not raise a limit to make a loaded run pass.
-- **Tests for another system skip themselves.** The tests of POSIX file modes, the Linux sandbox and the Windows job object run only where they can. On Windows about 16 tests are skipped; they run in CI. Nothing runs on macOS, so the code for it (the `sandbox-exec` profile, the `ps` reader of `client_run.py`) is tested as text or with a stand-in: say so in SECURITY.md when you add to it.
+- **Tests for another system skip themselves.** The tests of POSIX file modes, the Linux sandbox and the Windows job object run only where they can. On Windows 20 tests are skipped; they run in CI. Nothing runs on macOS, so the code for it (the `sandbox-exec` profile, the `ps` reader of `client_run.py`) is tested as text or with a stand-in: say so in SECURITY.md when you add to it.
 - **Tests that use pydantic** must skip when it is not installed. The package itself never imports it.
 - **The attack corpus.** `tests/attack_corpus/benign_tool_metadata.json` holds 650 real tool descriptions: none may be high, read as metadata and as tool output with the parameter names of real tools. `tests/attack_corpus/published/` holds one file per published attack (87 of them), written by `make_published.py` (run it after editing; a test checks the files are what it writes).
 
@@ -240,10 +240,11 @@ A matcher is one way of judging an argument's value (`"pattern"`, `"one_of"`, `"
 
 Every refusal names the rule that decided, and operators look it up with `explain`.
 
-1. A rule that is written in the policy gets the id of where it is written (`tools.NAME.deny_args[0]`, `limits.max_distinct[0]`). A fixed check gets a constant in `policy.py` (`RULE_*`).
-2. Describe it in `Policy.describe_rule`.
+1. A rule that is written in the policy gets the id of where it is written (`tools.NAME.deny_args[0]`, `limits.max_distinct[0]`). A fixed check gets a constant in `policy.py` (`RULE_*`), or in its own module when the check belongs to nothing a policy writes, as `elicitation.py` holds `elicitation.url` and `elicitation.form`.
+2. Describe it in `Policy.describe_rule`. A check that no policy writes has nothing to describe there, and `describe_rule` leaves it alone.
 3. Give it a kind and a hint in `fix_hints.py`. If the block protects against an attack and does not just show a gap in the policy, add the kind to `PROTECTIVE_KINDS`, so that `suggest` never offers to loosen it.
-4. Add it to `tests/test_rule_ids.py` and `tests/test_fix_hints.py`.
+4. Name it in the README, in the `rule` field of the audit log's table. A rule id reaches the operator, and one that no document names leaves the reader of a log with nothing to look up. `tests/test_rule_ids.py` reads every module for a rule-id constant and fails when the README names none.
+5. Add it to `tests/test_rule_ids.py` and `tests/test_fix_hints.py`.
 
 ## How to add a proxy option
 
@@ -269,7 +270,7 @@ The proxy takes no shortened option, so nothing more is needed for it. An option
 3. Use the shared pieces: the exit codes (0 ok, 1 blocked or found, 2 an error in the input, 3 ask), `load_policy`, `read_input`, `strict_json`. Print anything you did not write yourself through `printable`.
 4. A command that writes files never overwrites one (open with `"x"`), prints the full path of what it wrote, and changes a client's file only with `--apply`, after a backup (`config_file`). A new folder is made with `filelock.make_private_folder`, and a file that holds a policy or a key is created with mode 0600.
 5. Add `tests/test_cli_<name>.py`. `tests/test_cli_commands.py` already checks that the command has a help page and refuses stray words.
-6. Add the command to the commands table in the README.
+6. Add the command to the commands table in the README, and name every option it takes there or in the details below the table. An option that no document names cannot be found by the person who needs it.
 
 ## How to add a secret format
 

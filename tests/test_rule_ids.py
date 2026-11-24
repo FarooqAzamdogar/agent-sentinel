@@ -432,6 +432,10 @@ class EveryRuleIdIsInTheReadme(unittest.TestCase):
     """
 
     README = Path(__file__).resolve().parent.parent / "README.md"
+    PACKAGE = Path(__file__).resolve().parent.parent / "agent_sentinel"
+    # A rule id written as a constant: RULE_X = "an.id". RULE_INDEX and anything else
+    # that is a pattern, not an id, is no word to look up and is left out.
+    CONSTANT = re.compile(r'^(RULE_[A-Z_]+) *(?::[^=]+)?= *"([\w.]+(?:/[\w.]+)?)"', re.MULTILINE)
 
     def test_every_rule_constant_of_the_policy_module_is_named_in_the_readme(self):
         text = self.README.read_text(encoding="utf-8")
@@ -447,6 +451,22 @@ class EveryRuleIdIsInTheReadme(unittest.TestCase):
             with self.subTest(rule=name):
                 self.assertIn(value, text, f"policy.{name} ({value!r}) is in no line of README.md")
         self.assertGreater(checked, 15)
+
+    def test_a_rule_id_any_module_defines_is_named_in_the_readme(self):
+        # Not every rule id is a policy's: the elicitation checks (elicitation.url,
+        # elicitation.form) are no rule anyone writes in a policy, and until 0.6.0 they
+        # were in no document. Every module that names an id is read, so the next one
+        # added outside policy.py cannot be left out either.
+        text = self.README.read_text(encoding="utf-8")
+        found = {}
+        for path in sorted(self.PACKAGE.glob("*.py")):
+            for name, value in self.CONSTANT.findall(path.read_text(encoding="utf-8")):
+                found[value] = f"{path.stem}.{name}"
+        for value in ("elicitation.url", "elicitation.form", "hook_failed"):
+            self.assertIn(value, found)  # the ones the check was written for
+        for value, where in sorted(found.items()):
+            with self.subTest(rule=where):
+                self.assertIn(value, text, f"{where} ({value!r}) is in no line of README.md")
 
 
 if __name__ == "__main__":
