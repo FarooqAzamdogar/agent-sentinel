@@ -35,6 +35,9 @@ hashes (SHA-256, cut to 128 bits), never as text. Every count has a bound
 forgets the calls made longest ago once it counts MAX_IDENTICAL_KEYS
 different ones. Arguments that cannot be written as JSON (UnwritableValue:
 only a library caller can pass them) cannot be counted: the call is refused.
+Arguments nested more than MAX_DEPTH deep are refused the same way, by that
+bound and not by whatever depth the interpreter's own JSON writer gives up
+at: that depth is not the same from one Python, or one system, to the next.
 
 Approval memory (POL-9)
 -----------------------
@@ -57,6 +60,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Iterable
@@ -82,7 +86,10 @@ IDENTICAL = "identical"
 # max_distinct reads every entry of a list argument (nested lists too); past this many entries and lists
 # in all, the call is refused. A list as long is far beyond any real number of recipients or hosts.
 MAX_LIST_ENTRIES = 10_000
-# How deep canonical_json writes arguments whose keys are not all text (only a library caller passes them).
+# How deep canonical_json writes arguments. Past this the call is refused (UnwritableValue), whether or not
+# this interpreter's own JSON writer could have followed them: CPython bounds the writer's recursion by a
+# number that differs between 3.11 and 3.12, and between Windows and Linux, and nothing a caller sends may
+# be counted on one system and refused on another.
 MAX_DEPTH = 200
 
 # What an approval question lists of the call's destinations, and how much it reads to find them.
@@ -230,6 +237,10 @@ class UnwritableValue(ValueError):
     """Arguments that cannot be written as JSON (they hold themselves, or are nested too deeply)."""
 
 
+_TOO_DEEP = ("the arguments cannot be written as JSON (they hold themselves, or are nested more than "
+             f"{MAX_DEPTH} deep)")
+
+
 def canonical_json(value: Any) -> str:
     """A value written as JSON in one fixed way: keys sorted, no spaces; anything else is named by its type.
 
@@ -237,22 +248,49 @@ def canonical_json(value: Any) -> str:
     that are not text (an int beside a str cannot be sorted, a tuple cannot be
     written at all) are written as text, "<int>1", and the value is written
     again; UnwritableValue if it still cannot be: it holds itself, or is
-    nested more than MAX_DEPTH deep.
+    nested more than MAX_DEPTH deep. The depth is read from the JSON written,
+    so the same arguments are refused on every system (see MAX_DEPTH).
     """
     try:
-        return _dumps(value)
+        text = _dumps(value)
     except (TypeError, ValueError, RecursionError):
         pass
+    else:
+        return _within_depth(text)
     try:
-        return _dumps(_with_text_keys(value, MAX_DEPTH))
+        return _within_depth(_dumps(_with_text_keys(value, MAX_DEPTH)))
     except (TypeError, ValueError, RecursionError):
-        raise UnwritableValue(
-            f"the arguments cannot be written as JSON (they hold themselves, or are nested more than {MAX_DEPTH} deep)"
-        ) from None
+        raise UnwritableValue(_TOO_DEEP) from None
 
 
 def _dumps(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=_unwritable)
+
+
+# Everything in JSON text that is not a bracket of its own: a string (brackets inside it are text, not
+# nesting), or a run of other characters. What is left of the text once these are gone is its shape.
+_NOT_A_BRACKET = re.compile(r'"(?:[^"\\]|\\.)*"|[^\[\]{}"]+')
+
+
+def _within_depth(text: str) -> str:
+    """`text` itself, or UnwritableValue when it nests more than MAX_DEPTH deep.
+
+    The depth is read from the JSON written, never walked through the Python
+    objects, so this adds no recursion of its own and gives the same answer on
+    every system. A text with no more than MAX_DEPTH brackets in all cannot be
+    that deep, which is the usual case and costs two counts in C.
+    """
+    if text.count("[") + text.count("{") <= MAX_DEPTH:
+        return text
+    depth = 0
+    for bracket in _NOT_A_BRACKET.sub("", text):
+        if bracket in "[{":
+            depth += 1
+            if depth > MAX_DEPTH:
+                raise UnwritableValue(_TOO_DEEP)
+        else:
+            depth -= 1
+    return text
 
 
 def _unwritable(value: Any) -> str:

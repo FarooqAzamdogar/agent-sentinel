@@ -28,6 +28,7 @@ from agent_sentinel.session import (
     SessionStateError,
 )
 from agent_sentinel.session_limits import (
+    MAX_DEPTH,
     MAX_LIST_ENTRIES,
     UnwritableValue,
     call_digest,
@@ -396,6 +397,31 @@ class SessionLimits(unittest.TestCase):
         self.assertEqual([decision.approval for decision in decisions], [APPROVAL_REFUSED, APPROVAL_REPEAT, None, None])
         self.assertEqual([decision.rule for decision in decisions[2:]], ["unscannable", "unscannable"])
         self.assertEqual(len(asked), 1)  # the same call as JSON was refused without asking; the others never asked
+
+    def test_the_depth_arguments_are_refused_at_is_agent_sentinels_own_not_the_interpreters(self):
+        """MAX_DEPTH decides, so the same arguments are refused on every system and every Python.
+
+        CPython bounds the recursion of its own JSON writer by a number that
+        is neither sys.getrecursionlimit() (from 3.12) nor the same on Windows
+        as on Linux (3,000 against 10,000), so a depth the writer follows here
+        is one it refuses there. Nothing a caller sends may be counted on one
+        system and refused on another.
+        """
+        def nest(depth):
+            value = current = []
+            for _ in range(depth - 1):
+                current.append([])
+                current = current[0]
+            return value
+
+        self.assertTrue(canonical_json(nest(MAX_DEPTH)))  # exactly the bound is still written
+        # 2,000 and 2,500 are depths one of these two systems writes and the other gives up on.
+        for depth in (MAX_DEPTH + 1, 2_000, 2_500, 20_000):
+            with self.subTest(depth=depth), self.assertRaises(UnwritableValue):
+                canonical_json({"to": nest(depth)})
+        # Brackets inside a string are text, not nesting, however many of them there are.
+        self.assertIn("[" * 500, canonical_json({"to": "[" * 500}))
+        self.assertTrue(canonical_json({"to": ["{" * 400, "}" * 400, '"]' * 200]}))
 
     def test_sink_bytes_count_only_calls_to_sinks(self):
         firewall = Firewall(policy(tools={"post": {"action": "allow", "labels": ["sink"]}, "read": "allow"},
