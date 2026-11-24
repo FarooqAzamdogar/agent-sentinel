@@ -284,10 +284,11 @@ class NumbersAreRead(unittest.TestCase):
 
     def test_large_calls_of_objects_and_strings_are_checked_quickly(self):
         block = Firewall(Policy.from_dict({"default": "allow", "secrets": {"in_arguments": "block"}}))
+        deepest = textutil.MAX_ARGUMENT_DEPTH - 2  # the object and the array around them are two levels
         for name, args in [
             ("small objects", {"a": [{"k": "v"} for _ in range(300_000)]}),
             ("short strings", {"a": ["ab"] * 1_000_000}),
-            ("deep arrays", {"a": [json.loads("[" * 200 + "1" + "]" * 200) for _ in range(2_000)]}),
+            ("deep arrays", {"a": [json.loads("[" * deepest + "1" + "]" * deepest) for _ in range(2_000)]}),
         ]:
             with self.subTest(args=name):
                 started = time.perf_counter()

@@ -249,7 +249,7 @@ This release closes the gaps that a security review of 0.5.0 found, and adds def
 
 **Library**
 
-- **Arguments of a type that cannot be made JSON are refused**, in monitor mode too: a numpy array, a `timedelta`, a custom class, a generator, an open file. In 0.5.0 such parts were skipped unseen. Turn them into JSON values, or text, before the call. Also refused: two keys that become the same text (the number 1 and the text "1"), a value that contains itself, nesting deeper than 256, and more than 4,000,000 parts.
+- **Arguments of a type that cannot be made JSON are refused**, in monitor mode too: a numpy array, a `timedelta`, a custom class, a generator, an open file. In 0.5.0 such parts were skipped unseen. Turn them into JSON values, or text, before the call. Also refused: two keys that become the same text (the number 1 and the text "1"), a value that contains itself, nesting deeper than 200, and more than 4,000,000 parts. The depth is agent-sentinel's own bound, so an argument nested deeper is refused on every system and every Python alike, where in 0.5.0 how deep an argument could be was whatever the interpreter's own JSON writer managed (3,000 levels on Windows, 10,000 on Linux, the recursion limit before 3.12). It is also the only depth bound a call meets: a call that is read is never refused later for being too deep to count.
 - **The approver and the audit record get the JSON copy** when the arguments were not JSON already (a `Path` as text, an Enum as its value). Plain JSON arguments are passed as they are.
 - `allow_args` can now accept a `Path` or an Enum argument, since they judge the JSON copy.
 - A number argument that carries a guarded digit-only value is refused.

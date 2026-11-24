@@ -36,6 +36,7 @@ from agent_sentinel.session_limits import (
     destinations,
     new_values,
 )
+from agent_sentinel.textutil import MAX_ARGUMENT_DEPTH, UnscannableError, normalised_arguments
 
 TOOLS = {
     "fetch_page": {"action": "allow", "labels": ["untrusted"]},
@@ -422,6 +423,36 @@ class SessionLimits(unittest.TestCase):
         # Brackets inside a string are text, not nesting, however many of them there are.
         self.assertIn("[" * 500, canonical_json({"to": "[" * 500}))
         self.assertTrue(canonical_json({"to": ["{" * 400, "}" * 400, '"]' * 200]}))
+
+    def test_arguments_the_reader_allows_are_never_refused_afterwards_for_their_depth(self):
+        """One bound decides how deep a call may be: the argument reader's.
+
+        The counter's bound was the lower of the two for a while, so arguments
+        nested between them were read and checked and then refused as
+        uncountable - and only when a session limit happened to apply to the
+        call, which is not something an operator could reason about. MAX_DEPTH
+        now follows MAX_ARGUMENT_DEPTH, so the reader is the only bound a call
+        meets, whether or not anything counts it.
+        """
+        def nested(levels, leaf):
+            value = leaf
+            for _ in range(levels):
+                value = [value]
+            return value
+
+        read_in, refused = 0, 0
+        for leaf in ("x", 1, {}, [], {"a": "x"}, ["x"]):
+            for levels in range(MAX_ARGUMENT_DEPTH - 2, MAX_ARGUMENT_DEPTH + 3):
+                with self.subTest(leaf=repr(leaf), levels=levels):
+                    try:
+                        args = normalised_arguments({"to": nested(levels, leaf)})
+                    except UnscannableError:
+                        refused += 1
+                        continue
+                    read_in += 1
+                    canonical_json(args)  # no UnwritableValue: what was read can be counted
+                    call_digest("send", args)
+        self.assertTrue(read_in and refused, "every case fell on one side: the bound is not being crossed")
 
     def test_sink_bytes_count_only_calls_to_sinks(self):
         firewall = Firewall(policy(tools={"post": {"action": "allow", "labels": ["sink"]}, "read": "allow"},

@@ -290,10 +290,14 @@ def _members(item: Any) -> tuple[list[tuple[Any, Any]], list[Any]] | None:
 # The arguments of a call, as JSON
 # --------------------------------------------------------------------------
 
-# How deeply the arguments of one call may be nested. Far deeper than any
-# real call: the audit log writes the arguments with json.dumps, which
-# recurses, and a value that holds itself must end somewhere.
-MAX_ARGUMENT_DEPTH = 256
+# How deeply the arguments of one call may be nested: no part of them may be
+# inside more than this many containers. Far deeper than any real call: the
+# audit log writes the arguments with json.dumps, which recurses, and a value
+# that holds itself must end somewhere. This is the one bound on how deep a
+# call may be. Everything that reads the arguments afterwards goes by it
+# (session_limits.MAX_DEPTH), so a call is never read here and then refused
+# further in for its depth.
+MAX_ARGUMENT_DEPTH = 200
 # How many parts (objects, arrays, strings, numbers...) the arguments of one
 # call may have in all. Real calls have far fewer; arguments with more (a
 # message of 16 MB of one-digit numbers holds 8 million) are refused, not

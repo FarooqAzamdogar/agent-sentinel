@@ -35,9 +35,11 @@ hashes (SHA-256, cut to 128 bits), never as text. Every count has a bound
 forgets the calls made longest ago once it counts MAX_IDENTICAL_KEYS
 different ones. Arguments that cannot be written as JSON (UnwritableValue:
 only a library caller can pass them) cannot be counted: the call is refused.
-Arguments nested more than MAX_DEPTH deep are refused the same way, by that
-bound and not by whatever depth the interpreter's own JSON writer gives up
-at: that depth is not the same from one Python, or one system, to the next.
+Arguments nested too deeply are refused the same way, by a bound of this
+package's own (textutil.MAX_ARGUMENT_DEPTH, which the reader applies to every
+call before anything is counted) and not by whatever depth the interpreter's
+own JSON writer gives up at: that depth is not the same from one Python, or
+one system, to the next.
 
 Approval memory (POL-9)
 -----------------------
@@ -75,7 +77,7 @@ from .policy import (
     Policy,
 )
 from .session import MAX_IDENTICAL_KEYS, MAX_REFUSALS, SINK, SessionState
-from .textutil import printable, texts_in
+from .textutil import MAX_ARGUMENT_DEPTH, printable, texts_in
 
 # The kinds of session limit.
 CALLS = "calls"
@@ -90,7 +92,13 @@ MAX_LIST_ENTRIES = 10_000
 # this interpreter's own JSON writer could have followed them: CPython bounds the writer's recursion by a
 # number that differs between 3.11 and 3.12, and between Windows and Linux, and nothing a caller sends may
 # be counted on one system and refused on another.
-MAX_DEPTH = 200
+#
+# The depth a call may have is the argument reader's to decide (textutil.MAX_ARGUMENT_DEPTH: no part of the
+# arguments inside more than that many containers), and every call has passed the reader before anything is
+# counted. The deepest arguments it lets through are a part that many containers deep, written with one
+# bracket more when that part is an empty object or array, so the bound here is that JSON: the counter
+# refuses for depth only what the reader would never have passed on.
+MAX_DEPTH = MAX_ARGUMENT_DEPTH + 1
 
 # What an approval question lists of the call's destinations, and how much it reads to find them.
 MAX_DESTINATIONS = 10
@@ -238,7 +246,7 @@ class UnwritableValue(ValueError):
 
 
 _TOO_DEEP = ("the arguments cannot be written as JSON (they hold themselves, or are nested more than "
-             f"{MAX_DEPTH} deep)")
+             f"{MAX_ARGUMENT_DEPTH} deep)")
 
 
 def canonical_json(value: Any) -> str:
@@ -248,8 +256,10 @@ def canonical_json(value: Any) -> str:
     that are not text (an int beside a str cannot be sorted, a tuple cannot be
     written at all) are written as text, "<int>1", and the value is written
     again; UnwritableValue if it still cannot be: it holds itself, or is
-    nested more than MAX_DEPTH deep. The depth is read from the JSON written,
-    so the same arguments are refused on every system (see MAX_DEPTH).
+    nested deeper than the arguments of a call may be. The depth is read from
+    the JSON written, so the same arguments are refused on every system, and
+    the bound is the reader's own (see MAX_DEPTH), so arguments the reader
+    passed on are never refused here for their depth.
     """
     try:
         text = _dumps(value)
