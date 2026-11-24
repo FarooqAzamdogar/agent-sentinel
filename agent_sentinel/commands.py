@@ -52,27 +52,44 @@ $env:NAME, ${env:NAME}, $(...) and a member access ($x.y). A "~" or "~user" is
 plain text: it spells no hidden name, and the part after its "/" is read like
 any other. What the line gives a variable is what an assignment in the same
 line sets it to (p=~/.agent-s; cp x $p*/..., VAR=value command, export p=...,
-cmd's set p=..., PowerShell's $p = '...'), the text written inside a ${ }
-(${p:-.agent-s}), and a word inside a $( ) or backticks that spells such a
-folder's name or the start of it ($(echo ~/.agent-s)). An assignment counts
-wherever the line puts it, with whatever stands in front of it: a brace group
-or a subshell, the body of an if, a while, a for or a case, either side of a
-&& or a ||, a function's body, a continued line, and "time". A name set from
-another name is followed from one to the next, _MAX_CHAIN steps of the chain
-(p=~/.agent-s; q=$p; cp x $q*/...). A variable the line does not set shows
-nothing: what it holds is no more known here than what a variable set in an
-earlier call holds, and a name whose own text names it again (PATH=$HOME/bin:
-$PATH) says only what it held before the line, which is the same case.
+cmd's set p=..., PowerShell's $p = '...'), the text written inside a ${ } where
+that text is one the expansion may really give - a default or an alternative
+(${p:-.agent-s}, ${p=d}, ${p:+d}) or the replacement of a substitution
+(${p/a/.agent-s}), never a pattern that is removed (${p%.*}), an index
+(${p:1:2}) or an error message - and a word inside a $( ) or backticks that
+spells such a folder's name or the start of it ($(echo ~/.agent-s)). An
+assignment counts wherever the line puts it, with whatever stands in front of
+it: a brace group or a subshell, the body of an if, a while, a for or a case,
+either side of a && or a ||, a function's body, a continued line, and "time".
+A variable the line does not set shows nothing: what it holds is no more known
+here than what a variable set in an earlier call holds, and a name whose own
+text names it again (PATH=$HOME/bin:$PATH) says only what it held before the
+line, which is the same case.
+
+A name set from another name is followed too (p=~/.agent-s; q=$p; cp x
+$q*/...): the texts the line shows are put into one another four times over,
+and each round puts in what the round before worked out. A chain written in the
+usual order, with each name set before the name that uses it, is followed
+however long it is; one written backwards is followed 16 steps.
 
 Every bound on this fails CLOSED. When the reader has had to drop something it
-would otherwise have followed - more names than _MAX_VALUES, a text longer than
-_MAX_VALUE_CHARS, more texts for one name than _MAX_VALUES_PER_NAME, a chain
-longer than _MAX_CHAIN, more readings of one word than _MAX_RESOLVED or more
-text put into one than _MAX_RESOLVED_CHARS, an expansion longer than
-_MAX_EXPANSION_CHARS, or a path of more than _MAX_PATH_PARTS parts - the part
-it could not work out counts as a protected name, not as an ordinary one. A
-line too large or too tangled to read is a line the reader could not read, and
-such a line is asked about.
+would otherwise have followed - more than 64 names set in the line, more than
+4 texts for one name, a chain it did not work out in those four rounds, more
+than 16 readings of one word or more than 4 KiB of text put into one, an
+expansion of more than 256 characters, or a path of more than 256 parts - the
+part it could not work out counts as a protected name, not as an ordinary one,
+and the reason the operator is given says that is what happened. A line too
+large or too tangled to read is a line the reader could not read, and such a
+line is asked about.
+
+One bound keeps what it had instead of dropping it: a text longer than 128
+characters is kept as its first 128 characters. A path part is spelled from its
+start, and the longest protected name is 15 characters, so the start of a text
+is what says where a word using the name lands; a name set to 300 characters of
+a commit message is not a name that may stand for a protected folder. Where the
+cut itself could hide one - an expansion, a protected name or the start of one
+in the part the cut falls in or after it - the name stands for text the reader
+could not work out, as the other bounds leave it.
 
 A part counts as a hidden protected folder (.claude, .agent-sentinel, .git,
 .ssh, .aws ...) when what it shows could spell one:
@@ -86,9 +103,15 @@ A part counts as a hidden protected folder (.claude, .agent-sentinel, .git,
     when the part is a folder on the way to a file (?ssh/id_x);
   * it shows none of a name - only wildcards and variables the line does not
     set - and, in PowerShell, the shell searches it with a wildcard while it
-    is a folder on the way to the file named after it (*/policy.json,
-    $env:NAME*/policy.json, *$p/policy.json). In Bash such a part is the
-    ordinary case and does not count (rm $build*, cp $src* /tmp/, rm $*,
+    is a folder on the way to the file named after it, and the path either
+    begins there (*/policy.json, ~\\*\\policy.json, $env:NAME*/policy.json) or
+    spells out one of the protected names after it (repo\\*\\settings.json,
+    repo\\*\\config): a protected folder of a project's own sits inside the
+    project's folder, so a search above one is not held to the folder it
+    starts in. What the path ends in keeps the everyday writes and reads of
+    that shape ordinary, since their own names are not protected ones
+    (build\\*\\app.exe, logs\\*\\latest.log). In Bash such a part is the
+    ordinary case and never counts (rm $build*, cp $src* /tmp/, rm $*,
     rm -rf $build/*): a Bash wildcard never matches a leading ".", and what
     the variable holds is not shown;
   * in PowerShell, a ( ) group with a word that is the start of such a
@@ -96,11 +119,12 @@ A part counts as a hidden protected folder (.claude, .agent-sentinel, .git,
   * the variables that name agent-sentinel's folder or Claude Code's
     ($AGENT_SENTINEL_HOME, ${CLAUDE_CONFIG_DIR}, $env:..., %...%).
 
-A write counts as config_write too when a wildcard or a variable may turn a
-part after a protected folder into one of its protected entries
-(.git/hoo*/pre-commit, .vscode/*.json), or a wildcard may turn the file name
-into an agent's instruction or MCP file (CLAUDE.m?, AGENT?.md, .mcp.j*); a
-search by extension (*.md) does not count.
+A word counts in the same way when a wildcard or a variable may turn a part
+after a protected folder into one of its protected entries (.git/hoo*/pre-commit,
+.vscode/*.json), or a wildcard may turn the file name into an agent's
+instruction or MCP file (CLAUDE.m?, AGENT?.md, .mcp.j*): a write to it is
+config_write, and a read of it is secret_read and obfuscation, as for a hidden
+folder. A search by extension (*.md) does not count.
 
 In Bash, a wildcard or brace inside quotes or after a backslash is not
 expanded, so it does not count ('s/.*//' is a sed script); PowerShell's
@@ -122,12 +146,14 @@ quote or $( ), a heredoc or here-string, ANSI-C quoting ($'...'), a program
 chosen at run time ($c args, PowerShell's & $c, & (...) and . (...), zsh's
 =curl, cmd's %a%rl and !a!rl), a program name with a wildcard or a brace
 expansion (/???/cur?, {curl,x}), a shell's -c that cannot be placed (bash -o -c
-x), more wrappers before the program than _MAX_WRAPPERS (nice nice ... curl),
-more than MAX_SEGMENTS commands, more than MAX_COMMAND_CHARS characters, deeper
-nesting than MAX_DEPTH, or a control character. The policy decides what happens
-to it (see CommandRule). A "#" after an escaped blank (a\\ #b, PowerShell's
-a` #b) is part of the word, as the shells read it, not a comment; in cmd's text
-("cmd /c ...") a "#" never starts a comment and a "'" is no quote.
+x), more than 8 wrappers before the program (nice nice ... curl), a bracket
+that is not closed or closes nothing, more than MAX_SEGMENTS commands, more
+than MAX_COMMAND_CHARS characters, deeper nesting than MAX_DEPTH, or a control
+character. The policy decides what happens to it (see CommandRule). A "#" after
+an escaped blank (a\\ #b, PowerShell's a` #b) is part of the word, as the shells
+read it, not a comment; in cmd's text ("cmd /c ...") a "#" never starts a
+comment and a "'" is no quote. The ")" that ends the pattern of a case has no
+"(" of its own and is read as the shells read it ("case $x in a) p=1;; esac").
 
 This raises the bar; it is not a boundary. A shell can reach the same ends in
 ways no text reading follows: variables, aliases and functions set in an
@@ -402,6 +428,12 @@ class _Splitter:
         return self.pipelines
 
 
+# The words that begin and end a Bash case statement, for the ")" that ends each of its patterns.
+_CASE_HEADER = re.compile(r"(^|[\s;&|])case($|[\s;])")
+_CASE_IN = re.compile(r"(^|\s)in($|\s)")
+_ESAC = re.compile(r"(^|[\s;&|])esac($|[\s;&|])")
+
+
 def _nested_splitter(shell: str) -> type:
     if shell == "bash":
         return _BashSplitter
@@ -415,6 +447,31 @@ class _BashSplitter(_Splitter):
         if depth > MAX_DEPTH:
             raise Unreadable("it nests commands more deeply than is followed")
         super().__init__(text, budget, depth)
+        self.cases = 0  # "case" statements begun and not yet ended by their "esac"
+
+    def end_command(self) -> None:
+        text = "".join(self.current)
+        if _CASE_HEADER.search(text) and _CASE_IN.search(text):
+            self.cases += 1
+        elif self.cases and _ESAC.search(text):
+            self.cases -= 1
+        super().end_command()
+
+    def case_pattern(self) -> bool:
+        """Whether the ")" now being read ends the pattern of a case, as in "case $x in a) p=1;; esac".
+
+        That ")" has no "(" of its own in the spelling people write, so it must not be taken for a
+        stray closing bracket: the whole line would then be unreadable, and an everyday case statement
+        asked about. The pattern is known by the "case ... in" in front of it, in the text being read
+        or in a command already ended ("case $x in a|b)"), until the "esac" that ends the statement.
+        """
+        text = "".join(self.current)
+        return self.cases > 0 or bool(_CASE_HEADER.search(text) and _CASE_IN.search(text))
+
+    def pattern_read(self) -> None:
+        """Keep a case's pattern as the words of a header, not as a command to run: "*" is no program."""
+        self.current.insert(0, "case ")
+        self.end_pipeline()
 
     def split(self) -> list[list[_Segment]]:
         text, i, n = self.text, 0, len(self.text)
@@ -478,6 +535,9 @@ class _BashSplitter(_Splitter):
                     i += 1
             elif c == "(":
                 self.opened()
+                i += 1
+            elif c == ")" and self.open == 0 and self.case_pattern():
+                self.pattern_read()
                 i += 1
             elif c == ")":
                 self.closed()
@@ -1858,12 +1918,16 @@ _PROTECTED_NAMES = (
     "mcp.json", "mcp_config.json", "claude_desktop_config.json", "config.toml", "hooks.json", "cli.json",
     "tasks.json", "config", "hooks", "credentials", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
 )
+_PROTECTED_NAME_SET = frozenset(_PROTECTED_NAMES)
 # What a part of a path may become when the shell expands it: any one character (? and [...]), any text from
 # a wildcard (*), any text from a variable, a brace list or a command's output, and any text at all where the
 # reader could not work out what the line sets a name to (_UNKNOWN). Other characters stand for themselves,
 # lowercased.
 _ANY_ONE, _ANY_GLOB, _ANY_TEXT, _ANY_NAME = 1, 2, 3, 4
 _EXPANSION_CHARACTERS = "*?[{}$%!" + _SUBST + _GROUP + _UNKNOWN
+# One scan for any of them. This runs on every word of every command, so a character class is worth
+# having over looking each character up in the word in turn.
+_AN_EXPANSION = re.compile(f"[{re.escape(_EXPANSION_CHARACTERS)}]")
 _PATH_SEPARATORS = "\\/:=@"  # and "," in PowerShell, where a list of paths is one word
 _MAX_PATH_PARTS = 256  # of one word; a word with more is not a path
 _MAX_EXPANSION_CHARS = 256  # of one ${...}, %...%, !...! or brace list; longer, and it is not read as one
@@ -1885,6 +1949,10 @@ _AGENT_FILE_NAMES = (
     "claude.md", "claude.local.md", "agents.md", "memory.md", "gemini.md", ".mcp.json", "mcp_config.json",
     ".cursorrules", "claude_desktop_config.json", ".claude.json",
 )
+# The longest of those names and of the protected entries: a part with more characters of its own than that
+# can spell none of them, which is worth knowing before looking at each name in turn.
+_LONGEST_PROTECTED_ENTRY = max(len(name) for group in (_AGENT_FILE_NAMES, *_PROTECTED_ENTRIES.values())
+                               for name in group)
 
 
 class _Part(NamedTuple):
@@ -1893,6 +1961,11 @@ class _Part(NamedTuple):
     text: str  # the part as written
     tokens: tuple[Any, ...]  # see _ANY_ONE, _ANY_GLOB, _ANY_TEXT; other characters stand for themselves
     searched: bool  # a wildcard in it makes the shell look for the part through the file system
+    plain: bool  # every token stands for itself: the shell expands nothing here (worked out once, read often)
+
+
+def _one_part(text: str, tokens: tuple[Any, ...], searched: bool) -> _Part:
+    return _Part(text, tokens, searched, all(isinstance(token, str) for token in tokens))
 
 
 def _expansion_end(word: str, i: int, shell: str, globs: bool) -> int:
@@ -1977,7 +2050,7 @@ def _path_parts(word: str, shell: str, globs: bool) -> tuple[_Part, ...]:
             i += 1
             continue
         if c in separators:
-            parts.append(_Part("".join(text), tuple(tokens), searched))
+            parts.append(_one_part("".join(text), tuple(tokens), searched))
             if len(parts) > _MAX_PATH_PARTS:
                 return _unreadable_path(word)  # a word with that many parts is more than the reader reads
             text, tokens, searched = [], [], False
@@ -1997,13 +2070,13 @@ def _path_parts(word: str, shell: str, globs: bool) -> tuple[_Part, ...]:
             bracket = False
         text.append(word[i:closing + 1] if bracket else c)
         i = closing + 1 if bracket else i + 1
-    parts.append(_Part("".join(text), tuple(tokens), searched))
+    parts.append(_one_part("".join(text), tuple(tokens), searched))
     return tuple(parts) if len(parts) <= _MAX_PATH_PARTS else _unreadable_path(word)
 
 
 def _unreadable_path(word: str) -> tuple[_Part, ...]:
     """A word with more parts than the reader reads, as one part that may be any text at all."""
-    return (_Part(word, (_ANY_NAME,), True),)
+    return (_one_part(word, (_ANY_NAME,), True),)
 
 
 def _could_spell(tokens: tuple[Any, ...], name: str) -> bool:
@@ -2030,7 +2103,7 @@ def _may_be_hidden(word: str, shell: str, reading: bool = False) -> bool:
     reading: the word is only read, so a part whose first characters are expanded counts only as a folder
     on the way to a file.
     """
-    if not any(ch in word for ch in _EXPANSION_CHARACTERS):
+    if not _AN_EXPANSION.search(word):
         return False
     if _PROTECTED_VARIABLE.search(word):
         return True  # $AGENT_SENTINEL_HOME/policy.json: the variable names the folder itself
@@ -2039,7 +2112,7 @@ def _may_be_hidden(word: str, shell: str, reading: bool = False) -> bool:
     last = len(parts) - 1
     for index, part in enumerate(parts):
         tokens = part.tokens
-        if all(isinstance(token, str) for token in tokens):
+        if part.plain:
             if globs and shell == "bash" and part.text.startswith(".") and "}" in part.text:
                 return True  # the end of a brace list that began in an earlier part: {~/.cl,x}aude
             continue
@@ -2060,8 +2133,10 @@ def _may_be_hidden(word: str, shell: str, reading: bool = False) -> bool:
             # never sets, a command's output). In Bash nothing there can put a "." first, so the part is the
             # ordinary case (rm $build*). In PowerShell a wildcard does match a leading ".", so a part the
             # shell searches with one counts while it is a folder on the way to the file named after it,
-            # and while nothing before it names a folder of its own (_at_the_top).
-            if not (shell == "powershell" and part.searched and index < last and _at_the_top(parts, index)):
+            # and while the path either begins there (_at_the_top) or ends in one of the protected names
+            # (_reaches_a_protected_name).
+            if not (shell == "powershell" and part.searched and index < last and (
+                    _at_the_top(parts, index) or _reaches_a_protected_name(parts, index))):
                 continue
         elif first == _ANY_GLOB and tokens[1:2] == (".",) and "." not in tokens[2:] and all(
                 isinstance(token, str) for token in tokens[1:]):
@@ -2071,18 +2146,34 @@ def _may_be_hidden(word: str, shell: str, reading: bool = False) -> bool:
     return False
 
 
+def _reaches_a_protected_name(parts: tuple[_Part, ...], index: int) -> bool:
+    """Whether a part the PowerShell shell searches is on the way to one of the protected names, which the
+    path spells out after it (".../*/settings.json", ".../*/config", ".../*/sub/policy.json").
+
+    A protected folder is normally found INSIDE an ordinary project folder, so judging such a search by
+    what stands before it misses the everyday shape of the attack ("repo\\*\\settings.json"), while judging
+    it by where the path ends keeps the everyday reads and writes that have the same shape: "app.exe" and
+    "latest.log" are not protected names, so "build\\*\\app.exe" and "logs\\*\\latest.log" stay ordinary.
+    Every part after the search is looked at, not only the next one, because a search that lands in a
+    protected folder makes a protected file of everything under it.
+    """
+    return any(part.plain and part.text.lower() in _PROTECTED_NAME_SET
+               for part in parts[index + 1:])
+
+
 def _at_the_top(parts: tuple[_Part, ...], index: int) -> bool:
     """Whether a path part is still where a protected folder of the user's own is found: nothing before it
     but a root, a drive, "." or "..", a "~", or another part the shell expands.
 
     A PowerShell wildcard matches a leading ".", so "*\\policy.json", "~\\*\\policy.json" and
     "$env:NAME*\\policy.json" may land in one. Under a folder the line names itself ("build\\*\\app.exe",
-    "logs\\*\\latest.log") the search is held inside that folder, and the part stays ordinary.
+    "logs\\*\\latest.log") the search is held inside that folder, and the part stays ordinary unless the
+    path spells out a protected name after it (_reaches_a_protected_name).
     """
     for before, part in enumerate(parts[:index]):
         if not part.text:
             continue  # a leading separator, a UNC path, or the root right after a drive letter
-        if not all(isinstance(token, str) for token in part.tokens):
+        if not part.plain:
             continue  # a part the shell expands: what it names is not known either
         if part.text in (".", "..") or part.text.startswith("~"):
             continue
@@ -2097,20 +2188,22 @@ def _may_be_protected_entry(word: str, shell: str) -> bool:
     spelled out: an entry of a protected folder (.git/hoo*/pre-commit, .vscode/*.json) or an instruction file
     (CLAUDE.m?, AGENT?.md). A search by extension (*.md) or a bare wildcard as the file name does not count.
     """
-    if not any(ch in word for ch in _EXPANSION_CHARACTERS):
+    if not _AN_EXPANSION.search(word):
         return False
     globs = shell != "bash" or not isinstance(word, _Literal)
     parts = _path_parts(word, shell, globs)
     for index, part in enumerate(parts):
         tokens = part.tokens
-        if all(isinstance(token, str) for token in tokens):
+        if part.plain:
             continue
+        plain = [token for token in tokens if isinstance(token, str)]
+        if len(plain) > _LONGEST_PROTECTED_ENTRY:
+            continue  # more characters of its own than any of these names has, so it can spell none of them
         entries = _PROTECTED_ENTRIES.get(parts[index - 1].text.lower(), ()) if index else ()
         if any(_could_spell(tokens, name) for name in entries):
             return True
         if index < len(parts) - 1 or _ANY_TEXT in tokens:
             continue  # a file name from a variable ("$name.json") is the limit of a path made of variables
-        plain = [token for token in tokens if isinstance(token, str)]
         by_extension = tokens[0] == _ANY_GLOB and plain[:1] == ["."] and "." not in plain[1:] and len(plain) == len(
             tokens) - 1
         if plain and not by_extension and any(_could_spell(tokens, name) for name in _AGENT_FILE_NAMES):
@@ -2139,9 +2232,13 @@ def _may_name_a_hidden_folder(word: str) -> bool:
 # past a bound the name stands for _UNKNOWN, text the reader could not work out, and a path part holding
 # one counts as a protected name. A line too large or too tangled to read is asked about, not allowed.
 _MAX_VALUES = 64  # names one command line sets, as far as the reader follows them
-_MAX_VALUE_CHARS = 128  # of one such text
+_MAX_VALUE_CHARS = 128  # of one such text; a longer one is kept as its first _MAX_VALUE_CHARS characters
 _MAX_VALUES_PER_NAME = 4  # texts one name may stand for (a line that sets it more than once)
-_MAX_CHAIN = 4  # assignments followed from one to the next (p=~/.agent-s; q=$p; r=$q ...)
+# Rounds of putting those texts into one another, which is how a chain of assignments is followed
+# (p=~/.agent-s; q=$p; r=$q ...). One round is not one step: each round puts in what the round before
+# worked out, so a chain written in the usual order, with each name set before it is used, is followed
+# however long it is, and one written backwards reaches _MAX_SUBSTITUTION_ROUNDS doublings, 16 steps.
+_MAX_SUBSTITUTION_ROUNDS = 4
 _MAX_RESOLVED = 16  # texts one word is read as, with those values put in
 _MAX_RESOLVED_CHARS = 4 * 1024  # of the text put into one of them
 # Programs that set a variable for the rest of the line: Bash's export and the like, cmd's set.
@@ -2170,7 +2267,7 @@ def _line_values(words: list[str], shell: str, values: dict[str, list[str]]) -> 
         found = [(word.partition("=")[0].rstrip("+").partition("[")[0], word.partition("=")[2])
                  for word in assignments]
     for name, value in found:
-        _remember_value(values, name, value)
+        _remember_value(values, name, value, shell)
 
 
 def _past_keywords(words: list[str], shell: str) -> list[str]:
@@ -2205,28 +2302,69 @@ def _powershell_assignment(words: list[str]) -> list[tuple[str, str]]:
     return [(name, found.group(2) or (words[1] if len(words) > 1 else ""))]
 
 
-def _remember_value(values: dict[str, list[str]], name: str, value: str) -> None:
+def _remember_value(values: dict[str, list[str]], name: str, value: str, shell: str) -> None:
     """Keep a text a name may stand for, under the name as written and lowercased (cmd and PowerShell
     do not mind the case).
 
-    A text the reader cannot keep - longer than _MAX_VALUE_CHARS, one more than _MAX_VALUES_PER_NAME
-    for this name, or a name past _MAX_VALUES - makes the name stand for _UNKNOWN instead: the line
-    sets it, so a word using it is read as one whose landing place the reader could not work out. The
-    name is kept either way, so that only the names the line really sets are read that way.
+    A text too long to keep whole is kept as its first _MAX_VALUE_CHARS characters where the reader can
+    see that the cut takes nothing away from it (_cut_shows_nothing): a path part is spelled from its
+    start, so the start of the text is what says where a word using the name lands, and a name that
+    stands for 300 characters of a commit message is not a name that may stand for a protected folder.
+
+    A text the reader cannot keep even as a prefix - one whose cut could hide a protected name, one more
+    than _MAX_VALUES_PER_NAME for this name, or a name past _MAX_VALUES - makes the name stand for
+    _UNKNOWN instead: the line sets it, so a word using it is read as one whose landing place the reader
+    could not work out. The name is kept either way, so that only the names the line really sets are
+    read that way.
     """
     if not name or not value:
         return
+    if len(value) > _MAX_VALUE_CHARS:
+        value = value[:_MAX_VALUE_CHARS] if _cut_shows_nothing(value, shell) else _UNKNOWN
+    # The bound is on the NAMES one line sets. Each is kept under two keys where its case differs, so
+    # counting keys would halve it for the upper-case names people give environment variables.
+    names = {key.lower() for key in values}
+    past_the_names = name.lower() not in names and len(names) >= _MAX_VALUES
     for key in dict.fromkeys((name, name.lower())):
         kept = values.get(key)
         if kept is None:
             kept = values[key] = []
         if kept[:1] == [_UNKNOWN]:
             continue
-        if len(value) > _MAX_VALUE_CHARS or len(kept) >= _MAX_VALUES_PER_NAME or len(values) > _MAX_VALUES:
+        if value == _UNKNOWN or len(kept) >= _MAX_VALUES_PER_NAME or past_the_names:
             kept.clear()
             kept.append(_UNKNOWN)
         elif value not in kept:
             kept.append(value)
+
+
+def _cut_shows_nothing(value: str, shell: str) -> bool:
+    """Whether the characters dropped from a text longer than _MAX_VALUE_CHARS can hold nothing the
+    reader looks for, so that the prefix it keeps says as much about where a word using the name lands
+    as the whole text would.
+
+    The prefix is read exactly as the whole text would be, up to the part the cut falls in: a path part
+    is spelled from its start, so every part before that one is kept whole. What is left to look at is
+    that part and the text after it, from the last separator the prefix holds. The cut hides nothing
+    there when all of it is plain text (an expansion could turn into anything, a separator included),
+    no part of it is a protected name, it does not end in a separator (which would leave the word's own
+    text after the name to begin a part of its own), and its last part - which runs into that text - is
+    not the start of a protected name ("...nel/.agent-s", with "*/policy.json" written after the name).
+    """
+    separators = _PATH_SEPARATORS + "," if shell == "powershell" else _PATH_SEPARATORS
+    start = max(value.rfind(separator, 0, _MAX_VALUE_CHARS) for separator in separators) + 1
+    if _AN_EXPANSION.search(value, start):
+        return False
+    rest = value[start:]
+    if _SECRET_WORD.search(rest) or _PROTECTED_TARGET.search(rest):
+        return False
+    parts = _path_parts(rest, shell, True)
+    if not parts[-1].text:
+        return False
+    if any(part.text.lower() in _PROTECTED_NAME_SET for part in parts[:-1]):
+        return False
+    last = parts[-1].text.lower()
+    return not any(protected.startswith(last) for protected in _PROTECTED_NAMES)
 
 
 def _capped(texts: list[str], bound: int) -> list[str]:
@@ -2240,32 +2378,53 @@ def _follow_chains(values: dict[str, list[str]], shell: str) -> None:
     is followed: "p=~/.agent-s; q=$p; cp x $q*/policy.json" shows where that write lands as plainly as the
     one-step form does.
 
-    One round is one step of a chain, _MAX_CHAIN of them. A name still standing for another name's text
-    after the last round - a longer chain, or one that leads back round a ring of names - stands for
-    _UNKNOWN, so a chain the reader cannot follow to its end fails closed.
+    Each round puts in what the round before worked out, _MAX_SUBSTITUTION_ROUNDS rounds of it, and the
+    rounds stop as soon as one changes nothing. A name whose text STILL names another name the line sets
+    when the rounds run out - a chain longer than they reach, or a ring of names they do not come round -
+    stands for _UNKNOWN, so a chain the reader cannot follow to its end fails closed. That a name's text
+    changed in the last round says nothing about that: by then it may be worked out in full, and a chain
+    the reader did follow must not be thrown away, which would turn the bound into a refusal of the
+    everyday lines it also reads.
 
     A name in its own text is left as written: "PATH=$HOME/bin:$PATH" says what the name held before
-    this line, which is no more shown here than what any variable the line does not set holds.
+    this line, which is no more shown here than what any variable the line does not set holds. A short
+    ring of names ("a=$b; b=$c; c=$a") works out to exactly that, and says as little.
     """
-    unfinished: list[str] = []
-    for _ in range(_MAX_CHAIN):
-        unfinished = []
-        for key, texts in list(values.items()):
-            itself = {name: values.pop(name) for name in dict.fromkeys((key, key.lower())) if name in values}
-            found: list[str] = []
-            changed = False
-            for text in texts:
-                more = _resolved(text, shell, values)
-                found.extend(more[1:] if len(more) > 1 else more)
-                changed = changed or len(more) > 1
-            values.update(itself)
-            if changed:
-                values[key] = _capped(list(dict.fromkeys(found)), _MAX_VALUES_PER_NAME)
-                unfinished.append(key)
-        if not unfinished:
-            return
-    for key in unfinished:
+    for _ in range(_MAX_SUBSTITUTION_ROUNDS):
+        if not _one_round(values, shell):
+            break
+    for key in _still_naming_a_name(values, shell):
         values[key] = [_UNKNOWN]
+
+
+def _one_round(values: dict[str, list[str]], shell: str) -> bool:
+    """One round of putting the texts the line shows for its names into one another; True if any changed."""
+    changed = False
+    for key, texts in list(values.items()):
+        itself = {name: values.pop(name) for name in dict.fromkeys((key, key.lower())) if name in values}
+        found: list[str] = []
+        put_in = False
+        for text in texts:
+            more = _resolved(text, shell, values)
+            found.extend(more[1:] if len(more) > 1 else more)
+            put_in = put_in or len(more) > 1
+        values.update(itself)
+        if put_in:
+            values[key] = _capped(list(dict.fromkeys(found)), _MAX_VALUES_PER_NAME)
+            changed = True
+    return changed
+
+
+def _still_naming_a_name(values: dict[str, list[str]], shell: str) -> list[str]:
+    """The names whose texts another round would still change: the ones left standing for another name's
+    text when the rounds ran out. A name in its own text does not count (see _follow_chains)."""
+    found: list[str] = []
+    for key, texts in list(values.items()):
+        itself = {name: values.pop(name) for name in dict.fromkeys((key, key.lower())) if name in values}
+        if any(len(_resolved(text, shell, values)) > 1 for text in texts):
+            found.append(key)
+        values.update(itself)
+    return found
 
 
 def _shown_for(word: str, start: int, end: int, shell: str, values: dict[str, list[str]]) -> list[str]:
@@ -2289,12 +2448,31 @@ def _shown_for(word: str, start: int, end: int, shell: str, values: dict[str, li
     found = list(values.get(name.group()) or values.get(name.group().lower()) or []) if name else []
     # A name the line sets to a command's output (p=$(echo ~/.agent-s)) keeps what that command shows.
     found = [text for value in found for text in (values.get(value, ()) if value in (_SUBST, _GROUP) else (value,))]
-    written = inner[name.end():].lstrip(":-=+?#%/") if braced and name else ""
+    written = _written_inside(inner[name.end():]) if braced and name else ""
     if written:
         found.append(written)  # ${p:-.agent-s}: the text the line writes inside the expansion itself
-        if "/" in written:
-            found.append(written.rpartition("/")[2])  # ${p/a/.agent-s}: the text it puts in
     return _capped(found, _MAX_VALUES_PER_NAME)
+
+
+# What the operators written after a name inside a "${ }" do with the text after them. Only these write a
+# text the expansion may really give: a default or an alternative (${p:-d}, ${p=d}, ${p:+d}), and the
+# replacement of a substitution (${p/a/b}). The others write something that can never appear in what the
+# expansion gives - a pattern that is REMOVED (${p#x}, ${p%%x}), an index (${p:1:2}), an error message
+# (${p:?msg}), a case change (${p^^}) or a transformation (${p@Q}) - and reading one as a text the name may
+# stand for turns the commonest expansion in shell scripting into a protected name ("base=${file%.*}").
+_DEFAULT_OPERATORS = (":-", ":=", ":+", "-", "=", "+")
+
+
+def _written_inside(rest: str) -> str:
+    """The text written after a name inside a "${ }" that the expansion may really give, "" for none."""
+    for operator in _DEFAULT_OPERATORS:
+        if rest.startswith(operator):
+            return rest[len(operator):]
+    if rest.startswith("/"):
+        # ${p/a/b}, ${p//a/b}, ${p/#a/b}, ${p/%a/b}: "b" is put in place of the pattern, so it appears.
+        put = rest.lstrip("/").lstrip("#%")
+        return put.partition("/")[2] if "/" in put else ""
+    return ""
 
 
 def _substitution_values(commands: list[_Command], values: dict[str, list[str]]) -> None:
@@ -2304,8 +2482,8 @@ def _substitution_values(commands: list[_Command], values: dict[str, list[str]])
     for command in commands:
         for word in (command.written, *command.words):
             if _may_name_a_hidden_folder(word):
-                _remember_value(values, _SUBST, word)
-                _remember_value(values, _GROUP, word)
+                _remember_value(values, _SUBST, word, command.shell)
+                _remember_value(values, _GROUP, word, command.shell)
 
 
 def _resolved(word: str, shell: str, values: dict[str, list[str]]) -> tuple[str, ...]:
@@ -2317,7 +2495,7 @@ def _resolved(word: str, shell: str, values: dict[str, list[str]]) -> tuple[str,
     _UNKNOWN, so a word with more readings than the reader keeps counts as naming a protected file
     instead of being read as though the line had never set those names.
     """
-    if not any(ch in word for ch in _EXPANSION_CHARACTERS) or (not values and "${" not in word):
+    if not _AN_EXPANSION.search(word) or (not values and "${" not in word):
         return (word,)
     texts: list[list[str]] = [[]]
     put_in = 0  # characters of text put in, against _MAX_RESOLVED_CHARS
@@ -2351,16 +2529,28 @@ def _resolved(word: str, shell: str, values: dict[str, list[str]]) -> tuple[str,
     return (word, *dict.fromkeys(type(word)(found) for text in texts if (found := "".join(text)) != word))
 
 
-def _expanded_word(command: _Command, values: dict[str, list[str]]) -> str | None:
-    """A word of the command that the shell may expand to a hidden protected name, if any (as it is read)."""
+def _expanded_word(command: _Command, values: dict[str, list[str]]) -> tuple[str, bool] | None:
+    """A word of the command that the shell may expand to a protected name, if any (as it is read), and
+    whether it counts only because the line set a name in it to more than the reader keeps of one line.
+
+    A hidden protected folder (.agent-s*), and equally an entry of a protected folder or an agent's
+    instruction file that only a wildcard spells (.git/hoo*/pre-commit, .vscode/sett*.json, CLAUDE.m?):
+    which file such a word names is known only once the shell has run, and reading one is as much a read
+    of an agent's configuration as reading the name spelled out would be.
+
+    The second half of the answer is for the operator: past a bound there was no wildcard and no name put
+    together as the command ran, so a reason that says there was names something the word never had.
+    """
     for word in (*command.words, *command.targets, *command.groups):
         for candidate in _resolved(word, command.shell, values):
-            if _may_be_hidden(candidate, command.shell, reading=True) or (
+            if _may_be_hidden(candidate, command.shell, reading=True) or _may_be_protected_entry(
+                    candidate, command.shell) or (
                     candidate is not word and any(_SECRET_WORD.search(spelling)
                                                   for spelling in _spellings(candidate))):
-                return word
+                return word, _UNKNOWN in candidate
     if command.shell == "powershell":
-        return next((word for word in command.groups if _starts_a_hidden_name(word)), None)
+        built = next((word for word in command.groups if _starts_a_hidden_name(word)), None)
+        return None if built is None else (built, False)
     return None
 
 
@@ -2623,8 +2813,11 @@ def _secret_read(command: _Command, earlier: list[_Command], values: dict[str, l
     for word in _named_files(command):
         if _SECRET_WORD.search(word):
             return f"word '{word}'"
-    expanded = _expanded_word(command, values)
-    if expanded is not None:
+    found = _expanded_word(command, values)
+    if found is not None:
+        expanded, past_a_bound = found
+        if past_a_bound:
+            return f"word '{expanded}', which names more text than the reader keeps of this line"
         return f"word '{expanded}', which the shell may expand to a protected name"
     positional = _positional(words)
     if program == "printenv":
@@ -2739,9 +2932,15 @@ def _obfuscation(command: _Command, earlier: list[_Command], values: dict[str, l
         return f"decoded text piped to '{program}'"
     if command.shell == "powershell" and any(_DOTNET_DECODE.search(word) for word in (program, *words)):
         return "[Convert]::FromBase64String"
-    expanded = _expanded_word(command, values)
-    if expanded is not None:
+    found = _expanded_word(command, values)
+    if found is not None:
         # cat ~/.agent-s*/audit.key: which file is read or written is only known when the shell has run.
+        expanded, past_a_bound = found
+        if past_a_bound:
+            # Not a wildcard and not a built name: the line sets a name in this word to more than the
+            # reader keeps of one line, so where the word lands is not worked out at all.
+            return (f"word '{expanded}' holds a name this line sets to more text than the reader keeps, "
+                    "so where it lands was not worked out")
         return f"word '{expanded}' may name a protected file through a wildcard, a variable or a built name"
     return None
 

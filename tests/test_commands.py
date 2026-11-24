@@ -1303,8 +1303,8 @@ class RealHookProcess(IsolatedHomeTest):
                         "if true; then p=~/.agent-s; cp p.json $p*/policy.json; fi",
                         "for f in x; do p=~/.agent-s; cp p.json $p*/policy.json; done",
                         "p=~/.agent-s; q=$p; cp p.json $q*/policy.json",
-                        "; ".join(f"V{index}=x" for index in range(40)) + "; cp p.json $V39*/policy.json",
-                        "p=" + "y" * 200 + "; cp p.json $p*/policy.json"):
+                        "export " + " ".join(f"V{index}=x" for index in range(70)) + "; cp p.json $V69*/policy.json",
+                        "p=" + "y" * 130 + "/.agent-s; cp p.json $p*/policy.json"):
             with self.subTest(command=command):
                 self.assertIn(self.run_hook(policy, "Bash", {"command": command}), ("ask", "deny"))
                 self.assertEqual(self.run_hook(policy, "Bash", {"command": command}, "bypassPermissions"), "deny")
@@ -1313,12 +1313,23 @@ class RealHookProcess(IsolatedHomeTest):
         for command in ("rm $build*", "rm -rf $tmp*", "mv $f* archive/", "mv out/$stamp* archive/",
                         "cp $src* /tmp/", 'cp "${files[0]}" out/', "rm $*", "chmod +x $*",
                         'export PATH="$HOME/bin:$PATH"; make build', "out=dist; mkdir -p $out; cp build/app $out/",
-                        "if [ -f build.sh ]; then ./build.sh; fi", "for f in *.txt; do cp \"$f\" out/; done"):
+                        "if [ -f build.sh ]; then ./build.sh; fi", "for f in *.txt; do cp \"$f\" out/; done",
+                        # Review round 5: a name set to more text than the reader keeps whole, a pattern
+                        # removed inside a ${ }, a chain written backwards, and a case statement.
+                        'msg="' + "Tidy the build. " * 10 + '"; git commit -m "$msg"',
+                        "base=${file%.*}; mv $file $base.bak",
+                        "; ".join(f"v{index}=$v{index + 1}" for index in range(9)) + "; v9=build; rm -rf $v0/*",
+                        "case $1 in build) out=dist; cp build/app $out/;; esac"):
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(policy, "Bash", {"command": command}), "allow")
         for command in (r"Copy-Item build\*\app.exe dist", r"Get-Content logs\*\latest.log"):
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(policy, "PowerShell", {"command": command}), "allow")
+        # Review round 5: a protected folder sits inside an ordinary one, so a searched part on the way
+        # to a name that is protected counts wherever the path begins.
+        for command in (r"Copy-Item evil.json repo\*\settings.json", r"Copy-Item evil.json repo\*\config"):
+            with self.subTest(command=command):
+                self.assertEqual(self.run_hook(policy, "PowerShell", {"command": command}), "ask")
         records = [json.loads(line) for line in (self.folder / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertIn("tools.Bash.command.install", [record.get("rule") for record in records])
 
@@ -1666,16 +1677,24 @@ class NamesTheShellExpands(unittest.TestCase):
         asked about: a command too large or too tangled to read is one the reader could not read.
         """
         past_a_bound = (
-            # More names than _MAX_VALUES, so the one that matters is not kept as itself (a name is kept
-            # as written and lower-cased, since cmd and PowerShell do not mind the case).
-            "; ".join(f"V{index}=x" for index in range(40)) + "; cp new.json $V39*/policy.json",
-            # A text longer than _MAX_VALUE_CHARS.
-            "p=" + "y" * 200 + "; cp new.json $p*/policy.json",
-            "p=~/.agent-s; p=" + "y" * 200 + "; cp new.json $p*/policy.json",
+            # More names than the reader keeps (64 of them), whichever case they are written in: the one
+            # that matters is not kept as itself. A name is kept as written and lower-cased, since cmd and
+            # PowerShell do not mind the case, and that must not halve the bound.
+            "export " + " ".join(f"V{index}=x" for index in range(70)) + "; cp new.json $V69*/policy.json",
+            "export " + " ".join(f"v{index}=x" for index in range(70)) + "; cp new.json $v69*/policy.json",
+            # A text longer than the 128 characters the reader keeps whose cut could hide a protected name.
+            "p=" + "y" * 130 + "/.agent-s; cp new.json $p*/policy.json",
+            "p=" + "y" * 130 + "/.ag; cp new.json ${p}ent-sentinel/policy.json",
+            "p=" + "y" * 130 + "/; cp new.json ${p}.agent-sentinel/policy.json",
+            "p=" + "y" * 130 + "/x/.claude/y; cp new.json ${p}/settings.json",
+            "p=~/.agent-s; p=" + "y" * 130 + "/.cl; cp new.json ${p}aude/settings.json",
             # More texts for one name than _MAX_VALUES_PER_NAME.
             "p=a; p=b; p=c; p=d; p=e; cp new.json $p*/policy.json",
-            # A chain of assignments longer than _MAX_CHAIN.
-            "a=~/.agent-s; b=$a; c=$b; d=$c; e=$d; f=$e; g=$f; cp new.json $g*/policy.json",
+            # A chain of assignments longer than the rounds of substitution reach, which is 16 steps of a
+            # chain written backwards (each name set after the one that uses it).
+            "; ".join(f"v{index}=$v{index + 1}" for index in range(16)) + "; v16=~/.agent-s"
+            + "; cp new.json $v0*/policy.json",
+            "; ".join(f"v{index}=$v{index + 1}" for index in range(16)) + "; v16=build; rm -rf $v0/*",
             # More readings of one word than _MAX_RESOLVED keeps, and more text put in than fits.
             "p=a; p=b; cp new.json " + "$p" * 8 + "*/policy.json",
             "p=" + "z" * 120 + "; cp new.json " + "$p" * 60 + "*/policy.json",
@@ -1694,10 +1713,183 @@ class NamesTheShellExpands(unittest.TestCase):
         # line shows nothing of a protected name: the bounds are generous enough for everyday work.
         for text in ("; ".join(f"v{index}=x" for index in range(30)) + "; cp new.json $v29*/policy.json",
                      "a=build; b=$a; c=$b; d=$c; rm -rf $d/*",
+                     # A short ring of names works out to a name in its own text, which says only what it
+                     # held before the line - the same case as PATH=$HOME/bin:$PATH, and as ordinary.
+                     "a=$b; b=$c; c=$a; rm -rf $a/*",
                      "p=" + "y" * 100 + "; cp new.json $p/out.json"):
             with self.subTest(text=text[:60]):
                 self.assertEqual(kinds(text), set())
                 self.assertEqual(STARTER.evaluate("Bash", {"command": text}).action, "allow")
+
+    def test_a_bound_says_in_its_own_words_that_it_was_reached(self):
+        """The operator is told what really happened. Past a bound there is no wildcard and no name put
+        together when the command runs: the line set a name to more than the reader keeps of one line,
+        and the reason says so, so that the word is not reported as something it never was."""
+        text = "; ".join(f"v{index}=$v{index + 1}" for index in range(16)) + "; v16=build; rm -rf $v0/*"
+        reasons = [finding.evidence for finding in read_command(text).findings]
+        self.assertTrue(any("more text than the reader keeps" in reason for reason in reasons), reasons)
+        self.assertFalse(any("through a wildcard" in reason for reason in reasons), reasons)
+        spelled = [finding.evidence for finding in read_command("cat ~/.agent-s*/audit.key").findings]
+        self.assertTrue(any("through a wildcard" in reason for reason in spelled), spelled)
+
+    def test_a_chain_is_followed_to_its_end_whenever_the_reader_reaches_it(self):
+        """The reader puts the texts the line shows into one another four times over, and each round puts
+        in what the round before worked out. A chain written in the usual order, with each name set before
+        it is used, is followed however long it is; one written backwards is followed 16 steps. Reaching
+        the end in the last round is reaching it: what the reader did work out must not be thrown away,
+        or an everyday chain of nine names written backwards would be read as a protected name.
+        """
+        for steps in (1, 2, 4, 8, 9, 15):
+            forwards = "v0=build; " + "; ".join(f"v{index}=$v{index - 1}" for index in range(1, steps + 1))
+            backwards = "; ".join(f"v{index}=$v{index + 1}" for index in range(steps)) + f"; v{steps}=build"
+            for text in (f"{forwards}; rm -rf $v{steps}/*", f"{backwards}; rm -rf $v0/*"):
+                with self.subTest(steps=steps, text=text[:50]):
+                    self.assertEqual(kinds(text), set())
+                    self.assertEqual(STARTER.evaluate("Bash", {"command": text}).action, "allow")
+                    self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "allow")
+        # A chain written in the usual order is followed whatever its length, and still spells out where
+        # a write lands; one written backwards past 16 steps is the fail-closed case.
+        long_chain = "v0=~/.agent-s; " + "; ".join(f"v{index}=$v{index - 1}" for index in range(1, 40))
+        self.assertIn("config_write", kinds(f"{long_chain}; cp new.json $v39*/policy.json"))
+        past_it = "; ".join(f"v{index}=$v{index + 1}" for index in range(16)) + "; v16=build; rm -rf $v0/*"
+        self.assertIn("config_write", kinds(past_it))
+
+    def test_a_long_text_is_kept_as_its_start_rather_than_thrown_away(self):
+        """A name the line sets to more than 128 characters stands for the first 128 of them, where the
+        reader can see that the cut hides nothing: a path part is spelled from its start, and the longest
+        protected name is 15 characters. The bound used to fire on length alone, on words that are not
+        paths at all, so an everyday long commit message turned every later use of the name protected.
+        """
+        everyday = (
+            'msg="' + "Tidy the build and update the notes. " * 6 + '"; git commit -m "$msg"',
+            'CFLAGS="-O2 -Wall -Wextra -I/usr/local/include -I/opt/homebrew/include -L/usr/local/lib '
+            '-DNDEBUG=1 -std=c17 -fPIC -fno-omit-frame-pointer"; gcc $CFLAGS -o app main.c',
+            "d=/home/dev/work/" + "monorepo/packages/frontend/src/components/widgets/" * 3 + "src; ls $d",
+            "d=/home/dev/work/" + "monorepo/packages/frontend/src/components/widgets/" * 3 + "src; cp app $d/",
+            "p=" + "y" * 200 + "; echo $p",
+            "p=" + "y" * 200 + "; echo ${p}abc",
+            "export LONG=" + "y" * 200 + "; make build",
+        )
+        for text in everyday:
+            with self.subTest(text=text[:50]):
+                self.assertEqual(kinds(text), set())
+                self.assertEqual(STARTER.evaluate("Bash", {"command": text}).action, "allow")
+                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "allow")
+        for text in ('$msg = "' + "Tidy the build. " * 10 + '"; git commit -m $msg',
+                     "$CFLAGS = '-O2 -Wall -I/usr/local/include " + "-DA=1 " * 20 + "'; gcc $CFLAGS main.c"):
+            with self.subTest(text=text[:50]):
+                self.assertEqual(kinds(text, "powershell"), set())
+                self.assertEqual(STARTER.evaluate("PowerShell", {"command": text}).action, "allow")
+        # And the cut never hides a protected name: what the prefix keeps is read as a prefix, and a cut
+        # that could carry one makes the name stand for text the reader could not work out.
+        for text in ("p=" + "y" * 130 + "/.agent-sentinel; cp evil.json $p/policy.json",
+                     "p=" + "y" * 130 + "/.agent-s; cp evil.json $p*/policy.json",
+                     "p=" + "y" * 130 + "/.ag; cp evil.json ${p}ent-sentinel/policy.json",
+                     "p=" + "y" * 130 + "/.agent-sentine; cp evil.json ${p}l/policy.json",
+                     "p=" + "y" * 130 + "/; cp evil.json ${p}.agent-sentinel/policy.json",
+                     "p=" + "y" * 130 + "/hoo; cp evil.json .git/${p}ks/pre-commit",
+                     "p=" + "y" * 130 + "/x/.claude/y; cp evil.json ${p}/settings.json",
+                     "p=" + "y" * 124 + "${HOME}/.agent-sentinel; cp evil.json $p/policy.json",
+                     "p=" + "y" * 130 + "/.ssh; cat $p/id_rsa",
+                     "p=" + "y" * 130 + "/.agent-s; cat $p*/audit.key"):
+            with self.subTest(text=text[-50:]):
+                self.assertNotEqual(kinds(text), set())
+                self.assertIn(STARTER.evaluate("Bash", {"command": text}).action, ("ask", "block"))
+                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "block")
+
+    def test_only_the_operators_that_write_a_text_inside_a_brace_are_read_as_one(self):
+        """${p:-d}, ${p:=d}, ${p:+d} and the replacement of ${p/a/b} write a text the expansion may give.
+        ${p#x}, ${p##x}, ${p%x}, ${p%%x} and ${p:1:2} write a pattern that is removed or an index, which
+        can never appear in the result - and reading one as a text the name may take made the commonest
+        expansion in shell scripting ("base=${file%.*}") a write to an agent's configuration."""
+        for text in ("base=${file%.*}; mv $file $base.bak", "base=${f%.txt}; cp $base.md out/",
+                     "name=${path##*/}; echo $name", "dir=${path%/*}; cd $dir", "s=${x:2:4}; echo $s",
+                     "v=${x#pre}; echo $v", "v=${x%%.*}; touch $v.log",
+                     "cp new.json ${p%~/.agent-s}*/policy.json", "cp new.json ${p#~/.agent-s}*/policy.json",
+                     "cp new.json ${p:1:9}*/policy.json"):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text), set())
+                self.assertEqual(STARTER.evaluate("Bash", {"command": text}).action, "allow")
+                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "allow")
+        for text in ("cp new.json ${p:-~/.agent-s}*/policy.json", "cp new.json ${p:=~/.agent-s}*/policy.json",
+                     "cp new.json ${p:+~/.agent-s}*/policy.json", "cp new.json ${p-~/.agent-s}*/policy.json",
+                     "cp new.json ${p=~/.agent-s}*/policy.json", "cp new.json ${p+~/.agent-s}*/policy.json",
+                     "cp new.json ${p/x/~/.agent-s}*/policy.json",
+                     "cp new.json ${p//x/~/.agent-s}*/policy.json",
+                     "p=~/.agent-s; cp new.json ${p%x}*/policy.json",
+                     "p=~/.agent-s; cp new.json ${p:0:9}*/policy.json"):
+            with self.subTest(text=text):
+                self.assertIn("config_write", kinds(text))
+                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "block")
+
+    def test_a_searched_part_counts_by_where_the_path_ends_as_well_as_where_it_begins(self):
+        """In PowerShell a wildcard matches a leading ".", so a part the shell searches may land in a
+        protected folder - and such a folder normally sits INSIDE an ordinary project folder, so judging
+        the search only by what stands before it let "repo\\*\\settings.json" through while the spelled-out
+        "repo\\.claude\\settings.json" was refused. A search on the way to one of the protected names counts
+        wherever the path begins; the everyday shapes, whose paths end in a name of their own, do not."""
+        for text in (r"Copy-Item evil.json repo\*\settings.json", r"Copy-Item evil.json repo\*\config",
+                     r"Copy-Item evil.json repo\*\mcp.json", r"Copy-Item evil.json repo\*\credentials",
+                     r"Copy-Item evil.json repo\*\policy.json", r"Copy-Item evil.json repo\*\audit.key",
+                     r"Copy-Item evil.json repo\*\sub\settings.json",
+                     r"Copy-Item evil.json repo\*\*\settings.json",
+                     r"Copy-Item evil.json a\b\c\*\settings.json",
+                     r"Copy-Item evil.json repo\$name*\settings.json"):
+            with self.subTest(text=text):
+                self.assertIn("config_write", kinds(text, "powershell"))
+                self.assertIn(STARTER.evaluate("PowerShell", {"command": text}).action, ("ask", "block"))
+                self.assertEqual(STRICT.evaluate("PowerShell", {"command": text}).action, "block")
+        for text in (r"Get-Content repo\*\settings.json", r"Get-Content repo\*\credentials",
+                     r"Get-Content repo\*\sub\id_ed25519"):
+            with self.subTest(text=text):
+                self.assertIn("secret_read", kinds(text, "powershell"))
+        for text in (r"Copy-Item build\*\app.exe dist", r"Get-Content logs\*\latest.log",
+                     r"Get-ChildItem src\*\*.ps1", r"Copy-Item dist\*\app.exe out",
+                     r"Copy-Item build\*\sub\app.exe out", r"Remove-Item build\*\notes.txt"):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text, "powershell"), set())
+                self.assertEqual(STARTER.evaluate("PowerShell", {"command": text}).action, "allow")
+                self.assertEqual(STRICT.evaluate("PowerShell", {"command": text}).action, "allow")
+
+    def test_a_read_of_a_protected_entry_named_through_a_wildcard_counts_too(self):
+        """A write to .git/hoo*/pre-commit, .vscode/sett*.json or CLAUDE.m? is config_write, and reading
+        one is secret_read and obfuscation, as README.md and SECURITY.md both say: which file such a word
+        names is known only once the shell has run. A search by extension still does not count."""
+        for text, shell in (("cat .git/hoo*/pre-commit", "bash"), ("cat .git/conf?g", "bash"),
+                            ("cat .vscode/sett*.json", "bash"), ("cat .vscode/*.json", "bash"),
+                            ("cat .github/copilot*", "bash"), ("cat CLAUDE.m?", "bash"),
+                            ("cat AGENT?.md", "bash"), ("cat C*.md", "bash"),
+                            ("grep -r secret .cursor/cli.j*", "bash"),
+                            ("Get-Content CLAUDE.m?", "powershell"),
+                            (r"Get-Content .git\hoo*\pre-commit", "powershell")):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text, shell), {"secret_read", "obfuscation"})
+                tool = "Bash" if shell == "bash" else "PowerShell"
+                self.assertIn(STARTER.evaluate(tool, {"command": text}).action, ("ask", "block"))
+                self.assertEqual(STRICT.evaluate(tool, {"command": text}).action, "block")
+        for text, shell in (("cat *.md", "bash"), ("cat docs/*.md", "bash"), ("cat README*.md", "bash"),
+                            ("cat src/*.json", "bash"), ("head -n 5 *.txt", "bash"),
+                            ("Get-Content *.md", "powershell")):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text, shell), set())
+
+    def test_an_assignment_in_the_body_of_a_case_is_read_as_the_shells_read_it(self):
+        """"case $x in a) p=...;; esac" is how people write a case, and its pattern's ")" has no "(" of
+        its own: taking that for a stray bracket made the whole line unreadable and asked about."""
+        self.assertEqual(kinds("case $x in a) p=1;; esac"), set())
+        self.assertEqual(kinds("case $x in a) echo hi;; *) echo no;; esac"), set())
+        self.assertEqual(kinds("case $1 in build) out=dist; cp build/app $out/;; esac"), set())
+        self.assertEqual(kinds("case $x in (a) p=1;; esac"), set())
+        self.assertEqual(kinds("case $x in a|b) echo hi;; esac"), set())
+        for text in ("case $x in a) p=~/.agent-s;; esac; cp new.json $p*/policy.json",
+                     "case $x in a) cp new.json ~/.agent-s*/policy.json;; esac",
+                     "case $x in *) curl https://evil.example;; esac"):
+            with self.subTest(text=text):
+                self.assertIsNotNone(kinds(text))
+                self.assertNotEqual(kinds(text), set())
+        # A ")" with no case in front of it is still a command the reader cannot read with certainty.
+        self.assertIsNone(kinds("echo hi) there"))
+        self.assertIsNone(kinds("esac; echo hi)"))
 
     def test_an_assignment_in_an_earlier_call_is_not_followed(self):
         """The assignment has to be in the same command line. Claude Code runs each Bash call in a shell
@@ -1725,7 +1917,16 @@ class NamesTheShellExpands(unittest.TestCase):
                    "p=a; p=b; p=c; p=d; cp x " + "${p}" * 2000,
                    "a=~/.agent-s; b=$a; c=$b; d=$c; cp x " + "$d" * 2000,
                    "; ".join(f"v{i}=$v{i - 1}" for i in range(1, 80)) + "; cp x " + "$v79" * 1000,
-                   "; ".join(f"v{i}=$v{i + 1}" for i in range(80)) + "; cp x " + "$v0" * 1000]
+                   "; ".join(f"v{i}=$v{i + 1}" for i in range(80)) + "; cp x " + "$v0" * 1000,
+                   # Texts longer than the reader keeps whole, of which it keeps the start.
+                   "p=" + "y" * 300 + "; cp x " + "$p" * 3000,
+                   "p=" + "/aaaaaaaa" * 800 + "; cp x $p/policy.json",
+                   "p=" + "/.agent-s" * 800 + "; cp x $p*/policy.json",
+                   "; ".join(f"v{i}=/a/b/c/" + "y" * 200 for i in range(60)) + "; cp x $v1/policy.json",
+                   # A case statement, whose patterns the reader reads without their brackets.
+                   "case $x in " + "a) p=1;; " * 1300 + "esac", "echo " + ") " * 4000,
+                   # A part the shell searches with a wildcard, over and over.
+                   "Copy-Item x " + "*\\" * 2000 + "settings.json"]
         for shell in ("bash", "powershell"):
             for text in hostile:
                 with self.subTest(shell=shell, text=ascii(text[:30])):

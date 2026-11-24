@@ -793,9 +793,15 @@ class TheHookTemplatesAndTheShell(HookTest):
             ("Bash", "p=~/.agent-s; q=$p; r=$q; cp p.json $r*/policy.json"),
             ("PowerShell", "if ($true) { $p = '~/.agent-s'; Copy-Item p.json $p*/policy.json }"),
             # And past any bound on what the reader keeps, the write is refused, not let through.
-            ("Bash", "; ".join(f"V{index}=x" for index in range(40)) + "; cp p.json $V39*/policy.json"),
-            ("Bash", "p=" + "y" * 200 + "; cp p.json $p*/policy.json"),
+            ("Bash", "export " + " ".join(f"V{index}=x" for index in range(70)) + "; cp p.json $V69*/policy.json"),
+            ("Bash", "p=" + "y" * 130 + "/.agent-s; cp p.json $p*/policy.json"),
+            ("Bash", "; ".join(f"v{index}=$v{index + 1}" for index in range(16))
+                     + "; v16=~/.agent-s; cp p.json $v0*/policy.json"),
+            # A chain of assignments spells the folder out however long it is, as long as each name is
+            # set before the name that uses it, which is how people write one.
             ("Bash", "a=~/.agent-s; b=$a; c=$b; d=$c; e=$d; f=$e; g=$f; cp p.json $g*/policy.json"),
+            # In PowerShell a protected folder normally sits inside an ordinary project folder.
+            ("PowerShell", "Copy-Item p.json repo\\*\\settings.json"),
         ]
         for name, refused in (("claude-code", "ask"), ("claude-code-strict", "deny")):
             self.use(name)
