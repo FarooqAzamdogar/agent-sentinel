@@ -4822,7 +4822,16 @@ def _run(argv: list[str] | None, under_way: _Started) -> int:
             contained.command([executable, *command[1:]]), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, env=environment, **contained.popen_options(),
         )
-    except (OSError, subprocess.SubprocessError) as exc:  # SubprocessError: the containment setup in the child failed
+    except subprocess.SubprocessError as exc:
+        # The containment set-up in the child (preexec_fn) failed: the server's program never ran, and what
+        # failed was the containment, not the server, so say so rather than "cannot start server".
+        _warn(f"cannot contain the server as asked, so it was not started: {exc}", limit=1000)
+        if group is not None:
+            group.store.leave()  # its server never ran, so it is no member of the client run
+        firewall.provenance(audit_chain.SESSION_END, "the server could not be contained as asked, so it was not "
+                                                     "started")
+        return 2
+    except OSError as exc:
         _warn(f"cannot start server: {exc}")
         if group is not None:
             group.store.leave()  # its server never ran, so it is no member of the client run

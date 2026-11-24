@@ -142,7 +142,9 @@ class _ProcProcesses(_Reader):
 
     When /proc/stat does not say when the system started (_boot_time), the
     start times count from the start of the system, not from the epoch
-    (since_epoch is False): the run's id does not need more.
+    (since_epoch is False): the run's id does not need more. A boot id that
+    cannot be read (a kernel or a container that does not show it) is left
+    out of the id in the same way, rather than making the run unknown.
     """
 
     def __init__(self, root: str = "/proc") -> None:
@@ -151,7 +153,12 @@ class _ProcProcesses(_Reader):
         self.since_epoch = boot is not None
         self._boot = boot if boot is not None else 0.0
         self._ticks = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-        self._boot_id = _read_small(f"{root}/sys/kernel/random/boot_id").strip()[:36]
+        # The boot id only tells one start of the system from the next in a run's id. A kernel or a
+        # container that does not show it leaves the id without one; it must not make the run unknown.
+        try:
+            self._boot_id = _read_small(f"{root}/sys/kernel/random/boot_id").strip()[:36]
+        except OSError:
+            self._boot_id = ""
 
     def process(self, pid: int) -> _Process | None:
         try:

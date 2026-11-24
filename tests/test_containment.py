@@ -33,6 +33,61 @@ POSIX = os.name == "posix"
 WINDOWS = sys.platform == "win32"
 
 
+def _containment_works():
+    """Whether the end-to-end --contain tests can work here, which os.name alone does not say.
+
+    They need what the proxy's POSIX containment needs: a child that really
+    gets a session and process group of its own, the resource limits, and the
+    signals the proxy takes as "stop". A system that has none of them must
+    skip these tests, not fail them.
+    """
+    if os.name != "posix":
+        return False
+    if not all(hasattr(os, name) for name in ("setsid", "getpgid", "killpg")):
+        return False
+    if not all(hasattr(signal, name) for name in ("SIGHUP", "SIGQUIT", "SIGTERM", "SIGINT", "SIGKILL")):
+        return False
+    try:
+        import resource
+
+        resource.getrlimit(resource.RLIMIT_CORE)
+        resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ImportError, AttributeError, OSError, ValueError):
+        return False
+    try:
+        probe = subprocess.run(
+            [sys.executable, "-c", "import os, sys; sys.exit(0 if os.getpgid(0) == os.getpid() else 1)"],
+            start_new_session=True, capture_output=True, timeout=60)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+def _bwrap_makes_a_sandbox():
+    """Whether bubblewrap is installed here and can actually make a sandbox.
+
+    Installed is not working: on Ubuntu 24.04 and later AppArmor keeps an
+    ordinary user from making the user namespace bwrap needs, so it exits
+    non-zero. The guard asks the tool itself rather than trust that it is
+    on PATH.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    bwrap = mcp_proxy._resolve_executable("bwrap")
+    if bwrap is None:
+        return False
+    try:
+        probe = subprocess.run([bwrap, "--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev",
+                                "--proc", "/proc", "true"], capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+CONTAINMENT_WORKS = _containment_works()
+BWRAP_WORKS = _bwrap_makes_a_sandbox()
+
+
 def found(name):
     return f"/usr/bin/{name}"
 
@@ -376,6 +431,9 @@ class TheSandboxesWords(unittest.TestCase):
                 self.assertEqual(containment._homes(), [one])
             with mock.patch.dict(os.environ, {"HOME": "/"}):
                 self.assertIsNone(containment._homes())
+        # Never an empty list: a sandbox that hides no home folder would show every credential in it.
+        self.assertIsNone(containment._homes(()))
+        self.assertIsNone(containment._homes([""]))
 
     def test_describe_says_what_the_server_gets(self):
         self.assertIn("job object", containment.describe(Settings(contain=True), "win32"))
@@ -432,6 +490,64 @@ class SettingUpWithoutAnything(unittest.TestCase):
         with mock.patch.object(containment, "check", side_effect=ValueError("embedded null byte")):
             with self.assertRaises(ContainmentError):
                 containment.prepare(Settings(contain=True), found)
+
+
+class ASandboxToolThatRefuses(unittest.TestCase):
+    """An installed sandbox tool is not a working one: bwrap exits non-zero where AppArmor keeps an
+    ordinary user from making a user namespace (Ubuntu 24.04 and later). The proxy must say that, not
+    let the server appear to close the connection."""
+
+    PREFIX = ["/usr/bin/bwrap", "--unshare-all", "--"]
+
+    def probe(self, returncode=0, stderr=b"", error=None):
+        done = subprocess.CompletedProcess(self.PREFIX, returncode, b"", stderr)
+        with mock.patch.object(os.path, "isfile", lambda path: path == "/bin/true"), \
+                mock.patch.object(subprocess, "run", side_effect=error, return_value=done) as run:
+            problem = containment._sandbox_works(self.PREFIX)
+        return problem, run
+
+    def test_a_tool_that_makes_the_sandbox_is_no_problem(self):
+        problem, run = self.probe()
+        self.assertIsNone(problem)
+        self.assertEqual(run.call_args.args[0], [*self.PREFIX, "/bin/true"])
+
+    def test_a_tool_that_refuses_names_itself_its_exit_code_and_what_it_said(self):
+        problem, _ = self.probe(1, b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\n")
+        self.assertIn("bwrap cannot make the sandbox asked for on this machine (it exited 1)", problem)
+        self.assertIn("Failed RTM_NEWADDR: Operation not permitted", problem)
+        self.assertNotIn("\n", problem)
+
+    def test_a_tool_that_says_nothing_still_says_which_tool_and_what_code(self):
+        problem, _ = self.probe(126)
+        self.assertIn("(it exited 126): it said nothing", problem)
+
+    def test_a_tool_that_does_not_answer_or_cannot_be_run_is_a_problem_too(self):
+        problem, _ = self.probe(error=subprocess.TimeoutExpired(self.PREFIX, containment.SANDBOX_PROBE_SECONDS))
+        self.assertIn("did not answer within", problem)
+        problem, _ = self.probe(error=OSError(13, "Permission denied"))
+        self.assertIn("could not be run to make the sandbox", problem)
+
+    def test_without_a_sandbox_or_a_program_to_try_nothing_is_probed(self):
+        with mock.patch.object(subprocess, "run", side_effect=AssertionError("nothing should be run")):
+            self.assertIsNone(containment._sandbox_works([]))
+            with mock.patch.object(os.path, "isfile", return_value=False):
+                self.assertIsNone(containment._sandbox_works(self.PREFIX))
+
+    def test_what_the_tool_says_goes_through_the_printable_helper(self):
+        problem, _ = self.probe(1, "bwrap: \x07setting up uid map\u202e".encode())
+        self.assertNotIn("\x07", problem)
+        self.assertNotIn("\u202e", problem)
+        self.assertIn("setting up uid map", problem)
+
+    def test_prepare_refuses_the_containment_when_the_tool_cannot_make_the_sandbox(self):
+        with mock.patch.object(containment.sys, "platform", "linux"), \
+                mock.patch.object(containment, "check", return_value=None), \
+                mock.patch.object(containment, "_sandbox_prefix", return_value=self.PREFIX), \
+                mock.patch.object(containment, "_ProcessGroup", side_effect=AssertionError("never reached")), \
+                mock.patch.object(containment, "_sandbox_works", return_value="bwrap cannot make the sandbox"):
+            with self.assertRaises(ContainmentError) as raised:
+                containment.prepare(Settings(sandbox="bwrap"), found)
+        self.assertEqual(str(raised.exception), "bwrap cannot make the sandbox")
 
 
 class TheAuditTrailOfContainment(unittest.TestCase):
@@ -501,6 +617,29 @@ class TheAuditTrailOfContainment(unittest.TestCase):
         self.assertEqual(end["reason"], "the server could not be contained as asked, so it was stopped")
         self.assertIsInstance(end["server_exit_code"], int)
         self.assertEqual(self.verified(), ("intact", 0))
+
+    def test_containment_that_fails_in_the_child_is_reported_as_containment_not_as_a_server_that_cannot_start(self):
+        # preexec_fn sets the server's limits in the child between fork and exec (POSIX). When it raises,
+        # Popen raises SubprocessError: the server's program never ran, and what failed was the
+        # containment, so the proxy must not blame the server's command.
+        failed = subprocess.SubprocessError("Exception occurred in preexec_fn.")
+        with mock.patch.object(subprocess, "Popen", side_effect=failed):
+            code, err = self.run_proxy("--contain", prepare=lambda *args, **kwargs: containment.Containment())
+        self.assertEqual(code, 2)
+        self.assertIn("cannot contain the server as asked, so it was not started: Exception occurred in preexec_fn.",
+                      err)
+        self.assertNotIn("cannot start server", err)
+        start, end = self.sessions()
+        self.assertEqual(start["containment"], "contained")
+        self.assertEqual(end["reason"], "the server could not be contained as asked, so it was not started")
+        self.assertEqual(self.verified(), ("intact", 0))
+
+    def test_a_server_whose_program_is_missing_is_still_reported_as_a_server_that_cannot_start(self):
+        with mock.patch.object(subprocess, "Popen", side_effect=FileNotFoundError(2, "No such file or directory")):
+            code, err = self.run_proxy("--contain", prepare=lambda *args, **kwargs: containment.Containment())
+        self.assertEqual(code, 2)
+        self.assertIn("cannot start server:", err)
+        self.assertEqual(self.sessions()[-1]["reason"], "the server could not be started")
 
     def test_a_containment_that_fails_in_an_unplanned_way_is_refused_in_plain_words_and_recorded(self):
         error = AttributeError("function 'prctl' not found")
@@ -650,8 +789,8 @@ class TheProcessGroupSetup(unittest.TestCase):
             with self.assertRaises(ContainmentError):
                 containment._ProcessGroup(Settings(contain=True), [])
 
-    def test_the_sweep_ends_what_is_left_of_the_group(self):
-        contained, _, _ = self.group(Settings(contain=True))
+    def swept(self, contained, server):
+        """The (group, signal) pairs the sweep sends, with killpg standing in for the real one."""
         sent = []
 
         def killpg(group, signal_number):
@@ -660,8 +799,39 @@ class TheProcessGroupSetup(unittest.TestCase):
                 raise ProcessLookupError
 
         with mock.patch.object(os, "killpg", killpg, create=True):
-            contained.sweep(types.SimpleNamespace(pid=4242))
-        self.assertEqual(sent, [(4242, signal.SIGTERM), (4242, 0)])
+            contained.sweep(server)
+        return sent
+
+    def test_the_sweep_ends_what_is_left_of_the_group(self):
+        contained, _, _ = self.group(Settings(contain=True))
+        server = types.SimpleNamespace(pid=4242, poll=lambda: None)
+        with mock.patch.object(os, "getpgid", lambda pid: pid, create=True):
+            contained.after_start(server)
+        self.assertEqual(self.swept(contained, server), [(4242, signal.SIGTERM), (4242, 0)])
+
+    def test_a_server_that_does_not_lead_its_own_group_is_refused_and_no_group_is_signalled(self):
+        # killpg on a process that is not a group leader signals whatever group it is in, which could be
+        # the proxy's own: the proxy must refuse the containment rather than send that signal.
+        contained, _, _ = self.group(Settings(contain=True))
+        server = types.SimpleNamespace(pid=4242, poll=lambda: None)
+        with mock.patch.object(os, "getpgid", lambda pid: 7, create=True):
+            with self.assertRaises(ContainmentError) as raised:
+                contained.after_start(server)
+        self.assertIn("did not start in a process group of its own (it is in group 7, not 4242)",
+                      str(raised.exception))
+        self.assertEqual(self.swept(contained, server), [])
+
+    def test_a_group_that_cannot_be_read_is_refused_unless_the_server_has_already_ended(self):
+        contained, _, _ = self.group(Settings(contain=True))
+        refused = OSError(1, "Operation not permitted")
+        running = types.SimpleNamespace(pid=4242, poll=lambda: None)
+        with mock.patch.object(os, "getpgid", side_effect=refused, create=True):
+            with self.assertRaises(ContainmentError) as raised:
+                contained.after_start(running)
+            self.assertIn("cannot tell which process group the server is in", str(raised.exception))
+            ended = types.SimpleNamespace(pid=4242, poll=lambda: 1)
+            contained.after_start(ended)  # nothing of it is left to end
+        self.assertEqual(self.swept(contained, ended), [])
 
     def test_a_sandbox_goes_in_front_of_the_server(self):
         module, _ = self.fake_resource()
@@ -1210,7 +1380,7 @@ class TheRealProxy(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 40)
         self.assertFalse(alive(server_pid))
 
-    @unittest.skipUnless(POSIX, "process groups and resource limits are a POSIX matter")
+    @unittest.skipUnless(CONTAINMENT_WORKS, "a process group, resource limits and signal delivery are needed here")
     def test_on_posix_the_server_has_its_own_group_and_limits_and_the_group_ends_with_the_proxy(self):
         pid_file = self.folder / "pids.txt"
         proxy = self.start(["--contain"], self.server("tree.py", TREE_SERVER), pid_file)
@@ -1266,7 +1436,7 @@ class TheRealProxy(unittest.TestCase):
         records = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines()]
         self.assertEqual((records[-1]["event"], records[-1]["reason"]), ("session_end", "the proxy stopped"))
 
-    @unittest.skipUnless(POSIX, "these signals, and a session of the server's own, are a POSIX matter")
+    @unittest.skipUnless(CONTAINMENT_WORKS, "these signals, and a session of the server's own, are needed here")
     def test_on_posix_every_signal_that_stops_the_proxy_ends_the_servers_group_too(self):
         # Under --contain the server has a session of its own, so the terminal's Ctrl+C or hangup reaches the
         # proxy alone: the proxy must stop the server and sweep its group itself.
@@ -1287,7 +1457,7 @@ class TheRealProxy(unittest.TestCase):
                 events = [json.loads(line)["event"] for line in audit.read_text(encoding="utf-8").splitlines()]
                 self.assertEqual(events[-1], "session_end")
 
-    @unittest.skipUnless(POSIX, "these signals are a POSIX matter")
+    @unittest.skipUnless(CONTAINMENT_WORKS, "these signals are needed here")
     def test_on_posix_a_hangup_that_was_being_ignored_stays_ignored(self):
         # nohup: the proxy must not stop on a signal that whoever started it chose to ignore.
         pid_file = self.folder / "pids.txt"
@@ -1304,7 +1474,8 @@ class TheRealProxy(unittest.TestCase):
         proxy.wait(timeout=30)
         self.assertTrue(wait_until(lambda: not alive(grandchild)), "the grandchild outlived the proxy")
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_PDEATHSIG is a Linux matter")
+    @unittest.skipUnless(sys.platform.startswith("linux") and CONTAINMENT_WORKS,
+                         "PR_SET_PDEATHSIG is a Linux matter, and a process group is needed here")
     def test_on_linux_the_server_dies_with_a_killed_proxy(self):
         pid_file = self.folder / "pid.txt"
         proxy = self.start(["--contain"], self.server("stubborn.py", STUBBORN_SERVER), pid_file, "sleep")
@@ -1314,13 +1485,9 @@ class TheRealProxy(unittest.TestCase):
         proxy.wait(timeout=30)
         self.assertTrue(wait_until(lambda: not alive(server_pid)), "the server outlived the proxy")
 
-    @unittest.skipUnless(sys.platform.startswith("linux") and mcp_proxy._resolve_executable("bwrap"),
-                         "bubblewrap is a Linux tool, and is not installed here")
+    @unittest.skipUnless(BWRAP_WORKS, "bubblewrap is a Linux tool, and cannot make a sandbox here")
     def test_on_linux_bwrap_hides_the_home_folder_and_shows_what_is_allowed(self):
-        probe = subprocess.run([mcp_proxy._resolve_executable("bwrap"), "--unshare-all", "--die-with-parent",
-                                "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "true"], capture_output=True)
-        if probe.returncode != 0:
-            self.skipTest("bubblewrap cannot make a sandbox here (user namespaces may be off)")
+        # BWRAP_WORKS has already asked the tool itself whether it can make a sandbox here.
         home = self.folder / "home"
         (home / ".ssh").mkdir(parents=True)
         (home / ".ssh" / "id_rsa").write_text("not a real key")

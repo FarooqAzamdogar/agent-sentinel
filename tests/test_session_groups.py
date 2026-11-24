@@ -503,6 +503,30 @@ class TheClientRun(unittest.TestCase):
             run = client_run._walk_up(reader, time.monotonic() + 5)
         self.assertEqual((run.id, run.started), ("8@0f0e0d0c-3000", 1762191376.0 + 3000 / ticks))
 
+    def test_a_boot_id_that_cannot_be_read_leaves_the_id_without_one_rather_than_unknown(self):
+        # /proc/sys/kernel/random/boot_id is missing on some kernels and hidden in some containers.
+        # It only tells one start of the system from the next, so losing it must not lose the run.
+        root = self.proc(self.system_stat(2, 20), self.PROCESSES)
+        (Path(root) / "sys" / "kernel" / "random" / "boot_id").unlink()
+        reader = client_run._ProcProcesses(root)
+        self.assertEqual(reader.process(8).start_key, "3000")
+        with mock.patch.object(os, "getpid", return_value=10):
+            run = client_run._walk_up(reader, time.monotonic() + 5)
+        self.assertEqual(run.id, "8@3000")
+        # And a boot_id that is there but cannot be opened is the same, not an error out of the reader.
+        root = self.proc(self.system_stat(2, 20), self.PROCESSES)
+        refused = PermissionError(13, "Permission denied")
+        real_open = client_run._read_small
+
+        def read(path):
+            if path.endswith("boot_id"):
+                raise refused
+            return real_open(path)
+
+        with mock.patch.object(client_run, "_read_small", read):
+            reader = client_run._ProcProcesses(root)
+        self.assertEqual(reader.process(8).start_key, "3000")
+
     def test_a_group_file_is_not_judged_by_a_start_that_is_not_a_date(self):
         folder = Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(shutil.rmtree, folder, True)
@@ -520,10 +544,13 @@ class TheClientRun(unittest.TestCase):
                  "print(client_run.find_client_run().id)"
         found = {subprocess.run([sys.executable, "-c", script, str(ROOT)], capture_output=True, text=True,
                                 timeout=60).stdout.strip() for _ in range(2)}
-        self.assertEqual(len(found), 1)
+        self.assertEqual(len(found), 1)  # whatever can be read, both proxies must read the same run
         (run,) = found
-        if run == client_run.UNKNOWN and sys.platform not in ("win32", "linux"):
-            self.skipTest("the processes cannot be read on this system")
+        if run == client_run.UNKNOWN:
+            # Not a platform question: /proc can be missing or unreadable on Linux too (a container, a
+            # hardened kernel), and macOS has no `ps` in a minimal image. An unknown run is the strict
+            # answer and is tested elsewhere; there is nothing here to compare it with.
+            self.skipTest("the processes cannot be read on this system, so the client run is unknown")
         self.assertTrue(run.startswith(f"{os.getpid()}@"), run)  # this test process is their client
 
 

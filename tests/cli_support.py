@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 import support  # noqa: F401  (puts the project folder on sys.path)
+from agent_sentinel import home as home_module
 from agent_sentinel.__main__ import main
 
 # The fake servers the tests start.
@@ -105,6 +106,31 @@ class IsolatedHomeTest(TempFolderTest):
     def home(self):
         """The agent-sentinel home folder of this test's user."""
         return self.user / ".agent-sentinel"
+
+    def make_home(self, *folders):
+        """Create the agent-sentinel home, its pins folder and any others named, as agent-sentinel creates them.
+
+        Owner-only: mode 0700 on POSIX (home.make_private_folder). A fixture
+        that made them with Path.mkdir would leave them 0755 under the usual
+        umask, which is not what the product does, and `doctor` would then
+        report every one of them as readable by other users.
+        """
+        home_module.make_folders(self.home)
+        for folder in folders:
+            home_module.make_private_folder(folder)
+        return self.home
+
+    def write_private(self, name, content):
+        """Write one of agent-sentinel's own files (a policy, a pins file, an audit key) as the product writes it.
+
+        Owner-only: mode 0600 on POSIX (home.PRIVATE_FILE_MODE), which is
+        what `init` gives the policy and what the proxy requires of an audit
+        key file. On Windows the mode is the read-only flag and means nothing
+        to these checks.
+        """
+        path = self.write(name, content)
+        os.chmod(path, home_module.PRIVATE_FILE_MODE)  # 0600 keeps the owner's write permission: rmtree still works
+        return path
 
     def scenario(self, **scenario):
         """Write a scenario for tests/scripted_mcp_server.py; return the command that starts it."""

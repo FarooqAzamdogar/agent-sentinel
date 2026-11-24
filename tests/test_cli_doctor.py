@@ -52,9 +52,10 @@ class DoctorTest(IsolatedHomeTest):
         check = mock.patch("agent_sentinel.cli_doctor.installed_version", return_value=__version__)
         self.installed_version = check.start()
         self.addCleanup(check.stop)
-        self.home.mkdir()
-        (self.home / "pins").mkdir()
-        self.policy = self.write("user/.agent-sentinel/policy.json", templates.template("starter"))
+        # As agent-sentinel makes its own home and writes its own policy: owner-only. A fixture that left
+        # them 0755 and 0644 would have doctor report each of them on POSIX, which the product never does.
+        self.make_home()
+        self.policy = self.write_private("user/.agent-sentinel/policy.json", templates.template("starter"))
 
     def wrapped(self, name, *extra, policy=None, pins=None, audit=None, server=None):
         """A wrapped entry as `wrap` writes it, starting this Python as the 'server'."""

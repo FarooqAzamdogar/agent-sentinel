@@ -622,7 +622,9 @@ def texts(server):
 class DoctorAndTheAuditKeyFile(DoctorTest):
     def setUp(self):
         super().setUp()
-        self.key = self.write("keys/audit.key", b"k" * 32)
+        # Owner-only, as the proxy requires of an audit key file: a fixture that left it 0644 would have
+        # doctor report it on POSIX and the proxy refuse it, which is not what this class is about.
+        self.key = self.write_private("keys/audit.key", b"k" * 32)
 
     def test_doctor_reports_a_sandbox_that_would_show_the_server_the_key_file(self):
         # Known from the pair merges: only the proxy made this check, at start.

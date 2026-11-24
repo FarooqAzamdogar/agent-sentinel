@@ -29,7 +29,11 @@ Phase 1: --contain (standard library only)
   browser to sign in.
 * Linux and macOS: the server runs in a session and process group of its own
   (start_new_session), which the proxy ends (killpg) when it stops: whatever
-  the server started that is still in the group goes too. It starts with no
+  the server started that is still in the group goes too. The proxy checks
+  that the server really leads that group before it ever signals it
+  (_ProcessGroup.after_start): killpg on a process that is not a group
+  leader signals whatever group it is in, which could be the proxy's own.
+  It starts with no
   core dumps (RLIMIT_CORE 0) and at most SERVER_OPEN_FILES open files; on
   Linux it is also killed when the proxy dies (PR_SET_PDEATHSIG, through
   ctypes). --server-memory-mb sets RLIMIT_AS, the virtual memory of each
@@ -71,6 +75,10 @@ Phase 2: --sandbox (implies --contain), with a tool already installed
 * Windows has none: run the server as another user, or in an AppContainer
   (see the notes); --contain still ends it with the proxy.
 A tool that is not installed is not downloaded: the proxy refuses to start.
+A tool that is installed but cannot make the sandbox asked for (AppArmor
+keeps an ordinary user from creating a user namespace on Ubuntu 24.04 and
+later, so bwrap exits non-zero) is found by trying it once before the server
+starts (_sandbox_works), and the proxy refuses with what the tool said.
 
 What this does NOT do
 ---------------------
@@ -107,6 +115,11 @@ MAX_SERVER_PROCESSES = 10_000
 MAX_SERVER_CPU_SECONDS = 10_000_000  # about 115 days
 MAX_SANDBOX_PATHS = 64  # --sandbox-allow and --sandbox-read together
 SWEEP_SECONDS = 1.0  # how long what is left of the server's process group has to exit before it is killed
+# Trying the sandbox once, on a program that does nothing, before the server is started behind it
+# (_sandbox_works): how long it may take, how much of what it says is kept, and the program to run.
+SANDBOX_PROBE_SECONDS = 20.0
+MAX_SANDBOX_MESSAGE_CHARS = 300
+SANDBOX_PROBE_PROGRAMS = ("/bin/true", "/usr/bin/true")
 
 # Credential places, relative to the home folder, that a sandboxed server never sees: those of
 # templates.CREDENTIAL_PATTERN, and the MCP clients' own configuration (so a server cannot unwrap itself).
@@ -273,12 +286,19 @@ def check(settings: Settings, find: Callable[[str], str | None], platform: str =
 
 
 def _homes(given: str | Sequence[str] | None = None) -> list[str] | None:
-    """The home folders a sandbox hides, as real paths; None when $HOME is / or unknown.
+    """The home folders a sandbox hides, as real paths; None when none of them can be worked out.
 
     By default, the one $HOME names and the account's own (from the password
     database) when it differs: a client or launcher may set HOME to another
-    folder, and the real one, with ~/.ssh in it, must not show through.
+    folder, and the real one, with ~/.ssh in it, must not show through. The
+    account's own is read on POSIX alone, because only POSIX has a password
+    database; on a machine where it holds the folder the proxy runs in (a
+    build agent's /home/runner), the sandbox hides that folder too, and the
+    server's program must be named with --sandbox-read to be seen inside.
     `given` replaces both (for tests). An account home of / is skipped.
+
+    None, never an empty list: a sandbox that hides no home folder at all
+    would show the server every credential in it, so the caller must refuse.
     """
     if given is None:
         names = [os.path.expanduser("~"), _account_home()]
@@ -293,7 +313,7 @@ def _homes(given: str | Sequence[str] | None = None) -> list[str] | None:
             continue
         if home not in homes:
             homes.append(home)
-    return homes
+    return homes or None
 
 
 def _account_home() -> str | None:
@@ -687,6 +707,9 @@ def prepare(settings: Settings, find: Callable[[str], str | None], control_files
         prefix: list[str] = []
         if settings.sandbox is not None:
             prefix = _sandbox_prefix(settings, find, control_files, server_executable, secret_files, numbered_files)
+            problem = _sandbox_works(prefix)
+            if problem is not None:
+                raise ContainmentError(problem)
         return _ProcessGroup(settings, prefix)
     except ContainmentError:
         raise
@@ -738,6 +761,48 @@ def _sandbox_prefix(settings: Settings, find: Callable[[str], str | None], contr
     if bwrap is None:
         raise ContainmentError("bwrap (bubblewrap) is not on PATH")
     return [bwrap, *bwrap_arguments(settings, homes, agent_home), "--"]
+
+
+def _sandbox_works(prefix: Sequence[str]) -> str | None:
+    """Why the sandbox tool refuses to make this sandbox on this machine, or None. Fail closed.
+
+    An installed tool is not a working one: on Ubuntu 24.04 and later
+    AppArmor keeps an ordinary user from creating the user namespace bwrap
+    needs, so bwrap exits non-zero and never runs the program behind it.
+    Without this the proxy would start, the tool would write its complaint
+    to stderr and exit, and the operator would be told the server had closed
+    the connection rather than that the server was never sandboxed. So the
+    tool is tried once, with exactly these options, on a program that does
+    nothing, and whatever it says is passed on as the reason.
+
+    No probe is possible without that program (an unusual system): the
+    sandbox is then left to the server's own start, as before.
+    """
+    if not prefix:
+        return None
+    program = next((path for path in SANDBOX_PROBE_PROGRAMS if os.path.isfile(path)), None)
+    if program is None:
+        return None
+    try:
+        probe = subprocess.run([*prefix, program], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=SANDBOX_PROBE_SECONDS)
+    except subprocess.TimeoutExpired:
+        return (f"{os.path.basename(prefix[0])} did not answer within {SANDBOX_PROBE_SECONDS:g} seconds when asked "
+                "to make the sandbox, so the server was not started")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"{os.path.basename(prefix[0])} could not be run to make the sandbox: {exc}"
+    if probe.returncode == 0:
+        return None
+    return (f"{os.path.basename(prefix[0])} cannot make the sandbox asked for on this machine (it exited "
+            f"{probe.returncode}): {_sandbox_message(probe.stderr or probe.stdout)}")
+
+
+def _sandbox_message(output: bytes) -> str:
+    """What the sandbox tool said, as one printable line: untrusted text, so it goes through printable."""
+    from .textutil import printable  # here, not at the top: containment is imported by the proxy's start-up
+
+    text = " ".join(output.decode("utf-8", "replace").split())
+    return printable(text, limit=MAX_SANDBOX_MESSAGE_CHARS) if text else "it said nothing"
 
 
 class _WindowsJob(Containment):
@@ -851,11 +916,17 @@ class _ProcessGroup(Containment):
             new_soft = new_hard if soft == resource.RLIM_INFINITY else min(soft, new_hard)
             self._limits.append((which, (new_soft, new_hard)))
         self._prctl = _linux_prctl() if sys.platform.startswith("linux") else None
+        # The group the sweep may signal: the server's own, once after_start has seen that it leads one.
+        self._group: int | None = None
         # preexec_fn runs in the child between fork and exec, where only async-signal-safe work is safe if the
         # parent has other threads (a lock one of them held stays locked in the child). The proxy starts its
-        # threads only after the server; refuse rather than take that risk if that ever changes.
-        if threading.active_count() > 1:
-            raise ContainmentError("the proxy has other threads running, so it cannot set the server's limits safely")
+        # threads only after the server; refuse rather than take that risk if that ever changes. Windows has
+        # no such restriction because its job object is set from the proxy itself, with nothing to do in the
+        # child; a library caller that already has threads running must start the server before them.
+        running = threading.active_count()
+        if running > 1:
+            raise ContainmentError(f"the proxy has {running - 1} other thread(s) running, so it cannot set the "
+                                   "server's limits safely in the child process; start the server before any thread")
 
     def command(self, server_command: Sequence[str]) -> list[str]:
         return [*self._prefix, *server_command]
@@ -883,8 +954,32 @@ class _ProcessGroup(Containment):
 
         return setup
 
+    def after_start(self, server: subprocess.Popen) -> None:
+        """Check that the server really leads a process group of its own, which the sweep may then end.
+
+        start_new_session asks for that group, but the sweep must not take it
+        on trust: killpg on a number that is not a group leader's signals
+        whatever group that process is in, which can be the proxy's own (and
+        so its client's, or a test runner's). Only a group whose number is
+        the server's own is swept.
+        """
+        try:
+            group = os.getpgid(server.pid)
+        except OSError as exc:  # a server that has already ended has no group left to sweep
+            if server.poll() is not None:
+                return
+            raise ContainmentError(f"cannot tell which process group the server is in, so the proxy could not end "
+                                   f"it: {exc.strerror or exc}") from exc
+        if group != server.pid:
+            raise ContainmentError(f"the server did not start in a process group of its own (it is in group {group}, "
+                                   f"not {server.pid}), so the proxy could not end its group without signalling "
+                                   "other processes")
+        self._group = group
+
     def sweep(self, server: subprocess.Popen) -> None:
-        group = server.pid  # start_new_session made the server the leader of a group of that number
+        group = self._group  # the server's own group, as after_start saw it; None when it never led one
+        if group is None:
+            return
         try:
             os.killpg(group, signal.SIGTERM)
             deadline = time.monotonic() + SWEEP_SECONDS
