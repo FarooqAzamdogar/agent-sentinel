@@ -491,22 +491,28 @@ class ConfigChanges(HookTest):
         self.assertEqual(self.hook(recorded("config_change.json", file_path=None))[:2], (0, None))
         self.assertIn("no file named", self.last()["reason"])
 
-    def test_an_event_that_cannot_be_read_is_recorded_under_audit_and_refused_under_block(self):
-        for changes in ({"source": None}, {"source": 5}, {"file_path": ["x"]}, {"session_id": None}):
-            with self.subTest(changes=changes, mode="audit"):
-                data = json.dumps(recorded("config_change.json", **changes)).encode("utf-8")
-                code, answer, err = self.hook(data)
-                self.assertEqual((code, answer), (0, None))
-                self.assertIn("could not be read", err)
-                self.assertIn("could not be read", self.last()["reason"])
-        self.block_changes()
-        for changes in ({"source": None}, {"session_id": None}):
-            with self.subTest(changes=changes, mode="block"):
-                code, answer, _ = self.hook(json.dumps(recorded("config_change.json", **changes)).encode("utf-8"))
-                self.assertEqual(code, 2)
-                self.assertRegex(answer["reason"], BLOCKED + "the settings change could not be checked, so it was "
-                                                             "not applied " + REF)
-                self.assertEqual(self.records()[-1]["rule"], "malformed")
+    def test_an_event_that_cannot_be_read_is_refused_whatever_the_policy_file_now_says(self):
+        """An unreadable event names no session, so the policy the session began with cannot be looked up
+        for it, and the file on disk may be exactly what changed. It is refused either way: a policy whose
+        hook.config_changes is "audit" must not be what decides an event that could not be read."""
+        self.start()
+        unreadable = [json.dumps(recorded("config_change.json", **changes)).encode("utf-8")
+                      for changes in ({"source": None}, {"source": 5}, {"file_path": ["x"]},
+                                      {"session_id": None})]
+        unreadable.append(b'{"hook_event_name": "ConfigChange", "source": "project_settings", "x": NaN}')
+        for setting in ("audit", "block"):
+            self.policy.write_text(json.dumps({**HOOK_POLICY, "hook": {"config_changes": setting}}),
+                                   encoding="utf-8")
+            for data in unreadable:
+                with self.subTest(config_changes=setting, event=data[:60]):
+                    code, answer, err = self.hook(data)
+                    self.assertEqual(code, 2)
+                    self.assertEqual(answer["decision"], "block")
+                    self.assertRegex(answer["reason"], BLOCKED + "the settings change could not be checked, so it "
+                                                                 "was not applied " + REF)
+                    self.assertEqual(err.strip(), answer["reason"])
+                    record = self.records()[-1]
+                    self.assertEqual((record["rule"], record["action"]), ("malformed", "block"))
 
     def test_a_policy_that_does_not_load_refuses_the_change(self):
         self.policy.write_text("{oops", encoding="utf-8")

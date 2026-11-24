@@ -83,7 +83,9 @@ ConfigChange        a settings file or a skill changed during the session. Recor
                     audit log (event "config_change") with the source, the file and the
                     top-level keys that changed, from the SessionStart snapshot (names only,
                     never values). With the policy's hook.config_changes "block", the change
-                    is also refused (exit 2), and so is an event that cannot be read. A refusal
+                    is also refused (exit 2). An event that cannot be read is refused whatever
+                    that setting says: it names no session, so nothing can be looked up for it,
+                    and the policy file on disk may itself be what changed. A refusal
                     only keeps the running session on its old settings: the file stays changed,
                     and the next session reads it. Managed policy settings cannot be refused
                     (Claude Code ignores the answer), so their changes are only recorded.
@@ -127,9 +129,9 @@ even the event's name could be read does the hook exit with code 2 and print
 the stop as well: 2 is what blocks a call that has not been made. An event
 too large or too deeply nested to read still gives its name when that comes
 before its large fields (event_name_of). The elicitation events decline, and
-ConfigChange refuses the change
-(an event that cannot be read under hook.config_changes "audit" is recorded
-and let through, since that setting refuses nothing). Whatever Claude can read
+ConfigChange refuses the change. No unreadable event is decided by the policy
+file: it names no session, so the policy the session began with cannot be
+looked up, and the file on disk may be what changed. Whatever Claude can read
 (the deny reason, stderr on exit 2, the stop reason) is a generic text with a
 ref; the detail goes to the audit log. Claude Code v2.1.295 or later is
 needed, with "onFailure": "block" on each hook: without it, a hook that cannot
@@ -520,11 +522,10 @@ def answer_event(data: bytes, settings: HookSettings) -> HookAnswer:
     try:
         event = read_event(data)
     except MalformedEvent as exc:
+        # An event that cannot be read is not decided by the policy file: it names no session, so the
+        # record of the policy the session began with cannot be looked up, and the file on disk may be
+        # exactly what changed. Every unreadable event blocks, whatever hook.config_changes now says.
         reason = f"the hook event could not be read: {exc}"
-        if exc.event_name == CONFIG_CHANGE and _only_audits_config_changes(settings.policy):
-            # hook.config_changes "audit" refuses no settings change, so an unreadable one is recorded only.
-            _log_note(settings.audit, reason, "config:?", "config_change", settings)
-            return HookAnswer(message="agent-sentinel: a ConfigChange event could not be read; see the audit log")
         ref = _log_failure(settings.audit, None, reason, RULE_MALFORMED, settings)
         return failed_answer(exc.event_name, ref)
     name = event["hook_event_name"]
@@ -769,14 +770,6 @@ def _log_note(
         firewall.note(label, reason, event=event)
     except Exception:
         pass
-
-
-def _only_audits_config_changes(policy: Path) -> bool:
-    """Whether the policy loads and its hook.config_changes is "audit" (so a settings change is never refused)."""
-    try:
-        return Policy.from_file(policy).hook.config_changes == "audit"
-    except Exception:  # a policy that does not load: nothing says the change may go through
-        return False
 
 
 # ---- the tool events -------------------------------------------------------------------------------

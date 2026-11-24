@@ -453,9 +453,9 @@ class OneSignedChainForEveryRecordOfTheHook(HookTest):
         secret = recorded("elicitation_result.json", session_id=self.session, content={"project_key": TOKEN})
         self.assertEqual(self.hook(secret, *self.signed)[0], 2)
         self.assertEqual(self.hook(recorded("config_change.json", session_id=self.session), *self.signed)[0], 0)
-        # Two events that cannot be read: their records are written without the policy.
+        # Two events that cannot be read: both are refused without the policy, and so are their records.
         unreadable = json.dumps(recorded("config_change.json", source=5)).encode("utf-8")
-        self.assertEqual(self.hook(unreadable, *self.signed)[0], 0)
+        self.assertEqual(self.hook(unreadable, *self.signed)[0], 2)
         self.assertEqual(self.hook(b'{"hook_event_name": "PreToolUse", "session_id": 5}', *self.signed)[0], 2)
         # The mark of the content refuses the sink, in the same chain.
         code, answer, _ = self.hook(recorded("pre_tool_use_mcp.json", session_id=self.session), *self.signed)
@@ -468,7 +468,7 @@ class OneSignedChainForEveryRecordOfTheHook(HookTest):
                          ("client_reply", "block"), ("config_change", "note"), ("call", "block")):
             self.assertIn(expected, events)
         self.assertEqual([record["tool"] for record in records if record["event"] == "config_change"],
-                         ["config:project_settings", "config:?"])
+                         ["config:project_settings"])
         flow = records[-1]
         self.assertEqual(flow["rule"], "flows[0]")
         self.assertIn("(server 'claude-code', result", flow["reason"])

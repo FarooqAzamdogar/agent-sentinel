@@ -1285,9 +1285,24 @@ class RealHookProcess(IsolatedHomeTest):
         self.assertEqual(self.run_hook(policy, "Bash", wildcard, "bypassPermissions"), "deny")
         # And the same write with the start of the name in a variable, so that the command spells none of
         # it and the shell's wildcard finds the folder.
-        from_variable = {"command": "p=~/.agent-s; cp p.json $p*/policy.json"}
-        self.assertEqual(self.run_hook(policy, "Bash", from_variable), "ask")
-        self.assertEqual(self.run_hook(policy, "Bash", from_variable, "bypassPermissions"), "deny")
+        for command in ("p=~/.agent-s; cp p.json $p*/policy.json",
+                        "p=~/.agent-s; cp p.json ${p:-x}*/policy.json",
+                        "p=~/.agent-s; cp p.json ${p/a/b}*/policy.json",
+                        "cp p.json $(echo ~/.agent-s)*/policy.json",
+                        "p=~/.agent-sentinel; cp p.json $p/policy.json"):
+            with self.subTest(command=command):
+                # "deny" where the line spells a protected name outright, which the deny rule also sees.
+                self.assertIn(self.run_hook(policy, "Bash", {"command": command}), ("ask", "deny"))
+                self.assertEqual(self.run_hook(policy, "Bash", {"command": command}, "bypassPermissions"), "deny")
+        for command in ("Copy-Item p.json $env:NAME*/policy.json", "Copy-Item p.json */policy.json"):
+            with self.subTest(command=command):
+                self.assertEqual(self.run_hook(policy, "PowerShell", {"command": command}), "ask")
+        # And the everyday commands of the same shape, which the line shows nothing of a name for, are
+        # allowed: a firewall that asks about "rm $build*" is one people switch off.
+        for command in ("rm $build*", "rm -rf $tmp*", "mv $f* archive/", "mv out/$stamp* archive/",
+                        "cp $src* /tmp/", 'cp "${files[0]}" out/', "rm $*", "chmod +x $*"):
+            with self.subTest(command=command):
+                self.assertEqual(self.run_hook(policy, "Bash", {"command": command}), "allow")
         records = [json.loads(line) for line in (self.folder / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertIn("tools.Bash.command.install", [record.get("rule") for record in records])
 
@@ -1345,7 +1360,7 @@ class NamesTheShellExpands(unittest.TestCase):
         (r"""[IO.File]::WriteAllText("$HOME\.agent-s$x\policy.json", 'x')""", "powershell"),
         ("Remove-Item -Recurse ?claude", "powershell"),
         # A part the shell makes of an expansion and a wildcard, so the word never spells any of the name:
-        # the expansion holds the start (".agent-s"), the wildcard finds the rest on the file system.
+        # the same line sets the variable to the start (".agent-s"), and the wildcard finds the rest.
         ("p=~/.agent-s; cp new.json $p*/policy.json", "bash"),
         ("p=.agent-s; cp new.json ~/$p*/policy.json", "bash"),
         ("h=$HOME/.agent-s; cp new.json $h*/policy.json", "bash"),
@@ -1362,6 +1377,35 @@ class NamesTheShellExpands(unittest.TestCase):
         ("p=~/.agent-s; rm -rf $p*", "bash"),
         (r"Set-Content $HOME\$p*\policy.json '{}'", "powershell"),
         (r"Copy-Item new.json $env:USERPROFILE\$p*\policy.json", "powershell"),
+        # Every ${ } form of Bash names its variable, and what the line sets it to is what it may hold;
+        # a separator written inside the expansion ("/", ":", "=") does not split the path's part in two.
+        ("p=~/.agent-s; cp new.json ${p:-x}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp new.json ${p:=x}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp new.json ${p/a/b}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp new.json ${p#x}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp new.json ${p%x}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp new.json ${p:0:9}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp new.json ${!p}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp new.json ${#p}*/policy.json", "bash"),
+        # The text written inside a ${ } is shown by the line too, set or not.
+        ("cp new.json ${p:-~/.agent-s}*/policy.json", "bash"),
+        ("cp new.json ${p:+~/.agent-s}*/policy.json", "bash"),
+        # A name the line sets to a command's output keeps what that command shows.
+        ("p=$(echo ~/.agent-s); cp new.json $p*/policy.json", "bash"),
+        # No wildcard is needed when the line spells the folder itself.
+        ("p=~/.agent-sentinel; cp new.json $p/policy.json", "bash"),
+        ("a=.age; b=nt-sentinel; cp new.json ~/$a$b/policy.json", "bash"),
+        ("export p=~/.agent-s; cp new.json $p*/policy.json", "bash"),
+        ("p=~/.agent-s cp new.json $p*/policy.json", "bash"),
+        (r'cmd /c "set p=%USERPROFILE%\.agent-s& copy new.json %p%*\policy.json"', "bash"),
+        # PowerShell: $env:NAME is one expansion, ":" and all; a wildcard there matches a leading ".",
+        # so a part the shell searches with one counts while it is a folder on the way to the file.
+        ("Copy-Item new.json $env:NAME*/policy.json", "powershell"),
+        (r"Copy-Item new.json ${env:NAME}*\policy.json", "powershell"),
+        ("Copy-Item new.json */policy.json", "powershell"),
+        ("Copy-Item new.json *$p/policy.json", "powershell"),
+        (r"$p = '.agent-s'; Copy-Item new.json $HOME\$p*\policy.json", "powershell"),
+        (r"$env:P = '.agent-s'; Copy-Item new.json $HOME\$env:P*\policy.json", "powershell"),
     )
     READS = (
         ("cat ~/.agent-s*/policy.json", "bash"),
@@ -1395,10 +1439,27 @@ class NamesTheShellExpands(unittest.TestCase):
         ("Set-Content ($name + '.json') $x", "powershell"),
         ("(Get-Content f.txt) -replace 'a.*','b' | Set-Content f.txt", "powershell"),
         (r"Get-ChildItem $env:TEMP\*.log | Remove-Item", "powershell"),
-        # A wildcard in a part of its own stays ordinary: the expansion before it is a whole part, so
-        # nothing it holds can run into the wildcard (and in Bash a wildcard never matches a leading ".").
+        # A part that shows none of a protected name - only wildcards and variables the line never sets -
+        # is the ordinary case: a Bash wildcard never matches a leading ".", and what the variable holds
+        # is not shown. These are the everyday write-side commands of exactly that shape.
         ("rm -rf $build/*", "bash"), ("cp $src/* /tmp/", "bash"), ("ls $dir*", "bash"),
         ("grep -l TODO $src*", "bash"), (r"Remove-Item $build\*", "powershell"),
+        ("rm $build*", "bash"), ("rm -rf $tmp*", "bash"), ("rm -f $out*", "bash"),
+        ("mv $f* archive/", "bash"), ("mv out/$stamp* archive/", "bash"), ("mv $old* $new/", "bash"),
+        ("cp $src* /tmp/", "bash"), ("cp -r $dir* backup/", "bash"), ("cp build/$name* dist/", "bash"),
+        ("tar czf x.tgz $dir*", "bash"), ("chmod +x $bin*", "bash"), ("touch $prefix*", "bash"),
+        ("sed -i 's/a/b/' $f*", "bash"), ("tee $log* < in.txt", "bash"), ("truncate -s 0 $log*", "bash"),
+        ("rm -rf ${tmp}*", "bash"), ("rm ${x:-build}*", "bash"),
+        # A Bash array subscript is part of the expansion, not a [...] wildcard.
+        ('cp "${files[0]}" out/', "bash"), ("cp ${files[1]} out/", "bash"), ('rm "${paths[$i]}"', "bash"),
+        # $* and $@ are Bash's positional parameters, one expansion each, not a variable and a wildcard.
+        ("rm $*", "bash"), ("chmod +x $*", "bash"), ('cp $@ out/', "bash"),
+        # A backslash-escaped wildcard is not expanded at all, so nothing searches from the variable.
+        (r"cp new.json $p\*/policy.json", "bash"),
+        # A variable the line sets to something ordinary stays ordinary.
+        ("stamp=$(date +%s); mv out/$stamp* archive/", "bash"), ("d=/tmp; rm $d/*", "bash"),
+        ("build=out; rm -rf $build*", "bash"),
+        (r"Remove-Item $env:TEMP\*", "powershell"), ("Remove-Item $build*", "powershell"),
     )
 
     def test_a_write_to_a_name_the_shell_may_expand_to_a_protected_one_is_config_write(self):
@@ -1425,21 +1486,69 @@ class NamesTheShellExpands(unittest.TestCase):
         self.assertIn("config_write", kinds("find /tmp/build -type f -delete"))
         self.assertNotIn("config_write", kinds("find . -name '*.json' -exec cat {} +"))
 
-    def test_an_expansion_a_wildcard_searches_on_from_counts_as_a_hidden_name(self):
-        """p=~/.agent-s; cp x $p*/policy.json. The word holds none of the name: the variable puts the
-        start of it there and the shell's wildcard finds the rest on the file system. A part made only of
-        expansions says nothing on its own, but with a wildcard in it the shell really looks through the
-        file system, so such a part counts as any hidden protected folder."""
-        for text in ("p=~/.agent-s; cp x $p*/policy.json", "p=~/.agent-s; cat $p*/audit.key",
-                     "p=~/.agent-s; rm -f $p*/audit.jsonl", "q=~/.cl; cp x $q*/settings.json",
-                     "p=~/.agent-sentine; cp x $p?/policy.json", "p=~/.agent-s; cp x $p[a-z]*/policy.json"):
+    # Every expansion syntax the shells have, with the same variable set to the start of agent-sentinel's
+    # own folder in the same line. Each must be read as that folder, whichever syntax names the variable.
+    EVERY_SYNTAX = (
+        ("p=~/.agent-s; cp x $p*/policy.json", "bash"),
+        ("p=~/.agent-s; cp x ${p}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp x ${p:-d}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp x ${p:=d}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp x ${p:+d}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp x ${p#x}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp x ${p%x}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp x ${p/a/b}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp x ${p//a/b}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp x ${p:0:9}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp x ${!p}*/policy.json", "bash"),
+        ("p=~/.agent-s; cp x ${#p}*/policy.json", "bash"),
+        ("cp x $(echo ~/.agent-s)*/policy.json", "bash"),
+        ("cp x `echo ~/.agent-s`*/policy.json", "bash"),
+        (r'cmd /c "set p=%USERPROFILE%\.agent-s& copy x %p%*\policy.json"', "bash"),
+        (r'cmd /c "set p=%USERPROFILE%\.agent-s& copy x %p:~0,40%*\policy.json"', "bash"),
+        (r"$p = '.agent-s'; Copy-Item x $HOME\$p*\policy.json", "powershell"),
+        (r"$p='.agent-s'; Copy-Item x $HOME\${p}*\policy.json", "powershell"),
+        (r"$env:P = '.agent-s'; Copy-Item x $HOME\$env:P*\policy.json", "powershell"),
+        (r"$env:P = '.agent-s'; Copy-Item x $HOME\${env:P}*\policy.json", "powershell"),
+        ("Copy-Item x $($p)*/policy.json", "powershell"),
+    )
+
+    def test_a_part_is_read_as_what_the_same_command_line_shows_it_may_be(self):
+        """p=~/.agent-s; cp x $p*/policy.json. The word spells none of the name: the same line sets the
+        variable to the start of it, and the shell's wildcard finds the rest. The reader puts in what the
+        line shows, whichever expansion syntax names the variable."""
+        for text, shell in self.EVERY_SYNTAX:
+            tool = "Bash" if shell == "bash" else "PowerShell"
             with self.subTest(text=text):
-                self.assertTrue({"config_write", "secret_read"} & kinds(text))
-                self.assertIn(STARTER.evaluate("Bash", {"command": text}).action, ("ask", "block"))
-                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "block")
-        # Without a wildcard, a path part made only of variables is the documented limit of the reader
-        # (the module docstring says so, and so does SECURITY.md): there is nothing to look through.
-        self.assertEqual(kinds("a=.age; b=nt-sentinel; cp x ~/$a$b/policy.json"), set())
+                self.assertIn("config_write", kinds(text, shell))
+                self.assertIn(STARTER.evaluate(tool, {"command": text}).action, ("ask", "block"))
+                self.assertEqual(STRICT.evaluate(tool, {"command": text}).action, "block")
+
+    def test_a_part_that_shows_none_of_a_name_stays_ordinary(self):
+        """The same shapes with no assignment in the line: a variable the line never sets shows nothing,
+        so these everyday commands keep their class. This is the documented limit of the reader (the
+        module docstring says so, and so does SECURITY.md): what the variable holds is not known."""
+        everyday = (
+            "rm $build*", "rm -rf $tmp*", "rm -f $out*", "mv $f* archive/", "mv out/$stamp* archive/",
+            "mv $old* $new/", "cp $src* /tmp/", "cp -r $dir* backup/", "cp build/$name* dist/",
+            "tar czf x.tgz $dir*", "chmod +x $bin*", "touch $prefix*", "sed -i 's/a/b/' $f*",
+            "tee $log* < in.txt", "truncate -s 0 $log*", "rm -rf ${tmp}*",
+            'cp "${files[0]}" out/', "rm $*", "chmod +x $*", r"cp new.json $p\*/policy.json",
+        )
+        for text in everyday:
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text), set())
+                self.assertEqual(STARTER.evaluate("Bash", {"command": text}).action, "allow")
+                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "allow")
+        # In PowerShell a wildcard does match a leading ".", so a part the shell searches with one counts
+        # while it is a folder on the way to the file named after it, and not at the end of a path.
+        for text in ("Copy-Item x */policy.json", "Copy-Item x $env:NAME*/policy.json",
+                     "Copy-Item x *$p/policy.json"):
+            with self.subTest(text=text):
+                self.assertIn("config_write", kinds(text, "powershell"))
+        for text in (r"Remove-Item $build\*", "Remove-Item *", "Remove-Item $build*",
+                     r"Remove-Item $env:TEMP\*"):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text, "powershell"), set())
 
     def test_both_hook_templates_ask_or_refuse_in_every_permission_mode(self):
         for text, shell in (*self.WRITES, *self.READS):
@@ -1491,7 +1600,12 @@ class NamesTheShellExpands(unittest.TestCase):
         hostile = ["cp x " + "$a" * 4000, "cp x ~/" + "*a" * 4000, "rm ." + "?" * 8000, "cp x " + "{" * 8000,
                    "cat " + "%a" * 4000, "cp x ~/$a" + "*" * 8000 + "b", "cp x ~/$a" + "?" * 8000 + "b",
                    "rm " + ".[" * 4000, "cp x " + "a/" * 4000, "cp x ${" * 2000, "find . " + "-name '*' " * 800 + "-delete",
-                   "Set-Content " + "('.ag' + 'x') " * 500, "cat " + "$x.claude/" * 800]
+                   "Set-Content " + "('.ag' + 'x') " * 500, "cat " + "$x.claude/" * 800,
+                   # The texts the line gives its variables are put in, which is bounded too.
+                   "p=~/.agent-s; cp x " + "$p" * 3000, "p=~/.agent-s; cp x " + "${p}" * 1500,
+                   "p=~/.agent-s; cp x " + "${p:-~/.agent-s}" * 500,
+                   "; ".join(f"v{i}=~/.agent-s" for i in range(40)) + "; cp x " + "$v1" * 2000,
+                   "cp x " + "$(echo ~/.agent-s)" * 400]
         for shell in ("bash", "powershell"):
             for text in hostile:
                 with self.subTest(shell=shell, text=ascii(text[:30])):
