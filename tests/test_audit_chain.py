@@ -316,21 +316,22 @@ class FilePermissions(LogTest):
             done = subprocess.run(["icacls", str(path), "/deny", f"{getpass.getuser()}:(RD)"], capture_output=True)
             if done.returncode != 0:
                 self.skipTest("icacls could not deny reading")
-            self.addCleanup(self.allow_reading, path)
         else:
             if os.geteuid() == 0:
                 self.skipTest("root reads any file")
             path.chmod(0o200)
-            self.addCleanup(path.chmod, 0o600)
+        self.addCleanup(self.allow_reading, path)
         with self.assertRaises(PermissionError):
             path.read_bytes()
 
     def allow_reading(self, path):
+        """Let this user read the file again. A cleanup runs after tearDown, which has already deleted the
+        temporary folder, so a file that is no longer there has nothing left to put back."""
         if sys.platform == "win32":
             import getpass
 
             subprocess.run(["icacls", str(path), "/remove:d", getpass.getuser()], capture_output=True)
-        else:
+        elif path.exists():
             path.chmod(0o600)
 
 
