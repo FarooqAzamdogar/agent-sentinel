@@ -1722,16 +1722,65 @@ class NamesTheShellExpands(unittest.TestCase):
                 self.assertEqual(kinds(text), set())
                 self.assertEqual(STARTER.evaluate("Bash", {"command": text}).action, "allow")
 
-    def test_a_bound_says_in_its_own_words_that_it_was_reached(self):
-        """The operator is told what really happened. Past a bound there is no wildcard and no name put
-        together when the command runs: the line set a name to more than the reader keeps of one line,
-        and the reason says so, so that the word is not reported as something it never was."""
-        text = "; ".join(f"v{index}=$v{index + 1}" for index in range(16)) + "; v16=build; rm -rf $v0/*"
-        reasons = [finding.evidence for finding in read_command(text).findings]
-        self.assertTrue(any("more text than the reader keeps" in reason for reason in reasons), reasons)
-        self.assertFalse(any("through a wildcard" in reason for reason in reasons), reasons)
+    def test_every_bound_says_in_its_own_words_that_it_was_reached(self):
+        """The operator is told what really happened, for each of the seven bounds. Past one of them
+        there is no wildcard and no name put together when the command runs: the reader had to give up
+        on part of the word, and the reason says so rather than reporting the word as something it
+        never was. Two of the seven used to leave the operator the word and nothing else - the word was
+        long enough that the words after it were the ones cut from what is shown."""
+        past_a_bound = {
+            "more names than the reader keeps":
+                "export " + " ".join(f"V{index}=x" for index in range(70)) + "; cp new.json $V69*/policy.json",
+            "more texts for one name":
+                "p=a; p=b; p=c; p=d; p=e; cp new.json $p*/policy.json",
+            "a chain longer than the rounds reach":
+                "; ".join(f"v{index}=$v{index + 1}" for index in range(16)) + "; v16=build; rm -rf $v0/*",
+            "more readings of one word":
+                "p=a; p=b; cp new.json " + "$p" * 8 + "*/policy.json",
+            "more text put into one word":
+                "p=" + "z" * 120 + "; cp new.json " + "$p" * 60 + "*/policy.json",
+            "a path of more parts than it reads":
+                "p=x; cp new.json " + "a/" * 300 + "$p*/policy.json",
+            "an expansion longer than it reads":
+                "cp new.json ~/{.agent-sen," + "y" * 300 + "}tinel/policy.json",
+        }
+        for bound, text in past_a_bound.items():
+            reasons = [finding.evidence for finding in read_command(text).findings]
+            with self.subTest(bound=bound):
+                self.assertTrue(any("more text than the reader keeps" in reason for reason in reasons), reasons)
+                self.assertFalse(any("through a wildcard" in reason for reason in reasons), reasons)
         spelled = [finding.evidence for finding in read_command("cat ~/.agent-s*/audit.key").findings]
         self.assertTrue(any("through a wildcard" in reason for reason in spelled), spelled)
+        self.assertFalse(any("more text than the reader keeps" in reason for reason in spelled), spelled)
+
+    def test_the_documented_longest_protected_name_is_the_real_one(self):
+        """The 128 characters the reader keeps of a long text are justified in the module docstring, in
+        README.md and in SECURITY.md by the longest name the reader checks a path part against. That
+        figure drifted: the documents said 15 while the list the code checks held one of 26."""
+        longest = max(len(name) for name in commands._EVERY_PROTECTED_NAME)
+        self.assertEqual(longest, commands._LONGEST_PROTECTED_NAME)
+        said = f"longest protected name is {longest} characters"
+        self.assertIn(said, commands.__doc__)
+        for path in (ROOT / "README.md", ROOT / "SECURITY.md"):
+            with self.subTest(document=path.name):
+                self.assertIn(said, path.read_text(encoding="utf-8"))
+
+    def test_a_ring_of_names_is_ordinary_where_the_rounds_come_round_it(self):
+        """The chain docstring used to say a ring of names the rounds do not come round fails closed.
+        It is the other way about more often than not: where the rounds DO come round, every name ends
+        up in its own text, which says only what it held before the line, and the word is ordinary. The
+        edge is not monotone in the ring's size, so both sides of it are pinned here."""
+        def ring(size):
+            names = [f"v{index}" for index in range(size)]
+            return "; ".join(f"{names[at]}=${names[(at + 1) % size]}" for at in range(size)) + "; rm -rf $v0/*"
+
+        for size in (2, 3, 4, 10, 12, 16, 24):
+            with self.subTest(ring=size):
+                self.assertEqual(kinds(ring(size)), set())
+                self.assertEqual(STRICT.evaluate("Bash", {"command": ring(size)}).action, "allow")
+        for size in (11, 13, 17):
+            with self.subTest(ring=size):
+                self.assertIn("config_write", kinds(ring(size)))
 
     def test_a_chain_is_followed_to_its_end_whenever_the_reader_reaches_it(self):
         """The reader puts the texts the line shows into one another four times over, and each round puts
@@ -1758,7 +1807,7 @@ class NamesTheShellExpands(unittest.TestCase):
     def test_a_long_text_is_kept_as_its_start_rather_than_thrown_away(self):
         """A name the line sets to more than 128 characters stands for the first 128 of them, where the
         reader can see that the cut hides nothing: a path part is spelled from its start, and the longest
-        protected name is 15 characters. The bound used to fire on length alone, on words that are not
+        protected name is 26 characters. The bound used to fire on length alone, on words that are not
         paths at all, so an everyday long commit message turned every later use of the name protected.
         """
         everyday = (
@@ -1770,6 +1819,16 @@ class NamesTheShellExpands(unittest.TestCase):
             "p=" + "y" * 200 + "; echo $p",
             "p=" + "y" * 200 + "; echo ${p}abc",
             "export LONG=" + "y" * 200 + "; make build",
+            # A "%", a "!", a "[" or a "{" standing on its own is an expansion in neither shell, so a
+            # long message holding a percentage or a "[BREAKING]" tag is kept as its start like any
+            # other. These were refused under the strict template, with no way to approve them.
+            'msg="chore: speed the hook up by 50% on large policies, ' + "and tidy the notes. " * 5 + '";'
+            ' git commit -m "$msg"',
+            'msg="[BREAKING] drop the v1 endpoint. ' + "The v2 one has been the default since 0.4.0. " * 3
+            + '"; git commit -m "$msg"',
+            'msg="' + "Reduce peak memory. " * 7 + 'Costs ~35% of the old run (see [1])"; git commit -m "$msg"',
+            'msg="' + "Tidy the build. " * 9 + 'Closes #42 ! At last"; git commit -m "$msg"',
+            'msg="' + "Note the new flag. " * 7 + 'Use {a,b} to pick one"; git commit -m "$msg"',
         )
         for text in everyday:
             with self.subTest(text=text[:50]):
@@ -1792,7 +1851,15 @@ class NamesTheShellExpands(unittest.TestCase):
                      "p=" + "y" * 130 + "/x/.claude/y; cp evil.json ${p}/settings.json",
                      "p=" + "y" * 124 + "${HOME}/.agent-sentinel; cp evil.json $p/policy.json",
                      "p=" + "y" * 130 + "/.ssh; cat $p/id_rsa",
-                     "p=" + "y" * 130 + "/.agent-s; cat $p*/audit.key"):
+                     "p=" + "y" * 130 + "/.agent-s; cat $p*/audit.key",
+                     # A part the cut falls in that may spell the start of a name through a wildcard of
+                     # one character: the test is on what the part may spell, not on its characters.
+                     "p=" + "y" * 120 + "/clau[d]e.md; cp evil.json $p",
+                     "p=" + "y" * 120 + "/.cl[a]ude; cp evil.json $p/settings.json",
+                     "p=" + "y" * 125 + "/hoo?s; cp evil.json .git/$p/pre-commit",
+                     # An UNQUOTED brace list, which Bash expands where the assignment is written: the
+                     # first word it gives is still the assignment, so what the name holds is not shown.
+                     "p=" + "y" * 130 + "/{.agent-sen,x}tinel; cp evil.json $p/policy.json"):
             with self.subTest(text=text[-50:]):
                 self.assertNotEqual(kinds(text), set())
                 self.assertIn(STARTER.evaluate("Bash", {"command": text}).action, ("ask", "block"))
@@ -1926,8 +1993,22 @@ class NamesTheShellExpands(unittest.TestCase):
                    "; ".join(f"v{i}=/a/b/c/" + "y" * 200 for i in range(60)) + "; cp x $v1/policy.json",
                    # A case statement, whose patterns the reader reads without their brackets.
                    "case $x in " + "a) p=1;; " * 1300 + "esac", "echo " + ") " * 4000,
-                   # A part the shell searches with a wildcard, over and over.
-                   "Copy-Item x " + "*\\" * 2000 + "settings.json"]
+                   # A part the shell searches with a wildcard, over and over. The question each one
+                   # asks - is one of the protected names given after this part - is worked out once
+                   # for the whole path, or a word a command line need only write out would cost the
+                   # square of its length, and these words are at the reader's bound of 256 parts.
+                   "Copy-Item x " + "*\\" * 2000 + "settings.json",
+                   "Copy-Item x " + " ".join(["repo\\" + "*\\se\\" * 83 + "app.exe"] * 60),
+                   "Copy-Item x " + " ".join(["repo\\" + "*\\sett\\" * 62 + "app.exe"] * 55),
+                   "Copy-Item x " + " ".join(["repo\\" + "*\\s*\\" * 83 + "app.exe"] * 50),
+                   "Copy-Item x " + " ".join(["repo\\" + "*\\settings.jso?\\" * 25 + "x.exe"] * 20),
+                   "cp x " + " ".join(["repo/" + "*/se/" * 83 + "app.exe"] * 60),
+                   # Long texts whose cut falls among many short parts. Each part asks the same question
+                   # of the protected names, and its length and first character answer it before any
+                   # name is spelled out, or a line of such texts costs a walk over them for each part.
+                   "; ".join(f"v{i}=" + "/a" * 100 + "/c" * 100 for i in range(30)) + "; cp x $v1/policy.json",
+                   "; ".join(f"v{i}=" + "/a" * 100 + "/c" * 100 for i in range(20)) + "; cp x "
+                   + "".join(f"$v{i}" for i in range(20))]
         for shell in ("bash", "powershell"):
             for text in hostile:
                 with self.subTest(shell=shell, text=ascii(text[:30])):

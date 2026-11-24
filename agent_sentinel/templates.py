@@ -91,12 +91,20 @@ BASELINE_DENY_ARGS: tuple[dict[str, Any], ...] = (
 # CLAUDE.md, or a commit message that names it, must stay possible. The Windows
 # short names of these files are refused by the path entries that go with it
 # (HOME_CONFIG_ROOTS), which refuse every short name.
+# ".claude/plugins" is here because a plugin brings hooks and MCP servers of its
+# own, and ".vscode/launch.json" because it names a program the editor runs when
+# a developer starts debugging, as "tasks.json" names one it runs on a keystroke.
+# Deliberately NOT here: ".github/workflows", which runs on the forge after a
+# push and is everyday work for an agent to edit (the push itself is a network
+# call, which the templates already ask about), and ".vscode/extensions.json",
+# which runs nothing. ".cursorrules" is a file beside ".cursor", not an entry in
+# it, so it has an alternative of its own.
 AGENT_CONFIG_PATTERN = (
-    r"(^|[\\/:])\.claude[\\/](settings(\.local)?\.json|hooks|agents|skills|commands|rules)\b"
+    r"(^|[\\/:])\.claude[\\/](settings(\.local)?\.json|hooks|agents|skills|commands|rules|plugins)\b"
     r"|(^|[\\/:])\.mcp\.json\b"
     r"|(^|[\\/:])(CLAUDE(\.local)?|AGENTS|MEMORY|GEMINI)\.md\b"
     r"|(^|[\\/:])\.github[\\/]copilot-instructions\.md\b"
-    r"|(^|[\\/:])\.vscode[\\/](settings|tasks)\.json\b"
+    r"|(^|[\\/:])\.vscode[\\/](settings|tasks|launch)\.json\b"
     r"|(^|[\\/:])\.cursor[\\/](rules|cli\.json|hooks\.json)\b"
     r"|(^|[\\/:])\.cursorrules\b"
     r"|(^|[\\/:])\.(gemini|windsurf)([\\/]|$)"
