@@ -1891,13 +1891,97 @@ _DOTNET_NETWORK = re.compile(
 _DOTNET_DECODE = re.compile(r"frombase64string", re.IGNORECASE)
 _DOTNET_ENVIRONMENT = re.compile(r"\[(system\.)?environment\]::getenvironmentvariables", re.IGNORECASE)
 
-_SECRET_WORD = re.compile(f"{CREDENTIAL_PATTERN}|{AGENT_CONFIG_PATTERN}|{AGENT_SENTINEL_HOME_PATTERN}|"
-                          r"(^|[\s\\/:@='\"`<>|;&(,{])\.agent-sentinel([\\/]|$)", re.IGNORECASE)
-_PROTECTED_TARGET = re.compile(
-    f"{CREDENTIAL_PATTERN}|{AGENT_CONFIG_PATTERN}|{AGENT_SENTINEL_HOME_PATTERN}|"
-    r"(^|[\s\\/:@='\"`<>|;&(,{])\.(claude|cursor|codeium|gemini|codex|agent-sentinel)([\\/]|$)",
-    re.IGNORECASE,
+# ---- what this module protects -------------------------------------------------------------------------
+#
+# ONE declaration of what the product protects, and every test below is worked out from it: whether a
+# word a command WRITES to is protected (_PROTECTED_TARGET), whether a word it READS is
+# (_SECRET_WORD), whether a part after a protected folder may be one of that folder's entries
+# (_PROTECTED_ENTRIES, _may_be_protected_entry), and whether a path spells out a protected name after a
+# part the shell searches (_PROTECTED_WHEREVER_IT_IS, _a_protected_name_after). Each of those used to
+# carry a list of its own, the lists did not agree, and a name added to one was missing from the next.
+# A test generates every spelling of every name here and holds the four in step (tests/test_commands.py).
+#
+# The text patterns the shipped policy templates carry (CREDENTIAL_PATTERN, AGENT_CONFIG_PATTERN) name
+# the same files spelled out, and the same test checks that each name here is one of them.
+
+
+class _Folder(NamedTuple):
+    """A folder this module protects, and what inside it counts as protected."""
+
+    name: str  # ".claude", ".git", ".ssh" ...
+    entries: tuple[str, ...] = ()  # the entries of it that hold configuration, keys or agent-sentinel's own files
+    whole: str = ""  # "": only those entries; "write": every entry, for a write; "both": for a read as well
+
+
+class _File(NamedTuple):
+    """A file this module protects wherever in the file system it appears."""
+
+    name: str
+    by_wildcard: bool = True  # a part that spells this name only through a wildcard counts on its own
+
+
+# The folders. Every one begins with a "." (a part of a path the shell may expand to one of these names
+# counts as protected, whatever follows: see _may_be_hidden). "whole" says whose entries are all
+# protected and on which side: an agent's own folder may not be written at all, while reading one is a
+# read of its configuration only where the entry is named, so that an agent may still read its notes.
+_PROTECTED_FOLDERS = (
+    _Folder(".agent-sentinel", ("policy.json", "pins.json", "audit.jsonl", "audit.key"), whole="both"),
+    _Folder(".claude", ("settings.json", "settings.local.json", "hooks", "agents", "skills", "commands", "rules"),
+            whole="write"),
+    _Folder(".cursor", ("rules", "cli.json", "hooks.json", "mcp.json"), whole="write"),
+    _Folder(".codeium", whole="write"),
+    _Folder(".gemini", whole="both"),
+    _Folder(".windsurf", whole="both"),
+    _Folder(".codex", ("config.toml",), whole="write"),
+    _Folder(".git", ("hooks", "config")),
+    _Folder(".github", ("copilot-instructions.md",)),
+    _Folder(".vscode", ("settings.json", "tasks.json", "mcp.json")),
+    _Folder(".ssh", ("config", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"), whole="both"),
+    _Folder(".aws", ("credentials", "config"), whole="both"),
+    _Folder(".azure", whole="both"),
+    _Folder(".docker", whole="both"),
+    _Folder(".gnupg", whole="both"),
+    _Folder(".kube", whole="both"),
 )
+# The files, which are protected in whatever folder they stand. ".cursorrules" is here and not among
+# ".cursor"'s entries because it is a file beside that folder, not inside it.
+_PROTECTED_FILES = (
+    # Files that tell an agent what to do, or which MCP servers it starts. A wildcard that spells one of
+    # these names is looked for on its own (CLAUDE.m?, AGENT?.md, .mcp.j*).
+    _File("claude.md"), _File("claude.local.md"), _File("agents.md"), _File("memory.md"), _File("gemini.md"),
+    _File(".mcp.json"), _File("mcp_config.json"), _File(".cursorrules"),
+    _File("claude_desktop_config.json"), _File(".claude.json"),
+    # Credential files and the shell's start-up files. Every one of these begins with a ".", so a part
+    # that spells one through a wildcard is already a hidden name (".e*", ".bash*"); looking for the bare
+    # name as well would make an everyday listing such as "*env*" a read of a credential, which it is not.
+    _File(".env", by_wildcard=False), _File(".netrc", by_wildcard=False), _File(".npmrc", by_wildcard=False),
+    _File(".pypirc", by_wildcard=False), _File(".pgpass", by_wildcard=False),
+    _File(".git-credentials", by_wildcard=False), _File(".bashrc", by_wildcard=False),
+    _File(".bash_profile", by_wildcard=False), _File(".bash_login", by_wildcard=False),
+    _File(".zshrc", by_wildcard=False), _File(".zshenv", by_wildcard=False), _File(".zprofile", by_wildcard=False),
+    _File(".profile", by_wildcard=False),
+)
+
+# ---- the four tests, worked out from that declaration --------------------------------------------------
+
+# What may stand before a protected name where the name begins there: the start of the word, white space,
+# a path separator, or a character that opens an argument of its own.
+_NAME_START = r"(^|[\s\\/:@='\"`<>|;&(,{])"
+
+
+def _whole_folder_pattern(sides: tuple[str, ...]) -> str:
+    """The text test for a path that goes through a folder whose every entry is protected on this side."""
+    names = sorted(folder.name for folder in _PROTECTED_FOLDERS if folder.whole in sides)
+    return _NAME_START + "(" + "|".join(re.escape(name) for name in names) + r")([\\/]|$)"
+
+
+# The read test and the write test. They differ in one place, and the declaration says where: a write to
+# anything under an agent's own folder is a write of its configuration, while a read of one is a read of
+# a credential only for the folders whose every entry is one.
+_SECRET_WORD = re.compile(f"{CREDENTIAL_PATTERN}|{AGENT_CONFIG_PATTERN}|{AGENT_SENTINEL_HOME_PATTERN}|"
+                          + _whole_folder_pattern(("both",)), re.IGNORECASE)
+_PROTECTED_TARGET = re.compile(f"{CREDENTIAL_PATTERN}|{AGENT_CONFIG_PATTERN}|{AGENT_SENTINEL_HOME_PATTERN}|"
+                               + _whole_folder_pattern(("both", "write")), re.IGNORECASE)
 # A part of a path that is a Windows short (8.3) name: CLAUDE~1, SETTIN~1.JSO, MCP~1.JSO, GIT~1. Windows
 # opens the long name it stands for (.claude, settings.json ...), which the patterns cannot see, so a write
 # to one, or a change into one, counts as protected (the path matcher refuses such names for the same
@@ -1905,20 +1989,28 @@ _PROTECTED_TARGET = re.compile(
 _SHORT_NAME = re.compile(r"(^|[\\/:])[^\\/:.~\s]{1,8}~[0-9]{1,6}(\.[^\\/:.~\s]{1,3})?([\\/]|$)")
 # Hidden folders that hold an agent's settings, agent-sentinel's own files, git's hooks or keys. A part of
 # a path that the shell may expand to one of these names counts as protected (_may_be_hidden).
-_HIDDEN_FOLDERS = (
-    ".agent-sentinel", ".claude", ".cursor", ".codeium", ".gemini", ".windsurf", ".codex", ".git", ".github",
-    ".vscode", ".ssh", ".aws", ".azure", ".docker", ".gnupg", ".kube",
-)
-# Names of files that are protected wherever they are, for find's -name tests (find's * matches a leading dot).
-_PROTECTED_NAMES = (
-    *_HIDDEN_FOLDERS, ".env", ".netrc", ".npmrc", ".pypirc", ".pgpass", ".git-credentials", ".mcp.json",
-    ".claude.json", ".cursorrules", ".bashrc", ".bash_profile", ".bash_login", ".zshrc", ".zshenv", ".zprofile",
-    ".profile", "policy.json", "pins.json", "audit.jsonl", "audit.key", "settings.json", "settings.local.json",
-    "claude.md", "claude.local.md", "agents.md", "memory.md", "gemini.md", "copilot-instructions.md",
-    "mcp.json", "mcp_config.json", "claude_desktop_config.json", "config.toml", "hooks.json", "cli.json",
-    "tasks.json", "config", "hooks", "credentials", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
-)
-_PROTECTED_NAME_SET = frozenset(_PROTECTED_NAMES)
+_HIDDEN_FOLDERS = tuple(folder.name for folder in _PROTECTED_FOLDERS)
+# The entries of a folder that hold an agent's configuration, for a part after the folder that the shell
+# may expand to one: .git/hoo*/pre-commit, .claude/sett*.json.
+_PROTECTED_ENTRIES = {folder.name: folder.entries for folder in _PROTECTED_FOLDERS if folder.entries}
+# Files that are protected wherever they are and whose name a wildcard may spell on its own.
+_AGENT_FILE_NAMES = tuple(file.name for file in _PROTECTED_FILES if file.by_wildcard)
+# A name that means a protected file in WHATEVER folder it stands: an entry of one of the folders, or a
+# file protected wherever it appears. This is the set for a path that spells a name out after a part the
+# shell searches (_a_protected_name_after): the search may land in any folder at all, so the name that
+# follows it is what says whether the path reaches something protected. The folders whose EVERY entry is
+# protected are deliberately not read as "any name at all" here; see _a_protected_name_after.
+_PROTECTED_WHEREVER_IT_IS = tuple(dict.fromkeys(
+    [entry.lower() for folder in _PROTECTED_FOLDERS for entry in folder.entries]
+    + [file.name.lower() for file in _PROTECTED_FILES]))
+# Every name the product protects anywhere, the folders' own names included: the set for find's -name
+# tests, where find's "*" matches a leading dot and a find may walk into any of them, and for the test
+# that a cut text's start hides none of them (_cut_shows_nothing).
+_EVERY_PROTECTED_NAME = tuple(dict.fromkeys((*_HIDDEN_FOLDERS, *_PROTECTED_WHEREVER_IT_IS)))
+_EVERY_PROTECTED_NAME_SET = frozenset(_EVERY_PROTECTED_NAME)
+# The longest of those names: a part of a path with more characters of its own than that can spell none
+# of them, which is worth knowing before looking at each name in turn.
+_LONGEST_PROTECTED_NAME = max(len(name) for name in _EVERY_PROTECTED_NAME)
 # What a part of a path may become when the shell expands it: any one character (? and [...]), any text from
 # a wildcard (*), any text from a variable, a brace list or a command's output, and any text at all where the
 # reader could not work out what the line sets a name to (_UNKNOWN). Other characters stand for themselves,
@@ -1936,23 +2028,6 @@ _FIND_RUNNERS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 # Variables that name agent-sentinel's own folder or Claude Code's: a path through one is protected whatever
 # follows ($AGENT_SENTINEL_HOME/policy.json, ${CLAUDE_CONFIG_DIR}/settings.json, %AGENT_SENTINEL_HOME%).
 _PROTECTED_VARIABLE = re.compile(r"(\$\{?(env:)?|%)(agent_sentinel_home|claude_config_dir)\b", re.IGNORECASE)
-# The entries of a folder that hold an agent's configuration (AGENT_CONFIG_PATTERN), for a part after the
-# folder that the shell may expand to one: .git/hoo*/pre-commit. In .claude, .gemini and .windsurf every
-# entry is protected, which the patterns see already.
-_PROTECTED_ENTRIES = {
-    ".git": ("hooks", "config"), ".vscode": ("settings.json", "tasks.json", "mcp.json"),
-    ".cursor": ("rules", "cli.json", "hooks.json", "mcp.json"), ".github": ("copilot-instructions.md",),
-    ".codex": ("config.toml",),
-}
-# Files that tell an agent what to do, or which MCP servers it starts, wherever they are.
-_AGENT_FILE_NAMES = (
-    "claude.md", "claude.local.md", "agents.md", "memory.md", "gemini.md", ".mcp.json", "mcp_config.json",
-    ".cursorrules", "claude_desktop_config.json", ".claude.json",
-)
-# The longest of those names and of the protected entries: a part with more characters of its own than that
-# can spell none of them, which is worth knowing before looking at each name in turn.
-_LONGEST_PROTECTED_ENTRY = max(len(name) for group in (_AGENT_FILE_NAMES, *_PROTECTED_ENTRIES.values())
-                               for name in group)
 
 
 class _Part(NamedTuple):
@@ -2110,6 +2185,7 @@ def _may_be_hidden(word: str, shell: str, reading: bool = False) -> bool:
     globs = shell != "bash" or not isinstance(word, _Literal)
     parts = _path_parts(word, shell, globs)
     last = len(parts) - 1
+    after: tuple[bool, ...] | None = None  # worked out once, and only where a searched part needs it
     for index, part in enumerate(parts):
         tokens = part.tokens
         if part.plain:
@@ -2133,10 +2209,12 @@ def _may_be_hidden(word: str, shell: str, reading: bool = False) -> bool:
             # never sets, a command's output). In Bash nothing there can put a "." first, so the part is the
             # ordinary case (rm $build*). In PowerShell a wildcard does match a leading ".", so a part the
             # shell searches with one counts while it is a folder on the way to the file named after it,
-            # and while the path either begins there (_at_the_top) or ends in one of the protected names
-            # (_reaches_a_protected_name).
+            # and while the path gives one of the protected names after it (_a_protected_name_after) or
+            # begins where such a folder of the user's own is found (_at_the_top).
+            if shell == "powershell" and part.searched and index < last and after is None:
+                after = _a_protected_name_after(parts)
             if not (shell == "powershell" and part.searched and index < last and (
-                    _at_the_top(parts, index) or _reaches_a_protected_name(parts, index))):
+                    after[index + 1] or _at_the_top(parts, index))):
                 continue
         elif first == _ANY_GLOB and tokens[1:2] == (".",) and "." not in tokens[2:] and all(
                 isinstance(token, str) for token in tokens[1:]):
@@ -2146,19 +2224,70 @@ def _may_be_hidden(word: str, shell: str, reading: bool = False) -> bool:
     return False
 
 
-def _reaches_a_protected_name(parts: tuple[_Part, ...], index: int) -> bool:
-    """Whether a part the PowerShell shell searches is on the way to one of the protected names, which the
-    path spells out after it (".../*/settings.json", ".../*/config", ".../*/sub/policy.json").
+def _may_spell_a_name(part: _Part, names: Iterable[str]) -> bool:
+    """Whether a part of a path could spell one of `names`, with the everyday searches that have the same
+    shape left out: a search by extension ("*.md"), a bare wildcard ("*"), and a name the line does not
+    show ("$name"), none of which says anything about the name the part will end up with.
+
+    A part written out plainly has its own characters for tokens, so this is the same question for a
+    name the path spells out and for one a wildcard may spell ("settings.jso?", "sett*.json").
+
+    This is asked of every part of every path a command line names, so two cheap tests come before the
+    one that spells a name out: a part with no "*" in it is exactly as long as any name it may spell,
+    and a part beginning with a character of its own can only spell a name beginning with the same
+    character. Together they leave all but one or two of the names to look at.
+    """
+    tokens = part.tokens
+    own = [token for token in tokens if isinstance(token, str)]
+    if not own or _ANY_TEXT in tokens or _ANY_NAME in tokens:
+        return False  # "*", "$name", text past a bound: the part shows nothing of the name it will have
+    if len(own) > _LONGEST_PROTECTED_NAME:
+        return False  # more characters of its own than any of these names has
+    if tokens[0] == _ANY_GLOB and own[:1] == ["."] and "." not in own[1:] and len(own) == len(tokens) - 1:
+        return False  # "*.json", "*.md": a search by extension
+    stretches = _ANY_GLOB in tokens  # a "*" stands for any number of characters; every other token for one
+    begins = tokens[0] if isinstance(tokens[0], str) else None
+    for name in names:
+        if begins is not None and name[0] != begins:
+            continue
+        if not stretches and len(name) != len(tokens):
+            continue
+        if _could_spell(tokens, name):
+            return True
+    return False
+
+
+def _a_protected_name_after(parts: tuple[_Part, ...]) -> tuple[bool, ...]:
+    """For each place in a path, whether any part AFTER it could spell one of the names that are
+    protected in whatever folder they stand, which is what says whether a part the PowerShell shell
+    searches is on the way to one (".../*/settings.json", ".../*/config", ".../*/commands/deploy.md",
+    ".../*/settings.jso?"). The answer for a part at `index` is the entry at `index + 1`.
+
+    One backward pass over the path answers it for every part at once. A path may have as many parts
+    the shell searches as it has parts, and asking the question again for each of them would cost the
+    square of the path's length on a word a command line need only write out.
 
     A protected folder is normally found INSIDE an ordinary project folder, so judging such a search by
     what stands before it misses the everyday shape of the attack ("repo\\*\\settings.json"), while judging
-    it by where the path ends keeps the everyday reads and writes that have the same shape: "app.exe" and
-    "latest.log" are not protected names, so "build\\*\\app.exe" and "logs\\*\\latest.log" stay ordinary.
+    it by the name that follows keeps the everyday reads and writes that have the same shape: "app.exe"
+    and "latest.log" are protected nowhere, so "build\\*\\app.exe" and "logs\\*\\latest.log" stay ordinary.
     Every part after the search is looked at, not only the next one, because a search that lands in a
-    protected folder makes a protected file of everything under it.
+    protected folder makes a protected file of everything under it. A name a wildcard may spell counts as
+    the spelled-out name does, or one character in the name would be enough to pass ("settings.jso?").
+
+    Where the line is drawn: the names are the entries this module protects and the files it protects
+    wherever they stand, NOT every name at all. A search could also land in one of the folders whose
+    every entry is protected (".gemini", ".windsurf"), which taken to its end would make
+    "Copy-Item notes.md docs\\*\\x.md" a write of an agent's configuration, and with it every write and
+    read of that shape in PowerShell. That is a refusal the operator cannot approve under the strict
+    template, on a line that is ordinary work, so those folders stop at their spelled-out name here; a
+    search that begins where such a folder of the user's own is found still counts whatever follows it
+    (_at_the_top).
     """
-    return any(part.plain and part.text.lower() in _PROTECTED_NAME_SET
-               for part in parts[index + 1:])
+    after = [False] * (len(parts) + 1)
+    for index in reversed(range(len(parts))):
+        after[index] = after[index + 1] or _may_spell_a_name(parts[index], _PROTECTED_WHEREVER_IT_IS)
+    return tuple(after)
 
 
 def _at_the_top(parts: tuple[_Part, ...], index: int) -> bool:
@@ -2168,7 +2297,7 @@ def _at_the_top(parts: tuple[_Part, ...], index: int) -> bool:
     A PowerShell wildcard matches a leading ".", so "*\\policy.json", "~\\*\\policy.json" and
     "$env:NAME*\\policy.json" may land in one. Under a folder the line names itself ("build\\*\\app.exe",
     "logs\\*\\latest.log") the search is held inside that folder, and the part stays ordinary unless the
-    path spells out a protected name after it (_reaches_a_protected_name).
+    path spells out a protected name after it (_a_protected_name_after).
     """
     for before, part in enumerate(parts[:index]):
         if not part.text:
@@ -2184,9 +2313,15 @@ def _at_the_top(parts: tuple[_Part, ...], index: int) -> bool:
 
 
 def _may_be_protected_entry(word: str, shell: str) -> bool:
-    """True if the shell may expand a word a command writes to into an agent's file that the patterns see only
-    spelled out: an entry of a protected folder (.git/hoo*/pre-commit, .vscode/*.json) or an instruction file
-    (CLAUDE.m?, AGENT?.md). A search by extension (*.md) or a bare wildcard as the file name does not count.
+    """True if the shell may expand a word into an agent's file that the patterns see only spelled out: an
+    entry of one of the protected folders (.claude/sett*.json, .git/hoo*/pre-commit, .vscode/*.json) or a
+    file protected wherever it stands (CLAUDE.m?, AGENT?.md). A search by extension (*.md) or a bare
+    wildcard as the file name does not count.
+
+    After a folder the path names itself, every one of that folder's entries is looked for, searches of
+    that shape included (".vscode/*.json"): the folder is spelled out, so what such a search may reach is
+    not in doubt. Where no folder is named, only the files protected wherever they stand are looked for,
+    and the everyday searches are left out (_may_spell_a_name).
     """
     if not _AN_EXPANSION.search(word):
         return False
@@ -2196,17 +2331,13 @@ def _may_be_protected_entry(word: str, shell: str) -> bool:
         tokens = part.tokens
         if part.plain:
             continue
-        plain = [token for token in tokens if isinstance(token, str)]
-        if len(plain) > _LONGEST_PROTECTED_ENTRY:
+        own = [token for token in tokens if isinstance(token, str)]
+        if len(own) > _LONGEST_PROTECTED_NAME:
             continue  # more characters of its own than any of these names has, so it can spell none of them
         entries = _PROTECTED_ENTRIES.get(parts[index - 1].text.lower(), ()) if index else ()
         if any(_could_spell(tokens, name) for name in entries):
             return True
-        if index < len(parts) - 1 or _ANY_TEXT in tokens:
-            continue  # a file name from a variable ("$name.json") is the limit of a path made of variables
-        by_extension = tokens[0] == _ANY_GLOB and plain[:1] == ["."] and "." not in plain[1:] and len(plain) == len(
-            tokens) - 1
-        if plain and not by_extension and any(_could_spell(tokens, name) for name in _AGENT_FILE_NAMES):
+        if index == len(parts) - 1 and _may_spell_a_name(part, _AGENT_FILE_NAMES):
             return True
     return False
 
@@ -2361,10 +2492,10 @@ def _cut_shows_nothing(value: str, shell: str) -> bool:
     parts = _path_parts(rest, shell, True)
     if not parts[-1].text:
         return False
-    if any(part.text.lower() in _PROTECTED_NAME_SET for part in parts[:-1]):
+    if any(part.text.lower() in _EVERY_PROTECTED_NAME_SET for part in parts[:-1]):
         return False
     last = parts[-1].text.lower()
-    return not any(protected.startswith(last) for protected in _PROTECTED_NAMES)
+    return not any(protected.startswith(last) for protected in _EVERY_PROTECTED_NAME)
 
 
 def _capped(texts: list[str], bound: int) -> list[str]:
@@ -2556,14 +2687,19 @@ def _expanded_word(command: _Command, values: dict[str, list[str]]) -> tuple[str
 
 def _find_may_reach_protected(words: Iterable[str]) -> bool:
     """Whether a find's tests leave it free to find a protected file: no -name test, a negation, or a -name
-    that a protected name matches (find's own wildcards, which match a leading dot, quoted or not)."""
+    that one of the protected names matches (find's own wildcards, which match a leading dot, quoted or not).
+
+    A find walks into whatever folder it is given, so the names here are every name the product protects
+    anywhere, the folders' own names included - not only the ones that mean a protected file wherever
+    they stand.
+    """
     words = list(words)
     names = [words[index + 1] for index, word in enumerate(words[:-1]) if word in _FIND_NAME_TESTS]
     if not names or any(word in ("!", "-not") for word in words):
         return True
     for pattern in names:
         for part in _path_parts(pattern, "powershell", True):
-            if any(_could_spell(part.tokens, name) for name in _PROTECTED_NAMES):
+            if any(_could_spell(part.tokens, name) for name in _EVERY_PROTECTED_NAME):
                 return True
     return False
 
