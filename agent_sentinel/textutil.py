@@ -36,7 +36,6 @@ import os
 import re
 import sys
 import unicodedata
-import uuid
 from collections import UserString, deque
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple
@@ -304,8 +303,23 @@ MAX_ARGUMENT_PARTS = 4_000_000
 # will not write a longer one as text, and JSON read by this package has none.
 _MAX_INT_BITS = 14_000
 # Values that are written as their str(): what a library would send for them.
-_WRITTEN_AS_TEXT = (uuid.UUID, datetime.datetime, datetime.date, datetime.time, decimal.Decimal)
+# A UUID is one of them, but uuid is not imported here: see _is_uuid.
+_WRITTEN_AS_TEXT = (datetime.datetime, datetime.date, datetime.time, decimal.Decimal)
 _ARRAYS = (list, tuple, set, frozenset, deque)
+
+
+def _is_uuid(item: Any) -> bool:
+    """Whether `item` is a UUID, without importing uuid to find out.
+
+    A UUID cannot exist unless the program that made it imported uuid, so
+    looking the module up where it would then be answers this in every case
+    that can arise. Importing it here instead would cost the library the
+    command line: on Python 3.10 on a POSIX system uuid imports platform,
+    and platform of that version imports subprocess at its top. A value this
+    cannot recognise is refused as unscannable, never checked in part.
+    """
+    uuid = sys.modules.get("uuid")
+    return uuid is not None and isinstance(item, getattr(uuid, "UUID", ()))
 
 
 def normalised_arguments(value: Any) -> Any:
@@ -497,7 +511,7 @@ def _converted(item: Any) -> Any:
         if dataclasses.is_dataclass(item) and isinstance(item, (Mapping, *_ARRAYS)):
             raise UnscannableError(f"an argument of type {type(item).__name__} is two kinds of value at once")
         return _CONTAINER
-    if isinstance(item, _WRITTEN_AS_TEXT):
+    if isinstance(item, _WRITTEN_AS_TEXT) or _is_uuid(item):
         return _Leaf(str(item))
     if callable(getattr(item, "get_secret_value", None)):
         return _called(lambda secret: secret.get_secret_value(), item)

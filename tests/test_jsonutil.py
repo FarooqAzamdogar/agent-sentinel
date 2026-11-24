@@ -84,14 +84,47 @@ class TheAuditLogIsAlwaysJson(TempFolderTest):
 
 
 class TheLibraryDoesNotLoadTheCommandLine(unittest.TestCase):
-    def test_importing_the_package_loads_no_command_module(self):
+    def loaded_by_importing_the_package(self):
+        """Every module `import agent_sentinel` adds, in an interpreter of its own."""
         code = ("import sys; sys.path.insert(0, sys.argv[1]); before = set(sys.modules); import agent_sentinel; "
                 "print(' '.join(sorted(set(sys.modules) - before)))")
-        loaded = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT)], capture_output=True, text=True,
-                                timeout=60, check=True).stdout.split()
+        return subprocess.run([sys.executable, "-I", "-c", code, str(ROOT)], capture_output=True, text=True,
+                              timeout=60, check=True).stdout.split()
+
+    def test_importing_the_package_loads_no_command_module(self):
+        loaded = self.loaded_by_importing_the_package()
         for module in ("agent_sentinel.cli_common", "argparse", "subprocess", "shlex", "textwrap"):
             with self.subTest(module=module):
                 self.assertNotIn(module, loaded)
+
+    def test_importing_the_package_loads_nothing_that_reaches_a_command_module(self):
+        """The modules above are not imported on this system; these two would import them on another.
+
+        On Linux with Python 3.10, uuid imports platform (the fast path for a
+        known system came later) and platform of that version imports
+        subprocess at its top, so a library that imports uuid pays for the
+        command-line machinery there while this system shows nothing. Keeping
+        both of them out holds the rule wherever the tests run.
+        """
+        loaded = self.loaded_by_importing_the_package()
+        for module in ("uuid", "platform"):
+            with self.subTest(module=module):
+                self.assertNotIn(module, loaded)
+
+    def test_a_uuid_argument_is_still_read_as_text_although_the_package_imports_no_uuid(self):
+        """Leaving uuid out must not stop the firewall from reading a UUID a caller sends.
+
+        Run where the package is imported first and uuid afterwards, as a
+        program that embeds the library does: the type is found where that
+        program's own import left it.
+        """
+        code = ("import sys; sys.path.insert(0, sys.argv[1]);"
+                "from agent_sentinel.textutil import normalised_arguments;"
+                "import uuid;"
+                "print(normalised_arguments({'id': uuid.UUID(int=1)})['id'])")
+        written = subprocess.run([sys.executable, "-I", "-c", code, str(ROOT)], capture_output=True, text=True,
+                                 timeout=60, check=True).stdout.strip()
+        self.assertEqual(written, "00000000-0000-0000-0000-000000000001")
 
 
 if __name__ == "__main__":
