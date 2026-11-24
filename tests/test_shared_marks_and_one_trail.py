@@ -800,8 +800,11 @@ class TheHookTemplatesAndTheShell(HookTest):
             # A chain of assignments spells the folder out however long it is, as long as each name is
             # set before the name that uses it, which is how people write one.
             ("Bash", "a=~/.agent-s; b=$a; c=$b; d=$c; e=$d; f=$e; g=$f; cp p.json $g*/policy.json"),
-            # In PowerShell a protected folder normally sits inside an ordinary project folder.
-            ("PowerShell", "Copy-Item p.json repo\\*\\settings.json"),
+            # In PowerShell a protected folder normally sits inside an ordinary project folder, and the
+            # name the path gives after the search is what says so - where that name is not one a
+            # project uses for a folder of its own ("repo\\*\\config" is everyday work).
+            ("PowerShell", "Copy-Item p.json repo\\*\\settings.local.json"),
+            ("PowerShell", "Copy-Item p.json repo\\*\\policy.json"),
         ]
         for name, refused in (("claude-code", "ask"), ("claude-code-strict", "deny")):
             self.use(name)

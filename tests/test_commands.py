@@ -1326,11 +1326,16 @@ class RealHookProcess(IsolatedHomeTest):
         for command in (r"Copy-Item build\*\app.exe dist", r"Get-Content logs\*\latest.log"):
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(policy, "PowerShell", {"command": command}), "allow")
-        # Review round 5: a protected folder sits inside an ordinary one, so a searched part on the way
-        # to a name that is protected counts wherever the path begins.
-        for command in (r"Copy-Item evil.json repo\*\settings.json", r"Copy-Item evil.json repo\*\config"):
+        # A protected folder sits inside an ordinary one, so a searched part on the way to a name that is
+        # protected and is no ordinary word counts wherever the path begins; one on the way to a name a
+        # project uses for a folder of its own is the everyday line it looks like.
+        for command in (r"Copy-Item evil.json repo\*\settings.local.json",
+                        r"Copy-Item evil.json repo\*\policy.json"):
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(policy, "PowerShell", {"command": command}), "ask")
+        for command in (r"Copy-Item evil.json repo\*\config", r"Copy-Item app.ini src\*\config\app.ini"):
+            with self.subTest(command=command):
+                self.assertEqual(self.run_hook(policy, "PowerShell", {"command": command}), "allow")
         records = [json.loads(line) for line in (self.folder / "audit.jsonl").read_text(encoding="utf-8").splitlines()]
         self.assertIn("tools.Bash.command.install", [record.get("rule") for record in records])
 
@@ -1691,7 +1696,7 @@ class NamesTheShellExpands(unittest.TestCase):
             "p=~/.agent-s; p=" + "y" * 130 + "/.cl; cp new.json ${p}aude/settings.json",
             # More texts for one name than _MAX_VALUES_PER_NAME.
             "p=a; p=b; p=c; p=d; p=e; cp new.json $p*/policy.json",
-            # A chain of assignments longer than the rounds of substitution reach, which is 16 steps of a
+            # A chain of assignments longer than the rounds of substitution reach, which is 15 steps of a
             # chain written backwards (each name set after the one that uses it).
             "; ".join(f"v{index}=$v{index + 1}" for index in range(16)) + "; v16=~/.agent-s"
             + "; cp new.json $v0*/policy.json",
@@ -1785,7 +1790,7 @@ class NamesTheShellExpands(unittest.TestCase):
     def test_a_chain_is_followed_to_its_end_whenever_the_reader_reaches_it(self):
         """The reader puts the texts the line shows into one another four times over, and each round puts
         in what the round before worked out. A chain written in the usual order, with each name set before
-        it is used, is followed however long it is; one written backwards is followed 16 steps. Reaching
+        it is used, is followed however long it is; one written backwards is followed 15 steps. Reaching
         the end in the last round is reaching it: what the reader did work out must not be thrown away,
         or an everyday chain of nine names written backwards would be read as a protected name.
         """
@@ -1798,7 +1803,7 @@ class NamesTheShellExpands(unittest.TestCase):
                     self.assertEqual(STARTER.evaluate("Bash", {"command": text}).action, "allow")
                     self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "allow")
         # A chain written in the usual order is followed whatever its length, and still spells out where
-        # a write lands; one written backwards past 16 steps is the fail-closed case.
+        # a write lands; one written backwards past 15 steps is the fail-closed case.
         long_chain = "v0=~/.agent-s; " + "; ".join(f"v{index}=$v{index - 1}" for index in range(1, 40))
         self.assertIn("config_write", kinds(f"{long_chain}; cp new.json $v39*/policy.json"))
         past_it = "; ".join(f"v{index}=$v{index + 1}" for index in range(16)) + "; v16=build; rm -rf $v0/*"
@@ -1893,21 +1898,22 @@ class NamesTheShellExpands(unittest.TestCase):
     def test_a_searched_part_counts_by_where_the_path_ends_as_well_as_where_it_begins(self):
         """In PowerShell a wildcard matches a leading ".", so a part the shell searches may land in a
         protected folder - and such a folder normally sits INSIDE an ordinary project folder, so judging
-        the search only by what stands before it let "repo\\*\\settings.json" through while the spelled-out
-        "repo\\.claude\\settings.json" was refused. A search on the way to one of the protected names counts
+        the search only by what stands before it let "repo\\*\\settings.local.json" through while the
+        spelled-out "repo\\.claude\\settings.local.json" was refused. A search on the way to one of the
+        protected names that are distinctive enough to mean the protected thing wherever they stand counts
         wherever the path begins; the everyday shapes, whose paths end in a name of their own, do not."""
-        for text in (r"Copy-Item evil.json repo\*\settings.json", r"Copy-Item evil.json repo\*\config",
-                     r"Copy-Item evil.json repo\*\mcp.json", r"Copy-Item evil.json repo\*\credentials",
+        for text in (r"Copy-Item evil.json repo\*\settings.local.json",
+                     r"Copy-Item evil.json repo\*\mcp.json", r"Copy-Item evil.json repo\*\config.toml",
                      r"Copy-Item evil.json repo\*\policy.json", r"Copy-Item evil.json repo\*\audit.key",
-                     r"Copy-Item evil.json repo\*\sub\settings.json",
-                     r"Copy-Item evil.json repo\*\*\settings.json",
-                     r"Copy-Item evil.json a\b\c\*\settings.json",
-                     r"Copy-Item evil.json repo\$name*\settings.json"):
+                     r"Copy-Item evil.json repo\*\sub\settings.local.json",
+                     r"Copy-Item evil.json repo\*\*\settings.local.json",
+                     r"Copy-Item evil.json a\b\c\*\settings.local.json",
+                     r"Copy-Item evil.json repo\$name*\settings.local.json"):
             with self.subTest(text=text):
                 self.assertIn("config_write", kinds(text, "powershell"))
                 self.assertIn(STARTER.evaluate("PowerShell", {"command": text}).action, ("ask", "block"))
                 self.assertEqual(STRICT.evaluate("PowerShell", {"command": text}).action, "block")
-        for text in (r"Get-Content repo\*\settings.json", r"Get-Content repo\*\credentials",
+        for text in (r"Get-Content repo\*\settings.local.json", r"Get-Content repo\*\.netrc",
                      r"Get-Content repo\*\sub\id_ed25519"):
             with self.subTest(text=text):
                 self.assertIn("secret_read", kinds(text, "powershell"))
@@ -1918,6 +1924,43 @@ class NamesTheShellExpands(unittest.TestCase):
                 self.assertEqual(kinds(text, "powershell"), set())
                 self.assertEqual(STARTER.evaluate("PowerShell", {"command": text}).action, "allow")
                 self.assertEqual(STRICT.evaluate("PowerShell", {"command": text}).action, "allow")
+
+    def test_a_protected_name_that_is_an_ordinary_word_is_not_followed_after_a_search(self):
+        """A path with a part the shell searches used to count whenever ANY name the product protects
+        anywhere followed it, and nine of those names are words a project uses for a folder or a file of
+        its own. That refused everyday PowerShell work - a copy or a read through "...\\*\\config\\..." -
+        with no way for the operator to approve it under the strict template. Each of those names is still
+        protected where a path spells it out under the folder whose entry it is, which is where it means
+        the protected thing, and where the search may still land in a folder of the user's own."""
+        for name in commands._ORDINARY_WORDS:
+            for program, tool in ("Copy-Item evil.json", "PowerShell"), ("Get-Content", "PowerShell"):
+                for path in (rf"repo\*\{name}", rf"src\*\{name}\x.ini", rf"a\b\*\{name}"):
+                    text = f"{program} {path}"
+                    with self.subTest(text=text):
+                        self.assertEqual(kinds(text, "powershell"), set())
+                        self.assertEqual(STARTER.evaluate(tool, {"command": text}).action, "allow")
+                        self.assertEqual(STRICT.evaluate(tool, {"command": text}).action, "allow")
+        # Spelled out under the folder whose entry it is, each one still counts, in both shells.
+        for folder in commands._PROTECTED_FOLDERS:
+            for name in folder.entries:
+                if name not in commands._ORDINARY_WORDS:
+                    continue
+                read = folder.whole == "both"
+                for shell, program in (("powershell", "Copy-Item evil.json"), ("bash", "cp evil.json")):
+                    spelled = f"{folder.name}/{name}".replace("/", "\\" if shell == "powershell" else "/")
+                    for text in (f"{program} {spelled}", f"{program} repo/{spelled}".replace(
+                            "/", "\\" if shell == "powershell" else "/")):
+                        with self.subTest(text=text):
+                            self.assertIn("config_write", kinds(text, shell))
+                        if read:
+                            reading = ("Get-Content " if shell == "powershell" else "cat ") + spelled
+                            with self.subTest(text=reading):
+                                self.assertIn("secret_read", kinds(reading, shell))
+        # And a search that may still land in a folder of the user's own counts whatever follows it.
+        for text in (r"Copy-Item evil.json *\settings.json", r"Copy-Item evil.json ~\*\credentials",
+                     r"Get-Content *\config", r"Get-Content $env:NAME*\credentials"):
+            with self.subTest(text=text):
+                self.assertNotEqual(kinds(text, "powershell"), set())
 
     def test_a_read_of_a_protected_entry_named_through_a_wildcard_counts_too(self):
         """A write to .git/hoo*/pre-commit, .vscode/sett*.json or CLAUDE.m? is config_write, and reading
@@ -2061,6 +2104,431 @@ def spellings_of(parts):
             yield [*parts[:index], spelling, *parts[index + 1:]]
 
 
+class ReviewRoundSix(unittest.TestCase):
+    """A local copy is not network traffic, a brace list that holds a whole protected name counts, and
+    four numbers and wordings that said something the code does not do."""
+
+    def test_a_copy_between_two_paths_of_this_machine_is_not_network(self):
+        """rsync and scp copy locally unless a word names a remote host, and reading a local backup as a
+        network call refused it under the strict template with no way to approve it. ssh and sftp with no
+        host to log in to reach nothing either."""
+        for text in ("rsync -a src/ dst/", "rsync -av --delete /home/dev/p/ /mnt/backup/p/",
+                     "rsync -a --exclude=node_modules . ../snapshot/", "rsync -rtv docs/ /var/www/docs/",
+                     "rsync -a -e ssh src/ build/src/", "rsync -a ./a:b dst/", "scp build/app dist/app",
+                     "scp", "ssh", "ssh -V", "ssh --help", "sftp"):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text), set())
+                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "allow")
+        for text in ("rsync -a src/ user@host.example:/dst/", "rsync -a src/ host.example::module/",
+                     "rsync -a rsync://host.example/module/ dst/", "rsync -a src/ host.example:/dst/",
+                     "rsync -a src/ //server/share/dst/", "scp build/app user@host.example:/tmp/",
+                     "scp user@host.example:/tmp/x .", "sftp user@host.example", "sftp host.example",
+                     "ssh user@host.example ls", "ssh host.example", "ssh -p 2222 host.example uptime"):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text), {"network"})
+                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "block")
+
+    def test_git_against_a_path_of_this_machine_is_not_network_either(self):
+        for text in ("git clone ../other-repo", "git clone /srv/git/project.git build/project",
+                     "git clone ./template new-project", "git fetch ../upstream-mirror",
+                     "git push /srv/git/mirror.git main", "git pull ~/repos/other main",
+                     "git ls-remote ../other-repo"):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text), set())
+                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "allow")
+        # A remote's name says nothing about where it points, a URL and a UNC path name another machine,
+        # and the subcommands whose first word is not a repository are not read this way.
+        for text in ("git clone https://github.com/a/b", "git clone git@github.com:a/b.git",
+                     "git clone ssh://host.example/srv/x.git", "git clone //server/share/x.git",
+                     "git push origin main", "git pull", "git fetch --all", "git ls-remote origin",
+                     "git clone --depth 1 ../other-repo", "git send-email ./patches/0001.patch"):
+            with self.subTest(text=text):
+                self.assertIn("network", kinds(text))
+        # The programs that only ever copy locally were never network, and the ones that exist to fetch
+        # are named by the program alone, as this reader has always named them.
+        for text, shell in (("robocopy src build/src /E", "powershell"),
+                            ("xcopy /s /e src build\\src", "powershell"),
+                            ('cmd /c "robocopy src build\\src /E"', "bash")):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text, shell), set())
+        for text in ("curl --version", "curl file:///tmp/x.json", "wget --help", "nc -U /tmp/sock", "dig"):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text), {"network"})
+
+    def test_a_brace_list_that_holds_a_whole_protected_name_counts(self):
+        """A brace list was followed only where the word spelled part of the name outside the braces
+        (".cl{a,y}ude/settings.json"), so a list holding the whole of it said nothing. Each alternative
+        now goes through the same name tests the rest of the path does."""
+        for text in ("cp x {.claude,y}/settings.json", "cp x {y,.claude}/settings.json",
+                     "cp x {y,z,.claude}/settings.json", "cp x a/{y,.claude}/settings.json",
+                     "cp x {y,.cursor}/mcp.json", "cp x {y,.agent-sentinel}/policy.json",
+                     "cp x {y,.gemini}/notes.txt", "cp x {y,CLAUDE}.md", "cp x {y,.git}/hooks/pre-commit",
+                     "cp x .cl{a,y}ude/settings.json"):
+            with self.subTest(text=text):
+                self.assertIn("config_write", kinds(text))
+                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "block")
+        for text in ("cat {y,.ssh}/id_rsa", "cat {y,.env}", "cat {y,.aws}/credentials",
+                     "cat {y,.claude.json}"):
+            with self.subTest(text=text):
+                self.assertIn("secret_read", kinds(text))
+        # The everyday lists stay what they are, quoted ones included: a quoted "{a,b}" is the name it
+        # looks like, since Bash expands no brace inside quotes.
+        for text in ("cp src/{a,b}.txt out/", "mkdir -p build/{debug,release}",
+                     "cp x out/{dev,prod}/config.yml", "mv {old,new}/notes.md .",
+                     "tar czf x.tgz {src,docs,tests}", "rm -f build/{a,b,c}.o",
+                     "cp x '{y,.claude}/settings.json'", "mkdir -p '{a,b}'", "echo {1..9}",
+                     "cp x {a..c}.txt out/"):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text), set())
+                self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "allow")
+
+    def test_a_word_full_of_brace_lists_is_still_read_quickly(self):
+        """The alternatives are put in one list at a time and bounded, so a word written to make them
+        multiply is read in the time an ordinary one is."""
+        start = time.perf_counter()
+        for text in ("cp x " + "{a,b}" * 200 + "/y", "cp x " + "{.cl,x}" * 100 + "aude/settings.json",
+                     "cp x " + "{a,b,c,d,e,f,g,h}" * 50 + "/y"):
+            self.assertIsNotNone(kinds(text))
+        self.assertLess(time.perf_counter() - start, 1.0)
+
+    def test_the_documents_say_how_far_a_chain_written_backwards_is_followed(self):
+        """Three documents said sixteen steps where the code follows fifteen: the rounds reach the
+        sixteenth name's text and leave it still naming a name, which fails closed."""
+        steps = "; ".join(f"v{index}=$v{index + 1}" for index in range(15)) + "; v15=build; rm -rf $v0/*"
+        self.assertEqual(kinds(steps), set())
+        past_it = "; ".join(f"v{index}=$v{index + 1}" for index in range(16)) + "; v16=build; rm -rf $v0/*"
+        self.assertIn("config_write", kinds(past_it))
+        said = "written backwards is followed 15 steps"
+        self.assertIn(said, commands.__doc__)
+        for document in (ROOT / "README.md", ROOT / "SECURITY.md"):
+            with self.subTest(document=document.name):
+                self.assertIn(said, document.read_text(encoding="utf-8"))
+
+    def test_the_bound_on_one_expansion_covers_the_forms_the_documents_name(self):
+        """It is reached for a ${ } and for a brace list, the two that may hold a path separator of their
+        own; an over-long %name%, !name! or [...] is read as the characters it is written with, which is
+        what it is in a long message. The documents say which forms it covers rather than implying all."""
+        long = "y" * (commands._MAX_EXPANSION_CHARS + 40)
+        for text in (f"cp new.json ~/{{.agent-sen,{long}}}tinel/policy.json",
+                     "cp new.json ~/${" + long + "}/policy.json"):
+            with self.subTest(text=text[:40]):
+                self.assertIn("config_write", kinds(text))
+        for text in (f"echo %{long}%", f"echo !{long}!", f"echo [{long}]",
+                     f"git commit -m 'a message with %{long}% in it'"):
+            with self.subTest(text=text[:40]):
+                self.assertEqual(kinds(text), set())
+        self.assertIn("not read as an expansion at all", commands.__doc__)
+        for document in (ROOT / "README.md", ROOT / "SECURITY.md"):
+            with self.subTest(document=document.name):
+                self.assertIn("an over-long `%name%`", document.read_text(encoding="utf-8"))
+
+    def test_a_hashtable_written_on_one_line_is_reported_as_what_it_is(self):
+        """PowerShell's ";" ends a statement, so a hashtable written on one line reaches the reader as
+        statements of its own, and an entry whose value holds a variable arrives where a program's name
+        belongs. That was reported as a program chosen when the command runs, which it never was."""
+        for text in ("$opt = @{ErrorAction='Stop'; Verbose=$true}; Get-Content x @opt",
+                     "Get-ChildItem | Sort-Object @{Expression='Name'; Descending=$true}",
+                     "foreach ($i in 1..3) { $h = @{a=$i; b=2} }",
+                     "$PSDefaultParameterValues = @{'Get-Content:Path'='x'; 'Set-Content:Force'=$true}"):
+            with self.subTest(text=text):
+                reading = read_command(text, "powershell")
+                self.assertIn("hashtable written on one line", reading.unreadable)
+                self.assertNotIn("chosen when the command runs", reading.unreadable)
+        # A hashtable the reader can place is still read, and a program really chosen when the command
+        # runs still says so: the reason changed, and no line changed from readable to unreadable.
+        for text in ("$h = @{a=1; b=2}", "$h = @{a=1; b=2}; $h.Keys",
+                     "Copy-Item @{Path='a'; Destination='b'}", "$h = @{ a = 1 ; b = 2 ; c = 3 }",
+                     "[pscustomobject]@{Name='x'; Age=1}"):
+            with self.subTest(text=text):
+                self.assertEqual(kinds(text, "powershell"), set())
+        for text, shell in (("& $c x", "powershell"), ("$c args", "bash")):
+            with self.subTest(text=text):
+                self.assertIn("chosen when the command runs", read_command(text, shell).unreadable)
+
+    def test_a_long_text_keeps_the_characters_an_expansion_is_written_with(self):
+        """The note on the long-value bound said which characters are the plain text they look like. It
+        left out the ".." a path holds, and said nothing of the ones that still make the reader give up."""
+        long = "y" * 130
+        for value in (long, f"{long} 50% done", f"{long} [BREAKING] x", f"{long} ../relative",
+                      f"{long} a {{a}} b", f"{long} 10 ! 20"):
+            text = f'msg="{value}"; git commit -m "$msg"'
+            with self.subTest(value=value[-20:]):
+                self.assertEqual(kinds(text), set())
+        for value in (f"{long} star*here", f"{long} 100%-20%", f"{long} !bang!"):
+            text = f'msg="{value}"; git commit -m "$msg"'
+            with self.subTest(value=value[-20:]):
+                self.assertIn("secret_read", kinds(text))
+        note = "or a `..` standing on its own in a message is the plain text it is"
+        for document in (ROOT / "README.md", ROOT / "SECURITY.md"):
+            with self.subTest(document=document.name):
+                self.assertIn(note, document.read_text(encoding="utf-8"))
+
+
+# ---- everyday developer lines, which must take no class at all -----------------------------------
+#
+# The lines a developer writes all day, in the three shells the reader reads, with the shapes the
+# rounds of review have shown to be the ones a reader of command text gets wrong: a path with a part
+# the shell searches in it, a copy between two paths of this machine, a brace list, a long message, a
+# name the line sets. None of them may take ANY class, because every class a line takes is a question
+# the operator must answer - and under the strict template a refusal no operator can approve.
+
+EVERYDAY_BASH = r"""
+git status --short
+git diff --stat
+git log --oneline -20
+git show HEAD~1 --name-only
+git add -A
+git commit -m "Keep the ordinary lines ordinary"
+git commit -m "Fix 50% of the parser cases [BREAKING] and tidy up"
+git branch --sort=-committerdate
+git switch -c feature/parser
+git stash list
+git rebase --continue
+git worktree list
+git bisect start
+git clone ../other-repo
+git clone /srv/git/project.git build/project
+git clone ./template new-project
+git fetch ../upstream-mirror
+git push /srv/git/mirror.git main
+git -C ../other-repo status
+git tag -a v0.6.0 -m "Release 0.6.0"
+git describe --tags
+git blame -L 10,20 src/parser.py
+git cherry-pick abc1234
+git shortlog -sn
+git ls-files src
+git rev-parse --abbrev-ref HEAD
+git config --get user.name
+make test
+make -C build all
+cargo build --release
+cargo test -- --nocapture
+go build ./...
+go vet ./...
+python -m pytest -q tests/
+python -m unittest discover tests -q
+python scripts/build.py --out dist
+node --version
+npm run build
+npm test -- --watch=false
+pytest -q -k parser
+ruff check src/
+mypy src/
+black --check src/
+tox -e py310
+cmake -S . -B build
+ninja -C build
+gradle build --offline
+mvn -o test
+dotnet build --no-restore
+pre-commit run --all-files
+shellcheck scripts/build.sh
+mv old-notes.md docs/notes.md
+cp config.example.yml config.yml
+cp -r src/ build/src/
+cp src/{parser,lexer}.py out/
+cp src/{a,b}.txt out/
+mkdir -p build/{debug,release}
+mkdir -p dist/{linux,darwin}/bin
+mv {old,new}/notes.md .
+tar czf dist/app.tgz {src,docs,tests}
+rm -f build/{a,b,c}.o
+rm -rf build dist .pytest_cache
+rm -f out/*.log
+chmod +x scripts/build.sh
+ln -s ../shared/assets public/assets
+touch src/__init__.py
+truncate -s 0 out/app.log
+sed -i 's/0.5.0/0.6.0/' pyproject.toml
+awk '{print $1}' out/report.txt
+grep -rn TODO src/
+grep -c def src/parser.py
+rg --files-with-matches parser src
+head -n 40 README.md
+tail -f out/app.log
+wc -l src/*.py
+diff -u a/out.json b/out.json
+sort -u out/words.txt
+jq '.version' package.json
+du -sh build
+df -h .
+stat src/parser.py
+file build/app
+realpath build/app
+basename "$PWD"
+dirname src/parser.py
+ls -la build/
+tree -L 2 src
+find . -name '*.py' -newer pyproject.toml
+find src -type d -name tests
+tar -xzf vendor/lib.tgz -C vendor/lib
+unzip -o vendor/data.zip -d vendor/data
+rsync -a src/ build/src/
+rsync -av --delete /home/dev/project/ /mnt/backup/project/
+rsync -a --exclude=node_modules . ../snapshot/
+rsync -rtv docs/ /var/www/docs/
+scp build/app dist/app
+ssh -V
+sftp --help
+sqlite3 out/app.db ".tables"
+openssl dgst -sha256 dist/app.tgz
+md5sum dist/app.tgz
+split -b 1m dist/app.tgz out/part-
+paste out/a.txt out/b.txt
+tr -d '\r' < out/win.txt > out/unix.txt
+column -t out/report.txt
+less out/app.log
+echo "built at $(date)" > out/stamp.txt
+printf '%s\n' one two three
+cat out/report.txt
+cat src/parser.py src/lexer.py > out/all.py
+p=build; rm -rf $p/*
+out=dist; cp build/app $out/app
+base=${file%.*}; mv $file $base.bak
+msg="a long message that runs past the hundred and twenty-eight characters the reader keeps whole, with a 50% and a [BREAKING] tag and .. in it"; git commit -m "$msg"
+CFLAGS="-O2 -Wall -Wextra -pedantic -std=c17 -fno-omit-frame-pointer -fstack-protector-strong -D_FORTIFY_SOURCE=2"; gcc $CFLAGS -o build/app src/main.c
+d=../other-repo; git -C $d status
+for f in src/*.py; do python -m py_compile "$f"; done
+if [ -f pyproject.toml ]; then python -m build --sdist; fi
+while read -r line; do echo "$line"; done < out/list.txt
+cd build && make all
+cd src; ls -1
+time make test
+nice make -j4
+"""
+
+EVERYDAY_CMD = r"""
+cmd /c "dir /b build"
+cmd /c "copy config.example.yml config.yml"
+cmd /c "xcopy /s /e src build\src"
+cmd /c "robocopy src build\src /E"
+cmd /c "move old-notes.md docs\notes.md"
+cmd /c "del /q build\*.obj"
+cmd /c "rmdir /s /q build"
+cmd /c "mkdir dist\win32"
+cmd /c "type README.md"
+cmd /c "findstr /n TODO src\parser.py"
+cmd /c "where python"
+cmd /c "echo built > out\stamp.txt"
+cmd /c "fc a\out.json b\out.json"
+cmd /c "attrib +r dist\app.exe"
+cmd /c "tasklist | findstr python"
+cmd /c "set PYTHONPATH=src&& python -m pytest -q"
+cmd /c "cd build && nmake all"
+cmd /c "copy build\app.exe dist\app.exe"
+cmd /c "copy src\*.c build\src"
+cmd /c "ren build\app.exe app-old.exe"
+"""
+
+EVERYDAY_POWERSHELL = r"""
+Get-ChildItem -Recurse -Filter *.py src
+Get-ChildItem -Path build -Directory
+Get-Content README.md -TotalCount 40
+Get-Content out\app.log -Tail 20
+Set-Location src
+Push-Location build; Pop-Location
+Test-Path pyproject.toml
+Resolve-Path build\app.exe
+New-Item -ItemType Directory -Force dist\win32
+Copy-Item config.example.yml config.yml
+Copy-Item -Recurse src build\src
+Copy-Item build\app.exe dist\app.exe
+Copy-Item notes.md docs\*\x.md
+Copy-Item app.ini src\*\config\app.ini
+Copy-Item defaults.ini app\*\config\app.ini
+Copy-Item task.md repo\*\commands\deploy.md
+Copy-Item helper.ps1 repo\*\hooks\pre.ps1
+Copy-Item note.md repo\*\agents\notes.md
+Copy-Item skill.md repo\*\skills\build.md
+Copy-Item rule.yml app\*\rules\main.yml
+Copy-Item plugin.json app\*\plugins\list.json
+Copy-Item creds.txt vault\*\credentials
+Copy-Item defaults.json profiles\*\settings.json
+Get-Content src\*\config\app.ini
+Get-Content app\*\rules\main.yml
+Get-Content repo\*\commands\deploy.md
+Get-Content vault\*\credentials
+Get-Content profiles\*\settings.json
+Get-ChildItem repo\*\agents
+Get-ChildItem src\*\plugins
+Remove-Item src\*\config\old.ini
+Remove-Item -Recurse -Force build\*\config
+Get-Content build\*\app.log
+Copy-Item build\*\app.exe dist
+Get-ChildItem src\*\*.ps1
+Remove-Item -Recurse -Force build, dist
+Rename-Item build\app.exe app-old.exe
+Move-Item old-notes.md docs\notes.md
+Set-Content -Path out\stamp.txt -Value "built"
+Add-Content -Path out\app.log -Value "done"
+Out-File -FilePath out\report.txt -InputObject "ok"
+Select-String -Path src\*.py -Pattern TODO
+Select-String -Path src\*\*.ps1 -Pattern TODO
+Measure-Object -InputObject (Get-Content README.md)
+Get-Process | Sort-Object CPU -Descending | Select-Object -First 5
+Get-Service | Where-Object { $_.Status -eq 'Running' }
+Get-FileHash dist\app.exe -Algorithm SHA256
+Compare-Object (Get-Content a\out.json) (Get-Content b\out.json)
+ConvertFrom-Json (Get-Content package.json -Raw)
+Get-ChildItem build | ForEach-Object { $_.Name }
+python -m pytest -q tests\
+python scripts\build.py --out dist
+git status --short
+git log --oneline -10
+git clone ..\other-repo
+git push \srv\git\mirror.git main
+robocopy src build\src /E /XD node_modules
+xcopy /s /e src build\src
+$p = 'build'; Remove-Item -Recurse -Force $p\*
+$out = 'dist'; Copy-Item build\app.exe $out\app.exe
+$msg = 'a long message that runs past the hundred and twenty-eight characters the reader keeps whole, with a 50% and a [BREAKING] tag in it'; git commit -m $msg
+$files = Get-ChildItem src -Filter *.py; $files.Count
+Write-Output "done"
+Write-Host "building" -ForegroundColor Green
+Start-Process notepad README.md
+New-Item -ItemType File -Path out\empty.txt
+Expand-Archive vendor\data.zip -DestinationPath vendor\data
+Compress-Archive -Path src -DestinationPath dist\src.zip
+if (Test-Path build) { Remove-Item -Recurse -Force build }
+foreach ($f in Get-ChildItem src -Filter *.py) { Write-Output $f.Name }
+"""
+
+
+class EverydayLinesTakeNoClass(unittest.TestCase):
+    """More than two hundred everyday developer lines, in Bash, in cmd (as Claude Code's Bash tool is
+    given it) and in PowerShell, none of which may take any class at all.
+
+    This is the test that keeps a later round of reading a command line more closely from quietly
+    refusing ordinary work. Two of the rounds so far did exactly that: a path with a part the shell
+    searches began to count whenever any name the product protects anywhere followed it, "config" and
+    "commands" included, and a local rsync was read as a network call. Under the strict template both
+    were refusals the operator had no way to approve.
+    """
+
+    def lines(self):
+        found = [("Bash", text) for corpus in (EVERYDAY_BASH, EVERYDAY_CMD)
+                 for text in corpus.splitlines() if text.strip()]
+        found += [("PowerShell", text) for text in EVERYDAY_POWERSHELL.splitlines() if text.strip()]
+        self.assertGreaterEqual(len(found), 200)
+        return found
+
+    def test_not_one_of_them_takes_a_class(self):
+        for tool, text in self.lines():
+            shell = "bash" if tool == "Bash" else "powershell"
+            with self.subTest(tool=tool, command=text):
+                reading = read_command(text, shell)
+                self.assertIsNone(reading.unreadable, text)
+                self.assertEqual(set(reading.kinds()), set())
+
+    def test_neither_template_asks_about_one_of_them(self):
+        for tool, text in self.lines():
+            with self.subTest(tool=tool, command=text):
+                for name, policy in (("claude-code", STARTER), ("claude-code-strict", STRICT)):
+                    verdict = policy.evaluate(tool, {"command": text})
+                    self.assertEqual(verdict.action, "allow", f"{name}: {verdict.reason}")
+
+
 class EverySpellingOfEveryProtectedName(unittest.TestCase):
     """The reader has one declaration of what the product protects, and this generates every spelling
     of every name in it: the path written out, and the same path with a wildcard put into each of its
@@ -2103,8 +2571,16 @@ class EverySpellingOfEveryProtectedName(unittest.TestCase):
         folder at all, and the name the path gives after it is what says whether it reaches something
         protected - spelled out, or spelled with a wildcard of its own. In Bash such a search never
         matches a leading "." and adds nothing: where the same path under a folder the line names is
-        ordinary, the searched form is ordinary too, which is the reader's own documented limit."""
-        for name in commands._PROTECTED_WHEREVER_IT_IS:
+        ordinary, the searched form is ordinary too, which is the reader's own documented limit.
+
+        The names followed there are the ones that are not ordinary words a project uses for a folder or
+        a file of its own; the other test above holds the nine that are, which stay ordinary after a
+        search and are protected where a path spells them out."""
+        self.assertEqual(set(commands._PROTECTED_AFTER_A_SEARCH),
+                         set(commands._PROTECTED_WHEREVER_IT_IS) - set(commands._ORDINARY_WORDS))
+        for name in commands._ORDINARY_WORDS:
+            self.assertIn(name, commands._PROTECTED_WHEREVER_IT_IS, "an ordinary word that is in nothing")
+        for name in commands._PROTECTED_AFTER_A_SEARCH:
             for spelling in (name, *wildcard_spellings(name)):
                 for depth in (r"repo\*", r"a\b\*", r"repo\*\sub"):
                     for program, kind in (("Copy-Item evil", "config_write"), ("Get-Content", "secret_read")):

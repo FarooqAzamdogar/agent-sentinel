@@ -8,7 +8,11 @@ says which of these classes the command line falls into:
 
     network       talks to another machine: curl, wget, nc, ssh, scp, rsync, ping, nslookup,
                   dig, Invoke-WebRequest, certutil -urlcache, git push/clone/fetch/pull, npm
-                  publish, gh, a Bash /dev/tcp or /dev/udp redirection ...
+                  publish, gh, a Bash /dev/tcp or /dev/udp redirection ... The few that
+                  reach another machine only sometimes are read by what the line gives them:
+                  an rsync or scp between two paths of this machine is a copy, an ssh or
+                  sftp with no host to log in to reaches nothing, and a git clone, fetch,
+                  pull or push against a path of this machine copies locally
     install       installs or runs code from a registry or the web: npm/pnpm/yarn install or
                   add, pip install, uv pip install, npx, uvx, pipx run, deno run <url>, a
                   download piped to a shell, iex
@@ -70,7 +74,7 @@ A name set from another name is followed too (p=~/.agent-s; q=$p; cp x
 $q*/...): the texts the line shows are put into one another four times over,
 and each round puts in what the round before worked out. A chain written in the
 usual order, with each name set before the name that uses it, is followed
-however long it is; one written backwards is followed 16 steps.
+however long it is; one written backwards is followed 15 steps.
 
 A ring of names, where each is set to the next and the last to the first, is
 usually worked out to a name in its own text, which is the case just above, and
@@ -89,7 +93,11 @@ an ordinary one, and the reason the operator is given says so, in the same
 words for all seven. The word is shown shortened there, so that the words after
 it are not the ones cut from what the operator is given. A line too large or
 too tangled to read is a line the reader could not read, and such a line is
-asked about.
+asked about. The bound on one expansion is reached for a ${ } and for a brace
+list, the two that may hold a path separator of their own; a %name%, a !name! or
+a [...] longer than 256 characters is not read as an expansion at all and stands
+for the characters it is written with, which is what an over-long one of those
+is in a message far more often than it is an expansion.
 
 One bound keeps what it had instead of dropping it: a text longer than 128
 characters is kept as its first 128 characters. A path part is spelled from its
@@ -97,10 +105,12 @@ start, and the longest protected name is 26 characters, so the start of a text
 is what says where a word using the name lands; a name set to 300 characters of
 a commit message is not a name that may stand for a protected folder. Whether
 anything in the cut is an expansion is asked of the reader itself, part by part,
-and not of the characters an expansion is written with, so a "%", a "!", a "["
-or a "{" standing on its own in a message is the plain text it is, and a long
-commit message holding a percentage or a "[BREAKING]" tag is kept like any
-other. Where the cut itself could hide a protected name - text that may become
+and not of the characters an expansion is written with, so a "%", a "!", a "[",
+a "{" or a ".." standing on its own in a message is the plain text it is, and a
+long commit message holding a percentage or a "[BREAKING]" tag is kept like any
+other; a "*" in such a text, or a pair of "%" or "!" with no blank between
+them, is an expansion to the reader and makes it give up on the cut. Where the
+cut itself could hide a protected name - text that may become
 any text at all in the part the cut falls in or after it, a protected name in
 that text, or a part that could spell the START of one (".agent-s", "clau[d]")
 - the name stands for text the reader could not work out, as the other bounds
@@ -120,15 +130,19 @@ A part counts as a hidden protected folder (.claude, .agent-sentinel, .git,
     set - and, in PowerShell, the shell searches it with a wildcard while it
     is a folder on the way to the file named after it, and the path either
     begins there (*/policy.json, ~\\*\\policy.json, $env:NAME*/policy.json) or
-    gives one of the names that are protected wherever they stand after it
-    (repo\\*\\settings.json, repo\\*\\config, repo\\*\\commands\\deploy.md),
+    gives after it one of the names that are protected wherever they stand and
+    are distinctive enough to mean the protected thing there
+    (repo\\*\\settings.local.json, repo\\*\\policy.json, repo\\*\\id_rsa),
     spelled out or spelled with a wildcard of its own
-    (repo\\*\\settings.jso?, repo\\*\\sett*.json): a protected folder of a
-    project's own sits inside the project's folder, so a search above one is
-    not held to the folder it starts in. What the path ends in keeps the
-    everyday writes and reads of that shape ordinary, since their own names
-    are protected nowhere (build\\*\\app.exe, logs\\*\\latest.log,
-    repo\\*\\$name, repo\\*\\*.md, repo\\*\\*). In Bash such a part is the
+    (repo\\*\\settings.local.jso?, repo\\*\\sett*.local.json): a protected
+    folder of a project's own sits inside the project's folder, so a search
+    above one is not held to the folder it starts in. What the path ends in
+    keeps the everyday writes and reads of that shape ordinary, since their own
+    names are protected nowhere (build\\*\\app.exe, logs\\*\\latest.log,
+    repo\\*\\$name, repo\\*\\*.md, repo\\*\\*), and so do the names that are
+    ordinary words a project uses for a folder or a file of its own, which are
+    left out there (src\\*\\config\\app.ini, app\\*\\rules\\main.yml,
+    repo\\*\\commands\\deploy.md, repo\\*\\settings.json). In Bash such a part is the
     ordinary case and never counts (rm $build*, cp $src* /tmp/, rm $*,
     rm -rf $build/*): a Bash wildcard never matches a leading ".", and what
     the variable holds is not shown;
@@ -155,12 +169,16 @@ name after a searched part are all worked out from that declaration. Two things
 are left out of it on purpose: a workflow under .github, which runs on the forge
 after a push rather than here and is everyday work to edit, and .vscode's
 extensions.json, which runs nothing (its settings.json, tasks.json and
-launch.json are in, since the editor runs a program from each). The folders
-whose every entry is protected (.gemini, .windsurf) stop at their spelled-out
-name in the test for a name after a searched part: reading them as "any name at
-all" there would make an ordinary PowerShell line such as
-"Copy-Item notes.md docs\\*\\x.md" a write of an agent's configuration, which
-the operator cannot approve under the strict template.
+launch.json are in, since the editor runs a program from each). Two things stop at their
+spelled-out name in the test for a name after a searched part. The folders whose
+every entry is protected (.gemini, .windsurf): reading them as "any name at all"
+there would make an ordinary PowerShell line such as
+"Copy-Item notes.md docs\\*\\x.md" a write of an agent's configuration. And the
+protected names that are ordinary words a project uses for a folder or a file of
+its own (config, hooks, commands, agents, skills, rules, plugins, credentials,
+settings.json): following those after a search made "Copy-Item src\\*\\config\\app.ini
+dist" one too. Both are refusals the operator cannot approve under the strict
+template, on lines that are ordinary work.
 
 In Bash, a wildcard or brace inside quotes or after a backslash is not
 expanded, so it does not count ('s/.*//' is a sed script); PowerShell's
@@ -1135,6 +1153,11 @@ def _runtime_chosen(word: str) -> bool:
     return _SUBST in word or _GROUP in word or "$" in word or "`" in word
 
 
+# A "name=value" where a program word is expected, quoted key and all ("a=$i", "'Set-Content:Force'=$true"):
+# PowerShell has no such statement, and an entry of a one-line hashtable is what it is (_check_program_word).
+_POWERSHELL_PAIR = re.compile(r"""(['"]?)[A-Za-z_][\w.:\- ]*\1=""")
+
+
 def _check_program_word(word: str, shell: str) -> None:
     """Refuse (Unreadable) a program word whose program is only known when the command runs.
 
@@ -1142,7 +1165,15 @@ def _check_program_word(word: str, shell: str) -> None:
     Files\\x\\curl.exe"), or a command text that env -S, watch and the like
     run, which _inner_commands reads as a command line too. Its folders may hold
     a variable ("$DIR/tool"), but not its last part; quoted, it holds no wildcards.
+
+    A "name=value" standing where a program goes is an entry of a PowerShell hashtable written on one
+    line, whose ";" the reader has already taken for the end of a statement ("$h = @{a=$i; b=2}"). Such
+    a line cannot be placed, and that is what the operator is told: before, a hashtable whose values
+    held a variable was reported as a program chosen when the command runs, which it never was.
     """
+    if shell == "powershell" and _POWERSHELL_PAIR.match(word) and _runtime_chosen(word):
+        raise Unreadable("a 'name=value' stands where a program goes, as an entry of a hashtable written "
+                         "on one line does once its ';' has been read as the end of a statement")
     if shell != "powershell" and (word.startswith("=") or _CMD_VARIABLE.search(_last_part(word))):
         # zsh (which Claude Code's Bash tool may run) expands =curl to curl's path, and cmd, whose text is
         # read as Bash's, expands %name% and !name!: "set a=cu&& call %a%rl x" runs curl.
@@ -1814,6 +1845,30 @@ _NETWORK_PROGRAMS = frozenset({
     "resolve-dnsname", "test-netconnection", "tnc", "iwr", "irm", "invoke-webrequest", "invoke-restmethod",
     "start-bitstransfer", "bitsadmin", "send-mailmessage", "gh", "http", "https", "xh",
 })
+# Of those, the ones that reach another machine only when the line gives them one to reach. A copy
+# between two paths of this machine is a copy, not a network call, and reading it as one made the strict
+# template refuse an everyday backup with no way to approve it.
+#   * rsync and scp copy locally unless a word names a remote host, which is what their own syntax says:
+#     [user@]host:path, host::module, or a scheme such as rsync:// or ssh://.
+#   * ssh and sftp log in to the host written as their first word that is not an option, so a line that
+#     gives them nothing but options reaches nothing (ssh, ssh -V, sftp --help).
+# A word that could be either counts as remote, as it did before: rsync itself reads "C:\\src" as the
+# host "C". Everything else in the table above stays as it was, named by the program alone: nc listens
+# on a port, dig with no argument asks the root servers, and curl and wget exist to fetch - this reader
+# flags more than what would do harm, so "alias x=curl" is network whether x is used or not, and a curl
+# given a "file:" URL is network too.
+_LOCAL_UNLESS_REMOTE = frozenset({"rsync", "scp"})
+_NEEDS_SOMETHING_TO_REACH = frozenset({"ssh", "sftp"})
+# A word that names another machine: a scheme, "host:path" (a colon before any separator, as rsync and
+# scp read it), rsync's "host::module", or a UNC path, which names a share of another machine.
+_REMOTE_WORD = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*://|^[^\s\\/:]*:|::|^\\\\[^\\]|^//[^/]")
+# The git subcommands whose first word after them is the repository they work against, and the paths of
+# this machine it may be: git copies locally for those (git clone ../other-repo, git push /srv/mirror
+# main). A remote's NAME ("origin") says nothing about where it points, a UNC path names another
+# machine's share, and anything with a ":" in it may be an scp-style remote, so all three stay network
+# calls. The other network subcommands ("git send-email ./p.patch") are not read this way.
+_GIT_REMOTE_FIRST = frozenset({"clone", "fetch", "pull", "push", "ls-remote"})
+_LOCAL_GIT_PATH = re.compile(r"^(\.{1,2}([\\/]|$)|[\\/](?![\\/])|~[\\/])[^:]*$")
 # Programs that open what they are given in a browser or a mail client: given a URL, they send a request
 # that carries whatever its path and query hold (explorer https://x/?q=<secret>).
 _URL_OPENERS = frozenset({
@@ -1821,6 +1876,8 @@ _URL_OPENERS = frozenset({
     "www-browser", "gio", "kde-open", "gnome-open", "rundll32", "msedge", "chrome", "firefox", "brave", "iexplore",
 })
 _URL_WORD = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*://|mailto:)", re.IGNORECASE)
+# A URL that names this machine's own file system, which a fetching program reads without a request.
+_LOCAL_URL = re.compile(r"file:", re.IGNORECASE)
 
 
 def _opens_url(word: str) -> bool:
@@ -1933,7 +1990,7 @@ _DOTNET_ENVIRONMENT = re.compile(r"\[(system\.)?environment\]::getenvironmentvar
 # word a command WRITES to is protected (_PROTECTED_TARGET), whether a word it READS is
 # (_SECRET_WORD), whether a part after a protected folder may be one of that folder's entries
 # (_PROTECTED_ENTRIES, _may_be_protected_entry), and whether a path spells out a protected name after a
-# part the shell searches (_PROTECTED_WHEREVER_IT_IS, _a_protected_name_after). Each of those used to
+# part the shell searches (_PROTECTED_AFTER_A_SEARCH, _a_protected_name_after). Each of those used to
 # carry a list of its own, the lists did not agree, and a name added to one was missing from the next.
 # A test generates every spelling of every name here and holds the four in step (tests/test_commands.py).
 #
@@ -2008,6 +2065,19 @@ _PROTECTED_FILES = (
     _File(".zshrc", by_wildcard=False), _File(".zshenv", by_wildcard=False), _File(".zprofile", by_wildcard=False),
     _File(".profile", by_wildcard=False),
 )
+# The names above that are ORDINARY WORDS: a project uses each of them for a folder or a file of its
+# own ("config", "commands", a "credentials" file of its own making). They are protected where a path
+# spells them out under one of the folders above (".claude/commands", ".git/config",
+# ".aws/credentials"), which is where they mean the protected thing; they are NOT followed after a part
+# the PowerShell shell searches, where any folder at all may stand before them (_a_protected_name_after).
+# Following them there refused everyday work no operator could approve under the strict template:
+# "Copy-Item src\\*\\config\\app.ini dist", "Get-Content app\\*\\rules\\main.yml". The names left to
+# follow there are the ones distinctive enough to mean the protected thing wherever they stand
+# ("settings.local.json", "policy.json", "audit.key", "id_rsa", "claude_desktop_config.json").
+# A search that may land in the user's own home folder still counts whatever name follows it, ordinary
+# word or not ("*\\settings.json", "~\\*\\credentials": see _at_the_top).
+_ORDINARY_WORDS = ("config", "hooks", "commands", "agents", "skills", "rules", "plugins", "credentials",
+                   "settings.json")
 
 # ---- the four tests, worked out from that declaration --------------------------------------------------
 
@@ -2043,13 +2113,16 @@ _PROTECTED_ENTRIES = {folder.name: folder.entries for folder in _PROTECTED_FOLDE
 # Files that are protected wherever they are and whose name a wildcard may spell on its own.
 _AGENT_FILE_NAMES = tuple(file.name for file in _PROTECTED_FILES if file.by_wildcard)
 # A name that means a protected file in WHATEVER folder it stands: an entry of one of the folders, or a
-# file protected wherever it appears. This is the set for a path that spells a name out after a part the
-# shell searches (_a_protected_name_after): the search may land in any folder at all, so the name that
-# follows it is what says whether the path reaches something protected. The folders whose EVERY entry is
-# protected are deliberately not read as "any name at all" here; see _a_protected_name_after.
+# file protected wherever it appears. The search may land in any folder at all, so the name that follows
+# it is what says whether the path reaches something protected. The folders whose EVERY entry is
+# protected are deliberately not read as "any name at all" there, and the names that are ordinary words
+# are left out of it as well; see _ORDINARY_WORDS and _a_protected_name_after.
 _PROTECTED_WHEREVER_IT_IS = tuple(dict.fromkeys(
     [entry.lower() for folder in _PROTECTED_FOLDERS for entry in folder.entries]
     + [file.name.lower() for file in _PROTECTED_FILES]))
+# Of those, the names that are followed after a part the PowerShell shell searches: the ones that are
+# not ordinary words a project uses for a folder or a file of its own (see _ORDINARY_WORDS).
+_PROTECTED_AFTER_A_SEARCH = tuple(name for name in _PROTECTED_WHEREVER_IT_IS if name not in _ORDINARY_WORDS)
 # Every name the product protects anywhere, the folders' own names included: the set for find's -name
 # tests, where find's "*" matches a leading dot and a find may walk into any of them, and for the test
 # that a cut text's start hides none of them (_cut_shows_nothing).
@@ -2068,7 +2141,13 @@ _EXPANSION_CHARACTERS = "*?[{}$%!" + _SUBST + _GROUP + _UNKNOWN
 _AN_EXPANSION = re.compile(f"[{re.escape(_EXPANSION_CHARACTERS)}]")
 _PATH_SEPARATORS = "\\/:=@"  # and "," in PowerShell, where a list of paths is one word
 _MAX_PATH_PARTS = 256  # of one word; a word with more is not a path
-_MAX_EXPANSION_CHARS = 256  # of one ${...}, %...%, !...! or brace list; longer, and it is not read as one
+# Of one ${...}, %...%, !...!, [...] or brace list. Where the bound is reached the expansion is not read
+# as one, and what that leaves differs by form: a ${ } and a brace list may hold a path separator of
+# their own, so an over-long one leaves a part that may be any text at all and the word counts as a
+# protected name (the seventh of the bounds that fail closed); an over-long %...%, !...! or [...] stands
+# for the characters it is written with, which is what it is in a long message far more often than it is
+# an expansion. The documents say so (see the module docstring).
+_MAX_EXPANSION_CHARS = 256
 _FIND_NAME_TESTS = frozenset({"-name", "-iname"})
 _FIND_RUNNERS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 # Variables that name agent-sentinel's own folder or Claude Code's: a path through one is protected whatever
@@ -2095,8 +2174,9 @@ def _expansion_end(word: str, i: int, shell: str, globs: bool, braces: bool = Tr
     Every expansion syntax the shells have is taken whole (see the module docstring), so that a
     separator written inside one ($env:NAME, ${p:-x}, ${p/a/b}, %p:~0,2%) does not end the path's part
     and leave two halves that say nothing. A ${ }, %...%, !...! or brace list longer than
-    _MAX_EXPANSION_CHARS is not read as one; an unclosed ${ runs to the end of the word, as the shell's
-    word does.
+    _MAX_EXPANSION_CHARS is not read as one, which fails closed for the two that may hold a separator
+    and leaves the others as the characters they are written with (see _MAX_EXPANSION_CHARS); an
+    unclosed ${ runs to the end of the word, as the shell's word does.
     """
     c = word[i]
     nxt = word[i + 1:i + 2]
@@ -2324,18 +2404,22 @@ def _a_protected_name_after(parts: tuple[_Part, ...]) -> tuple[bool, ...]:
     protected folder makes a protected file of everything under it. A name a wildcard may spell counts as
     the spelled-out name does, or one character in the name would be enough to pass ("settings.jso?").
 
-    Where the line is drawn: the names are the entries this module protects and the files it protects
-    wherever they stand, NOT every name at all. A search could also land in one of the folders whose
-    every entry is protected (".gemini", ".windsurf"), which taken to its end would make
+    Where the line is drawn, twice. The names are the entries this module protects and the files it
+    protects wherever they stand, NOT every name at all: a search could also land in one of the folders
+    whose every entry is protected (".gemini", ".windsurf"), which taken to its end would make
     "Copy-Item notes.md docs\\*\\x.md" a write of an agent's configuration, and with it every write and
-    read of that shape in PowerShell. That is a refusal the operator cannot approve under the strict
-    template, on a line that is ordinary work, so those folders stop at their spelled-out name here; a
-    search that begins where such a folder of the user's own is found still counts whatever follows it
-    (_at_the_top).
+    read of that shape in PowerShell. And of those names, the ones that are ordinary words a project
+    uses for a folder or a file of its own are left out as well (_ORDINARY_WORDS): "config", "commands"
+    and "rules" after a search are "src\\*\\config\\app.ini" and "app\\*\\rules\\main.yml" far more often
+    than they are an agent's own folder, and following them refused that everyday work. Both are
+    refusals the operator cannot approve under the strict template, on lines that are ordinary work, so
+    both stop at their spelled-out name here (".claude\\commands", ".gemini\\x"); a search that begins
+    where such a folder of the user's own is found still counts whatever follows it, ordinary word or
+    not (_at_the_top).
     """
     after = [False] * (len(parts) + 1)
     for index in reversed(range(len(parts))):
-        after[index] = after[index + 1] or _may_spell_a_name(parts[index], _PROTECTED_WHEREVER_IT_IS)
+        after[index] = after[index + 1] or _may_spell_a_name(parts[index], _PROTECTED_AFTER_A_SEARCH)
     return tuple(after)
 
 
@@ -2417,10 +2501,12 @@ _MAX_VALUES_PER_NAME = 4  # texts one name may stand for (a line that sets it mo
 # Rounds of putting those texts into one another, which is how a chain of assignments is followed
 # (p=~/.agent-s; q=$p; r=$q ...). One round is not one step: each round puts in what the round before
 # worked out, so a chain written in the usual order, with each name set before it is used, is followed
-# however long it is, and one written backwards reaches _MAX_SUBSTITUTION_ROUNDS doublings, 16 steps.
+# however long it is, and one written backwards reaches _MAX_SUBSTITUTION_ROUNDS doublings, 15 steps.
 _MAX_SUBSTITUTION_ROUNDS = 4
 _MAX_RESOLVED = 16  # texts one word is read as, with those values put in
 _MAX_RESOLVED_CHARS = 4 * 1024  # of the text put into one of them
+_MAX_BRACE_ALTERNATIVES = 16  # of one brace list, put in one at a time (_brace_alternatives)
+_MAX_BRACE_READINGS = 64  # readings of one word the brace lists in it add
 # Programs that set a variable for the rest of the line: Bash's export and the like, cmd's set.
 _VALUE_SETTERS = frozenset({"export", "declare", "typeset", "local", "readonly", "set", "setenv", "env"})
 _VARIABLE_NAME = re.compile(r"[A-Za-z_]\w*")
@@ -2755,6 +2841,59 @@ def _resolved(word: str, shell: str, values: dict[str, list[str]]) -> tuple[str,
     return (word, *dict.fromkeys(type(word)(found) for text in texts if (found := "".join(text)) != word))
 
 
+def _readings(word: str, shell: str, values: dict[str, list[str]]) -> tuple[str, ...]:
+    """Every reading of a word the name tests are asked of: what _resolved makes of it, and each of
+    those with one alternative of one of its Bash brace lists put in.
+
+    A brace list that holds a WHOLE protected name ("{.claude,x}/settings.json", "cat {x,.aws}/y")
+    spells none of that name outside the braces, so neither the path read part by part (_may_be_hidden,
+    where the list is text that may become anything) nor the text patterns (which see "{.claude," and
+    ".claude}") find it. Putting each alternative in and asking the same questions of the result does.
+    """
+    readings = _resolved(word, shell, values)
+    if shell != "bash" or "{" not in word:
+        return readings
+    found = list(readings)
+    for reading in readings:
+        found.extend(_brace_alternatives(reading))
+        if len(found) > _MAX_BRACE_READINGS:
+            return readings  # more than the reader puts in: the lists are read as before (see below)
+    return tuple(dict.fromkeys(found))
+
+
+def _brace_alternatives(word: str) -> list[str]:
+    """The word with each alternative of each of its Bash brace lists put in, one list at a time.
+
+    One list at a time, and not every combination of them, so that the work is the word's length times
+    the alternatives in it rather than their product: a name inside one list is what this is for.
+    A quoted list is no list (_Literal), and "{a..z}" is left as written, since what it stands for is
+    not spelled in it.
+
+    This bound does NOT fail closed, deliberately, and it is the only one in the module that does not.
+    What it adds are readings that can only find a name the reader would otherwise miss, so giving up on
+    a word with many lists in it would turn an everyday "cp {a,b,c}/{d,e,f}/x out/" into a refusal the
+    operator cannot approve, to no one's gain. A list the reader does not put in is read as the text it
+    may become, part by part, exactly as every list was read before.
+    """
+    if isinstance(word, _Literal):
+        return []
+    found: list[str] = []
+    i, n = 0, len(word)
+    while i < n and len(found) <= _MAX_BRACE_READINGS:
+        if word[i] != "{":
+            i += 1
+            continue
+        end = _expansion_end(word, i, "bash", True)
+        inner = word[i + 1:end - 1]
+        if end <= i or word[end - 1:end] != "}" or "," not in inner:
+            i += 1
+            continue  # not a list the reader reads: a lone "{", a "{a..z}", or one past _MAX_EXPANSION_CHARS
+        found.extend(word[:i] + alternative + word[end:]
+                     for alternative in inner.split(",")[:_MAX_BRACE_ALTERNATIVES])
+        i = end
+    return found
+
+
 def _past_a_bound(word: str, shell: str) -> bool:
     """Whether a word counts only because the reader had to give up on part of it rather than because
     of anything the word shows.
@@ -2783,7 +2922,7 @@ def _expanded_word(command: _Command, values: dict[str, list[str]]) -> tuple[str
     one of the bounds says so, the two on the word itself included (_past_a_bound).
     """
     for word in (*command.words, *command.targets, *command.groups):
-        for candidate in _resolved(word, command.shell, values):
+        for candidate in _readings(word, command.shell, values):
             if _may_be_hidden(candidate, command.shell, reading=True) or _may_be_protected_entry(
                     candidate, command.shell) or (
                     candidate is not word and any(_SECRET_WORD.search(spelling)
@@ -2966,10 +3105,33 @@ def _positional(words: Iterable[str], with_value: frozenset[str] = frozenset()) 
     return found
 
 
+def _what_it_reaches(program: str, words: list[str]) -> str | None:
+    """What the line gives one of _NETWORK_PROGRAMS to reach: "" where the program reaches another
+    machine whenever it runs, the word that names one where only some lines do, and None where this line
+    stays on this machine.
+
+    rsync and scp copy between two paths of this machine unless a word names a remote host, so a local
+    backup ("rsync -a src/ /mnt/backup/") is a copy and not a network call; ssh and sftp log in to a host
+    the line writes, so "ssh -V" reaches nothing. Every word is looked at for a remote host, not only the
+    ones that are not options, because each of these programs has more options that take a value than it
+    is worth naming, and a word that could be either counts as remote (see _LOCAL_UNLESS_REMOTE).
+    """
+    if program in _LOCAL_UNLESS_REMOTE:
+        return next((word for word in words if _REMOTE_WORD.search(word)), None)
+    if program in _NEEDS_SOMETHING_TO_REACH:
+        remote = next((word for word in words if _REMOTE_WORD.search(word)), None)
+        if remote is not None:
+            return remote
+        return next((word for word in _positional(words) if not _LOCAL_URL.match(word)), None)
+    return ""
+
+
 def _network(command: _Command, earlier: list[_Command], values: dict[str, list[str]]) -> str | None:
     program, words = command.program, command.words
     if program in _NETWORK_PROGRAMS:
-        return f"program '{program}'"
+        reached = _what_it_reaches(program, list(words))
+        if reached is not None:
+            return f"program '{program}'" if not reached else f"program '{program}' with '{reached}'"
     if program == "certutil" and any(word.lstrip("-/").lower() in ("urlcache", "verifyctl") for word in words):
         return "program 'certutil' with -urlcache"
     if _opens_url(command.written):
@@ -2979,7 +3141,12 @@ def _network(command: _Command, earlier: list[_Command], values: dict[str, list[
     if program == "git":
         positional = _positional(words, _GIT_OPTIONS_WITH_VALUE)
         if positional and positional[0].lower() in _GIT_NETWORK:
-            return f"'git {positional[0].lower()}'"
+            # Against a path on this machine ("git clone ../other-repo", "git push /srv/mirror main")
+            # git copies locally. A remote's name ("origin") says nothing about where it points, and
+            # neither does a line that names no remote at all, so both stay network calls.
+            if not (positional[0].lower() in _GIT_REMOTE_FIRST and len(positional) > 1
+                    and _LOCAL_GIT_PATH.match(positional[1])):
+                return f"'git {positional[0].lower()}'"
         if positional[:2] in (["remote", "update"], ["submodule", "update"], ["submodule", "add"]) or (
                 positional[:1] == ["lfs"] and positional[1:2] in (["push"], ["pull"], ["fetch"], ["clone"])):
             return f"'git {' '.join(positional[:2])}'"
@@ -3111,7 +3278,7 @@ def _protected(word: str, shell: str = "bash", values: dict[str, list[str]] | No
         any(_PROTECTED_TARGET.search(spelling) or _PROFILE_VARIABLE.match(spelling) or _SHORT_NAME.search(spelling)
             for spelling in _spellings(candidate))
         or _may_be_hidden(candidate, shell) or _may_be_protected_entry(candidate, shell)
-        for candidate in _resolved(word, shell, values or {}))
+        for candidate in _readings(word, shell, values or {}))
 
 
 def _short_note(word: str) -> str:
