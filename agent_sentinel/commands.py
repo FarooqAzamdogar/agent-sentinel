@@ -3105,7 +3105,7 @@ def _positional(words: Iterable[str], with_value: frozenset[str] = frozenset()) 
     return found
 
 
-def _what_it_reaches(program: str, words: list[str]) -> str | None:
+def _what_it_reaches(program: str, words: list[str], shell: str, values: dict[str, list[str]]) -> str | None:
     """What the line gives one of _NETWORK_PROGRAMS to reach: "" where the program reaches another
     machine whenever it runs, the word that names one where only some lines do, and None where this line
     stays on this machine.
@@ -3114,22 +3114,23 @@ def _what_it_reaches(program: str, words: list[str]) -> str | None:
     backup ("rsync -a src/ /mnt/backup/") is a copy and not a network call; ssh and sftp log in to a host
     the line writes, so "ssh -V" reaches nothing. Every word is looked at for a remote host, not only the
     ones that are not options, because each of these programs has more options that take a value than it
-    is worth naming, and a word that could be either counts as remote (see _LOCAL_UNLESS_REMOTE).
+    is worth naming, and a word that could be either counts as remote (see _LOCAL_UNLESS_REMOTE). What
+    the same line shows a word to hold counts as the word written out does, as it does for a path
+    ("d=user@host:/x; rsync -a src/ $d"); a host the line does not show is a host the reader cannot see.
     """
-    if program in _LOCAL_UNLESS_REMOTE:
-        return next((word for word in words if _REMOTE_WORD.search(word)), None)
-    if program in _NEEDS_SOMETHING_TO_REACH:
-        remote = next((word for word in words if _REMOTE_WORD.search(word)), None)
-        if remote is not None:
-            return remote
-        return next((word for word in _positional(words) if not _LOCAL_URL.match(word)), None)
-    return ""
+    if program not in _LOCAL_UNLESS_REMOTE and program not in _NEEDS_SOMETHING_TO_REACH:
+        return ""
+    remote = next((word for word in words for reading in _resolved(word, shell, values)
+                   if _REMOTE_WORD.search(reading)), None)
+    if remote is not None or program in _LOCAL_UNLESS_REMOTE:
+        return remote
+    return next((word for word in _positional(words) if not _LOCAL_URL.match(word)), None)
 
 
 def _network(command: _Command, earlier: list[_Command], values: dict[str, list[str]]) -> str | None:
     program, words = command.program, command.words
     if program in _NETWORK_PROGRAMS:
-        reached = _what_it_reaches(program, list(words))
+        reached = _what_it_reaches(program, list(words), command.shell, values)
         if reached is not None:
             return f"program '{program}'" if not reached else f"program '{program}' with '{reached}'"
     if program == "certutil" and any(word.lstrip("-/").lower() in ("urlcache", "verifyctl") for word in words):

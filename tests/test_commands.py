@@ -2115,7 +2115,10 @@ class ReviewRoundSix(unittest.TestCase):
         for text in ("rsync -a src/ dst/", "rsync -av --delete /home/dev/p/ /mnt/backup/p/",
                      "rsync -a --exclude=node_modules . ../snapshot/", "rsync -rtv docs/ /var/www/docs/",
                      "rsync -a -e ssh src/ build/src/", "rsync -a ./a:b dst/", "scp build/app dist/app",
-                     "scp", "ssh", "ssh -V", "ssh --help", "sftp"):
+                     "scp", "ssh", "ssh -V", "ssh --help", "sftp",
+                     # A host the line does not show is one the reader cannot see, as a path part built
+                     # only from such text is: the documented limit of reading one command line.
+                     "rsync -a src/ $dest", "scp build/app $target", "d=/mnt/backup; rsync -a src/ $d"):
             with self.subTest(text=text):
                 self.assertEqual(kinds(text), set())
                 self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "allow")
@@ -2123,7 +2126,10 @@ class ReviewRoundSix(unittest.TestCase):
                      "rsync -a rsync://host.example/module/ dst/", "rsync -a src/ host.example:/dst/",
                      "rsync -a src/ //server/share/dst/", "scp build/app user@host.example:/tmp/",
                      "scp user@host.example:/tmp/x .", "sftp user@host.example", "sftp host.example",
-                     "ssh user@host.example ls", "ssh host.example", "ssh -p 2222 host.example uptime"):
+                     "ssh user@host.example ls", "ssh host.example", "ssh -p 2222 host.example uptime",
+                     # What the same line shows a word to hold counts as the word written out does.
+                     "d=user@host.example:/x; rsync -a src/ $d",
+                     "h=host.example; ssh $h uptime"):
             with self.subTest(text=text):
                 self.assertEqual(kinds(text), {"network"})
                 self.assertEqual(STRICT.evaluate("Bash", {"command": text}).action, "block")
