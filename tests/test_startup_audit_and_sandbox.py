@@ -706,6 +706,7 @@ class WrapAndDoctorTogether(DoctorTest):
             self.assertNotIn("not one this version knows", texts(server))
 
     def test_doctor_reads_every_option_of_the_proxy_in_one_entry(self):
+        self.program_on_path("cmd")  # every option read in one entry is the point, not whether cmd is here
         key = self.home / "audit.key"
         everything = self.wrapped("all", "--session-group", "desk", "--pin-server", "--on-server-change", "quarantine",
                                   "--contain", "--server-memory-mb", "512", "--audit-key-file", str(key),

@@ -132,6 +132,33 @@ class IsolatedHomeTest(TempFolderTest):
         os.chmod(path, home_module.PRIVATE_FILE_MODE)  # 0600 keeps the owner's write permission: rmtree still works
         return path
 
+    def program_on_path(self, name):
+        """Make `name` findable as a program on PATH for this test, with a stand-in where the system has none.
+
+        Several checks are written around a server command that starts a
+        shell, "cmd /c npx ...", because that is the form a real Windows
+        entry takes. What those tests are about is the launch lint, the
+        advisories or the containment, not whether the program exists: the
+        PATH lookup has tests of its own (test_cli_doctor). So on a system
+        with no program of that name, an empty stand-in is written into this
+        test's own folder and that folder is put on PATH. The command's words
+        stay as they were, so every check reads the same entry everywhere.
+        """
+        from agent_sentinel import mcp_proxy
+
+        if mcp_proxy._resolve_executable(name) is not None:
+            return
+        folder = self.folder / "programs"
+        folder.mkdir(exist_ok=True)
+        # Never with a .bat or .cmd ending: doctor fails an entry that passes such arguments to a batch file.
+        stand_in = folder / ((name + ".exe") if sys.platform == "win32" else name)
+        stand_in.write_bytes(b"")
+        stand_in.chmod(0o755)  # POSIX looks for the execute bit (mcp_proxy._resolve_executable)
+        path = mock.patch.dict(os.environ, {"PATH": str(folder) + os.pathsep + os.environ.get("PATH", "")})
+        path.start()
+        self.addCleanup(path.stop)
+        self.assertIsNotNone(mcp_proxy._resolve_executable(name), f"the stand-in for {name} is not on PATH")
+
     def scenario(self, **scenario):
         """Write a scenario for tests/scripted_mcp_server.py; return the command that starts it."""
         path = self.write(f"scenario-{len(list(self.folder.glob('scenario-*')))}.json", scenario)
