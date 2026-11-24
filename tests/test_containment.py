@@ -1298,8 +1298,19 @@ class TheRealProxy(unittest.TestCase):
 
     @staticmethod
     def stop(proxy):
+        """End a proxy the test started and reap it, whether or not the test closed its input.
+
+        communicate() flushes stdin before it reads, and a flush of a pipe the
+        test has already closed raises ValueError on POSIX up to Python 3.12
+        (3.13 ignores it; Windows closes stdin instead of flushing it, so it
+        never raised there). A test that closed stdin has already given the
+        proxy the end of input it wanted, so the closed pipe is taken off the
+        proxy and the output is still drained and the process still waited for.
+        """
         if proxy.poll() is None:
             proxy.kill()
+        if proxy.stdin is not None and proxy.stdin.closed:
+            proxy.stdin = None
         proxy.communicate(timeout=30)
 
     def pids(self, path):
