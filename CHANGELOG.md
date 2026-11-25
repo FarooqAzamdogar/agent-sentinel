@@ -169,6 +169,7 @@ This release closes the gaps that a security review of 0.5.0 found, and adds def
 - A terminal escape sequence with many parameter characters is removed whole, so the text it hides is read.
 - `validate` and the policy warnings no longer look through every rule for each rule: a policy of 20,000 rules takes well under a second instead of about 95, and every proxy start paid for that too.
 - Folding text for the secret guard is about ten times faster on text full of characters that NFKC expands, so `check_call` on a multi-megabyte argument is no longer many times slower than on 0.5.0.
+- The website reads and works better on phones, with a keyboard and in Windows contrast themes; its quick start comes before the feature list and ends with a step that tests the policy; and its Content-Security-Policy also enforces Trusted Types.
 
 ### Changes that may need action
 

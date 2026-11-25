@@ -1,6 +1,9 @@
 /* agent-sentinel site script: theme toggle, mobile menu, tabs, copy buttons,
    current-section highlight, reading progress, back to top, code-block fades.
-   No dependencies and no network requests. The page works without it. */
+   No dependencies and no network requests. The page works without it.
+   The page's CSP enforces Trusted Types, so this script must never use
+   innerHTML, outerHTML, insertAdjacentHTML or document.write; it builds
+   nodes with createElement and textContent. */
 (function () {
   'use strict';
 
@@ -93,10 +96,10 @@
       return button.getAttribute('aria-expanded') === 'true';
     }
 
+    // The button keeps its name, "Menu"; aria-expanded carries the state.
     function setOpen(open) {
       nav.classList.toggle('is-open', open);
       button.setAttribute('aria-expanded', open ? 'true' : 'false');
-      button.setAttribute('aria-label', open ? 'Close menu' : 'Menu');
     }
 
     button.addEventListener('click', function () {
@@ -119,6 +122,15 @@
     // A click or tap anywhere outside the open panel closes it.
     document.addEventListener('click', function (event) {
       if (isOpen() && !nav.contains(event.target) && !button.contains(event.target)) {
+        setOpen(false);
+      }
+    });
+
+    // Focus that moves out of the header closes the panel, so the panel
+    // never covers the element that has focus.
+    var header = button.closest('.site-header');
+    document.addEventListener('focusin', function (event) {
+      if (isOpen() && header && !header.contains(event.target)) {
         setOpen(false);
       }
     });

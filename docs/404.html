@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Page not found | agent-sentinel</title>
@@ -12,8 +12,11 @@
 <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
 <meta name="theme-color" content="#d0d0d0" media="(prefers-color-scheme: light)">
 <!-- Absolute paths: GitHub Pages serves this file for any missing URL, at any depth. -->
+<link rel="icon" href="/agent-sentinel/favicon-32.png" sizes="32x32" type="image/png">
 <link rel="icon" href="/agent-sentinel/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/agent-sentinel/apple-touch-icon.png">
 <link rel="preload" href="/agent-sentinel/fonts/space-grotesk-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/agent-sentinel/fonts/space-mono-700-latin.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="/agent-sentinel/styles.css">
 <script src="/agent-sentinel/site.js"></script>
 </head>
@@ -55,6 +58,14 @@
           <a class="btn btn--primary" href="/agent-sentinel/">Go to the home page</a>
           <a class="btn btn--ghost" href="https://github.com/FarooqAzamdogar/agent-sentinel" rel="noopener">View on GitHub</a>
         </div>
+        <nav class="notfound__nav" aria-label="Sections of the home page">
+          <ul>
+            <li><a href="/agent-sentinel/#quick-start">Quick start</a></li>
+            <li><a href="/agent-sentinel/#how-it-works">How it works</a></li>
+            <li><a href="/agent-sentinel/#security">Security</a></li>
+            <li><a href="/agent-sentinel/#faq">FAQ</a></li>
+          </ul>
+        </nav>
       </div>
     </div>
   </section>
