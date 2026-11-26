@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'self' https://api.github.com https://api.open-meteo.com; object-src 'none'; base-uri 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types 'none'">
 <meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MCP security proxy and AI agent firewall | agent-sentinel</title>
@@ -178,6 +178,7 @@
   <symbol id="i-server" viewBox="0 0 24 24"><rect x="3.5" y="4" width="17" height="6.5" rx="1.5"/><rect x="3.5" y="13.5" width="17" height="6.5" rx="1.5"/><path d="M7 7.25h.5M7 16.75h.5"/></symbol>
   <symbol id="i-up" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
   <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+  <symbol id="i-pin" viewBox="0 0 24 24"><path d="M12 21.5s-6.5-6-6.5-11.5a6.5 6.5 0 0 1 13 0c0 5.5-6.5 11.5-6.5 11.5z"/><circle cx="12" cy="10" r="2.5"/></symbol>
   <symbol id="i-scribble" viewBox="0 0 44 36"><path d="M3 9C14 3 28 5 34 16c2 4 3 9 3 15"/><path d="M29 24c3 3 6 5 8 8 2-4 3-7 5-11"/></symbol>
   <symbol id="i-github" viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></symbol>
 </svg>
@@ -296,6 +297,52 @@ agent-sentinel demo</code></pre>
             </li>
           </ul>
           <span class="rulecard__tag">no rule, no action</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Live: the project on GitHub, the visitor's own time, and the weather on request.
+       site.js fills it in. Without JavaScript the panel is hidden. -->
+  <section class="live" aria-labelledby="live-title">
+    <div class="container">
+      <div class="live__panel">
+        <h2 class="live__tag" id="live-title"><span class="live__dot" aria-hidden="true"></span>Live<span class="visually-hidden">: the project on GitHub, your time and your weather</span></h2>
+
+        <div class="live__part" data-stats>
+          <p class="live__label">On GitHub</p>
+          <p class="live__wait" data-stats-wait>Asking GitHub&hellip;</p>
+          <ul class="live__stats" data-stats-list hidden>
+            <li><a class="live__link" href="https://github.com/FarooqAzamdogar/agent-sentinel" rel="noopener" data-stats-repo><svg class="icon" aria-hidden="true" focusable="false" width="16" height="16"><use href="#i-star"/></svg><span class="live__link-text"><span data-stats-stars></span><span class="visually-hidden"> on GitHub</span></span></a></li>
+            <li data-stats-forks></li>
+            <li class="live__wide">Code changed <time data-stats-pushed></time></li>
+            <li class="live__wide" data-stats-run-item hidden>
+              <a class="live__link" href="https://github.com/FarooqAzamdogar/agent-sentinel/actions/workflows/tests.yml" rel="noopener" data-stats-run><span class="status" data-stats-run-state><svg class="icon" aria-hidden="true" focusable="false" width="14" height="14" data-icon="ok" hidden><use href="#i-check"/></svg><svg class="icon" aria-hidden="true" focusable="false" width="14" height="14" data-icon="bad" hidden><use href="#i-x"/></svg><span data-stats-run-word></span></span>
+                <span class="live__link-text">Tests on main, run <span data-stats-run-number></span></span></a>
+              <time class="live__ago" data-stats-run-ago></time>
+            </li>
+          </ul>
+        </div>
+
+        <div class="live__part live__part--time" data-clock>
+          <p class="live__label">Your time</p>
+          <p class="live__clock" data-clock-local>--:--:--</p>
+          <p class="live__zone" data-clock-zone>Your time zone</p>
+          <p class="live__utc">UTC <span class="live__utc-time" data-clock-utc>--:--:--</span></p>
+        </div>
+
+        <div class="live__part live__part--weather" data-weather>
+          <p class="live__label">Your weather</p>
+          <button type="button" class="btn btn--small live__button" data-weather-button aria-describedby="weather-privacy">
+            <svg class="icon" aria-hidden="true" focusable="false" width="16" height="16"><use href="#i-pin"/></svg>
+            Show my weather
+          </button>
+          <p class="live__privacy" id="weather-privacy">Weather comes from <a href="https://open-meteo.com/" rel="noopener">Open-Meteo</a>; your location is sent only after you click, rounded to about 1&nbsp;km, and is not stored.</p>
+          <div class="live__weather" aria-live="polite" aria-atomic="true" data-weather-out></div>
+          <template data-weather-icons>
+            <svg class="icon" aria-hidden="true" focusable="false" width="14" height="14" data-icon="day"><use href="#i-sun"/></svg>
+            <svg class="icon" aria-hidden="true" focusable="false" width="14" height="14" data-icon="night"><use href="#i-moon"/></svg>
+          </template>
         </div>
       </div>
     </div>

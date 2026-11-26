@@ -1365,6 +1365,280 @@ h1 {
   }
 }
 
+/* ---------- Live panel ---------- */
+
+/* Under the hero: the project on GitHub, the visitor's own time and, when
+   they ask, their weather. site.js fills it in, so without JavaScript it is
+   hidden. A card with a cyan sticker (information) on its top edge; its three
+   parts stand side by side from 62em, two above one from 40em, and stacked
+   on phones, with dashed lines between them. */
+.live {
+  padding-block: var(--space-5) var(--space-6);
+}
+
+html:not(.js) .live {
+  display: none;
+}
+
+.live__panel {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  border: var(--bw) solid var(--border);
+  background: var(--card);
+  box-shadow: var(--sh-3) var(--sh-3) 0 var(--border);
+}
+
+.live__tag {
+  position: absolute;
+  top: -1.05rem;
+  left: var(--space-5);
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.1rem 0.6rem;
+  border: 2px solid var(--border);
+  background: var(--cyan);
+  box-shadow: var(--sh-1) var(--sh-1) 0 var(--border);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1.6;
+  text-transform: uppercase;
+  transform: rotate(-2deg);
+}
+
+/* A square light. It blinks four times when the panel first comes into view
+   (site.js adds is-seen), under five seconds, then holds still. */
+.live__dot {
+  flex: none;
+  width: 0.5rem;
+  height: 0.5rem;
+  background: var(--ink);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .live.is-seen .live__dot {
+    animation: live-blink 1.2s steps(1, end) 4;
+  }
+}
+
+@keyframes live-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.live__part {
+  min-width: 0;
+  padding: var(--space-5);
+}
+
+.live__part--time,
+.live__part--weather {
+  border-top: 2px dashed var(--border);
+}
+
+.live__label {
+  margin-bottom: var(--space-2);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1.5;
+  text-transform: uppercase;
+}
+
+.live__wait {
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+
+/* The stars and forks share a row; the last change and the tests take one each. */
+.live__stats {
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  align-items: center;
+  gap: var(--space-1) var(--space-5);
+  list-style: none;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+}
+
+.live__wide {
+  flex-basis: 100%;
+}
+
+/* A link here underlines its words, not the chip beside them, and is at
+   least 28px tall. */
+.live__link {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  min-height: 1.75rem;
+  text-decoration: none;
+}
+
+.live__link-text {
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 0.2em;
+}
+
+.live__link > .icon {
+  width: 1rem;
+  height: 1rem;
+}
+
+.live__ago {
+  color: var(--muted);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+/* The clocks: digits in Space Mono, so the width holds as they change. */
+.live__clock,
+.live__utc-time {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.live__clock {
+  font-size: var(--text-xl);
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+/* The zone and UTC each take a line at every width, so a long zone name
+   never moves the UTC line. */
+.live__zone {
+  margin-top: var(--space-1);
+  color: var(--muted);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.live__utc {
+  margin-top: var(--space-1);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.live__button[aria-disabled="true"] {
+  cursor: progress;
+}
+
+/* While it works, the button stays pressed flat on the page. */
+@media (prefers-reduced-motion: no-preference) {
+  .live__button[aria-disabled="true"],
+  .live__button[aria-disabled="true"]:hover {
+    transform: translate(4px, 4px);
+    box-shadow: 0 0 0 var(--border);
+  }
+}
+
+/* Under the privacy note. An empty result keeps its place in the page, so
+   screen readers hear what arrives in it, and adds no space. From the click
+   on it holds room for a whole answer, so the page moves once, with the
+   click, and not again when the answer comes. No transition: with reduced
+   motion every element gets a 0.01ms one, which would bring the margin a
+   frame after the room and move the page twice. */
+.live__weather {
+  transition: none;
+}
+
+.live__weather:not(:empty) {
+  min-height: 6.5rem;
+  margin-top: var(--space-4);
+}
+
+.live__reading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+}
+
+.live__temp {
+  font-size: var(--text-xl);
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.live__more {
+  margin-top: var(--space-1);
+  color: var(--muted);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+
+.live__message {
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+
+.live__privacy {
+  max-width: 34rem;
+  margin-top: var(--space-3);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+@media (min-width: 40em) {
+  .live__panel {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  /* Side by side, the waiting line holds the room the stats will take, so
+     on a screen tall enough to show the panel nothing moves when they come. */
+  .live__wait,
+  .live__stats {
+    min-height: 7rem;
+  }
+
+  .live__part--time {
+    border-top: 0;
+    border-left: 2px dashed var(--border);
+  }
+
+  .live__part--weather {
+    grid-column: 1 / -1;
+  }
+}
+
+/* The clock's column is never narrower than its longest time, in any locale. */
+@media (min-width: 62em) {
+  .live__panel {
+    grid-template-columns: minmax(0, 1.2fr) minmax(min-content, 0.75fr) minmax(0, 1.3fr);
+  }
+
+  .live__part--weather {
+    grid-column: auto;
+    border-top: 0;
+    border-left: 2px dashed var(--border);
+  }
+}
+
+@media (max-width: 29.99em) {
+  .live__part {
+    padding-inline: var(--space-4);
+  }
+
+  .live__tag {
+    left: var(--space-4);
+  }
+}
+
 /* ---------- In plain words ---------- */
 
 /* An icon on a colored square. On most cards it hangs over the top edge. */
@@ -3881,6 +4155,12 @@ html:not(.js) .tabs__panel + .tabs__panel {
   .site-nav a:not([aria-current]) {
     border-color: Canvas;
   }
+
+  /* The live light is a fill, which forced colors would drop. */
+  .live__dot {
+    forced-color-adjust: none;
+    background: CanvasText;
+  }
 }
 
 /* ---------- Motion and print ---------- */
@@ -3912,7 +4192,8 @@ html:not(.js) .tabs__panel + .tabs__panel {
   .copy,
   .to-top,
   .hero__art,
-  .scribble {
+  .scribble,
+  .live {
     display: none !important;
   }
 

@@ -3,7 +3,9 @@
 The pages are read with html.parser, and nothing is fetched. The version the site gives is
 the package's, every link and every file a page names exists, nothing comes from another
 origin, and the pages and site.js keep to the policy, which allows no inline code and
-enforces Trusted Types. Without docs/ the whole module is skipped.
+enforces Trusted Types. site.js asks GitHub's API and Open-Meteo for data, the only origins
+the home page's policy lets it connect to, and reads the visitor's location, and asks for
+the weather, only once they click. Without docs/ the whole module is skipped.
 """
 
 import functools
@@ -40,7 +42,17 @@ UNSAFE_IN_SCRIPT = {
     "document.write": re.compile(r"\bdocument\s*\.\s*write"),
     "eval(": re.compile(r"\beval\s*\("),
     "new Function": re.compile(r"\bnew\s+Function\b"),
+    "DOMParser": re.compile(r"\bDOMParser\b"),
+    "createContextualFragment": re.compile(r"createContextualFragment"),
+    "srcdoc": re.compile(r"\bsrcdoc\b"),
+    "setHTMLUnsafe, parseHTMLUnsafe": re.compile(r"HTMLUnsafe"),
+    "a timer given a string": re.compile(r"\bset(?:Timeout|Interval)\s*\(\s*['\"`]"),
 }
+# Where the home page may fetch from: itself, GitHub's API (the live stats, as the page loads) and
+# Open-Meteo (the weather, once the visitor asks). The 404 page, which also runs site.js, may fetch nothing.
+CONNECT_SRC = ["'self'", "https://api.github.com", "https://api.open-meteo.com"]
+ADDRESS = re.compile(r"""https?://[^\s'"`<>()\\]+""")
+WEATHER_HANDLER = "addEventListener('click', function onWeatherClick("
 VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
 
 
@@ -176,6 +188,20 @@ def policy(name):
     return (policies(name) or [None])[0]
 
 
+def directives(name):
+    """The page's policy as {directive: [its values]}."""
+    found = {}
+    for part in policy(name).attr("content").split(";"):
+        words = part.split()
+        if words:
+            found[words[0].lower()] = words[1:]
+    return found
+
+
+def script():
+    return (DOCS / "site.js").read_text(encoding="utf-8")
+
+
 def without_comments(source):
     """JavaScript source without its comments; strings are kept. A rough scanner, enough for site.js."""
     out, i, quote = [], 0, None
@@ -202,6 +228,44 @@ def without_comments(source):
             out.append(char)
             i += 1
     return "".join(out)
+
+
+def braces(code, start):
+    """(first, last) such that code[first:last] is the block that the first "{" at or after start opens.
+
+    Strings are skipped, as in without_comments. A rough scanner, enough for the function of site.js it is
+    used on, which holds no regular expression.
+    """
+    first = code.index("{", start)
+    depth, quote, i = 0, None, first
+    while i < len(code):
+        char = code[i]
+        if quote:
+            if char == "\\":
+                i += 1
+            elif char == quote:
+                quote = None
+        elif char in "'\"`":
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return first, i + 1
+        i += 1
+    raise ValueError("the block never closes")
+
+
+def weather_handler(code):
+    """The span of the weather button's click handler in code, or None."""
+    header = code.find(WEATHER_HANDLER)
+    return None if header == -1 else braces(code, header)
+
+
+def marked(name, attribute):
+    """The elements of a page that carry the attribute."""
+    return [element for element in page(name) if attribute in element.attrs]
 
 
 class TheVersionTheSiteGives(unittest.TestCase):
@@ -337,6 +401,95 @@ class TheContentSecurityPolicy(unittest.TestCase):
         code = without_comments((DOCS / "site.js").read_text(encoding="utf-8"))
         self.assertIn("textContent", code)  # the comments went, the code stayed
         self.assertEqual([name for name, pattern in UNSAFE_IN_SCRIPT.items() if pattern.search(code)], [])
+
+
+class WhatThePageFetchesAndWhen(unittest.TestCase):
+    def test_the_home_page_may_connect_only_to_itself_github_and_open_meteo(self):
+        self.assertEqual(directives(HOME).get("connect-src"), CONNECT_SRC)
+
+    def test_the_404_page_may_connect_nowhere(self):
+        self.assertEqual(directives(NOT_FOUND).get("connect-src"), ["'none'"])
+
+    def test_every_address_in_the_script_is_on_an_origin_the_page_may_connect_to(self):
+        # Comments included. And every origin the policy allows is one the script uses.
+        found = ADDRESS.findall(script())
+        origins = tuple(origin + "/" for origin in CONNECT_SRC[1:])
+        self.assertEqual([address for address in found if not address.startswith(origins)], [])
+        unused = [origin for origin in origins if not any(address.startswith(origin) for address in found)]
+        self.assertEqual(unused, [])
+
+    def test_the_location_and_the_weather_are_asked_for_only_after_a_click(self):
+        # The weather button's click handler is a named function expression, a name that exists only
+        # inside it, passed straight to addEventListener('click', ...). Everything that touches the
+        # location or names Open-Meteo lies inside it, and the script never clicks or sends an event
+        # itself, so none of it can run before the visitor clicks.
+        code = without_comments(script())
+        span = weather_handler(code)
+        self.assertIsNotNone(span, "the weather button's click handler is missing")
+        for word in ("geolocation", "getCurrentPosition", "api.open-meteo.com"):
+            places = [match.start() for match in re.finditer(re.escape(word), code)]
+            with self.subTest(word=word):
+                self.assertTrue(places)  # the search works
+                self.assertEqual([place for place in places if not span[0] < place < span[1]], [])
+        self.assertEqual(len(re.findall(r"\bonWeatherClick\b", code)), 1, "the handler is used by name")
+        self.assertIsNone(re.search(r"watchPosition|\.click\b|dispatchEvent", code))
+
+    def test_the_weather_handler_keeps_the_location_nowhere(self):
+        code = without_comments(script())
+        first, last = weather_handler(code)
+        handler = code[first:last]
+        # The address carries the location, so the HTTP cache must not keep the answer under it.
+        self.assertIn("cache: 'no-store'", handler)
+        self.assertIsNone(re.search(r"Storage|cookie|indexedDB|caches\.|Cached|askGitHub", handler))
+        self.assertIn("toFixed(2)", handler)  # two decimals, about 1 km
+
+    def test_the_script_says_what_it_fetches(self):
+        opening = script().split("*/", 1)[0]
+        for host in ("api.github.com", "api.open-meteo.com"):
+            with self.subTest(host=host):
+                self.assertIn(host, opening)
+        self.assertNotIn("no network requests", opening)
+
+
+class TheLivePanel(unittest.TestCase):
+    def test_it_is_hidden_without_javascript(self):
+        styles = (DOCS / "styles.css").read_text(encoding="utf-8")
+        self.assertRegex(styles, r"html:not\(\.js\)\s+\.live\s*\{\s*display:\s*none;\s*\}")
+        self.assertEqual(len([element for element in page(HOME) if "live" in element.classes()]), 1)
+
+    def test_the_weather_answer_is_announced_and_the_clock_is_not(self):
+        answers = marked(HOME, "data-weather-out")
+        self.assertEqual([(element.attr("aria-live"), element.attr("aria-atomic")) for element in answers],
+                         [("polite", "true")])
+        clocks = marked(HOME, "data-clock")
+        self.assertEqual(len(clocks), 1)
+        around = list(clocks[0].walk())
+        element = clocks[0].parent
+        while element is not None:
+            around.append(element)
+            element = element.parent
+        self.assertEqual([element.tag for element in around if "aria-live" in element.attrs], [])
+
+    def test_the_weather_button_says_what_is_sent_and_where(self):
+        buttons = marked(HOME, "data-weather-button")
+        self.assertEqual([element.tag for element in buttons], ["button"])
+        note = [element for element in page(HOME) if element.attr("id") == buttons[0].attr("aria-describedby")]
+        self.assertEqual(len(note), 1, "the button is described by the privacy note")
+        words = " ".join(note[0].text().split())
+        for phrase in ("Open-Meteo", "only after you click", "about 1 km", "not stored"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, words)
+
+    def test_its_links_go_to_the_repository_and_open_safely(self):
+        # site.js only lets a test run's page through if it lies under the stars link's address.
+        self.assertEqual([element.attr("href") for element in marked(HOME, "data-stats-repo")],
+                         ["https://github.com/FarooqAzamdogar/agent-sentinel"])
+        section = next(element for element in page(HOME) if "live" in element.classes())
+        outward = [element for element in section.walk()
+                   if element.tag == "a" and from_another_origin(element.attr("href"))]
+        self.assertTrue(outward)  # the search works
+        self.assertEqual([element.attr("href") for element in outward
+                          if "noopener" not in element.attr("rel").split()], [])
 
 
 if __name__ == "__main__":
