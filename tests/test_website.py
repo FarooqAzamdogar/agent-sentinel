@@ -227,6 +227,18 @@ class TheVersionTheSiteGives(unittest.TestCase):
         self.assertIsNotNone(pill, "the version pill is missing")
         self.assertEqual(pill.text().split()[:1], ["v" + __version__])
 
+    def test_the_dates_the_site_gives_agree(self):
+        # The page's dateModified is the sitemap's lastmod; the software's is its release date in CHANGELOG.md.
+        pages = [node for data in parsed_json_ld(HOME) for node in nodes_of_type(data, "WebPage")]
+        software = [node for data in parsed_json_ld(HOME) for node in nodes_of_type(data, "SoftwareApplication")]
+        lastmod = re.findall(r"<lastmod>([^<]+)</lastmod>", (DOCS / "sitemap.xml").read_text(encoding="utf-8"))
+        self.assertTrue(lastmod)  # the search works
+        self.assertEqual([node.get("dateModified") for node in pages], lastmod)
+        released = re.search(r"^## %s \((\d{4}-\d{2}-\d{2})\)" % re.escape(__version__),
+                             (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"), re.MULTILINE)
+        self.assertIsNotNone(released, "CHANGELOG.md has no heading for this version")
+        self.assertEqual([node.get("dateModified") for node in software], [released.group(1)])
+
 
 class WhatThePagesPointAt(unittest.TestCase):
     def test_every_link_within_the_home_page_names_an_id_on_it(self):
