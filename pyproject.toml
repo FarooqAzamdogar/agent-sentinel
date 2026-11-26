@@ -5,20 +5,23 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-sentinel"
 dynamic = ["version"]
-description = "Security sentinel for AI agents and MCP servers: blocks unsafe tool calls, prompt injection and poisoned tools."
+description = "Security layer for AI agents and MCP servers: a default-deny policy for tool calls, prompt-injection scanning, poisoned-tool quarantine, a secret guard and an audit log."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE"]
 keywords = [
-    "ai", "llm", "agents", "security", "mcp", "model-context-protocol", "prompt-injection", "guardrails",
-    "firewall", "tool-calls", "secrets", "audit-log", "claude-code", "hooks",
+    "ai", "llm", "agents", "ai-agents", "security", "ai-security", "llm-security", "agent-security",
+    "mcp", "model-context-protocol", "mcp-security", "mcp-proxy", "prompt-injection", "tool-poisoning",
+    "guardrails", "firewall", "tool-calls", "secrets", "audit-log", "claude-code", "hooks",
 ]
 # The Python versions listed are the ones the tests run on (.github/workflows/tests.yml).
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -26,13 +29,17 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = []
 
 [project.urls]
 Homepage = "https://farooqazamdogar.github.io/agent-sentinel/"
+Documentation = "https://github.com/FarooqAzamdogar/agent-sentinel#readme"
 Source = "https://github.com/FarooqAzamdogar/agent-sentinel"
+Changelog = "https://github.com/FarooqAzamdogar/agent-sentinel/blob/main/CHANGELOG.md"
 Issues = "https://github.com/FarooqAzamdogar/agent-sentinel/issues"
 Security = "https://github.com/FarooqAzamdogar/agent-sentinel/blob/main/SECURITY.md"
 

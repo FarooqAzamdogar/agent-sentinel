@@ -1,6 +1,6 @@
 # agent-sentinel
 
-A security guard for AI agents and MCP servers. It sits between an agent and its tools. It does five things:
+An open-source security guard for AI agents and MCP servers: a firewall for tool calls and a scanner for prompt injection and tool poisoning. It sits between an agent and its tools, whether those are stdio MCP servers, Claude Code's own tools or functions in your Python code. It does five things:
 
 1. **Checks every tool call against your policy** before the tool runs.
 2. **Scans everything a tool server sends for prompt injection** before the agent reads it. This includes poisoned tool descriptions.
@@ -15,6 +15,8 @@ It is pure Python (3.10 or newer) with no dependencies. You can use it in three 
 - as a **library** inside your own agent.
 
 Website: https://farooqazamdogar.github.io/agent-sentinel/
+
+Framework mapping (OWASP Top 10 for LLM and Agentic Applications, OWASP MCP Top 10, MITRE ATLAS, CWE-1427), with the limit for each: https://farooqazamdogar.github.io/agent-sentinel/#frameworks
 
 > **Status: early version (0.6.0, alpha).** The permission policy is the dependable part. The injection detector is a set of pattern rules, not a trained model: it catches common, direct injections and undoes many cheap disguises, but it will miss reworded or translated ones, and it can flag harmless text. Treat it as an extra layer. The checks of shell commands, the launch checks in `doctor` and the audit log's hash chain raise the bar; none of them is a boundary against code that already runs as you. The proxy is tested against test servers in this repository, not yet against many third-party MCP servers, and the Linux and macOS sandboxes have had little real-world testing. There has been no independent audit. [SECURITY.md](SECURITY.md) lists what is covered and what is not.
 
@@ -568,7 +570,7 @@ What this policy does, in plain words:
 - `Edit`, `Write`, `MultiEdit` and `NotebookEdit` may run. Claude Code's own permission mode still decides about ordinary files. A write to an agent's settings or instruction files (`.claude/settings.json`, `.mcp.json`, `CLAUDE.md`, a git hook, a shell start-up file ...) is asked about, and so is text that sets a switch such as `ANTHROPIC_BASE_URL` or `enableAllProjectMcpServers`.
 - `Bash` and `PowerShell` may run. A command that reaches the network, installs a package, writes agent settings or hides what it runs is asked about. So is a command the reader cannot read with certainty, such as one with a heredoc.
 - **A shell reads private files, and a network command brings in untrusted content.** `Bash` and `PowerShell` are labelled `private`, because a command can read anything you can, as `Read`, `Grep`, `Glob`, `Skill`, `BashOutput`, `TaskOutput` and `ToolSearch` are. A `network` or `install` command gives the call the labels `untrusted` and `sink`. So one `curl` sets both marks of the flow rule below by itself, and the session's sinks are then closed.
-- `WebFetch`, `WebSearch` and MCP tools bring in untrusted content and are sinks. Once the session has read untrusted **and** private content, anything that sends data out is refused, including a Bash command that reaches the network.
+- `WebFetch`, `WebSearch` and MCP tools bring in untrusted content and are sinks. Once the session has read untrusted **and** private content, every call labelled `sink` is refused, including a Bash command that reaches the network.
 - `"labels": []` on a tool means "this tool has no flow label, on purpose". It keeps `validate` from warning about it.
 
 Save it as `hook-policy.json` in the home folder, check it with `agent-sentinel validate`, then install the hooks:
